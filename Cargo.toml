@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 core-foundation = "0.10.1"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.186"
