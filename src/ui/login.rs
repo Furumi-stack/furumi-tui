@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::theme;
@@ -66,7 +66,14 @@ fn draw_form(frame: &mut Frame, form: &LoginForm) {
 }
 
 fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
-    let area = centered(frame.area(), 64, 16);
+    // The dialog grows with the URL so it is always shown in full and can
+    // be copied/typed manually.
+    let width = 78.min(frame.area().width.saturating_sub(2)).max(40);
+    let inner_width = usize::from(width - 2);
+    let url_lines = (form.sso_url.len().div_ceil(inner_width.max(1)) as u16).clamp(1, 6);
+    let height = (13 + url_lines).min(frame.area().height);
+    let area = centered(frame.area(), width, height);
+
     let block = Block::bordered()
         .title(" Continue with SSO ")
         .title_style(theme::header())
@@ -74,10 +81,10 @@ fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [steps, url, _, paste, message, hint] = Layout::vertical([
-        Constraint::Length(4),
+    let [steps, url_label, url, paste, message, hint] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(1),
+        Constraint::Length(url_lines),
         Constraint::Length(3),
         Constraint::Length(2),
         Constraint::Length(1),
@@ -87,24 +94,34 @@ fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
     let lines = if let Some(port) = form.sso_port {
         vec![
             Line::raw("1. Finish signing in, in the browser window."),
-            Line::raw("2. Sign-in completes here automatically."),
-            Line::styled(format!("   (waiting on 127.0.0.1:{port})"), theme::dim()),
+            Line::from(vec![
+                Span::raw("2. Sign-in completes here automatically "),
+                Span::styled(format!("(waiting on 127.0.0.1:{port})"), theme::dim()),
+            ]),
             Line::raw("3. If it doesn't, paste the code from the page below."),
         ]
     } else {
         vec![
             Line::raw("1. Finish signing in, in the browser window."),
-            Line::raw("2. Copy the code shown on the final page"),
-            Line::raw("   (or right-click \"Open Furumi\" and copy its link)."),
+            Line::raw("2. Copy the code shown on the final page."),
             Line::raw("3. Paste it below and press Enter."),
         ]
     };
     frame.render_widget(Paragraph::new(lines), steps);
 
     frame.render_widget(
-        Paragraph::new(Line::styled(form.sso_url.clone(), theme::dim()))
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title("If the browser didn't open, visit").border_style(theme::dim())),
+        Paragraph::new(Line::styled(
+            "If the browser didn't open, visit:",
+            theme::dim(),
+        )),
+        url_label,
+    );
+    // Unbordered and character-wrapped: the URL is fully visible and can be
+    // selected in the terminal without picking up border glyphs.
+    frame.render_widget(
+        Paragraph::new(form.sso_url.clone())
+            .style(theme::accent())
+            .wrap(Wrap { trim: false }),
         url,
     );
 
