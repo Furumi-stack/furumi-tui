@@ -31,13 +31,14 @@ zbus (no libdbus), images and audio decoding are Rust crates.
 
 ### macOS / Windows
 
-No system packages required. (Windows: media keys are not wired up yet;
-playback works.)
+No system packages required.
 
 ## Configuration
 
-- `~/.config/furumi/keymap.toml` — keybinding overrides, see
+- `keymap.toml` in the config dir — keybinding overrides, see
   `src/config/default_keymap.toml` for the format and defaults.
-- `~/.config/furumi/credentials.json` — created on login (0600).
+  Config dir: `~/.config/furumi` on Linux,
+  `~/Library/Application Support/furumi` on macOS.
+- `credentials.json` in the same dir — created on login (0600).
 - Logs: in-app on the Logs tab (`5`), and in the cache dir
   (`furumi-cli.log`), filtered by `RUST_LOG`.

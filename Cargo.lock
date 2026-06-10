@@ -1190,6 +1190,7 @@ dependencies = [
  "directories",
  "futures-util",
  "image",
+ "libc",
  "open",
  "ratatui",
  "reqwest",
@@ -1203,6 +1204,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

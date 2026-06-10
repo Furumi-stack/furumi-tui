@@ -4,10 +4,9 @@
 //! MPRemoteCommandCenter on macOS, SMTC on Windows. On macOS the command
 //! callbacks are only delivered while the main thread services its CFRunLoop,
 //! so the app runs on a worker thread and `run_on_main_thread` keeps the main
-//! thread pumping the run loop and applying metadata updates.
-//!
-//! Windows note: SMTC needs a window handle; creating a hidden window is not
-//! wired up yet, so media keys are skipped there with a log line.
+//! thread pumping the run loop and applying metadata updates. On Windows,
+//! SMTC needs a window: a hidden one is created here and its message queue
+//! is pumped the same way.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -86,21 +85,65 @@ pub fn run_on_main_thread(
 }
 
 fn create_controls() -> Option<MediaControls> {
+    // SMTC on Windows attaches to a window; console apps create a hidden one.
+    #[cfg(target_os = "windows")]
+    let hwnd = match create_hidden_window() {
+        Some(hwnd) => Some(hwnd),
+        None => {
+            tracing::warn!("media keys: hidden window creation failed");
+            return None;
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let hwnd = None;
+
     let config = PlatformConfig {
         display_name: "Furumi",
         dbus_name: "cy.hexor.furumi",
-        hwnd: None,
+        hwnd,
     };
-    if cfg!(windows) {
-        tracing::info!("media keys: hidden-window SMTC setup not implemented yet, skipping");
-        return None;
-    }
     match MediaControls::new(config) {
         Ok(controls) => Some(controls),
         Err(err) => {
             tracing::warn!(?err, "media controls unavailable");
             None
         }
+    }
+}
+
+/// An invisible top-level window owning the SMTC session. Created on the
+/// main thread, which also pumps its messages in `pump_platform_events`.
+#[cfg(target_os = "windows")]
+fn create_hidden_window() -> Option<*mut std::ffi::c_void> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW,
+    };
+    unsafe {
+        let class_name: Vec<u16> = "furumi_media_keys\0".encode_utf16().collect();
+        let instance = GetModuleHandleW(core::ptr::null());
+        let mut class: WNDCLASSW = core::mem::zeroed();
+        class.lpfnWndProc = Some(DefWindowProcW);
+        class.hInstance = instance;
+        class.lpszClassName = class_name.as_ptr();
+        if RegisterClassW(&class) == 0 {
+            return None;
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            instance,
+            core::ptr::null(),
+        );
+        if hwnd.is_null() { None } else { Some(hwnd) }
     }
 }
 
@@ -155,5 +198,21 @@ fn pump_platform_events() {
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+/// On Windows the hidden SMTC window needs its message queue drained on the
+/// thread that created it.
+#[cfg(target_os = "windows")]
+fn pump_platform_events() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+    unsafe {
+        let mut msg: MSG = core::mem::zeroed();
+        while PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn pump_platform_events() {}

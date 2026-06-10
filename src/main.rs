@@ -19,6 +19,7 @@ fn main() -> Result<()> {
     if let Err(err) = config::logging::init() {
         startup_warning = Some(format!("logging disabled: {err:#}"));
     }
+    capture_stderr();
     let (keymap, keymap_warning) = config::keymap::Keymap::load();
     let startup_warning = keymap_warning.or(startup_warning);
 
@@ -83,6 +84,46 @@ fn run_app(
     ratatui::restore();
     result
 }
+
+/// C libraries (ALSA on some distros, in particular) print warnings straight
+/// to stderr, which corrupts the TUI. Replace stderr with a pipe and forward
+/// every line into tracing — it lands in the Logs tab and the log file
+/// instead of the screen.
+#[cfg(unix)]
+fn capture_stderr() {
+    use std::io::BufRead as _;
+    use std::os::fd::FromRawFd as _;
+
+    let mut fds = [0i32; 2];
+    // SAFETY: plain pipe/dup2 syscalls on freshly created fds.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        let [read_fd, write_fd] = fds;
+        if libc::dup2(write_fd, libc::STDERR_FILENO) == -1 {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            return;
+        }
+        libc::close(write_fd);
+        let reader = std::fs::File::from_raw_fd(read_fd);
+        std::thread::Builder::new()
+            .name("stderr".to_string())
+            .spawn(move || {
+                for line in std::io::BufReader::new(reader).lines() {
+                    let Ok(line) = line else { break };
+                    if !line.trim().is_empty() {
+                        tracing::warn!(target: "stderr", "{line}");
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_stderr() {}
 
 /// Kitty keyboard protocol, where supported, disambiguates Esc from alt-keys
 /// and modifier combos. The flags are popped on exit and on panic — leaving
