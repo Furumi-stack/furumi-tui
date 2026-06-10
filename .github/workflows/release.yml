@@ -2,15 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*"
-  pull_request:
-  release:
-    types:
-      - published
 
 permissions:
   contents: read
@@ -28,15 +21,15 @@ jobs:
         include:
           - os: ubuntu-latest
             asset_name: furumi-linux-x86_64
-            archive_name: furumi-linux-x86_64.tar.gz
+            archive_ext: tar.gz
             binary_name: furumi
           - os: macos-latest
             asset_name: furumi-macos-x86_64
-            archive_name: furumi-macos-x86_64.tar.gz
+            archive_ext: tar.gz
             binary_name: furumi
           - os: windows-latest
             asset_name: furumi-windows-x86_64
-            archive_name: furumi-windows-x86_64.zip
+            archive_ext: zip
             binary_name: furumi.exe
 
     steps:
@@ -58,28 +51,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          version="${GITHUB_REF_NAME#v}"
+          archive_name="${{ matrix.asset_name }}-${version}.${{ matrix.archive_ext }}"
           package_dir="dist/${{ matrix.asset_name }}"
           mkdir -p "$package_dir"
           cp "target/release/${{ matrix.binary_name }}" "$package_dir/"
           cp README.md "$package_dir/"
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            (cd dist && 7z a "../${{ matrix.archive_name }}" "${{ matrix.asset_name }}")
+            (cd dist && 7z a "../${archive_name}" "${{ matrix.asset_name }}")
           else
-            tar -C dist -czf "${{ matrix.archive_name }}" "${{ matrix.asset_name }}"
+            tar -C dist -czf "${archive_name}" "${{ matrix.asset_name }}"
           fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: ${{ matrix.archive_name }}
+          path: ${{ matrix.asset_name }}-*
           if-no-files-found: error
 
   publish:
     name: Publish release assets
     needs: build
-    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -89,8 +83,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Upload assets to release
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" artifacts/*/* --clobber
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$RELEASE_TAG" artifacts/*/* \
+            --title "furumi ${RELEASE_TAG}" \
+            --notes "Release ${RELEASE_TAG}" \
+            --verify-tag
