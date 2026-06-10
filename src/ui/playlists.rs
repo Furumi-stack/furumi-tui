@@ -29,7 +29,11 @@ fn centered_line(frame: &mut Frame, area: Rect, line: Line) {
     if area.height == 0 {
         return;
     }
-    let middle = Rect { y: area.y + area.height / 2, height: 1, ..area };
+    let middle = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), middle);
 }
 
@@ -47,7 +51,11 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
             );
         }
         _ => {
-            return centered_line(frame, inner, Line::styled("loading playlists…", theme::dim()));
+            return centered_line(
+                frame,
+                inner,
+                Line::styled("loading playlists…", theme::dim()),
+            );
         }
     };
     if list.is_empty() {
@@ -125,7 +133,11 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         return centered_line(frame, inner, Line::styled("loading…", theme::dim()));
     };
     if tracks.is_empty() {
-        return centered_line(frame, inner, Line::styled("no tracks here yet", theme::dim()));
+        return centered_line(
+            frame,
+            inner,
+            Line::styled("no tracks here yet", theme::dim()),
+        );
     }
 
     let visible = usize::from(inner.height.max(1));
@@ -139,6 +151,13 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             width: inner.width,
             height: 1,
         };
-        track_row(frame, row, state, track, (index + 1).to_string(), index == cursor);
+        track_row(
+            frame,
+            row,
+            state,
+            track,
+            (index + 1).to_string(),
+            index == cursor,
+        );
     }
 }

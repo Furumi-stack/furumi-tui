@@ -11,7 +11,9 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+};
 
 /// Commands arriving from the OS media keys, translated for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +160,7 @@ fn apply(controls: &mut MediaControls, update: MediaUpdate) {
             title: Some(&title),
             artist: Some(&artist),
             album: Some(&album),
-            duration: (duration_secs > 0.0)
-                .then(|| Duration::from_secs_f64(duration_secs)),
+            duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
             cover_url: None,
         }),
         MediaUpdate::Playback {

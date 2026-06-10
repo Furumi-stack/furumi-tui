@@ -190,8 +190,7 @@ mod tests {
 
     #[test]
     fn sso_code_from_deep_link() {
-        let code =
-            extract_sso_code("furumi://auth/callback?code=furu_mx_abc123").unwrap();
+        let code = extract_sso_code("furumi://auth/callback?code=furu_mx_abc123").unwrap();
         assert_eq!(code, "furu_mx_abc123");
     }
 

@@ -14,10 +14,10 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const SEARCH_LIMIT: i64 = 12;
 
 /// Keys go here instead of the keymap while the command line is open.
-pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
+pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => cancel(state),
-        KeyCode::Enter => commit(state),
+        KeyCode::Enter => commit(state, runtime),
         KeyCode::Backspace => {
             if state.cmdline.input.pop().is_none() {
                 // Backspace on an empty line closes it, like vim.
@@ -57,6 +57,21 @@ fn after_change(state: &mut AppState, runtime: &Runtime) {
 
 fn apply_live(state: &mut AppState, runtime: &Runtime, command: Command) {
     match command {
+        // One-shot commands have no live effect.
+        Command::Quit
+        | Command::Logout
+        | Command::Volume(_)
+        | Command::Seek(_)
+        | Command::SeekTo(_)
+        | Command::Shuffle
+        | Command::Repeat(_)
+        | Command::ClearQueue
+        | Command::Next
+        | Command::Prev
+        | Command::PlayPause
+        | Command::Help
+        | Command::Devices
+        | Command::Logs(_) => {}
         Command::Search(query) => {
             state.active_tab = Tab::Global;
             if !matches!(state.global.stack.last(), Some(GlobalView::Search { .. })) {
@@ -116,14 +131,77 @@ fn schedule_search(state: &mut AppState, runtime: &Runtime) {
 }
 
 /// Enter: close the line. Live commands already took effect (their view
-/// stays open); one-shot commands would execute here.
-fn commit(state: &mut AppState) {
+/// stays open); one-shot commands execute here.
+fn commit(state: &mut AppState, runtime: &mut Runtime) {
     let parsed = command::parse(&state.cmdline.input);
     close(state);
     match parsed {
-        Parsed::Empty | Parsed::Command(_) => {}
+        Parsed::Empty => {}
+        Parsed::Command(command) if command::is_live(&command) => {}
+        Parsed::Command(command) => execute(state, runtime, command),
+        Parsed::Invalid(usage) => state.status_message = Some(usage),
         Parsed::Unknown(name) => {
             state.status_message = Some(format!("unknown command: {name}"));
+        }
+    }
+}
+
+/// One-shot command execution. Most commands reuse the same Action/Effect
+/// path as keybindings, so behavior stays identical.
+fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
+    use crate::app::action::Action;
+    use crate::app::state::{LOG_LEVELS, RepeatMode, Tab};
+    use crate::app::update::Effect;
+
+    let run_action = |state: &mut AppState, runtime: &mut Runtime, action: Action| {
+        if let Some(effect) = crate::app::update::update(state, action) {
+            super::perform_effect(state, runtime, effect);
+        }
+    };
+    match command {
+        Command::Search(_) => {}
+        Command::Quit => state.should_quit = true,
+        Command::Logout => super::perform_logout(state, runtime),
+        Command::Volume(value) => {
+            state.player.volume = value;
+            super::perform_effect(state, runtime, Effect::SetVolume(value));
+            state.status_message = Some(format!("volume {value}%"));
+        }
+        Command::Seek(delta) => {
+            if state.player.current.is_some() {
+                super::perform_effect(state, runtime, Effect::SeekBy(delta));
+            }
+        }
+        Command::SeekTo(seconds) => {
+            if state.player.current.is_some() {
+                let delta = seconds as f64 - state.player.position_secs;
+                super::perform_effect(state, runtime, Effect::SeekBy(delta.round() as i64));
+            }
+        }
+        Command::Shuffle => run_action(state, runtime, Action::ToggleShuffle),
+        Command::Repeat(None) => run_action(state, runtime, Action::CycleRepeat),
+        Command::Repeat(Some(mode)) => {
+            state.player.repeat = match mode {
+                command::RepeatArg::Off => RepeatMode::Off,
+                command::RepeatArg::One => RepeatMode::One,
+                command::RepeatArg::All => RepeatMode::All,
+            };
+            super::perform_effect(state, runtime, Effect::SetOptions);
+            state.status_message = Some(format!("repeat {}", state.player.repeat.label()));
+        }
+        Command::ClearQueue => run_action(state, runtime, Action::ClearQueue),
+        Command::Next => run_action(state, runtime, Action::NextTrack),
+        Command::Prev => run_action(state, runtime, Action::PrevTrack),
+        Command::PlayPause => run_action(state, runtime, Action::PlayPause),
+        Command::Help => state.help_visible = true,
+        Command::Devices => run_action(state, runtime, Action::OpenDevices),
+        Command::Logs(level) => {
+            if let Some(index) = level {
+                state.logs.level_index = index.min(LOG_LEVELS.len() - 1);
+                state.logs.follow = true;
+                state.logs.selected_seq = None;
+            }
+            state.active_tab = Tab::Logs;
         }
     }
 }

@@ -133,11 +133,11 @@ impl Keymap {
         }
     }
 
-    /// All bindings as (keys, description, context) for the help view.
-    pub fn help_entries(&self) -> Vec<(String, String, KeyContext)> {
+    /// All bindings as (formatted keys, action, context) for the help view.
+    pub fn help_entries(&self) -> Vec<(String, Action, KeyContext)> {
         self.bindings
             .iter()
-            .map(|b| (self.format_keys(&b.keys), b.action.describe(), b.context))
+            .map(|b| (self.format_keys(&b.keys), b.action.clone(), b.context))
             .collect()
     }
 
@@ -231,14 +231,38 @@ fn normalize(key: KeyCombination) -> KeyCombination {
 /// layout (lowercase in, lowercase out).
 fn qwerty_equivalent(c: char) -> Option<char> {
     Some(match c {
-        'й' => 'q', 'ц' => 'w', 'у' => 'e', 'к' => 'r', 'е' => 't',
-        'н' => 'y', 'г' => 'u', 'ш' => 'i', 'щ' => 'o', 'з' => 'p',
-        'х' => '[', 'ъ' => ']',
-        'ф' => 'a', 'ы' => 's', 'в' => 'd', 'а' => 'f', 'п' => 'g',
-        'р' => 'h', 'о' => 'j', 'л' => 'k', 'д' => 'l', 'ж' => ';',
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'х' => '[',
+        'ъ' => ']',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ж' => ';',
         'э' => '\'',
-        'я' => 'z', 'ч' => 'x', 'с' => 'c', 'м' => 'v', 'и' => 'b',
-        'т' => 'n', 'ь' => 'm', 'б' => ',', 'ю' => '.',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        'б' => ',',
+        'ю' => '.',
         'ё' => '`',
         _ => return None,
     })
@@ -417,8 +441,7 @@ mod tests {
     #[test]
     fn shift_symbol_normalizes() {
         let mut km = keymap_from(DEFAULT_KEYMAP);
-        let question_with_shift =
-            KeyCombination::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        let question_with_shift = KeyCombination::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
         assert_eq!(
             km.resolve(question_with_shift, KeyContext::Library),
             KeyResolution::Action(Action::ToggleHelp)

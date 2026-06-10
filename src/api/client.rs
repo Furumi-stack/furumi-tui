@@ -4,8 +4,9 @@ use tokio::sync::Mutex;
 
 use super::auth::{self, AuthSession};
 use super::models::{
-    ApiErrorBody, ArtistDetail, ArtistsPage, LikesResponse, LoginResponse, MeResponse,
-    PlaylistCard, PlaylistDetail, ReleaseDetail, SearchResults, TokensResponse, TrackItem,
+    ApiErrorBody, ArtistDetail, ArtistsPage, DevicePlaybackState, DevicePollResponse,
+    LikesResponse, LoginResponse, MeResponse, PlaylistCard, PlaylistDetail, ReleaseDetail,
+    SearchResults, TokensResponse, TrackItem,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +37,14 @@ pub fn http_client() -> reqwest::Client {
 
 pub fn device_name() -> String {
     format!("furumi-tui ({})", std::env::consts::OS)
+}
+
+pub fn device_user_agent() -> String {
+    format!(
+        "FurumiTUI/{} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
 }
 
 #[derive(Serialize)]
@@ -77,7 +86,11 @@ pub async fn login_password(
         .send()
         .await?;
     let login: LoginResponse = parse_response(response).await?;
-    Ok(AuthSession::new(base_url.to_string(), login.user, login.tokens))
+    Ok(AuthSession::new(
+        base_url.to_string(),
+        login.user,
+        login.tokens,
+    ))
 }
 
 pub async fn login_sso_exchange(
@@ -94,7 +107,11 @@ pub async fn login_sso_exchange(
         .send()
         .await?;
     let login: LoginResponse = parse_response(response).await?;
-    Ok(AuthSession::new(base_url.to_string(), login.user, login.tokens))
+    Ok(AuthSession::new(
+        base_url.to_string(),
+        login.user,
+        login.tokens,
+    ))
 }
 
 /// Browser entry point for SSO. redirect_uri is either our loopback
@@ -134,6 +151,28 @@ pub struct PlaybackStateBody {
     pub shuffle: bool,
     pub repeat_mode: String,
     pub volume: f64,
+}
+
+#[derive(Serialize)]
+struct DevicePollRequest<'a> {
+    device_id: &'a str,
+    user_agent: String,
+    current_jam_id: Option<&'a str>,
+    playback_state: Option<DevicePlaybackState>,
+}
+
+#[derive(Serialize)]
+struct DeviceActiveRequest<'a> {
+    device_id: &'a str,
+    current_device_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct DeviceCommandRequest<'a> {
+    target_device_id: Option<&'a str>,
+    jam_id: Option<&'a str>,
+    command: &'a str,
+    payload: &'a serde_json::Value,
 }
 
 /// Percent-encode a query-string value.
@@ -257,7 +296,9 @@ impl ApiClient {
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, ApiError> {
         let url = format!("{}{path}", self.base_url);
         let response = self
-            .send_authed(&url, |client, url, token| client.get(url).bearer_auth(token))
+            .send_authed(&url, |client, url, token| {
+                client.get(url).bearer_auth(token)
+            })
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -272,6 +313,33 @@ impl ApiClient {
 
     pub async fn playlist(&self, id: i64) -> Result<PlaylistDetail, ApiError> {
         self.get_json(&format!("/api/player/playlists/{id}")).await
+    }
+
+    pub async fn create_playlist(&self, title: &str) -> Result<PlaylistCard, ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            title: &'a str,
+        }
+        self.post_json("/api/player/playlists", &Body { title })
+            .await
+    }
+
+    pub async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: i64,
+        track_ids: &[i64],
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            track_ids: &'a [i64],
+        }
+        let _: serde_json::Value = self
+            .post_json(
+                &format!("/api/player/playlists/{playlist_id}/tracks"),
+                &Body { track_ids },
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn likes(&self) -> Result<Vec<i64>, ApiError> {
@@ -290,7 +358,10 @@ impl ApiClient {
         Ok(body.liked)
     }
 
-    #[allow(dead_code, reason = "device-sync state restore needs id→track resolution")]
+    #[allow(
+        dead_code,
+        reason = "device-sync state restore needs id→track resolution"
+    )]
     pub async fn tracks_by_ids(&self, track_ids: &[i64]) -> Result<Vec<TrackItem>, ApiError> {
         #[derive(Serialize)]
         struct Body<'a> {
@@ -347,6 +418,58 @@ impl ApiClient {
     /// Persist playback state server-side (used for cross-device restore).
     pub async fn push_state(&self, state: &PlaybackStateBody) -> Result<(), ApiError> {
         let _: serde_json::Value = self.put_json("/api/player/state", state).await?;
+        Ok(())
+    }
+
+    pub async fn poll_device(
+        &self,
+        device_id: &str,
+        playback_state: Option<DevicePlaybackState>,
+    ) -> Result<DevicePollResponse, ApiError> {
+        self.post_json(
+            "/api/player/devices/poll",
+            &DevicePollRequest {
+                device_id,
+                user_agent: device_user_agent(),
+                current_jam_id: None,
+                playback_state,
+            },
+        )
+        .await
+    }
+
+    pub async fn select_device(
+        &self,
+        target_device_id: &str,
+        current_device_id: &str,
+    ) -> Result<DevicePollResponse, ApiError> {
+        self.post_json(
+            "/api/player/devices/active",
+            &DeviceActiveRequest {
+                device_id: target_device_id,
+                current_device_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn send_device_command(
+        &self,
+        target_device_id: Option<&str>,
+        command: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let _: serde_json::Value = self
+            .post_json(
+                "/api/player/devices/command",
+                &DeviceCommandRequest {
+                    target_device_id,
+                    jam_id: None,
+                    command,
+                    payload,
+                },
+            )
+            .await?;
         Ok(())
     }
 

@@ -25,34 +25,68 @@ fn draw_form(frame: &mut Frame, form: &LoginForm) {
 
     // SSO is the primary path: server URL + SSO button up top, the rarely
     // used password fallback below a separator.
-    let [server, sso_button, separator, username, password, signin_button, message, hint] =
-        Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .areas(inner);
+    let [
+        server,
+        sso_button,
+        separator,
+        username,
+        password,
+        signin_button,
+        message,
+        hint,
+    ] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
-    draw_field(frame, server, "Server URL", &form.server_url, false,
-        form.focus == LoginField::ServerUrl);
-    draw_button(frame, sso_button, "[ Continue with SSO ]",
-        form.focus == LoginField::SsoButton);
+    draw_field(
+        frame,
+        server,
+        "Server URL",
+        &form.server_url,
+        false,
+        form.focus == LoginField::ServerUrl,
+    );
+    draw_button(
+        frame,
+        sso_button,
+        "[ Continue with SSO ]",
+        form.focus == LoginField::SsoButton,
+    );
     frame.render_widget(
         Paragraph::new(Line::styled("── or sign in with password ──", theme::dim()))
             .alignment(Alignment::Center),
         separator,
     );
-    draw_field(frame, username, "Username", &form.username, false,
-        form.focus == LoginField::Username);
-    draw_field(frame, password, "Password", &form.password, true,
-        form.focus == LoginField::Password);
-    draw_button(frame, signin_button, "[ Sign in ]",
-        form.focus == LoginField::SignInButton);
+    draw_field(
+        frame,
+        username,
+        "Username",
+        &form.username,
+        false,
+        form.focus == LoginField::Username,
+    );
+    draw_field(
+        frame,
+        password,
+        "Password",
+        &form.password,
+        true,
+        form.focus == LoginField::Password,
+    );
+    draw_button(
+        frame,
+        signin_button,
+        "[ Sign in ]",
+        form.focus == LoginField::SignInButton,
+    );
 
     draw_message(frame, message, form);
     frame.render_widget(
@@ -68,8 +102,8 @@ fn draw_form(frame: &mut Frame, form: &LoginForm) {
 fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
     // The URL stays on ONE line (wrapping breaks copy-paste); the dialog is
     // as wide as the terminal allows and ctrl-l copies the full link.
-    let width = (form.sso_url.len() as u16 + 4)
-        .clamp(48, frame.area().width.saturating_sub(2).max(40));
+    let width =
+        (form.sso_url.len() as u16 + 4).clamp(48, frame.area().width.saturating_sub(2).max(40));
     let area = centered(frame.area(), width, 14.min(frame.area().height));
 
     let block = Block::bordered()
@@ -134,7 +168,11 @@ fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
 }
 
 fn draw_field(frame: &mut Frame, area: Rect, label: &str, value: &str, mask: bool, focused: bool) {
-    let border = if focused { theme::accent() } else { theme::dim() };
+    let border = if focused {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
     let block = Block::bordered().title(label).border_style(border);
     let shown = if mask {
         "•".repeat(value.chars().count())

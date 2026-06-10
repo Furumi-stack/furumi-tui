@@ -65,6 +65,15 @@ key_sequence = "shift-j"
 command = "GoToRelease"
 
 [[keymaps]]
+key_sequence = "shift-p"
+command = "AddToPlaylist"
+
+[[keymaps]]
+key_sequence = "n"
+command = "NewPlaylist"
+context = "playlists"
+
+[[keymaps]]
 key_sequence = "j"
 command = "MoveDown"
 
@@ -181,9 +190,17 @@ key_sequence = "shift-l"
 command = "Logout"
 
 [[keymaps]]
+key_sequence = "shift-d"
+command = "OpenDevices"
+
+[[keymaps]]
 key_sequence = "v"
 command = "ToggleViewMode"
 
 [[keymaps]]
 key_sequence = ":"
 command = "OpenCommandLine"
+
+[[keymaps]]
+key_sequence = "/"
+command = "OpenSearch"

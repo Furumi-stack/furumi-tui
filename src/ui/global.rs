@@ -39,7 +39,11 @@ fn centered_line(frame: &mut Frame, area: Rect, line: Line) {
     if area.height == 0 {
         return;
     }
-    let middle = Rect { y: area.y + area.height / 2, height: 1, ..area };
+    let middle = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), middle);
 }
 
@@ -86,21 +90,29 @@ fn draw_tile(
     let inner = block.inner(tile);
     frame.render_widget(block, tile);
 
-    let art_area = Rect { height: ART_CELL_HEIGHT.min(inner.height), ..inner };
+    let art_area = Rect {
+        height: ART_CELL_HEIGHT.min(inner.height),
+        ..inner
+    };
     draw_art(frame, art_area, art_state);
 
     if inner.height > ART_CELL_HEIGHT {
-        let name_area = Rect { y: inner.y + ART_CELL_HEIGHT, height: 1, ..inner };
-        frame.render_widget(
-            Paragraph::new(Line::raw(title.to_string())),
-            name_area,
-        );
+        let name_area = Rect {
+            y: inner.y + ART_CELL_HEIGHT,
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(Line::raw(title.to_string())), name_area);
         if selected {
             frame.buffer_mut().set_style(name_area, theme::tab_active());
         }
     }
     if inner.height > ART_CELL_HEIGHT + 1 {
-        let meta_area = Rect { y: inner.y + ART_CELL_HEIGHT + 1, height: 1, ..inner };
+        let meta_area = Rect {
+            y: inner.y + ART_CELL_HEIGHT + 1,
+            height: 1,
+            ..inner
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(meta.to_string(), theme::dim())),
             meta_area,
@@ -126,7 +138,6 @@ fn draw_row(frame: &mut Frame, area: Rect, line: Line, right: Option<String>, se
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Scrollable content plan: a vertical list of items with known heights; the
 // viewport is scrolled so the cursor's item stays centered.
@@ -137,7 +148,9 @@ enum PlanItem {
     Header(String),
     Gap,
     /// Selectable track row; the payload is the cursor index it represents.
-    Track { cursor_index: usize },
+    Track {
+        cursor_index: usize,
+    },
     /// One row of release tiles (display-order positions).
     TileRow(Vec<usize>),
     /// One release as a table row (display-order position).
@@ -147,7 +160,9 @@ enum PlanItem {
 impl PlanItem {
     fn height(&self) -> u16 {
         match self {
-            PlanItem::Header(_) | PlanItem::Gap | PlanItem::Track { .. }
+            PlanItem::Header(_)
+            | PlanItem::Gap
+            | PlanItem::Track { .. }
             | PlanItem::TableRow(_) => 1,
             PlanItem::TileRow(_) => TILE_HEIGHT,
         }
@@ -239,23 +254,30 @@ fn draw_grid_table(frame: &mut Frame, inner: Rect, state: &AppState) {
     let first = (global.selected / visible_rows) * visible_rows;
     let last = (first + visible_rows).min(global.artists.len());
 
-    let rows = global.artists[first..last].iter().enumerate().map(|(offset, artist)| {
-        let index = first + offset;
-        let style = if index == global.selected {
-            theme::tab_active()
-        } else {
-            Style::new()
-        };
-        Row::new(vec![
-            artist.name.clone(),
-            artist.release_count.to_string(),
-            artist.track_count.to_string(),
-        ])
-        .style(style)
-    });
+    let rows = global.artists[first..last]
+        .iter()
+        .enumerate()
+        .map(|(offset, artist)| {
+            let index = first + offset;
+            let style = if index == global.selected {
+                theme::tab_active()
+            } else {
+                Style::new()
+            };
+            Row::new(vec![
+                artist.name.clone(),
+                artist.release_count.to_string(),
+                artist.track_count.to_string(),
+            ])
+            .style(style)
+        });
     let table = Table::new(
         rows,
-        [Constraint::Min(24), Constraint::Length(9), Constraint::Length(7)],
+        [
+            Constraint::Min(24),
+            Constraint::Length(9),
+            Constraint::Length(7),
+        ],
     )
     .header(Row::new(vec!["Artist", "Releases", "Tracks"]).style(theme::header()));
     frame.render_widget(table, inner);
@@ -294,9 +316,16 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
     .areas(header_area);
     draw_art(
         frame,
-        Rect { height: ART_HEADER_HEIGHT.min(art_area.height), ..art_area },
+        Rect {
+            height: ART_HEADER_HEIGHT.min(art_area.height),
+            ..art_area
+        },
         header_art(state, detail.image_url.as_ref()),
     );
+    let mut about = format!("{} releases", detail.releases.len());
+    if !detail.featured_tracks.is_empty() {
+        about.push_str(&format!(" · appears on {}", detail.featured_tracks.len()));
+    }
     let info = vec![
         Line::default(),
         Line::styled(detail.name.clone(), theme::header()),
@@ -308,21 +337,33 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             ),
             theme::dim(),
         ),
-        Line::styled(format!("{} releases", detail.releases.len()), theme::dim()),
+        Line::styled(about, theme::dim()),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
-    // Scrollable content: top tracks, then releases grouped by type.
+    // Scrollable content: top tracks, releases grouped by type, then the
+    // tracks this artist is featured on.
     let tracks = detail.top_tracks.len();
+    let releases_len = detail.releases.len();
+    let featured_len = detail.featured_tracks.len();
     let mut items = Vec::new();
     let mut cursor_item = None;
+    if tracks + releases_len + featured_len == 0 {
+        return centered_line(
+            frame,
+            content_area,
+            Line::styled("nothing here yet", theme::dim()),
+        );
+    }
     if tracks > 0 {
         items.push(PlanItem::Header("Top tracks".to_string()));
         for index in 0..tracks {
             if cursor == index {
                 cursor_item = Some(items.len());
             }
-            items.push(PlanItem::Track { cursor_index: index });
+            items.push(PlanItem::Track {
+                cursor_index: index,
+            });
         }
         items.push(PlanItem::Gap);
     }
@@ -353,18 +394,39 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         }
         items.push(PlanItem::Gap);
     }
+    if featured_len > 0 {
+        items.push(PlanItem::Header(format!("Appears on ({featured_len})")));
+        for index in 0..featured_len {
+            let flat = tracks + releases_len + index;
+            if cursor == flat {
+                cursor_item = Some(items.len());
+            }
+            items.push(PlanItem::Track { cursor_index: flat });
+        }
+        items.push(PlanItem::Gap);
+    }
 
     let display_order = crate::app::state::release_display_order(&detail.releases);
-    render_plan(frame, content_area, state, &items, cursor_item, &mut |frame, rect, item| {
-        match item {
+    render_plan(
+        frame,
+        content_area,
+        state,
+        &items,
+        cursor_item,
+        &mut |frame, rect, item| match item {
             PlanItem::Track { cursor_index } => {
-                let track = &detail.top_tracks[*cursor_index];
+                let (track, number) = if *cursor_index < tracks {
+                    (&detail.top_tracks[*cursor_index], cursor_index + 1)
+                } else {
+                    let offset = cursor_index - tracks - releases_len;
+                    (&detail.featured_tracks[offset], offset + 1)
+                };
                 super::track_row(
                     frame,
                     rect,
                     state,
                     track,
-                    (cursor_index + 1).to_string(),
+                    number.to_string(),
                     cursor == *cursor_index,
                 );
             }
@@ -374,7 +436,8 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                     let tile = Rect {
                         x: rect.x + column as u16 * TILE_WIDTH,
                         y: rect.y,
-                        width: TILE_WIDTH.min(rect.width.saturating_sub(column as u16 * TILE_WIDTH)),
+                        width: TILE_WIDTH
+                            .min(rect.width.saturating_sub(column as u16 * TILE_WIDTH)),
                         height: rect.height,
                     };
                     if tile.width < 3 {
@@ -405,8 +468,8 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                 );
             }
             _ => unreachable!("headers and gaps are rendered by render_plan"),
-        }
-    });
+        },
+    );
 }
 
 fn release_tile_meta(release: &ReleaseCard) -> String {
@@ -491,7 +554,10 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
     .areas(header_area);
     draw_art(
         frame,
-        Rect { height: ART_HEADER_HEIGHT.min(art_area.height), ..art_area },
+        Rect {
+            height: ART_HEADER_HEIGHT.min(art_area.height),
+            ..art_area
+        },
         header_art(state, detail.cover_url.as_ref()),
     );
 
@@ -504,7 +570,11 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
         Line::raw(artists.join(", ")),
         Line::default(),
         Line::styled(
-            format!("{}{year} · {} tracks", detail.release_type, detail.tracks.len()),
+            format!(
+                "{}{year} · {} tracks",
+                detail.release_type,
+                detail.tracks.len()
+            ),
             theme::dim(),
         ),
     ];
@@ -599,12 +669,6 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             } else {
                 Span::raw("  ")
             };
-            let tech = track.tech_label_short();
-            let right = if tech.is_empty() {
-                track.duration_label()
-            } else {
-                format!("{tech} · {}", track.duration_label())
-            };
             rows.push((
                 Line::from(vec![
                     heart,
@@ -614,7 +678,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
                         theme::dim(),
                     ),
                 ]),
-                Some(right),
+                Some(super::track_meta_suffix(track, true)),
                 Some(index),
             ));
             index += 1;

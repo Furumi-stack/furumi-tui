@@ -27,7 +27,9 @@ pub fn amplitude(percent: u8) -> f32 {
 pub enum PlayerEvent {
     /// A track played to its end. `has_next` is true when a prefetched
     /// source was already queued and is now playing gaplessly.
-    TrackFinished { has_next: bool },
+    TrackFinished {
+        has_next: bool,
+    },
     Failed(String),
 }
 
@@ -44,6 +46,8 @@ enum Command {
         byte_len: Option<u64>,
     },
     TogglePause,
+    Pause,
+    Resume,
     Stop,
     Seek(Duration),
     SetVolume(f32),
@@ -90,6 +94,14 @@ impl Controller {
 
     pub fn toggle_pause(&self) {
         let _ = self.tx.send(Command::TogglePause);
+    }
+
+    pub fn pause(&self) {
+        let _ = self.tx.send(Command::Pause);
+    }
+
+    pub fn resume(&self) {
+        let _ = self.tx.send(Command::Resume);
     }
 
     pub fn stop(&self) {
@@ -140,7 +152,9 @@ fn run(rx: Receiver<Command>, shared: Arc<Shared>, on_event: impl Fn(PlayerEvent
                     shared
                         .position_ms
                         .store(out.player.get_pos().as_millis() as u64, Ordering::Relaxed);
-                    shared.paused.store(out.player.is_paused(), Ordering::Relaxed);
+                    shared
+                        .paused
+                        .store(out.player.is_paused(), Ordering::Relaxed);
                     let len = out.player.len();
                     if track_loaded && len < last_len {
                         if len == 0 {
@@ -223,7 +237,9 @@ fn handle(
             match builder.build() {
                 Ok(decoder) => out.player.append(decoder),
                 Err(err) => {
-                    on_event(PlayerEvent::Failed(format!("cannot decode next track: {err}")));
+                    on_event(PlayerEvent::Failed(format!(
+                        "cannot decode next track: {err}"
+                    )));
                 }
             }
         }
@@ -234,6 +250,16 @@ fn handle(
                 } else {
                     out.player.pause();
                 }
+            }
+        }
+        Command::Pause => {
+            if let Some(out) = output {
+                out.player.pause();
+            }
+        }
+        Command::Resume => {
+            if let Some(out) = output {
+                out.player.play();
             }
         }
         Command::Stop => {

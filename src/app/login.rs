@@ -107,9 +107,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
 }
 
 fn is_typing(key: KeyEvent) -> bool {
-    key.modifiers
-        .difference(KeyModifiers::SHIFT)
-        .is_empty()
+    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 fn focused_text(form: &mut LoginForm) -> Option<&mut String> {

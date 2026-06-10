@@ -32,13 +32,105 @@ pub enum Action {
     QueueAddLast,
     ClearQueue,
     GoToRelease,
+    AddToPlaylist,
+    NewPlaylist,
     ToggleHelp,
     ToggleViewMode,
+    OpenDevices,
     OpenCommandLine,
+    OpenSearch,
     Logout,
 }
 
+/// Help-window sections, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Playback,
+    Queue,
+    Navigation,
+    Search,
+    System,
+}
+
+impl Category {
+    pub const ALL: [Category; 5] = [
+        Category::Playback,
+        Category::Queue,
+        Category::Navigation,
+        Category::Search,
+        Category::System,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Category::Playback => "Playback",
+            Category::Queue => "Queue & playlists",
+            Category::Navigation => "Navigation",
+            Category::Search => "Search & commands",
+            Category::System => "System",
+        }
+    }
+}
+
 impl Action {
+    pub fn category(&self) -> Category {
+        match self {
+            Action::PlayPause
+            | Action::NextTrack
+            | Action::PrevTrack
+            | Action::SeekForward { .. }
+            | Action::SeekBackward { .. }
+            | Action::VolumeUp
+            | Action::VolumeDown
+            | Action::ToggleShuffle
+            | Action::CycleRepeat => Category::Playback,
+            Action::QueueAddNext
+            | Action::QueueAddLast
+            | Action::ClearQueue
+            | Action::AddToPlaylist
+            | Action::NewPlaylist
+            | Action::ToggleLike => Category::Queue,
+            Action::MoveUp
+            | Action::MoveDown
+            | Action::MoveLeft
+            | Action::MoveRight
+            | Action::PageUp
+            | Action::PageDown
+            | Action::SelectFirst
+            | Action::SelectLast
+            | Action::Select
+            | Action::Back
+            | Action::NextTab
+            | Action::PrevTab
+            | Action::GoToTab(_)
+            | Action::GoToRelease
+            | Action::ToggleViewMode => Category::Navigation,
+            Action::OpenSearch | Action::OpenCommandLine => Category::Search,
+            Action::OpenDevices => Category::System,
+            Action::ToggleHelp | Action::Logout | Action::Quit => Category::System,
+        }
+    }
+
+    /// The command-line equivalent shown in the help window, if any.
+    pub fn command_hint(&self) -> Option<&'static str> {
+        match self {
+            Action::Quit => Some(":q"),
+            Action::Logout => Some(":logout"),
+            Action::PlayPause => Some(":play"),
+            Action::NextTrack => Some(":next"),
+            Action::PrevTrack => Some(":prev"),
+            Action::SeekForward { .. } | Action::SeekBackward { .. } => Some(":seek +30 | 1:30"),
+            Action::VolumeUp | Action::VolumeDown => Some(":volume 0-100"),
+            Action::ToggleShuffle => Some(":shuffle"),
+            Action::CycleRepeat => Some(":repeat [off|one|all]"),
+            Action::ClearQueue => Some(":clear"),
+            Action::OpenDevices => Some(":devices"),
+            Action::ToggleHelp => Some(":help"),
+            Action::OpenSearch => Some("/text"),
+            _ => None,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Action::Quit => "Quit".into(),
@@ -69,9 +161,13 @@ impl Action {
             Action::QueueAddLast => "Queue: add to end".into(),
             Action::ClearQueue => "Queue: clear".into(),
             Action::GoToRelease => "Open the track's release".into(),
+            Action::AddToPlaylist => "Add track to a playlist…".into(),
+            Action::NewPlaylist => "Create a playlist".into(),
             Action::ToggleHelp => "Show / hide keybindings".into(),
             Action::ToggleViewMode => "Toggle tiles / table view".into(),
-            Action::OpenCommandLine => "Open command line (:/name searches)".into(),
+            Action::OpenDevices => "Connected devices".into(),
+            Action::OpenCommandLine => "Command line (:help for commands)".into(),
+            Action::OpenSearch => "Search artists, releases, tracks".into(),
             Action::Logout => "Sign out".into(),
         }
     }

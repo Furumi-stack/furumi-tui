@@ -3,6 +3,7 @@ mod cmdline;
 pub mod command;
 pub mod event;
 mod login;
+mod popup;
 mod sso;
 pub mod state;
 pub mod update;
@@ -28,6 +29,7 @@ use state::{AppState, Screen};
 use update::{Effect, update};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Handles shared by background tasks; AppState stays pure UI data.
 pub struct Runtime {
@@ -43,6 +45,9 @@ pub struct Runtime {
     pub last_state_push: Option<std::time::Instant>,
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
+    pub device_id: String,
+    pub last_device_poll: Option<std::time::Instant>,
+    pub device_poll_in_flight: bool,
 }
 
 pub async fn run(
@@ -53,10 +58,12 @@ pub async fn run(
     mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
     media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
 ) -> Result<()> {
+    let device_id = crate::config::load_or_create_device_id();
     let mut state = AppState {
         status_message: startup_warning,
         ..AppState::default()
     };
+    state.devices.device_id = device_id.clone();
 
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
@@ -72,6 +79,9 @@ pub async fn run(
         last_state_push: None,
         media_tx,
         last_media_push: None,
+        device_id,
+        last_device_poll: None,
+        device_poll_in_flight: false,
     };
 
     match auth::load_session() {
@@ -100,10 +110,22 @@ pub async fn run(
             Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
             _ = tick.tick() => {
                 expire_quit_confirmation(&mut state);
-                if state.player.current.is_some() {
+                if state.player.current.is_some() && state.devices.is_playback_device() {
                     state.player.position_secs = runtime.player.shared.position().as_secs_f64();
                     state.player.paused = runtime.player.shared.paused();
+                } else if state.player.current.is_some()
+                    && state.player.playing
+                    && !state.player.paused
+                {
+                    state.player.position_secs += TICK_INTERVAL.as_secs_f64();
+                    if let Some(track) = &state.player.current {
+                        if track.duration_seconds > 0.0 {
+                            state.player.position_secs =
+                                state.player.position_secs.min(track.duration_seconds);
+                        }
+                    }
                 }
+                maybe_poll_devices(&state, &mut runtime);
                 maybe_prefetch_next(&mut state, &runtime);
                 maybe_push_state(&state, &mut runtime);
                 push_media_update(&state, &mut runtime, false);
@@ -144,8 +166,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         // Keep at least a full screen plus a margin loaded, and stay ahead
         // of the cursor: a big terminal fills itself on startup without any
         // scrolling, page after page.
-        let needed = artist_grid_capacity()
-            .max(global.selected + ARTISTS_PREFETCH_MARGIN)
+        let needed = artist_grid_capacity().max(global.selected + ARTISTS_PREFETCH_MARGIN)
             + ARTISTS_PREFETCH_MARGIN;
         if global.has_more
             && !global.loading
@@ -185,8 +206,10 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         });
     }
 
-    // Playlists tab data.
-    if state.active_tab == state::Tab::Playlists {
+    // Playlists tab data (also wanted while the add-to-playlist picker is
+    // open from any tab).
+    let picker_open = matches!(state.popup, Some(state::Popup::AddToPlaylist { .. }));
+    if state.active_tab == state::Tab::Playlists || picker_open {
         if state.playlists.list.is_none() {
             state.playlists.list = Some(state::Loadable::Loading);
             let api = Arc::clone(&api);
@@ -202,8 +225,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         }
         if let Some(opened) = state.playlists.opened {
             let id = opened.id;
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                state.playlist_views.entry(id)
+            if let std::collections::hash_map::Entry::Vacant(entry) = state.playlist_views.entry(id)
             {
                 entry.insert(state::Loadable::Loading);
                 let api = Arc::clone(&api);
@@ -317,6 +339,63 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
     }
 }
 
+fn maybe_poll_devices(state: &AppState, runtime: &mut Runtime) {
+    if state.screen != Screen::Main || runtime.device_poll_in_flight {
+        return;
+    }
+    let Some(api) = runtime.api.clone() else {
+        return;
+    };
+    let due = runtime
+        .last_device_poll
+        .is_none_or(|at| at.elapsed() >= DEVICE_POLL_INTERVAL);
+    if !due {
+        return;
+    }
+
+    runtime.last_device_poll = Some(std::time::Instant::now());
+    runtime.device_poll_in_flight = true;
+    let device_id = runtime.device_id.clone();
+    let playback_state = state
+        .devices
+        .is_playback_device()
+        .then(|| device_playback_state(state))
+        .flatten();
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let event = match api.poll_device(&device_id, playback_state).await {
+            Ok(response) => AppEvent::DevicesPolled(Ok(response)),
+            Err(ApiError::SessionExpired) => AppEvent::SessionExpired,
+            Err(err) => AppEvent::DevicesPolled(Err(err.to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn device_playback_state(state: &AppState) -> Option<crate::api::models::DevicePlaybackState> {
+    let player = &state.player;
+    let current = player.current.as_ref()?;
+    if player.queue.is_empty() {
+        return None;
+    }
+    Some(crate::api::models::DevicePlaybackState {
+        track: serde_json::to_value(current).ok(),
+        tracks: player
+            .queue
+            .iter()
+            .filter_map(|track| serde_json::to_value(track).ok())
+            .collect(),
+        index: player.queue_pos as i32,
+        position_seconds: player.position_secs,
+        duration_seconds: current.duration_seconds,
+        paused: player.paused || !player.playing,
+        shuffle: player.shuffle,
+        repeat_mode: player.repeat.label().to_string(),
+        volume: f64::from(player.volume) / 100.0,
+        updated_at_ms: 0,
+    })
+}
+
 fn spawn_art_fetch(
     runtime: &Runtime,
     api: Arc<ApiClient>,
@@ -352,6 +431,9 @@ fn spawn_art_fetch(
 
 /// Execute a side effect requested by update().
 fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
+    if perform_remote_effect(state, runtime, effect) {
+        return;
+    }
     match effect {
         Effect::PlayCurrent => {
             play_current(state, runtime);
@@ -370,9 +452,14 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         Effect::SeekBy(delta) => {
             let target = (state.player.position_secs + delta as f64).max(0.0);
             state.player.position_secs = target;
-            runtime.player.seek(std::time::Duration::from_secs_f64(target));
+            runtime
+                .player
+                .seek(std::time::Duration::from_secs_f64(target));
         }
         Effect::SetVolume(volume) => runtime.player.set_volume(player::amplitude(volume)),
+        Effect::SetOptions => {
+            push_state_now(state, runtime);
+        }
         Effect::EnqueueRelease { id, next } => {
             let Some(api) = runtime.api.clone() else {
                 return;
@@ -413,9 +500,99 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
     }
 }
 
+fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: Effect) -> bool {
+    let Some(target) = state.devices.remote_target_id().map(str::to_string) else {
+        return false;
+    };
+    match effect {
+        Effect::PlayCurrent => {
+            if let Some(payload) =
+                device_playback_state(state).and_then(|state| serde_json::to_value(state).ok())
+            {
+                send_device_command(runtime, target, "play_from_index", payload);
+                state.status_message = Some("sent play command to active device".into());
+            }
+            true
+        }
+        Effect::TogglePause => {
+            let command = if state.player.paused {
+                "pause"
+            } else {
+                "resume"
+            };
+            send_device_command(runtime, target, command, serde_json::json!({}));
+            true
+        }
+        Effect::StopPlayback => {
+            send_device_command(runtime, target, "queue_clear", serde_json::json!({}));
+            true
+        }
+        Effect::SeekBy(delta) => {
+            let target_time = (state.player.position_secs + delta as f64).max(0.0);
+            state.player.position_secs = target_time;
+            send_device_command(
+                runtime,
+                target,
+                "seek",
+                serde_json::json!({ "time": target_time }),
+            );
+            true
+        }
+        Effect::SetVolume(volume) => {
+            send_device_command(
+                runtime,
+                target,
+                "set_volume",
+                serde_json::json!({ "volume": f64::from(volume) / 100.0 }),
+            );
+            true
+        }
+        Effect::SetOptions => {
+            send_device_command(
+                runtime,
+                target,
+                "set_options",
+                serde_json::json!({
+                    "shuffle": state.player.shuffle,
+                    "repeat_mode": state.player.repeat.label(),
+                }),
+            );
+            true
+        }
+        Effect::EnqueueRelease { .. } | Effect::ToggleLike { .. } => false,
+    }
+}
+
+fn send_device_command(
+    runtime: &Runtime,
+    target_device_id: String,
+    command: &'static str,
+    payload: serde_json::Value,
+) {
+    let Some(api) = runtime.api.clone() else {
+        return;
+    };
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let event = match api
+            .send_device_command(Some(&target_device_id), command, &payload)
+            .await
+        {
+            Ok(()) => AppEvent::StatusMessage(format!("sent {command} to active device")),
+            Err(ApiError::SessionExpired) => AppEvent::SessionExpired,
+            Err(err) => AppEvent::StatusMessage(format!("device command failed: {err}")),
+        };
+        let _ = tx.send(event);
+    });
+}
+
 /// Start streaming `queue[queue_pos]`: open the authenticated HTTP stream in
 /// a background task and hand the reader to the audio thread.
 fn play_current(state: &mut AppState, runtime: &Runtime) {
+    start_current_audio(state, runtime, 0.0, false);
+}
+
+fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f64, paused: bool) {
     let Some(track) = state.player.queue.get(state.player.queue_pos).cloned() else {
         return;
     };
@@ -424,7 +601,7 @@ fn play_current(state: &mut AppState, runtime: &Runtime) {
     };
     // The track that was playing until now was cut short by this switch.
     if let Some(previous) = state.player.current.take() {
-        if state.player.playing {
+        if state.player.playing && previous.id != track.id {
             report_history(
                 runtime,
                 previous.id,
@@ -436,19 +613,29 @@ fn play_current(state: &mut AppState, runtime: &Runtime) {
     }
     state.player.current = Some(track.clone());
     state.player.playing = true;
-    state.player.paused = false;
-    state.player.position_secs = 0.0;
+    state.player.paused = paused;
+    state.player.position_secs = position_secs.max(0.0);
     state.player.track_started_at = Some(auth::now_epoch_seconds());
     state.player.prefetched_pos = None;
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
-    report_now_playing(runtime, track.id);
+    if !paused {
+        report_now_playing(runtime, track.id);
+    }
 
     let controller = runtime.player.clone();
     let volume = player::amplitude(state.player.volume);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
         match api.open_stream(&track.stream_url).await {
-            Ok((reader, byte_len)) => controller.play(reader, byte_len, volume),
+            Ok((reader, byte_len)) => {
+                controller.play(reader, byte_len, volume);
+                if position_secs > 0.0 {
+                    controller.seek(std::time::Duration::from_secs_f64(position_secs));
+                }
+                if paused {
+                    controller.pause();
+                }
+            }
             Err(ApiError::SessionExpired) => {
                 let _ = tx.send(AppEvent::SessionExpired);
             }
@@ -464,6 +651,9 @@ fn play_current(state: &mut AppState, runtime: &Runtime) {
 /// device gap.
 fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     const PREFETCH_MARGIN_SECS: f64 = 30.0;
+    if !state.devices.is_playback_device() {
+        return;
+    }
     let player = &state.player;
     if !player.playing || player.paused || player.prefetched_pos.is_some() {
         return;
@@ -504,7 +694,7 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
 /// and every ~10s while something is playing (called from the tick).
 fn maybe_push_state(state: &AppState, runtime: &mut Runtime) {
     const PUSH_INTERVAL: Duration = Duration::from_secs(10);
-    if !state.player.playing {
+    if !state.player.playing || !state.devices.is_playback_device() {
         return;
     }
     let due = runtime
@@ -601,7 +791,9 @@ fn spawn_session_check(runtime: &Runtime, api: Arc<ApiClient>) {
             }
             Err(err) => {
                 tracing::warn!(%err, "session check failed");
-                let _ = tx.send(AppEvent::StatusMessage(format!("server unreachable: {err}")));
+                let _ = tx.send(AppEvent::StatusMessage(format!(
+                    "server unreachable: {err}"
+                )));
             }
         }
     });
@@ -622,12 +814,14 @@ fn handle_terminal_event(
             }
             match state.screen {
                 Screen::Login => login::handle_key(state, runtime, key),
+                Screen::Main if state.popup.is_some() => popup::handle_key(state, runtime, key),
                 Screen::Main if state.cmdline.active => cmdline::handle_key(state, runtime, key),
                 Screen::Main => handle_main_key(state, keymap, runtime, key),
             }
         }
         TermEvent::Paste(pasted) => match state.screen {
             Screen::Login => login::handle_paste(state, &pasted),
+            Screen::Main if state.popup.is_some() => popup::handle_paste(state, &pasted),
             Screen::Main if state.cmdline.active => cmdline::handle_paste(state, runtime, &pasted),
             Screen::Main => {}
         },
@@ -635,12 +829,19 @@ fn handle_terminal_event(
     }
 }
 
-fn handle_main_key(state: &mut AppState, keymap: &mut Keymap, runtime: &mut Runtime, key: KeyEvent) {
+fn handle_main_key(
+    state: &mut AppState,
+    keymap: &mut Keymap,
+    runtime: &mut Runtime,
+    key: KeyEvent,
+) {
     let combo = KeyCombination::from(key);
     match keymap.resolve(combo, state.active_tab.key_context()) {
         KeyResolution::Action(action) => {
             state.pending_keys = None;
-            tracing::debug!(?action, "key resolved");
+            // trace, not debug: on the Logs tab every keypress would
+            // otherwise append a line and pollute what's being read.
+            tracing::trace!(?action, "key resolved");
             // Logout needs the Runtime, which pure update() never touches.
             if action == action::Action::Logout {
                 perform_logout(state, runtime);
@@ -667,6 +868,8 @@ fn perform_logout(state: &mut AppState, runtime: &mut Runtime) {
         });
     }
     auth::delete_session();
+    runtime.last_device_poll = None;
+    runtime.device_poll_in_flight = false;
     runtime.player.stop();
     state.player = state::PlayerBar::default();
     state.user = None;
@@ -689,11 +892,307 @@ fn reset_library_state(state: &mut AppState) {
     state.queue_tab = state::QueueTab::default();
     state.pending_release_focus = None;
     state.jump_origin = None;
+    state.popup = None;
+    let device_id = state.devices.device_id.clone();
+    state.devices = state::DevicesState {
+        device_id,
+        ..state::DevicesState::default()
+    };
     state.likes.clear();
     state.likes_loaded = false;
     state.search = state::SearchState::default();
     state.cmdline = state::Cmdline::default();
     state.art.clear();
+}
+
+fn apply_devices_response(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    response: crate::api::models::DevicePollResponse,
+    from_activation: bool,
+) {
+    let was_playback_device = state.devices.is_playback_device();
+    state.devices.device_id = response.device_id;
+    state.devices.active_device_id = response.active_device_id;
+    state.devices.devices = response.devices;
+    state.devices.poll_error = None;
+    if from_activation {
+        state.devices.switching_to = None;
+        if matches!(state.popup, Some(state::Popup::Devices { .. })) {
+            state.popup = None;
+        }
+    }
+
+    let is_playback_device = state.devices.is_playback_device();
+    if was_playback_device && !is_playback_device {
+        runtime.player.stop();
+    }
+
+    if !is_playback_device {
+        if let Some(playback_state) = &response.playback_state {
+            apply_device_playback_state(state, runtime, playback_state, false);
+        } else {
+            runtime.player.stop();
+        }
+    } else if from_activation {
+        if let Some(playback_state) = &response.playback_state {
+            apply_device_playback_state(state, runtime, playback_state, true);
+        }
+    }
+
+    for command in response.commands {
+        execute_device_command(state, runtime, command);
+    }
+}
+
+fn apply_device_playback_state(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    playback_state: &crate::api::models::DevicePlaybackState,
+    start_audio: bool,
+) {
+    let mut tracks = tracks_from_values(&playback_state.tracks);
+    let track = playback_state
+        .track
+        .as_ref()
+        .and_then(track_from_value)
+        .or_else(|| {
+            usize::try_from(playback_state.index)
+                .ok()
+                .and_then(|index| tracks.get(index).cloned())
+        });
+    if tracks.is_empty() {
+        if let Some(track) = track.clone() {
+            tracks.push(track);
+        }
+    }
+    let mut index = usize::try_from(playback_state.index).unwrap_or(0);
+    if let Some(track) = &track {
+        index = tracks
+            .iter()
+            .position(|item| item.id == track.id)
+            .unwrap_or(index);
+    }
+    if !tracks.is_empty() {
+        index = index.min(tracks.len() - 1);
+    } else {
+        index = 0;
+    }
+
+    state.player.queue = tracks;
+    state.player.queue_pos = index;
+    state.player.current = track.or_else(|| state.player.queue.get(index).cloned());
+    state.player.playing = state.player.current.is_some();
+    state.player.paused = playback_state.paused;
+    state.player.position_secs = playback_state.position_seconds.max(0.0);
+    state.player.prefetched_pos = None;
+    state.player.original_order = None;
+    state.player.shuffle = playback_state.shuffle;
+    state.player.repeat = repeat_from_label(&playback_state.repeat_mode);
+    state.player.volume = volume_percent(playback_state.volume);
+    state.queue_tab.cursor = state
+        .queue_tab
+        .cursor
+        .min(state.player.queue.len().saturating_sub(1));
+
+    if start_audio && state.player.current.is_some() {
+        start_current_audio(
+            state,
+            runtime,
+            playback_state.position_seconds,
+            playback_state.paused,
+        );
+        push_media_metadata(state, runtime);
+        push_media_update(state, runtime, true);
+    } else {
+        runtime.player.stop();
+    }
+}
+
+fn track_from_value(value: &serde_json::Value) -> Option<crate::api::models::TrackItem> {
+    serde_json::from_value(value.clone())
+        .map_err(|err| tracing::warn!(%err, "invalid track in device payload"))
+        .ok()
+}
+
+fn tracks_from_values(values: &[serde_json::Value]) -> Vec<crate::api::models::TrackItem> {
+    values.iter().filter_map(track_from_value).collect()
+}
+
+fn repeat_from_label(label: &str) -> state::RepeatMode {
+    match label {
+        "one" => state::RepeatMode::One,
+        "all" => state::RepeatMode::All,
+        _ => state::RepeatMode::Off,
+    }
+}
+
+fn volume_percent(volume: f64) -> u8 {
+    (volume.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+fn payload_playback_state(payload: &serde_json::Value) -> crate::api::models::DevicePlaybackState {
+    serde_json::from_value(payload.clone()).unwrap_or_default()
+}
+
+fn payload_tracks(payload: &serde_json::Value) -> Vec<crate::api::models::TrackItem> {
+    if let Some(values) = payload.get("tracks").and_then(serde_json::Value::as_array) {
+        let tracks = tracks_from_values(values);
+        if !tracks.is_empty() {
+            return tracks;
+        }
+    }
+    payload
+        .get("track")
+        .and_then(track_from_value)
+        .into_iter()
+        .collect()
+}
+
+fn payload_index(payload: &serde_json::Value, key: &str) -> Option<usize> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn payload_f64(payload: &serde_json::Value, key: &str) -> Option<f64> {
+    payload.get(key).and_then(serde_json::Value::as_f64)
+}
+
+fn execute_device_command(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    command: crate::api::models::DeviceCommandDto,
+) {
+    let payload = command.payload;
+    tracing::debug!(command = %command.command, id = ?command.id, "device command");
+    match command.command.as_str() {
+        "transfer_state" | "play_track" | "play_from_index" => {
+            let playback_state = payload_playback_state(&payload);
+            let start_audio = state.devices.is_playback_device();
+            apply_device_playback_state(state, runtime, &playback_state, start_audio);
+        }
+        "pause" => {
+            state.player.paused = true;
+            runtime.player.pause();
+            push_media_update(state, runtime, true);
+        }
+        "resume" | "play" => {
+            state.player.paused = false;
+            runtime.player.resume();
+            push_media_update(state, runtime, true);
+        }
+        "seek" => {
+            if let Some(time) =
+                payload_f64(&payload, "time").or_else(|| payload_f64(&payload, "position_seconds"))
+            {
+                state.player.position_secs = time.max(0.0);
+                runtime.player.seek(std::time::Duration::from_secs_f64(
+                    state.player.position_secs,
+                ));
+            }
+        }
+        "next" => {
+            apply_options_payload(state, &payload);
+            if let Some(effect) = update::update(state, action::Action::NextTrack) {
+                perform_effect(state, runtime, effect);
+            }
+        }
+        "prev" | "previous" => {
+            if let Some(effect) = update::update(state, action::Action::PrevTrack) {
+                perform_effect(state, runtime, effect);
+            }
+        }
+        "set_volume" | "volume" => {
+            if let Some(volume) = payload_f64(&payload, "volume") {
+                state.player.volume = volume_percent(volume);
+                runtime
+                    .player
+                    .set_volume(player::amplitude(state.player.volume));
+            }
+        }
+        "set_options" => apply_options_payload(state, &payload),
+        "queue_add_end" => {
+            update::enqueue_tracks(state, payload_tracks(&payload), false);
+        }
+        "queue_add_next" => {
+            update::enqueue_tracks(state, payload_tracks(&payload), true);
+        }
+        "queue_remove" => {
+            if let Some(index) = payload_index(&payload, "index") {
+                remove_queue_index(state, runtime, index);
+            }
+        }
+        "queue_move" => {
+            if let (Some(from), Some(to)) = (
+                payload_index(&payload, "from_index"),
+                payload_index(&payload, "to_index"),
+            ) {
+                move_queue_index(state, from, to);
+            }
+        }
+        "queue_clear" => {
+            state.player = state::PlayerBar::default();
+            state.queue_tab.cursor = 0;
+            runtime.player.stop();
+            push_media_update(state, runtime, true);
+        }
+        _ => {}
+    }
+}
+
+fn apply_options_payload(state: &mut AppState, payload: &serde_json::Value) {
+    if let Some(shuffle) = payload.get("shuffle").and_then(serde_json::Value::as_bool) {
+        if shuffle != state.player.shuffle {
+            state.player.shuffle = shuffle;
+            if shuffle {
+                update::shuffle_upcoming(&mut state.player);
+            } else {
+                update::restore_queue_order(&mut state.player);
+            }
+        }
+    }
+    if let Some(repeat) = payload
+        .get("repeat_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        state.player.repeat = repeat_from_label(repeat);
+    }
+}
+
+fn remove_queue_index(state: &mut AppState, runtime: &Runtime, index: usize) {
+    if index >= state.player.queue.len() {
+        return;
+    }
+    let current_id = state.player.current.as_ref().map(|track| track.id);
+    state.player.queue.remove(index);
+    if state.player.queue.is_empty() {
+        state.player = state::PlayerBar::default();
+        runtime.player.stop();
+        return;
+    }
+    state.player.queue_pos = current_id
+        .and_then(|id| state.player.queue.iter().position(|track| track.id == id))
+        .unwrap_or_else(|| state.player.queue_pos.min(state.player.queue.len() - 1));
+    state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
+    state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+}
+
+fn move_queue_index(state: &mut AppState, from: usize, to: usize) {
+    if from >= state.player.queue.len() || to >= state.player.queue.len() || from == to {
+        return;
+    }
+    let current_id = state.player.current.as_ref().map(|track| track.id);
+    let track = state.player.queue.remove(from);
+    state.player.queue.insert(to, track);
+    if let Some(id) = current_id {
+        if let Some(position) = state.player.queue.iter().position(|track| track.id == id) {
+            state.player.queue_pos = position;
+        }
+    }
+    state.queue_tab.cursor = to;
+    state.player.prefetched_pos = None;
 }
 
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
@@ -706,6 +1205,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.status_message = Some(format!("signed in as {}", session.user.name));
             state.user = Some(session.user.clone());
             runtime.api = Some(Arc::new(ApiClient::new(runtime.http.clone(), *session)));
+            runtime.last_device_poll = None;
+            runtime.device_poll_in_flight = false;
             state.login = state::LoginForm::default();
             state.screen = Screen::Main;
         }
@@ -727,6 +1228,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
         }
         AppEvent::SessionExpired => {
+            runtime.device_poll_in_flight = false;
             state.user = None;
             state.login = state::LoginForm::default();
             if let Some(api) = runtime.api.take() {
@@ -892,14 +1394,105 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 "like removed".to_string()
             });
         }
+        AppEvent::DevicesPolled(result) => {
+            runtime.device_poll_in_flight = false;
+            match result {
+                Ok(response) => apply_devices_response(state, runtime, response, false),
+                Err(message) => {
+                    tracing::warn!(%message, "device poll failed");
+                    state.devices.poll_error = Some(message);
+                }
+            }
+        }
+        AppEvent::DeviceActivated(result) => match result {
+            Ok(response) => apply_devices_response(state, runtime, response, true),
+            Err(message) => {
+                tracing::warn!(%message, "device activation failed");
+                state.devices.switching_to = None;
+                state.devices.poll_error = Some(message.clone());
+                state.status_message = Some(format!("device switch failed: {message}"));
+            }
+        },
         AppEvent::EnqueueTracks { tracks, next } => {
             let count = tracks.len();
+            if let Some(target) = state.devices.remote_target_id().map(str::to_string) {
+                let payload = serde_json::json!({ "tracks": tracks });
+                send_device_command(
+                    runtime,
+                    target,
+                    if next {
+                        "queue_add_next"
+                    } else {
+                        "queue_add_end"
+                    },
+                    payload,
+                );
+                state.status_message = Some(if next {
+                    format!("{count} tracks queued next on active device")
+                } else {
+                    format!("{count} tracks queued on active device")
+                });
+                return;
+            }
             update::enqueue_tracks(state, tracks, next);
             state.status_message = Some(if next {
                 format!("{count} tracks queued next")
             } else {
                 format!("{count} tracks queued")
             });
+        }
+        AppEvent::PlaylistCreated { result, add_track } => match result {
+            Ok(playlist) => {
+                tracing::info!(title = %playlist.title, "playlist created");
+                state.status_message = Some(format!("playlist \"{}\" created", playlist.title));
+                state.popup = None;
+                // The list is stale; refetch when next needed.
+                state.playlists.list = None;
+                if let Some(track) = add_track {
+                    let Some(api) = runtime.api.clone() else {
+                        return;
+                    };
+                    let tx = runtime.event_tx.clone();
+                    let (id, title) = (playlist.id, playlist.title.clone());
+                    tokio::spawn(async move {
+                        let result = api
+                            .add_tracks_to_playlist(id, &[track.id])
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::PlaylistTracksAdded {
+                            playlist_id: id,
+                            playlist_title: title,
+                            result,
+                        });
+                    });
+                }
+            }
+            Err(message) => {
+                tracing::warn!(%message, "playlist creation failed");
+                state.status_message = Some(format!("create failed: {message}"));
+                if let Some(state::Popup::NewPlaylist { busy, .. }) = &mut state.popup {
+                    *busy = false;
+                }
+            }
+        },
+        AppEvent::PlaylistTracksAdded {
+            playlist_id,
+            playlist_title,
+            result,
+        } => {
+            state.popup = None;
+            match result {
+                Ok(()) => {
+                    state.status_message = Some(format!("added to \"{playlist_title}\""));
+                    // Counts and contents changed; refetch lazily.
+                    state.playlist_views.remove(&playlist_id);
+                    state.playlists.list = None;
+                }
+                Err(message) => {
+                    tracing::warn!(%message, playlist_id, "adding to playlist failed");
+                    state.status_message = Some(format!("add failed: {message}"));
+                }
+            }
         }
         AppEvent::Media(command) => {
             use crate::media::MediaCommand;

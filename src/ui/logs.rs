@@ -24,13 +24,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let visible = usize::from(inner.height.max(1));
-    let skip = if logs.follow { 0 } else { logs.scroll_from_end };
-    let (entries, matched) = buffer.window(level, skip, visible);
-    if entries.is_empty() {
+    let selected = if logs.follow { None } else { logs.selected_seq };
+    let view = buffer.view(level, selected, visible);
+    if view.entries.is_empty() {
         return centered(frame, inner, "no log entries at this level yet");
     }
 
-    for (row_index, entry) in entries.iter().enumerate() {
+    for (row_index, entry) in view.entries.iter().enumerate() {
         let row = Rect {
             x: inner.x,
             y: inner.y + row_index as u16,
@@ -44,6 +44,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::raw(entry.message.clone()),
         ]);
         frame.render_widget(Paragraph::new(line), row);
+        if view.cursor_row == Some(row_index) {
+            frame.buffer_mut().set_style(row, theme::tab_active());
+        }
     }
 
     // Footer hint with position info while scrolled back.
@@ -55,7 +58,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
         };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" ↑{skip} of {matched} · shift-g: follow · v: level "),
+                format!(
+                    " ↑{} of {} · enter: details · shift-g: follow · v: level ",
+                    view.from_end, view.matched
+                ),
                 theme::tab_active(),
             ))
             .alignment(Alignment::Right),
@@ -68,19 +74,23 @@ fn centered(frame: &mut Frame, area: Rect, text: &str) {
     if area.height == 0 {
         return;
     }
-    let middle = Rect { y: area.y + area.height / 2, height: 1, ..area };
+    let middle = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(text.to_string(), theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(text.to_string(), theme::dim())).alignment(Alignment::Center),
         middle,
     );
 }
 
 fn level_span(level: tracing::Level) -> Span<'static> {
     match level {
-        tracing::Level::ERROR => {
-            Span::styled("ERROR", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
-        }
+        tracing::Level::ERROR => Span::styled(
+            "ERROR",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         tracing::Level::WARN => Span::styled("WARN ", Style::new().fg(Color::Yellow)),
         tracing::Level::INFO => Span::styled("INFO ", theme::accent()),
         tracing::Level::DEBUG => Span::styled("DEBUG", theme::dim()),
@@ -90,7 +100,5 @@ fn level_span(level: tracing::Level) -> Span<'static> {
 
 /// `furumi_tui::app::update` → `app::update` — the crate prefix is noise.
 fn short_target(target: &str) -> &str {
-    target
-        .split_once("::")
-        .map_or(target, |(_, rest)| rest)
+    target.split_once("::").map_or(target, |(_, rest)| rest)
 }

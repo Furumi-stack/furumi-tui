@@ -4,7 +4,7 @@ use super::action::Action;
 use crate::api::models::TrackItem;
 
 use super::state::{
-    AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, Tab, TILE_HEIGHT, TILE_WIDTH,
+    AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, TILE_HEIGHT, TILE_WIDTH, Tab,
     ViewMode, release_display_order, release_rows,
 };
 
@@ -22,9 +22,15 @@ pub enum Effect {
     /// Seek relative to the current position, in seconds.
     SeekBy(i64),
     SetVolume(u8),
+    SetOptions,
     /// Fetch a release and append all its tracks to the queue.
-    EnqueueRelease { id: i64, next: bool },
-    ToggleLike { track_id: i64 },
+    EnqueueRelease {
+        id: i64,
+        next: bool,
+    },
+    ToggleLike {
+        track_id: i64,
+    },
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -35,6 +41,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         .is_some_and(|deadline| Instant::now() <= deadline);
     state.status_message = None;
     match action {
+        // While the help window is open, quit/back just close it.
+        Action::Quit | Action::Back if state.help_visible => {
+            state.help_visible = false;
+            None
+        }
         Action::Quit => {
             if quit_armed {
                 state.should_quit = true;
@@ -46,10 +57,6 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::ToggleHelp => {
             state.help_visible = !state.help_visible;
-            None
-        }
-        Action::Back if state.help_visible => {
-            state.help_visible = false;
             None
         }
         Action::NextTab => {
@@ -85,9 +92,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::NextTrack => queue_step(state, 1),
         Action::PrevTrack => queue_step(state, -1),
-        Action::SeekForward { seconds } => {
-            state.player.current.is_some().then_some(Effect::SeekBy(seconds as i64))
-        }
+        Action::SeekForward { seconds } => state
+            .player
+            .current
+            .is_some()
+            .then_some(Effect::SeekBy(seconds as i64)),
         Action::SeekBackward { seconds } => state
             .player
             .current
@@ -111,11 +120,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             } else {
                 restore_queue_order(&mut state.player);
             }
-            None
+            Some(Effect::SetOptions)
         }
         Action::CycleRepeat => {
             state.player.repeat = state.player.repeat.next();
-            None
+            Some(Effect::SetOptions)
         }
         Action::MoveUp => {
             move_selection(state, 0, -1);
@@ -156,7 +165,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 Tab::Logs => {
                     state.logs.level_index =
                         (state.logs.level_index + 1) % super::state::LOG_LEVELS.len();
-                    state.logs.scroll_from_end = 0;
+                    state.logs.selected_seq = None;
                     state.logs.follow = true;
                 }
                 _ => {}
@@ -168,15 +177,41 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             state.cmdline.input.clear();
             None
         }
+        Action::OpenSearch => {
+            // The command line opens pre-filled with "/": typing continues
+            // the live search, exactly as if `:` then `/` were pressed.
+            state.cmdline.active = true;
+            state.cmdline.input = "/".to_string();
+            state.cmdline.live = true;
+            state.search = SearchState::default();
+            state.active_tab = Tab::Global;
+            if !matches!(state.global.stack.last(), Some(GlobalView::Search { .. })) {
+                state.global.stack.push(GlobalView::Search { cursor: 0 });
+            }
+            None
+        }
+        Action::OpenDevices => {
+            let cursor = state
+                .devices
+                .devices
+                .iter()
+                .position(|device| {
+                    device.id == state.devices.active_device_id.clone().unwrap_or_default()
+                })
+                .unwrap_or(0);
+            state.popup = Some(super::state::Popup::Devices { cursor });
+            None
+        }
         Action::Select => select_current(state),
         Action::Back => {
             go_back(state);
             None
         }
         Action::ToggleLike => {
-            let target = selected_track(state)
-                .map(|t| t.id)
-                .or(state.player.current.as_ref().map(|t| t.id));
+            let target =
+                selected_track(state)
+                    .map(|t| t.id)
+                    .or(state.player.current.as_ref().map(|t| t.id));
             match target {
                 Some(track_id) => Some(Effect::ToggleLike { track_id }),
                 None => {
@@ -193,6 +228,24 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 Some(track) => open_release_for_track(state, &track),
                 None => state.status_message = Some("no track selected".into()),
             }
+            None
+        }
+        Action::AddToPlaylist => {
+            let track = selected_track(state).or_else(|| state.player.current.clone());
+            match track {
+                Some(track) => {
+                    state.popup = Some(super::state::Popup::AddToPlaylist { track, cursor: 0 });
+                }
+                None => state.status_message = Some("no track selected".into()),
+            }
+            None
+        }
+        Action::NewPlaylist => {
+            state.popup = Some(super::state::Popup::NewPlaylist {
+                for_track: None,
+                input: String::new(),
+                busy: false,
+            });
             None
         }
         Action::ClearQueue => {
@@ -223,7 +276,16 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
-                Loadable::Ready(detail) => detail.top_tracks.get(*cursor).cloned(),
+                Loadable::Ready(detail) => {
+                    let tracks = detail.top_tracks.len();
+                    if *cursor < tracks {
+                        detail.top_tracks.get(*cursor).cloned()
+                    } else {
+                        cursor
+                            .checked_sub(tracks + detail.releases.len())
+                            .and_then(|i| detail.featured_tracks.get(i).cloned())
+                    }
+                }
                 _ => None,
             },
             GlobalView::Release { id, cursor } => match state.release_views.get(id)? {
@@ -238,7 +300,9 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
         },
         Tab::Playlists => {
             let opened = state.playlists.opened.as_ref()?;
-            playlist_tracks(state, opened.id)?.get(opened.cursor).cloned()
+            playlist_tracks(state, opened.id)?
+                .get(opened.cursor)
+                .cloned()
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
         Tab::Logs => None,
@@ -315,7 +379,10 @@ fn open_release_for_track(state: &mut AppState, track: &TrackItem) {
     let origin = state.active_tab;
     state.active_tab = Tab::Global;
     match state.global.stack.last_mut() {
-        Some(GlobalView::Release { id, cursor: current }) if *id == release_id => {
+        Some(GlobalView::Release {
+            id,
+            cursor: current,
+        }) if *id == release_id => {
             *current = cursor;
         }
         _ => state.global.stack.push(GlobalView::Release {
@@ -478,7 +545,9 @@ pub fn restore_queue_order(player: &mut super::state::PlayerBar) {
         })
         .collect();
     keyed.sort_by_key(|(key, position, _)| (*key, *position));
-    player.queue.extend(keyed.into_iter().map(|(_, _, track)| track));
+    player
+        .queue
+        .extend(keyed.into_iter().map(|(_, _, track)| track));
     player.prefetched_pos = None;
 }
 
@@ -513,14 +582,17 @@ fn page_step(state: &AppState) -> isize {
             ViewMode::Table => lines,
         },
         Some(GlobalView::Artist { id, cursor }) => {
-            let in_tracks = match state.artist_views.get(id) {
-                Some(Loadable::Ready(detail)) => *cursor < detail.top_tracks.len(),
-                _ => true,
+            let in_release_tiles = match state.artist_views.get(id) {
+                Some(Loadable::Ready(detail)) => {
+                    *cursor >= detail.top_tracks.len()
+                        && *cursor < detail.top_tracks.len() + detail.releases.len()
+                }
+                _ => false,
             };
-            if in_tracks || state.global.view == ViewMode::Table {
-                lines
-            } else {
+            if in_release_tiles && state.global.view == ViewMode::Tiles {
                 tile_rows
+            } else {
+                lines
             }
         }
         Some(GlobalView::Release { .. }) | Some(GlobalView::Search { .. }) => lines,
@@ -529,15 +601,21 @@ fn page_step(state: &AppState) -> isize {
 
 fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
     if state.active_tab == Tab::Logs {
-        let total = crate::config::logging::buffer().map_or(0, |b| b.len());
-        let logs = &mut state.logs;
-        if dy < 0 {
-            logs.follow = false;
-            logs.scroll_from_end = (logs.scroll_from_end + dy.unsigned_abs()).min(total);
-        } else if dy > 0 {
-            logs.scroll_from_end = logs.scroll_from_end.saturating_sub(dy as usize);
-            if logs.scroll_from_end == 0 {
-                logs.follow = true;
+        // The cursor anchors to an entry's seq, so freshly appended log
+        // lines (including ones caused by this very keypress) don't shift
+        // the selection.
+        if dy != 0 {
+            let level = super::state::LOG_LEVELS[state.logs.level_index];
+            if let Some(buffer) = crate::config::logging::buffer() {
+                let current = if state.logs.follow {
+                    None
+                } else {
+                    state.logs.selected_seq
+                };
+                if let Some((seq, is_newest)) = buffer.move_selection(level, current, dy) {
+                    state.logs.selected_seq = Some(seq);
+                    state.logs.follow = is_newest && dy > 0;
+                }
             }
         }
         return;
@@ -589,24 +667,23 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
                 return;
             };
             let tracks = detail.top_tracks.len();
-            let total = tracks + detail.releases.len();
+            let releases = detail.releases.len();
+            let featured = detail.featured_tracks.len();
+            let total = tracks + releases + featured;
             if total == 0 {
                 return;
             }
-            let next = if cursor < tracks {
-                // Top-tracks zone: vertical only; stepping past the last
-                // track enters the releases zone (its first item).
+            let in_release_tiles = state.global.view == ViewMode::Tiles
+                && cursor >= tracks
+                && cursor < tracks + releases;
+            let next = if !in_release_tiles {
+                // List zones (top tracks, featured tracks; releases in
+                // table mode): plain vertical steps cross zone boundaries
+                // in flat order.
                 (cursor as isize + dy).clamp(0, total as isize - 1) as usize
-            } else if state.global.view == ViewMode::Table {
-                let next = cursor as isize + dy;
-                if next < tracks as isize && dy < 0 && tracks > 0 {
-                    tracks - 1
-                } else {
-                    next.clamp(0, total as isize - 1) as usize
-                }
             } else {
-                // Tiles: move by visual rows (groups break rows), keeping
-                // the column, so Up lands on the tile directly above.
+                // Release tiles: move by visual rows (groups break rows),
+                // keeping the column, so Up lands on the tile above.
                 let rows = release_rows(&detail.releases, grid_columns());
                 let position = cursor - tracks;
                 let (row, column) = rows
@@ -617,18 +694,21 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
                     })
                     .unwrap_or((0, 0));
                 if dx != 0 {
-                    let last = detail.releases.len() as isize - 1;
+                    let last = releases as isize - 1;
                     tracks + (position as isize + dx).clamp(0, last) as usize
                 } else {
                     let target = row as isize + dy;
                     if target < 0 {
-                        if tracks > 0 {
-                            tracks - 1
+                        if tracks > 0 { tracks - 1 } else { cursor }
+                    } else if target as usize >= rows.len() {
+                        // Below the last release row: the featured section.
+                        if featured > 0 {
+                            tracks + releases
                         } else {
                             cursor
                         }
                     } else {
-                        let items = &rows[(target as usize).min(rows.len() - 1)];
+                        let items = &rows[target as usize];
                         tracks + items[column.min(items.len() - 1)]
                     }
                 }
@@ -688,7 +768,9 @@ fn current_view_len(state: &AppState) -> usize {
     match state.global.stack.last() {
         None => state.global.artists.len(),
         Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
-            Some(Loadable::Ready(d)) => d.top_tracks.len() + d.releases.len(),
+            Some(Loadable::Ready(d)) => {
+                d.top_tracks.len() + d.releases.len() + d.featured_tracks.len()
+            }
             _ => 0,
         },
         Some(GlobalView::Release { id, .. }) => match state.release_views.get(id) {
@@ -709,11 +791,16 @@ fn jump_selection(state: &mut AppState, first: bool) {
     }
     if state.active_tab == Tab::Logs {
         if first {
-            state.logs.follow = false;
-            state.logs.scroll_from_end = crate::config::logging::buffer().map_or(0, |b| b.len());
+            let level = super::state::LOG_LEVELS[state.logs.level_index];
+            if let Some(buffer) = crate::config::logging::buffer() {
+                if let Some((seq, _)) = buffer.move_selection(level, None, isize::MIN) {
+                    state.logs.selected_seq = Some(seq);
+                    state.logs.follow = false;
+                }
+            }
         } else {
             state.logs.follow = true;
-            state.logs.scroll_from_end = 0;
+            state.logs.selected_seq = None;
         }
         return;
     }
@@ -768,6 +855,21 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     if state.active_tab == Tab::Playlists {
         return select_playlist(state);
     }
+    // Logs: open the full, wrapped entry under the cursor.
+    if state.active_tab == Tab::Logs {
+        let level = super::state::LOG_LEVELS[state.logs.level_index];
+        if let Some(buffer) = crate::config::logging::buffer() {
+            let selected = if state.logs.follow {
+                None
+            } else {
+                state.logs.selected_seq
+            };
+            if let Some(entry) = buffer.entry_at(level, selected) {
+                state.popup = Some(super::state::Popup::LogDetail(entry));
+            }
+        }
+        return None;
+    }
     // Queue: jump playback to the track under the cursor. Earlier tracks
     // stay in the queue as "played"; picking one of them just moves the
     // playing position back.
@@ -784,7 +886,10 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     }
     enum Outcome {
         Push(GlobalView),
-        Play { tracks: Vec<crate::api::models::TrackItem>, start: usize },
+        Play {
+            tracks: Vec<crate::api::models::TrackItem>,
+            start: usize,
+        },
         Nothing,
     }
     let outcome = match state.global.stack.last().copied() {
@@ -798,12 +903,13 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
         Some(GlobalView::Artist { id, cursor }) => match state.artist_views.get(&id) {
             Some(Loadable::Ready(detail)) => {
                 let tracks = detail.top_tracks.len();
+                let releases = detail.releases.len();
                 if cursor < tracks {
                     Outcome::Play {
                         tracks: detail.top_tracks.clone(),
                         start: cursor,
                     }
-                } else {
+                } else if cursor < tracks + releases {
                     let order = release_display_order(&detail.releases);
                     match order.get(cursor - tracks) {
                         Some(&original) => Outcome::Push(GlobalView::Release {
@@ -812,6 +918,17 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
                         }),
                         None => Outcome::Nothing,
                     }
+                } else if detail
+                    .featured_tracks
+                    .get(cursor - tracks - releases)
+                    .is_some()
+                {
+                    Outcome::Play {
+                        tracks: detail.featured_tracks.clone(),
+                        start: cursor - tracks - releases,
+                    }
+                } else {
+                    Outcome::Nothing
                 }
             }
             _ => Outcome::Nothing,
@@ -945,7 +1062,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
         Tab::Playlists => state.playlists.opened = None,
         Tab::Logs => {
             state.logs.follow = true;
-            state.logs.scroll_from_end = 0;
+            state.logs.selected_seq = None;
         }
         Tab::Queue => {}
     }
@@ -1104,6 +1221,7 @@ mod tests {
             total_track_count: 0,
             total_play_count: 0,
             top_tracks: vec![],
+            featured_tracks: vec![],
             releases: vec![
                 release(10, "album"),
                 release(11, "album"),
@@ -1115,7 +1233,10 @@ mod tests {
         };
         let mut state = AppState::default();
         state.artist_views.insert(1, Loadable::Ready(detail));
-        state.global.stack.push(GlobalView::Artist { id: 1, cursor: 4 });
+        state
+            .global
+            .stack
+            .push(GlobalView::Artist { id: 1, cursor: 4 });
 
         // Up from the first compilation lands on the album row directly
         // above (position 3), not three flat items back.
@@ -1132,7 +1253,10 @@ mod tests {
         );
         // Up from the second compilation clamps to the single tile above.
         state.global.stack.pop();
-        state.global.stack.push(GlobalView::Artist { id: 1, cursor: 5 });
+        state
+            .global
+            .stack
+            .push(GlobalView::Artist { id: 1, cursor: 5 });
         update(&mut state, Action::MoveUp);
         assert_eq!(
             state.global.stack.last(),
@@ -1260,7 +1384,10 @@ mod tests {
         update(&mut state, Action::MoveUp);
         update(&mut state, Action::MoveUp);
         assert_eq!(state.queue_tab.cursor, 0);
-        assert_eq!(update(&mut state, Action::Select), Some(Effect::PlayCurrent));
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PlayCurrent)
+        );
         assert_eq!(state.player.queue_pos, 0);
         assert_eq!(state.player.queue.len(), 3);
 

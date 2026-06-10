@@ -3,13 +3,14 @@ mod global;
 mod login;
 mod logs;
 mod playlists;
+mod popup;
 pub mod theme;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
 use crate::app::state::{AppState, Screen, Tab};
 use crate::config::keymap::Keymap;
@@ -38,6 +39,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     if state.help_visible {
         draw_help(frame, keymap);
     }
+    popup::draw(frame, state);
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -75,12 +77,7 @@ pub(crate) fn track_row(
     ]);
     frame.render_widget(Paragraph::new(line), area);
 
-    let tech = track.tech_label_short();
-    let right = if tech.is_empty() || area.width < 60 {
-        track.duration_label()
-    } else {
-        format!("{tech} · {}", track.duration_label())
-    };
+    let right = track_meta_suffix(track, area.width >= 60);
     frame.render_widget(
         Paragraph::new(Line::styled(right, theme::dim())).alignment(Alignment::Right),
         area,
@@ -88,6 +85,38 @@ pub(crate) fn track_row(
     if selected {
         frame.buffer_mut().set_style(area, theme::tab_active());
     }
+}
+
+pub(crate) fn track_meta_suffix(
+    track: &crate::api::models::TrackItem,
+    include_tech: bool,
+) -> String {
+    let has_tech = track.audio_format.is_some()
+        || track.audio_bitrate.is_some()
+        || track.file_size_bytes.is_some();
+    if !include_tech || !has_tech {
+        return track.duration_label();
+    }
+
+    let format = track
+        .audio_format
+        .as_deref()
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_default();
+    let format: String = format.chars().take(4).collect();
+    let bitrate = track
+        .audio_bitrate
+        .map(|value| format!("{value}k"))
+        .unwrap_or_default();
+    let size = track
+        .file_size_bytes
+        .map(|bytes| format!("{:.1}MB", bytes as f64 / 1_048_576.0))
+        .unwrap_or_default();
+
+    format!(
+        "{format:<4} {bitrate:>5} {size:>8} · {:>5}",
+        track.duration_label()
+    )
 }
 
 /// Interactive queue: its own cursor, enter plays the selected track and
@@ -105,7 +134,11 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(block, area);
 
     if player.queue.is_empty() {
-        let middle = Rect { y: inner.y + inner.height / 2, height: 1, ..inner };
+        let middle = Rect {
+            y: inner.y + inner.height / 2,
+            height: 1,
+            ..inner
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "queue is empty — open a track and press enter",
@@ -122,9 +155,7 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     let first = cursor
         .saturating_sub(visible / 2)
         .min(player.queue.len().saturating_sub(visible));
-    let played_style = Style::new()
-        .fg(Color::DarkGray)
-        .bg(Color::Rgb(28, 28, 32));
+    let played_style = Style::new().fg(Color::DarkGray).bg(Color::Rgb(28, 28, 32));
     for (index, track) in player.queue.iter().enumerate().skip(first).take(visible) {
         let row = Rect {
             x: inner.x,
@@ -207,14 +238,34 @@ fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<
             ));
         }
     } else {
-        spans.push(Span::styled(
-            format!("  {}%", player.volume),
-            theme::dim(),
-        ));
+        spans.push(Span::styled(format!("  {}%", player.volume), theme::dim()));
     }
     // Keep a gap between the flags and the username block to the right.
     spans.push(Span::raw("  "));
     Line::from(spans)
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut out: String = value.chars().take(max).collect();
+    if value.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+fn device_status_line(state: &AppState) -> Line<'static> {
+    if state.devices.is_playback_device() {
+        return Line::from(vec![Span::styled("playing here", theme::accent())]);
+    }
+    let name = state
+        .devices
+        .active_device_name()
+        .map(|name| truncate_chars(name, 26))
+        .unwrap_or_else(|| "remote device".to_string());
+    Line::from(vec![
+        Span::styled("controlling ", theme::dim()),
+        Span::styled(name, theme::accent()),
+    ])
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -227,6 +278,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     // truncates into whatever is left.
     let center = player_right_line(player, area.width);
     let center_width = (center.width() as u16).min(area.width);
+    let device_line = device_status_line(state);
+    let device_width = (device_line.width() as u16).min(32);
     let user_line = state.user.as_ref().map(|user| {
         Line::from(vec![
             Span::styled("◉ ", theme::accent()),
@@ -234,12 +287,17 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         ])
     });
     let user_width = user_line.as_ref().map_or(0, |l| l.width() as u16);
-    let [title_area, right_area, user_area] = Layout::horizontal([
+    let [title_area, right_area, device_area, user_area] = Layout::horizontal([
         Constraint::Min(8),
         Constraint::Length(center_width),
+        Constraint::Length(device_width.saturating_add(2)),
         Constraint::Length(user_width),
     ])
     .areas(player_row);
+    frame.render_widget(
+        Paragraph::new(device_line).alignment(Alignment::Right),
+        device_area,
+    );
     if let Some(user_line) = user_line {
         frame.render_widget(
             Paragraph::new(user_line).alignment(Alignment::Right),
@@ -271,7 +329,6 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), title_area);
     frame.render_widget(Paragraph::new(center), right_area);
 
-
     if state.cmdline.active {
         // Vim-style command line takes over the message row.
         let line = Line::from(vec![
@@ -280,6 +337,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("█", theme::accent()),
         ]);
         frame.render_widget(Paragraph::new(line), message_row);
+        draw_version(frame, message_row);
         return;
     }
 
@@ -294,6 +352,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         },
     };
     frame.render_widget(Paragraph::new(message), message_row);
+    draw_version(frame, message_row);
 
     if let Some(pending) = &state.pending_keys {
         let pending = Paragraph::new(Line::styled(format!("{pending} …"), theme::header()))
@@ -302,36 +361,115 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
+fn draw_version(frame: &mut Frame, area: Rect) {
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    frame.render_widget(
+        Paragraph::new(Line::styled(version, theme::dim())).alignment(Alignment::Right),
+        area,
+    );
+}
+
+/// Help window: bindings merged per action (j / down on one row), grouped
+/// into titled sections and laid out in two balanced columns.
 fn draw_help(frame: &mut Frame, keymap: &Keymap) {
-    let entries = keymap.help_entries();
-    let height = (entries.len() as u16 + 4).min(frame.area().height.saturating_sub(2));
-    let width = 56.min(frame.area().width.saturating_sub(2));
+    use crate::app::action::{Action, Category};
+    use crate::config::keymap::KeyContext;
+
+    struct MergedRow {
+        keys: Vec<String>,
+        action: Action,
+        context: KeyContext,
+    }
+    let mut merged: Vec<MergedRow> = Vec::new();
+    for (keys, action, context) in keymap.help_entries() {
+        match merged
+            .iter_mut()
+            .find(|row| row.action == action && row.context == context)
+        {
+            Some(row) => row.keys.push(keys),
+            None => merged.push(MergedRow {
+                keys: vec![keys],
+                action,
+                context,
+            }),
+        }
+    }
+
+    // One block of lines per category: section header + its rows.
+    let mut blocks: Vec<Vec<Line>> = Vec::new();
+    for category in Category::ALL {
+        let rows: Vec<&MergedRow> = merged
+            .iter()
+            .filter(|row| row.action.category() == category)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let mut lines = vec![Line::styled(category.title(), theme::header())];
+        for row in rows {
+            let keys = row.keys.join(" / ");
+            let context = if row.context == KeyContext::Global {
+                String::new()
+            } else {
+                format!(" [{}]", row.context.label())
+            };
+            let command = row.action.command_hint().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled(format!("{keys:<13}"), theme::accent()),
+                Span::raw(format!(
+                    "{:<24}",
+                    format!("{}{context}", row.action.describe())
+                )),
+                Span::styled(command.to_string(), theme::accent()),
+            ]));
+        }
+        lines.push(Line::default());
+        blocks.push(lines);
+    }
+
+    // Balance the blocks across two columns.
+    let total: usize = blocks.iter().map(Vec::len).sum();
+    let mut left: Vec<Line> = Vec::new();
+    let mut right: Vec<Line> = Vec::new();
+    for block in blocks {
+        if left.len() < total.div_ceil(2) {
+            left.extend(block);
+        } else {
+            right.extend(block);
+        }
+    }
+
+    let column_height = left.len().max(right.len()) as u16;
+    let width = 110.min(frame.area().width.saturating_sub(2));
+    let height = (column_height + 4).min(frame.area().height.saturating_sub(2));
     let area = centered_rect(frame.area(), width, height);
 
-    let rows = entries.into_iter().map(|(keys, description, context)| {
-        Row::new(vec![
-            Span::styled(keys, theme::accent()),
-            Span::raw(description),
-            Span::styled(context.label(), theme::dim()),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(12),
-            Constraint::Min(20),
-            Constraint::Length(9),
-        ],
-    )
-    .header(Row::new(vec!["keys", "action", "context"]).style(theme::header()))
-    .block(
-        Block::bordered()
-            .title(" Keybindings ")
-            .title_style(theme::header()),
-    );
-
+    let block = Block::bordered()
+        .title(" Keybindings & commands ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(table, area);
+    frame.render_widget(block, area);
+
+    let [columns_area, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [left_area, _, right_area] = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Length(2),
+        Constraint::Percentage(50),
+    ])
+    .areas(columns_area);
+    frame.render_widget(Paragraph::new(left), left_area);
+    frame.render_widget(Paragraph::new(right), right_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            ": opens the command line · full forms: :seek +30|1:30 · :volume 0-100 · :repeat off|one|all · :logs [level]",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        footer,
+    );
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -343,4 +481,3 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         .areas(rect);
     rect
 }
-

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::models::{
-    ArtistCard, ArtistDetail, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
+    ArtistCard, ArtistDetail, DeviceDto, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
     SearchResults, TrackItem, User,
 };
 use crate::art::ArtImage;
@@ -57,10 +57,18 @@ pub enum ArtState {
 pub enum GlobalView {
     /// Linear cursor over top tracks (0..tracks) then releases in display
     /// order (tracks..tracks+releases).
-    Artist { id: i64, cursor: usize },
-    Release { id: i64, cursor: usize },
+    Artist {
+        id: i64,
+        cursor: usize,
+    },
+    Release {
+        id: i64,
+        cursor: usize,
+    },
     /// Linear cursor over search results: artists, then releases, then tracks.
-    Search { cursor: usize },
+    Search {
+        cursor: usize,
+    },
 }
 
 /// The Global tab: the whole server library of artists.
@@ -194,8 +202,9 @@ pub struct LogsTab {
     pub level_index: usize,
     /// Stick to the newest entries as they arrive.
     pub follow: bool,
-    /// When not following: how many (filtered) entries back from the end.
-    pub scroll_from_end: usize,
+    /// Cursor anchored to a specific entry's seq; appends never move it.
+    /// None = newest (follow mode).
+    pub selected_seq: Option<u64>,
 }
 
 impl Default for LogsTab {
@@ -203,8 +212,71 @@ impl Default for LogsTab {
         Self {
             level_index: 2,
             follow: true,
-            scroll_from_end: 0,
+            selected_seq: None,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DevicesState {
+    pub device_id: String,
+    pub active_device_id: Option<String>,
+    pub devices: Vec<DeviceDto>,
+    pub poll_error: Option<String>,
+    pub switching_to: Option<String>,
+}
+
+impl DevicesState {
+    pub fn is_playback_device(&self) -> bool {
+        self.active_device_id
+            .as_deref()
+            .is_none_or(|active| active == self.device_id)
+    }
+
+    pub fn remote_target_id(&self) -> Option<&str> {
+        self.active_device_id
+            .as_deref()
+            .filter(|active| *active != self.device_id)
+    }
+
+    pub fn active_device_name(&self) -> Option<&str> {
+        let active = self.active_device_id.as_deref()?;
+        self.devices
+            .iter()
+            .find(|device| device.id == active)
+            .map(|device| device.name.as_str())
+    }
+}
+
+/// Modal dialog over the main screen.
+#[derive(Debug)]
+pub enum Popup {
+    /// Pick one of the user's playlists (row 0 = "create new"); the track
+    /// is added on Enter.
+    AddToPlaylist { track: TrackItem, cursor: usize },
+    /// Name input for a new playlist; when `for_track` is set, the track is
+    /// added to it right after creation.
+    NewPlaylist {
+        for_track: Option<TrackItem>,
+        input: String,
+        busy: bool,
+    },
+    /// Connected devices list; Enter transfers active playback to the row.
+    Devices { cursor: usize },
+    /// Full, wrapped view of one log entry (Enter on the Logs tab).
+    LogDetail(crate::config::logging::LogEntry),
+}
+
+/// User's own playlists eligible as add-targets (the virtual Likes playlist
+/// is managed through likes, not direct adds).
+pub fn addable_playlists(state: &AppState) -> Vec<(i64, String)> {
+    match &state.playlists.list {
+        Some(Loadable::Ready(list)) => list
+            .iter()
+            .filter(|p| p.is_own && p.kind != "likes")
+            .map(|p| (p.id, p.title.clone()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -445,6 +517,7 @@ pub struct AppState {
     pub likes: std::collections::HashSet<i64>,
     pub likes_loaded: bool,
     pub logs: LogsTab,
+    pub devices: DevicesState,
     pub queue_tab: QueueTab,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.
@@ -453,6 +526,7 @@ pub struct AppState {
     /// view): Esc from that view returns to the origin tab instead of
     /// unwinding the Global stack.
     pub jump_origin: Option<(Tab, usize)>,
+    pub popup: Option<Popup>,
     pub cmdline: Cmdline,
     pub search: SearchState,
     /// Shared image cache keyed by `art::cache_key(url, w, h)`; reused by
