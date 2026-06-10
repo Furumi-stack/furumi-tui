@@ -1,0 +1,180 @@
+# Default keybindings for furumi-cli.
+#
+# To customize, copy entries into <config dir>/furumi/keymap.toml
+# (~/.config/furumi/keymap.toml on Linux/macOS). A user binding replaces the
+# default binding with the same key sequence and context.
+#
+# key_sequence: space-separated chords, e.g. "g g" or "ctrl-a x".
+#   Modifiers: ctrl-, alt-, shift-, cmd-. Uppercase letters: "shift-g".
+# command: an Action name, optionally with parameters:
+#   command = { SeekForward = { seconds = 30 } }
+# context: optional view filter — global (default), library, search,
+#   playlists, queue, devices.
+
+[[keymaps]]
+key_sequence = "q"
+command = "Quit"
+
+[[keymaps]]
+key_sequence = "ctrl-c"
+command = "Quit"
+
+[[keymaps]]
+key_sequence = "?"
+command = "ToggleHelp"
+
+[[keymaps]]
+key_sequence = "tab"
+command = "NextTab"
+
+[[keymaps]]
+key_sequence = "backtab"
+command = "PrevTab"
+
+[[keymaps]]
+key_sequence = "1"
+command = { GoToTab = 0 }
+
+[[keymaps]]
+key_sequence = "2"
+command = { GoToTab = 1 }
+
+[[keymaps]]
+key_sequence = "3"
+command = { GoToTab = 2 }
+
+[[keymaps]]
+key_sequence = "4"
+command = { GoToTab = 3 }
+
+[[keymaps]]
+key_sequence = "a"
+command = "QueueAddNext"
+
+[[keymaps]]
+key_sequence = "shift-a"
+command = "QueueAddLast"
+
+[[keymaps]]
+key_sequence = "j"
+command = "MoveDown"
+
+[[keymaps]]
+key_sequence = "down"
+command = "MoveDown"
+
+[[keymaps]]
+key_sequence = "k"
+command = "MoveUp"
+
+[[keymaps]]
+key_sequence = "up"
+command = "MoveUp"
+
+[[keymaps]]
+key_sequence = "h"
+command = "MoveLeft"
+
+[[keymaps]]
+key_sequence = "left"
+command = "MoveLeft"
+
+[[keymaps]]
+key_sequence = "l"
+command = "MoveRight"
+
+[[keymaps]]
+key_sequence = "right"
+command = "MoveRight"
+
+[[keymaps]]
+key_sequence = "pageup"
+command = "PageUp"
+
+[[keymaps]]
+key_sequence = "pagedown"
+command = "PageDown"
+
+[[keymaps]]
+key_sequence = "ctrl-u"
+command = "PageUp"
+
+[[keymaps]]
+key_sequence = "ctrl-d"
+command = "PageDown"
+
+[[keymaps]]
+key_sequence = "g g"
+command = "SelectFirst"
+
+[[keymaps]]
+key_sequence = "shift-g"
+command = "SelectLast"
+
+[[keymaps]]
+key_sequence = "enter"
+command = "Select"
+
+[[keymaps]]
+key_sequence = "esc"
+command = "Back"
+
+[[keymaps]]
+key_sequence = "backspace"
+command = "Back"
+
+[[keymaps]]
+key_sequence = "space"
+command = "PlayPause"
+
+[[keymaps]]
+key_sequence = "n"
+command = "NextTrack"
+
+[[keymaps]]
+key_sequence = "p"
+command = "PrevTrack"
+
+[[keymaps]]
+key_sequence = "."
+command = { SeekForward = { seconds = 10 } }
+
+[[keymaps]]
+key_sequence = ","
+command = { SeekBackward = { seconds = 10 } }
+
+[[keymaps]]
+key_sequence = "+"
+command = "VolumeUp"
+
+[[keymaps]]
+key_sequence = "="
+command = "VolumeUp"
+
+[[keymaps]]
+key_sequence = "-"
+command = "VolumeDown"
+
+[[keymaps]]
+key_sequence = "s"
+command = "ToggleShuffle"
+
+[[keymaps]]
+key_sequence = "r"
+command = "CycleRepeat"
+
+[[keymaps]]
+key_sequence = "x"
+command = "ToggleLike"
+
+[[keymaps]]
+key_sequence = "shift-l"
+command = "Logout"
+
+[[keymaps]]
+key_sequence = "v"
+command = "ToggleViewMode"
+
+[[keymaps]]
+key_sequence = ":"
+command = "OpenCommandLine"
