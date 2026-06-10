@@ -66,13 +66,11 @@ fn draw_form(frame: &mut Frame, form: &LoginForm) {
 }
 
 fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
-    // The dialog grows with the URL so it is always shown in full and can
-    // be copied/typed manually.
-    let width = 78.min(frame.area().width.saturating_sub(2)).max(40);
-    let inner_width = usize::from(width - 2);
-    let url_lines = (form.sso_url.len().div_ceil(inner_width.max(1)) as u16).clamp(1, 6);
-    let height = (13 + url_lines).min(frame.area().height);
-    let area = centered(frame.area(), width, height);
+    // The URL stays on ONE line (wrapping breaks copy-paste); the dialog is
+    // as wide as the terminal allows and ctrl-l copies the full link.
+    let width = (form.sso_url.len() as u16 + 4)
+        .clamp(48, frame.area().width.saturating_sub(2).max(40));
+    let area = centered(frame.area(), width, 14.min(frame.area().height));
 
     let block = Block::bordered()
         .title(" Continue with SSO ")
@@ -84,7 +82,7 @@ fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
     let [steps, url_label, url, paste, message, hint] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(1),
-        Constraint::Length(url_lines),
+        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(2),
         Constraint::Length(1),
@@ -111,25 +109,26 @@ fn draw_sso_pending(frame: &mut Frame, form: &LoginForm) {
 
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "If the browser didn't open, visit:",
+            "If the browser didn't open — ctrl-l copies this link, ctrl-o retries:",
             theme::dim(),
         )),
         url_label,
     );
-    // Unbordered and character-wrapped: the URL is fully visible and can be
-    // selected in the terminal without picking up border glyphs.
+    // One line, never wrapped: a wrapped URL copies with a line break and
+    // stops working. If it doesn't fit, ctrl-l still copies it whole.
     frame.render_widget(
-        Paragraph::new(form.sso_url.clone())
-            .style(theme::accent())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Line::styled(form.sso_url.clone(), theme::accent())),
         url,
     );
 
     draw_field(frame, paste, "Link or code", &form.sso_paste, false, true);
     draw_message(frame, message, form);
     frame.render_widget(
-        Paragraph::new(Line::styled("enter submit · esc back · ctrl-c quit", theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(
+            "enter submit · ctrl-l copy link · esc back · ctrl-c quit",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
         hint,
     );
 }

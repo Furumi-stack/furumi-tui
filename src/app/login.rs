@@ -59,6 +59,31 @@ fn handle_form_key(form: &mut LoginForm, runtime: &mut Runtime, key: KeyEvent) {
 }
 
 fn handle_sso_key(form: &mut LoginForm, runtime: &mut Runtime, key: KeyEvent) {
+    // Ctrl-shortcuts first: plain letters belong to the paste field.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            // Copy the full SSO URL — terminals can't copy a wrapped link
+            // in one piece, the clipboard can.
+            KeyCode::Char('l') => {
+                form.error = None;
+                match copy_to_clipboard(&form.sso_url) {
+                    Ok(()) => form.error = Some("link copied to clipboard".to_string()),
+                    Err(err) => {
+                        tracing::warn!(%err, "clipboard copy failed");
+                        form.error = Some(format!("copy failed: {err}"));
+                    }
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Err(err) = open::that_detached(&form.sso_url) {
+                    tracing::warn!(%err, "failed to reopen browser");
+                    form.error = Some("couldn't open a browser".to_string());
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             if let Some(listener) = runtime.sso.take() {
@@ -75,6 +100,10 @@ fn handle_sso_key(form: &mut LoginForm, runtime: &mut Runtime, key: KeyEvent) {
         KeyCode::Char(c) if is_typing(key) => form.sso_paste.push(c),
         _ => {}
     }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+    arboard::Clipboard::new()?.set_text(text.to_string())
 }
 
 fn is_typing(key: KeyEvent) -> bool {
