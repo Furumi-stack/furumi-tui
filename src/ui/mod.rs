@@ -7,6 +7,7 @@ pub mod theme;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, Tabs};
 
@@ -30,7 +31,6 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Global => global::draw(frame, main_area, state),
         Tab::Playlists => playlists::draw(frame, main_area, state),
         Tab::Queue => draw_queue(frame, main_area, state),
-        Tab::Devices => draw_main(frame, main_area, state),
         Tab::Logs => logs::draw(frame, main_area, state),
     }
     draw_status(frame, status_area, state);
@@ -50,30 +50,6 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
         .highlight_style(theme::tab_active())
         .divider("");
     frame.render_widget(tabs, area);
-}
-
-fn draw_main(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::bordered()
-        .title(format!(" {} ", state.active_tab.title()))
-        .title_style(theme::header())
-        .border_style(theme::dim());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let (summary, milestone) = match state.active_tab {
-        Tab::Devices => ("Connected devices and playback transfer", "milestone 5"),
-        _ => ("", ""),
-    };
-    let lines = vec![
-        Line::default(),
-        Line::styled(summary, theme::accent()),
-        Line::styled(format!("coming in {milestone}"), theme::dim()),
-        Line::default(),
-        Line::styled("Tab / Shift-Tab or 1-5 to switch tabs", theme::dim()),
-        Line::styled("?  keybindings    q  quit", theme::dim()),
-    ];
-    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
-    frame.render_widget(paragraph, centered_vertically(inner, 6));
 }
 
 /// One track row used by every track list: ♥ marker for liked tracks, the
@@ -114,11 +90,15 @@ pub(crate) fn track_row(
     }
 }
 
-/// Read-only queue listing; the playing track is highlighted.
+/// Interactive queue: its own cursor, enter plays the selected track and
+/// already-played tracks stay listed, greyed out.
 fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     let player = &state.player;
     let block = Block::bordered()
-        .title(format!(" Queue — {} tracks ", player.queue.len()))
+        .title(format!(
+            " Queue — {} tracks · enter: play · shift-c: clear ",
+            player.queue.len()
+        ))
         .title_style(theme::header())
         .border_style(theme::dim());
     let inner = block.inner(area);
@@ -137,11 +117,14 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    let cursor = state.queue_tab.cursor.min(player.queue.len() - 1);
     let visible = usize::from(inner.height.max(1));
-    let first = player
-        .queue_pos
+    let first = cursor
         .saturating_sub(visible / 2)
         .min(player.queue.len().saturating_sub(visible));
+    let played_style = Style::new()
+        .fg(Color::DarkGray)
+        .bg(Color::Rgb(28, 28, 32));
     for (index, track) in player.queue.iter().enumerate().skip(first).take(visible) {
         let row = Rect {
             x: inner.x,
@@ -149,14 +132,17 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
             width: inner.width,
             height: 1,
         };
-        track_row(
-            frame,
-            row,
-            state,
-            track,
-            (index + 1).to_string(),
-            index == player.queue_pos,
-        );
+        let label = if index == player.queue_pos && player.playing {
+            "▶".to_string()
+        } else {
+            (index + 1).to_string()
+        };
+        track_row(frame, row, state, track, label, index == cursor);
+        // Tracks before the playing one are history: greyed out unless the
+        // cursor is on them.
+        if index < player.queue_pos && index != cursor {
+            frame.buffer_mut().set_style(row, played_style);
+        }
     }
 }
 
@@ -203,17 +189,31 @@ fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<
             Span::styled("█".repeat(volume_cells), theme::accent()),
             Span::styled("░".repeat(10 - volume_cells), theme::dim()),
             Span::raw(format!(" {:3}%", player.volume)),
-            Span::styled("  shuffle ", theme::dim()),
-            Span::raw(if player.shuffle { "on" } else { "off" }.to_string()),
-            Span::styled("  repeat ", theme::dim()),
-            Span::raw(player.repeat.label().to_string()),
+            Span::raw("  "),
         ]);
+        // Enabled modes light up as filled chips; disabled stay dim text.
+        if player.shuffle {
+            spans.push(Span::styled(" shuffle ", theme::tab_active()));
+        } else {
+            spans.push(Span::styled("shuffle off", theme::dim()));
+        }
+        spans.push(Span::raw("  "));
+        if player.repeat == crate::app::state::RepeatMode::Off {
+            spans.push(Span::styled("repeat off", theme::dim()));
+        } else {
+            spans.push(Span::styled(
+                format!(" repeat {} ", player.repeat.label()),
+                theme::tab_active(),
+            ));
+        }
     } else {
         spans.push(Span::styled(
             format!("  {}%", player.volume),
             theme::dim(),
         ));
     }
+    // Keep a gap between the flags and the username block to the right.
+    spans.push(Span::raw("  "));
     Line::from(spans)
 }
 
@@ -344,9 +344,3 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     rect
 }
 
-fn centered_vertically(area: Rect, content_height: u16) -> Rect {
-    let [rect] = Layout::vertical([Constraint::Length(content_height)])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(area);
-    rect
-}

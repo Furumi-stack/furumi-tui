@@ -75,6 +75,9 @@ pub struct GlobalTab {
     pub selected: usize,
     pub view: ViewMode,
     pub stack: Vec<GlobalView>,
+    /// Page size, fixed at the first request — the server's offset is
+    /// `(page-1) * limit`, so it must not change between pages.
+    pub page_limit: Option<i64>,
 }
 
 impl Default for GlobalTab {
@@ -89,6 +92,7 @@ impl Default for GlobalTab {
             selected: 0,
             view: ViewMode::default(),
             stack: Vec::new(),
+            page_limit: None,
         }
     }
 }
@@ -165,6 +169,13 @@ pub struct PlaylistsTab {
     pub list: Option<Loadable<Vec<PlaylistCard>>>,
     pub selected: usize,
     pub opened: Option<OpenedPlaylist>,
+}
+
+/// The Queue tab's own cursor — independent from the playing position, so
+/// the user can browse and pick tracks while something else plays.
+#[derive(Debug, Default)]
+pub struct QueueTab {
+    pub cursor: usize,
 }
 
 /// Severity steps for the Logs tab filter, cycled with the view-toggle key.
@@ -300,25 +311,17 @@ pub enum Tab {
     Global,
     Playlists,
     Queue,
-    Devices,
     Logs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
-        Tab::Global,
-        Tab::Playlists,
-        Tab::Queue,
-        Tab::Devices,
-        Tab::Logs,
-    ];
+    pub const ALL: [Tab; 4] = [Tab::Global, Tab::Playlists, Tab::Queue, Tab::Logs];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Global => "Global",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
-            Tab::Devices => "Devices",
             Tab::Logs => "Logs",
         }
     }
@@ -344,7 +347,6 @@ impl Tab {
             Tab::Global => KeyContext::Library,
             Tab::Playlists => KeyContext::Playlists,
             Tab::Queue => KeyContext::Queue,
-            Tab::Devices => KeyContext::Devices,
             Tab::Logs => KeyContext::Logs,
         }
     }
@@ -393,6 +395,9 @@ pub struct PlayerBar {
     pub prefetched_pos: Option<usize>,
     pub volume: u8,
     pub shuffle: bool,
+    /// Track ids in pre-shuffle order; restores the queue when shuffle is
+    /// turned off.
+    pub original_order: Option<Vec<i64>>,
     pub repeat: RepeatMode,
 }
 
@@ -407,6 +412,7 @@ impl Default for PlayerBar {
             position_secs: 0.0,
             track_started_at: None,
             prefetched_pos: None,
+            original_order: None,
             volume: 80,
             shuffle: false,
             repeat: RepeatMode::Off,
@@ -439,6 +445,7 @@ pub struct AppState {
     pub likes: std::collections::HashSet<i64>,
     pub likes_loaded: bool,
     pub logs: LogsTab,
+    pub queue_tab: QueueTab,
     pub cmdline: Cmdline,
     pub search: SearchState,
     /// Shared image cache keyed by `art::cache_key(url, w, h)`; reused by

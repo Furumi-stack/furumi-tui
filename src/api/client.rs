@@ -300,6 +300,19 @@ impl ApiClient {
             .await
     }
 
+    /// Tell last.fm (via the server) what is playing right now. Called at
+    /// track start; the completed-play scrobble goes through /history.
+    pub async fn lastfm_now_playing(&self, track_id: i64) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body {
+            track_id: i64,
+        }
+        let _: serde_json::Value = self
+            .post_json("/api/player/lastfm/now-playing", &Body { track_id })
+            .await?;
+        Ok(())
+    }
+
     /// Report a finished/aborted listen to the play history.
     /// Body shape is the backend's HistoryEntry; `completed` marks a full
     /// play (vs a manual skip).

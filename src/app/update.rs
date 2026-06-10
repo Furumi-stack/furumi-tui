@@ -103,6 +103,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::ToggleShuffle => {
             state.player.shuffle = !state.player.shuffle;
+            // Shuffle physically reorders the unplayed tail, so the Queue
+            // tab always shows the real upcoming order; turning it off
+            // restores the original ordering.
+            if state.player.shuffle {
+                shuffle_upcoming(&mut state.player);
+            } else {
+                restore_queue_order(&mut state.player);
+            }
             None
         }
         Action::CycleRepeat => {
@@ -179,6 +187,23 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::QueueAddNext => queue_add(state, true),
         Action::QueueAddLast => queue_add(state, false),
+        Action::ClearQueue => {
+            let had_tracks = !state.player.queue.is_empty();
+            state.player.queue.clear();
+            state.player.queue_pos = 0;
+            state.player.current = None;
+            state.player.playing = false;
+            state.player.paused = false;
+            state.player.prefetched_pos = None;
+            state.player.original_order = None;
+            state.queue_tab.cursor = 0;
+            if had_tracks {
+                state.status_message = Some("queue cleared".into());
+                Some(Effect::StopPlayback)
+            } else {
+                None
+            }
+        }
         // Needs the Runtime, so it is intercepted in app::handle_main_key
         // before reaching update().
         Action::Logout => None,
@@ -207,12 +232,8 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
             let opened = state.playlists.opened.as_ref()?;
             playlist_tracks(state, opened.id)?.get(opened.cursor).cloned()
         }
-        Tab::Queue => state
-            .player
-            .queue
-            .get(state.player.queue_pos)
-            .cloned(),
-        Tab::Devices | Tab::Logs => None,
+        Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
+        Tab::Logs => None,
     }
 }
 
@@ -295,7 +316,8 @@ pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) 
     }
 }
 
-/// Manual queue navigation (n / p).
+/// Manual queue navigation (n / p); the tail is pre-shuffled when shuffle
+/// is on, so stepping is always sequential.
 fn queue_step(state: &mut AppState, direction: isize) -> Option<Effect> {
     let player = &mut state.player;
     if player.queue.is_empty() {
@@ -303,10 +325,6 @@ fn queue_step(state: &mut AppState, direction: isize) -> Option<Effect> {
         return None;
     }
     let len = player.queue.len();
-    if player.shuffle && direction > 0 {
-        player.queue_pos = pseudo_random(len);
-        return Some(Effect::PlayCurrent);
-    }
     let next = player.queue_pos as isize + direction;
     if next < 0 {
         player.queue_pos = 0;
@@ -325,13 +343,13 @@ fn queue_step(state: &mut AppState, direction: isize) -> Option<Effect> {
 
 /// What plays after the current track, without mutating anything — used to
 /// pick the gapless prefetch target. Mirrors `advance_after_finish`.
+/// Shuffle needs no special case: the queue tail is already shuffled.
 pub fn peek_next_pos(player: &super::state::PlayerBar) -> Option<usize> {
     if player.queue.is_empty() {
         return None;
     }
     match player.repeat {
         super::state::RepeatMode::One => Some(player.queue_pos),
-        _ if player.shuffle => Some(pseudo_random(player.queue.len())),
         repeat => {
             if player.queue_pos + 1 < player.queue.len() {
                 Some(player.queue_pos + 1)
@@ -344,8 +362,8 @@ pub fn peek_next_pos(player: &super::state::PlayerBar) -> Option<usize> {
     }
 }
 
-/// The current track finished: pick what plays next according to
-/// repeat/shuffle, or stop at the end of the queue.
+/// The current track finished: play the next queue position (the tail is
+/// pre-shuffled when shuffle is on), or stop at the end.
 pub fn advance_after_finish(state: &mut AppState) -> Option<Effect> {
     let player = &mut state.player;
     if player.queue.is_empty() {
@@ -355,10 +373,6 @@ pub fn advance_after_finish(state: &mut AppState) -> Option<Effect> {
     }
     match player.repeat {
         super::state::RepeatMode::One => Some(Effect::PlayCurrent),
-        _ if player.shuffle => {
-            player.queue_pos = pseudo_random(player.queue.len());
-            Some(Effect::PlayCurrent)
-        }
         repeat => {
             if player.queue_pos + 1 < player.queue.len() {
                 player.queue_pos += 1;
@@ -375,13 +389,55 @@ pub fn advance_after_finish(state: &mut AppState) -> Option<Effect> {
     }
 }
 
-/// Shuffle pick without a rand dependency: clock-derived index.
-fn pseudo_random(len: usize) -> usize {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    nanos as usize % len.max(1)
+/// First index of the not-yet-played queue tail: everything after the
+/// current track, or from the current position when nothing is loaded.
+fn upcoming_start(player: &super::state::PlayerBar) -> usize {
+    if player.current.is_some() {
+        (player.queue_pos + 1).min(player.queue.len())
+    } else {
+        player.queue_pos.min(player.queue.len())
+    }
+}
+
+/// Remember the original order and Fisher-Yates the unplayed tail.
+pub fn shuffle_upcoming(player: &mut super::state::PlayerBar) {
+    if player.queue.is_empty() {
+        return;
+    }
+    if player.original_order.is_none() {
+        player.original_order = Some(player.queue.iter().map(|t| t.id).collect());
+    }
+    shuffle_range(player, upcoming_start(player));
+}
+
+/// Put the unplayed tail back into pre-shuffle order. Tracks queued while
+/// shuffled (absent from the snapshot) keep their relative order at the end.
+pub fn restore_queue_order(player: &mut super::state::PlayerBar) {
+    let Some(order) = player.original_order.take() else {
+        return;
+    };
+    let start = upcoming_start(player);
+    if start >= player.queue.len() {
+        return;
+    }
+    let tail = player.queue.split_off(start);
+    let mut used = vec![false; order.len()];
+    let mut keyed: Vec<(usize, usize, crate::api::models::TrackItem)> = tail
+        .into_iter()
+        .enumerate()
+        .map(|(position, track)| {
+            let key = order
+                .iter()
+                .enumerate()
+                .position(|(slot, id)| !used[slot] && *id == track.id)
+                .inspect(|&slot| used[slot] = true)
+                .unwrap_or(usize::MAX);
+            (key, position, track)
+        })
+        .collect();
+    keyed.sort_by_key(|(key, position, _)| (*key, *position));
+    player.queue.extend(keyed.into_iter().map(|(_, _, track)| track));
+    player.prefetched_pos = None;
 }
 
 /// Columns of the Global tile grid. Derived from the terminal width the same
@@ -459,6 +515,15 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
                     (state.playlists.selected as isize + dy).clamp(0, last) as usize;
             }
         }
+        return;
+    }
+    if state.active_tab == Tab::Queue {
+        let len = state.player.queue.len();
+        if len == 0 {
+            return;
+        }
+        state.queue_tab.cursor =
+            (state.queue_tab.cursor as isize + dy).clamp(0, len as isize - 1) as usize;
         return;
     }
     if state.active_tab != Tab::Global {
@@ -575,6 +640,9 @@ fn current_view_len(state: &AppState) -> usize {
     if state.active_tab == Tab::Playlists {
         return playlists_view_len(state);
     }
+    if state.active_tab == Tab::Queue {
+        return state.player.queue.len();
+    }
     match state.global.stack.last() {
         None => state.global.artists.len(),
         Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
@@ -590,6 +658,13 @@ fn current_view_len(state: &AppState) -> usize {
 }
 
 fn jump_selection(state: &mut AppState, first: bool) {
+    if state.active_tab == Tab::Queue {
+        let len = state.player.queue.len();
+        if len > 0 {
+            state.queue_tab.cursor = if first { 0 } else { len - 1 };
+        }
+        return;
+    }
     if state.active_tab == Tab::Logs {
         if first {
             state.logs.follow = false;
@@ -631,6 +706,7 @@ fn select_playlist(state: &mut AppState) -> Option<Effect> {
             }
             state.player.queue = tracks;
             state.player.queue_pos = opened.cursor.min(state.player.queue.len() - 1);
+            on_new_queue(state);
             Some(Effect::PlayCurrent)
         }
         None => {
@@ -649,6 +725,16 @@ fn select_playlist(state: &mut AppState) -> Option<Effect> {
 fn select_current(state: &mut AppState) -> Option<Effect> {
     if state.active_tab == Tab::Playlists {
         return select_playlist(state);
+    }
+    // Queue: jump playback to the track under the cursor. Earlier tracks
+    // stay in the queue as "played"; picking one of them just moves the
+    // playing position back.
+    if state.active_tab == Tab::Queue {
+        if state.player.queue.is_empty() {
+            return None;
+        }
+        state.player.queue_pos = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+        return Some(Effect::PlayCurrent);
     }
     if state.active_tab != Tab::Global {
         not_yet(state, "Navigation in this view");
@@ -729,10 +815,41 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
         Outcome::Play { tracks, start } => {
             state.player.queue = tracks;
             state.player.queue_pos = start;
+            on_new_queue(state);
             Some(Effect::PlayCurrent)
         }
         Outcome::Nothing => None,
     }
+}
+
+/// A freshly created play context: drop the stale pre-shuffle snapshot and,
+/// if shuffle is on, shuffle everything after the chosen track right away.
+fn on_new_queue(state: &mut AppState) {
+    let player = &mut state.player;
+    player.original_order = None;
+    if player.shuffle && !player.queue.is_empty() {
+        player.original_order = Some(player.queue.iter().map(|t| t.id).collect());
+        shuffle_range(player, (player.queue_pos + 1).min(player.queue.len()));
+    }
+}
+
+fn shuffle_range(player: &mut super::state::PlayerBar, start: usize) {
+    let tail = &mut player.queue[start..];
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+        | 1;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for i in (1..tail.len()).rev() {
+        tail.swap(i, next() as usize % (i + 1));
+    }
+    player.prefetched_pos = None;
 }
 
 /// Esc/Backspace: pop the navigation stack; leaving a search view resets the
@@ -776,7 +893,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.logs.follow = true;
             state.logs.scroll_from_end = 0;
         }
-        Tab::Queue | Tab::Devices => {}
+        Tab::Queue => {}
     }
 }
 
@@ -1054,6 +1171,94 @@ mod tests {
         assert!(state.playlists.opened.is_some());
         update(&mut state, Action::GoToTab(1));
         assert!(state.playlists.opened.is_none());
+    }
+
+    #[test]
+    fn queue_tab_select_and_clear() {
+        use crate::api::models::TrackItem;
+        let track = |id: i64| TrackItem {
+            id,
+            title: format!("t{id}"),
+            track_number: None,
+            duration_seconds: 1.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id: 1,
+            release_title: "r".into(),
+            release_year: None,
+            cover_url: None,
+            stream_url: format!("/s/{id}"),
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            file_size_bytes: None,
+            lastfm_playcount: None,
+        };
+        let mut state = AppState {
+            active_tab: Tab::Queue,
+            ..AppState::default()
+        };
+        state.player.queue = vec![track(1), track(2), track(3)];
+        state.player.queue_pos = 2;
+
+        // Cursor moves independently; enter rewinds playback to that track
+        // without dropping anything from the queue.
+        update(&mut state, Action::MoveUp);
+        update(&mut state, Action::MoveUp);
+        assert_eq!(state.queue_tab.cursor, 0);
+        assert_eq!(update(&mut state, Action::Select), Some(Effect::PlayCurrent));
+        assert_eq!(state.player.queue_pos, 0);
+        assert_eq!(state.player.queue.len(), 3);
+
+        assert_eq!(
+            update(&mut state, Action::ClearQueue),
+            Some(Effect::StopPlayback)
+        );
+        assert!(state.player.queue.is_empty());
+        assert!(!state.player.playing);
+    }
+
+    #[test]
+    fn shuffle_reorders_tail_and_restores() {
+        use crate::api::models::TrackItem;
+        let track = |id: i64| TrackItem {
+            id,
+            title: format!("t{id}"),
+            track_number: None,
+            duration_seconds: 1.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id: 1,
+            release_title: "r".into(),
+            release_year: None,
+            cover_url: None,
+            stream_url: format!("/s/{id}"),
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            file_size_bytes: None,
+            lastfm_playcount: None,
+        };
+        let mut state = AppState::default();
+        state.player.queue = (1..=8).map(track).collect();
+        state.player.queue_pos = 2;
+        state.player.current = Some(track(3));
+
+        update(&mut state, Action::ToggleShuffle);
+        assert!(state.player.shuffle);
+        // Played part and the current track stay in place.
+        let ids: Vec<i64> = state.player.queue.iter().map(|t| t.id).collect();
+        assert_eq!(&ids[..3], &[1, 2, 3]);
+        // The tail is a permutation of the original tail.
+        let mut tail = ids[3..].to_vec();
+        tail.sort_unstable();
+        assert_eq!(tail, vec![4, 5, 6, 7, 8]);
+
+        update(&mut state, Action::ToggleShuffle);
+        assert!(!state.player.shuffle);
+        let restored: Vec<i64> = state.player.queue.iter().map(|t| t.id).collect();
+        assert_eq!(restored, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(state.player.original_order.is_none());
     }
 
     #[test]

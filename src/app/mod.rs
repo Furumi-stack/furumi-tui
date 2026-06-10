@@ -117,8 +117,16 @@ pub async fn run(
     }
 }
 
-const ARTISTS_PAGE_SIZE: i64 = 48;
 const ARTISTS_PREFETCH_MARGIN: usize = 24;
+
+/// How many artist tiles one screen holds right now (grid geometry from the
+/// live terminal size), so the initial load always fills the viewport.
+fn artist_grid_capacity() -> usize {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let columns = usize::from((width.saturating_sub(2) / state::TILE_WIDTH).max(1));
+    let rows = usize::from((height.saturating_sub(5) / state::TILE_HEIGHT).max(1));
+    columns * rows
+}
 
 /// Runs after every event: kicks off whatever background work the current
 /// state needs — the first artists page, the next page when the selection
@@ -133,16 +141,26 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
 
     {
         let global = &mut state.global;
-        let initial = global.artists.is_empty();
-        let near_end =
-            !initial && global.selected + ARTISTS_PREFETCH_MARGIN >= global.artists.len();
-        if global.has_more && !global.loading && global.error.is_none() && (initial || near_end) {
+        // Keep at least a full screen plus a margin loaded, and stay ahead
+        // of the cursor: a big terminal fills itself on startup without any
+        // scrolling, page after page.
+        let needed = artist_grid_capacity()
+            .max(global.selected + ARTISTS_PREFETCH_MARGIN)
+            + ARTISTS_PREFETCH_MARGIN;
+        if global.has_more
+            && !global.loading
+            && global.error.is_none()
+            && global.artists.len() < needed
+        {
             global.loading = true;
             let page = global.next_page;
+            let limit = *global
+                .page_limit
+                .get_or_insert_with(|| (needed as i64).clamp(48, 200));
             let api = Arc::clone(&api);
             let tx = runtime.event_tx.clone();
             tokio::spawn(async move {
-                let event = match api.artists(page, ARTISTS_PAGE_SIZE).await {
+                let event = match api.artists(page, limit).await {
                     Ok(page) => AppEvent::ArtistsLoaded(Ok(page)),
                     Err(ApiError::SessionExpired) => AppEvent::SessionExpired,
                     Err(err) => AppEvent::ArtistsLoaded(Err(err.to_string())),
@@ -423,6 +441,7 @@ fn play_current(state: &mut AppState, runtime: &Runtime) {
     state.player.track_started_at = Some(auth::now_epoch_seconds());
     state.player.prefetched_pos = None;
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
+    report_now_playing(runtime, track.id);
 
     let controller = runtime.player.clone();
     let volume = player::amplitude(state.player.volume);
@@ -514,6 +533,19 @@ fn push_state_now(state: &AppState, runtime: &mut Runtime) {
     tokio::spawn(async move {
         if let Err(err) = api.push_state(&body).await {
             tracing::warn!(%err, "state push failed");
+        }
+    });
+}
+
+/// Announce the just-started track as "now playing" on last.fm. Quiet on
+/// failure — last.fm may simply not be connected for this account.
+fn report_now_playing(runtime: &Runtime, track_id: i64) {
+    let Some(api) = runtime.api.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(err) = api.lastfm_now_playing(track_id).await {
+            tracing::debug!(%err, track_id, "lastfm now-playing failed");
         }
     });
 }
@@ -654,6 +686,7 @@ fn reset_library_state(state: &mut AppState) {
     state.release_views.clear();
     state.playlists = state::PlaylistsTab::default();
     state.playlist_views.clear();
+    state.queue_tab = state::QueueTab::default();
     state.likes.clear();
     state.likes_loaded = false;
     state.search = state::SearchState::default();
@@ -776,6 +809,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
                 state.player.position_secs = 0.0;
                 state.player.track_started_at = Some(auth::now_epoch_seconds());
+                if let Some(track) = &state.player.current {
+                    report_now_playing(runtime, track.id);
+                }
                 push_media_metadata(state, runtime);
                 push_media_update(state, runtime, true);
             } else {

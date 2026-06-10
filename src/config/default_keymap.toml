@@ -48,16 +48,17 @@ key_sequence = "4"
 command = { GoToTab = 3 }
 
 [[keymaps]]
-key_sequence = "5"
-command = { GoToTab = 4 }
-
-[[keymaps]]
 key_sequence = "a"
 command = "QueueAddNext"
 
 [[keymaps]]
 key_sequence = "shift-a"
 command = "QueueAddLast"
+
+[[keymaps]]
+key_sequence = "shift-c"
+command = "ClearQueue"
+context = "queue"
 
 [[keymaps]]
 key_sequence = "j"
