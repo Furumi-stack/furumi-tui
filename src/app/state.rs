@@ -446,6 +446,13 @@ pub struct AppState {
     pub likes_loaded: bool,
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
+    /// Shift-J jump in flight: focus this (release, track) once the release
+    /// view finishes loading.
+    pub pending_release_focus: Option<(i64, i64)>,
+    /// Where a Shift-J jump came from (tab, stack depth of the pushed
+    /// view): Esc from that view returns to the origin tab instead of
+    /// unwinding the Global stack.
+    pub jump_origin: Option<(Tab, usize)>,
     pub cmdline: Cmdline,
     pub search: SearchState,
     /// Shared image cache keyed by `art::cache_key(url, w, h)`; reused by

@@ -687,6 +687,8 @@ fn reset_library_state(state: &mut AppState) {
     state.playlists = state::PlaylistsTab::default();
     state.playlist_views.clear();
     state.queue_tab = state::QueueTab::default();
+    state.pending_release_focus = None;
+    state.jump_origin = None;
     state.likes.clear();
     state.likes_loaded = false;
     state.search = state::SearchState::default();
@@ -769,6 +771,26 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             };
             state.release_views.insert(id, entry);
+            // A Shift-J jump was waiting for this release: focus its track.
+            if let Some((release_id, track_id)) = state.pending_release_focus {
+                if release_id == id {
+                    state.pending_release_focus = None;
+                    if let Some(state::Loadable::Ready(detail)) = state.release_views.get(&id) {
+                        let position = detail
+                            .tracks
+                            .iter()
+                            .position(|t| t.id == track_id)
+                            .unwrap_or(0);
+                        if let Some(state::GlobalView::Release { id: top, cursor }) =
+                            state.global.stack.last_mut()
+                        {
+                            if *top == release_id {
+                                *cursor = position;
+                            }
+                        }
+                    }
+                }
+            }
         }
         AppEvent::SearchLoaded { seq, result } => {
             if seq != runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) {

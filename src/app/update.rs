@@ -187,6 +187,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::QueueAddNext => queue_add(state, true),
         Action::QueueAddLast => queue_add(state, false),
+        Action::GoToRelease => {
+            let track = selected_track(state).or_else(|| state.player.current.clone());
+            match track {
+                Some(track) => open_release_for_track(state, &track),
+                None => state.status_message = Some("no track selected".into()),
+            }
+            None
+        }
         Action::ClearQueue => {
             let had_tracks = !state.player.queue.is_empty();
             state.player.queue.clear();
@@ -286,6 +294,40 @@ fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
     }
     state.status_message = Some("nothing to queue here".into());
     None
+}
+
+/// Shift-J: open the release the track belongs to, with the cursor on that
+/// track. If the release view is still loading, the focus is applied when
+/// it arrives (`pending_release_focus`).
+fn open_release_for_track(state: &mut AppState, track: &TrackItem) {
+    let release_id = track.release_id;
+    let cursor = match state.release_views.get(&release_id) {
+        Some(Loadable::Ready(detail)) => detail
+            .tracks
+            .iter()
+            .position(|t| t.id == track.id)
+            .unwrap_or(0),
+        _ => {
+            state.pending_release_focus = Some((release_id, track.id));
+            0
+        }
+    };
+    let origin = state.active_tab;
+    state.active_tab = Tab::Global;
+    match state.global.stack.last_mut() {
+        Some(GlobalView::Release { id, cursor: current }) if *id == release_id => {
+            *current = cursor;
+        }
+        _ => state.global.stack.push(GlobalView::Release {
+            id: release_id,
+            cursor,
+        }),
+    }
+    // Jumps from another tab return there on Esc; jumps within Global
+    // unwind the navigation stack as usual.
+    if origin != Tab::Global {
+        state.jump_origin = Some((origin, state.global.stack.len() - 1));
+    }
 }
 
 /// Insert tracks after the playing one (`next`) or at the end. Keeps the
@@ -860,6 +902,16 @@ fn go_back(state: &mut AppState) {
             state.playlists.opened = None;
         }
         Tab::Global => {
+            // Esc on a view opened by Shift-J from another tab goes back to
+            // that tab, not down the Global stack.
+            if let Some((origin, depth)) = state.jump_origin {
+                if state.global.stack.len() == depth + 1 {
+                    state.global.stack.pop();
+                    state.jump_origin = None;
+                    state.active_tab = origin;
+                    return;
+                }
+            }
             if let Some(popped) = state.global.stack.pop() {
                 if matches!(popped, GlobalView::Search { .. }) {
                     state.search = SearchState::default();
@@ -873,6 +925,8 @@ fn go_back(state: &mut AppState) {
 fn switch_tab(state: &mut AppState, tab: Tab) {
     state.active_tab = tab;
     state.help_visible = false;
+    // Manually leaving a view cancels any pending Shift-J return path.
+    state.jump_origin = None;
 }
 
 fn reset_tab(state: &mut AppState, tab: Tab) {
@@ -1259,6 +1313,74 @@ mod tests {
         let restored: Vec<i64> = state.player.queue.iter().map(|t| t.id).collect();
         assert_eq!(restored, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(state.player.original_order.is_none());
+    }
+
+    #[test]
+    fn shift_j_opens_release_from_queue() {
+        use crate::api::models::{ReleaseDetail, TrackItem};
+        let track = |id: i64, release_id: i64| TrackItem {
+            id,
+            title: format!("t{id}"),
+            track_number: None,
+            duration_seconds: 1.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id,
+            release_title: "r".into(),
+            release_year: None,
+            cover_url: None,
+            stream_url: format!("/s/{id}"),
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            file_size_bytes: None,
+            lastfm_playcount: None,
+        };
+        let mut state = AppState {
+            active_tab: Tab::Queue,
+            ..AppState::default()
+        };
+        state.player.queue = vec![track(1, 7), track(2, 7)];
+        state.queue_tab.cursor = 1;
+
+        // Release not loaded yet → jump queued as pending focus.
+        update(&mut state, Action::GoToRelease);
+        assert_eq!(state.active_tab, Tab::Global);
+        assert_eq!(
+            state.global.stack.last(),
+            Some(&GlobalView::Release { id: 7, cursor: 0 })
+        );
+        assert_eq!(state.pending_release_focus, Some((7, 2)));
+
+        // Esc returns to the origin tab, not to the Global grid.
+        update(&mut state, Action::Back);
+        assert_eq!(state.active_tab, Tab::Queue);
+        assert!(state.global.stack.is_empty());
+        assert!(state.jump_origin.is_none());
+
+        // With the release cached, the cursor lands on the track directly.
+        state.global.stack.clear();
+        state.pending_release_focus = None;
+        state.release_views.insert(
+            7,
+            Loadable::Ready(ReleaseDetail {
+                id: 7,
+                title: "r".into(),
+                release_type: "album".into(),
+                year: None,
+                cover_url: None,
+                artists: vec![],
+                tracks: vec![track(1, 7), track(2, 7)],
+                uploaders: vec![],
+            }),
+        );
+        state.active_tab = Tab::Queue;
+        update(&mut state, Action::GoToRelease);
+        assert_eq!(
+            state.global.stack.last(),
+            Some(&GlobalView::Release { id: 7, cursor: 1 })
+        );
+        assert!(state.pending_release_focus.is_none());
     }
 
     #[test]

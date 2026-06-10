@@ -61,6 +61,10 @@ command = "ClearQueue"
 context = "queue"
 
 [[keymaps]]
+key_sequence = "shift-j"
+command = "GoToRelease"
+
+[[keymaps]]
 key_sequence = "j"
 command = "MoveDown"
 
