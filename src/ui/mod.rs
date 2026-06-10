@@ -1,6 +1,7 @@
 pub mod art;
 mod global;
 mod login;
+mod logs;
 mod playlists;
 pub mod theme;
 
@@ -30,6 +31,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Playlists => playlists::draw(frame, main_area, state),
         Tab::Queue => draw_queue(frame, main_area, state),
         Tab::Devices => draw_main(frame, main_area, state),
+        Tab::Logs => logs::draw(frame, main_area, state),
     }
     draw_status(frame, status_area, state);
 

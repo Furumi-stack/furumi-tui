@@ -129,11 +129,17 @@ fn hms_now() -> String {
 pub fn init() -> Result<()> {
     let buffer = Arc::new(LogBuffer::default());
     let _ = BUFFER.set(Arc::clone(&buffer));
-    let memory_layer = MemoryLayer { buffer }.with_filter(
-        tracing_subscriber::filter::Targets::new()
-            .with_default(LevelFilter::INFO)
-            .with_target("furumi_cli", LevelFilter::TRACE),
-    );
+
+    fn memory_layer<S>(buffer: Arc<LogBuffer>) -> impl tracing_subscriber::Layer<S>
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        MemoryLayer { buffer }.with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(LevelFilter::INFO)
+                .with_target(env!("CARGO_CRATE_NAME"), LevelFilter::TRACE),
+        )
+    }
 
     match open_log_file() {
         Ok(file) => {
@@ -146,13 +152,13 @@ pub fn init() -> Result<()> {
                 .with_filter(filter);
             tracing_subscriber::registry()
                 .with(file_layer)
-                .with(memory_layer)
+                .with(memory_layer(buffer))
                 .init();
-            tracing::info!(version = env!("CARGO_PKG_VERSION"), "furumi-cli starting");
+            tracing::info!(version = env!("CARGO_PKG_VERSION"), "furumi starting");
             Ok(())
         }
         Err(err) => {
-            tracing_subscriber::registry().with(memory_layer).init();
+            tracing_subscriber::registry().with(memory_layer(buffer)).init();
             tracing::warn!(%err, "log file unavailable, in-app logs only");
             Err(err)
         }

@@ -24,7 +24,7 @@ pub enum ApiError {
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!(
-            "furumi-cli/{} ({})",
+            "furumi-tui/{} ({})",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS
         ))
@@ -35,7 +35,7 @@ pub fn http_client() -> reqwest::Client {
 }
 
 pub fn device_name() -> String {
-    format!("furumi-cli ({})", std::env::consts::OS)
+    format!("furumi-tui ({})", std::env::consts::OS)
 }
 
 #[derive(Serialize)]
@@ -395,8 +395,22 @@ impl ApiClient {
                 }
                 request
             })
-            .await?;
-        parse_response(response).await
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(%err, %method, path, "api request failed");
+                return Err(err);
+            }
+        };
+        let status = response.status();
+        let result = parse_response(response).await;
+        if let Err(err) = &result {
+            tracing::warn!(%err, %status, %method, path, "api response error");
+        } else {
+            tracing::debug!(%status, %method, path, "api ok");
+        }
+        result
     }
 
     /// Send a request with a fresh bearer token; on 401, refresh once and

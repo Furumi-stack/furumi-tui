@@ -88,7 +88,7 @@ pub fn run_on_main_thread(
 fn create_controls() -> Option<MediaControls> {
     let config = PlatformConfig {
         display_name: "Furumi",
-        dbus_name: "cy.hexor.furumi_cli",
+        dbus_name: "cy.hexor.furumi",
         hwnd: None,
     };
     if cfg!(windows) {

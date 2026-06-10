@@ -167,6 +167,36 @@ pub struct PlaylistsTab {
     pub opened: Option<OpenedPlaylist>,
 }
 
+/// Severity steps for the Logs tab filter, cycled with the view-toggle key.
+pub const LOG_LEVELS: [tracing::Level; 5] = [
+    tracing::Level::ERROR,
+    tracing::Level::WARN,
+    tracing::Level::INFO,
+    tracing::Level::DEBUG,
+    tracing::Level::TRACE,
+];
+
+/// The Logs tab: a live view over the in-memory ring buffer.
+#[derive(Debug)]
+pub struct LogsTab {
+    /// Index into LOG_LEVELS; entries more verbose than this are hidden.
+    pub level_index: usize,
+    /// Stick to the newest entries as they arrive.
+    pub follow: bool,
+    /// When not following: how many (filtered) entries back from the end.
+    pub scroll_from_end: usize,
+}
+
+impl Default for LogsTab {
+    fn default() -> Self {
+        Self {
+            level_index: 2,
+            follow: true,
+            scroll_from_end: 0,
+        }
+    }
+}
+
 /// Command line (`:`), vim-style. Lives on the Main screen status bar.
 #[derive(Debug, Default)]
 pub struct Cmdline {
@@ -271,10 +301,17 @@ pub enum Tab {
     Playlists,
     Queue,
     Devices,
+    Logs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Global, Tab::Playlists, Tab::Queue, Tab::Devices];
+    pub const ALL: [Tab; 5] = [
+        Tab::Global,
+        Tab::Playlists,
+        Tab::Queue,
+        Tab::Devices,
+        Tab::Logs,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -282,6 +319,7 @@ impl Tab {
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
             Tab::Devices => "Devices",
+            Tab::Logs => "Logs",
         }
     }
 
@@ -307,6 +345,7 @@ impl Tab {
             Tab::Playlists => KeyContext::Playlists,
             Tab::Queue => KeyContext::Queue,
             Tab::Devices => KeyContext::Devices,
+            Tab::Logs => KeyContext::Logs,
         }
     }
 }
@@ -399,6 +438,7 @@ pub struct AppState {
     /// Liked track ids, for the ♥ markers everywhere tracks are shown.
     pub likes: std::collections::HashSet<i64>,
     pub likes_loaded: bool,
+    pub logs: LogsTab,
     pub cmdline: Cmdline,
     pub search: SearchState,
     /// Shared image cache keyed by `art::cache_key(url, w, h)`; reused by

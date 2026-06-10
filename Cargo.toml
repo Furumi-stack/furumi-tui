@@ -1,7 +1,11 @@
 [package]
-name = "furumi_cli"
+name = "furumi_tui"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "furumi"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -16,7 +20,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "symphonia-aac", "symphonia-isomp4", "symphonia-alac"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-souvlaki = "0.8.3"
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 stream-download = { version = "0.24.1", default-features = false, features = ["reqwest-rustls", "temp-storage"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }

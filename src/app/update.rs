@@ -142,8 +142,16 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::ToggleViewMode => {
-            if state.active_tab == Tab::Global {
-                state.global.view = state.global.view.toggle();
+            match state.active_tab {
+                Tab::Global => state.global.view = state.global.view.toggle(),
+                // On the Logs tab the same key cycles the severity filter.
+                Tab::Logs => {
+                    state.logs.level_index =
+                        (state.logs.level_index + 1) % super::state::LOG_LEVELS.len();
+                    state.logs.scroll_from_end = 0;
+                    state.logs.follow = true;
+                }
+                _ => {}
             }
             None
         }
@@ -204,7 +212,7 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
             .queue
             .get(state.player.queue_pos)
             .cloned(),
-        Tab::Devices => None,
+        Tab::Devices | Tab::Logs => None,
     }
 }
 
@@ -397,6 +405,9 @@ fn viewport_lines() -> isize {
 /// lines.
 fn page_step(state: &AppState) -> isize {
     let lines = viewport_lines();
+    if state.active_tab != Tab::Global {
+        return lines;
+    }
     let tile_rows = (lines / TILE_HEIGHT as isize).max(1);
     match state.global.stack.last() {
         None => match state.global.view {
@@ -419,6 +430,20 @@ fn page_step(state: &AppState) -> isize {
 }
 
 fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
+    if state.active_tab == Tab::Logs {
+        let total = crate::config::logging::buffer().map_or(0, |b| b.len());
+        let logs = &mut state.logs;
+        if dy < 0 {
+            logs.follow = false;
+            logs.scroll_from_end = (logs.scroll_from_end + dy.unsigned_abs()).min(total);
+        } else if dy > 0 {
+            logs.scroll_from_end = logs.scroll_from_end.saturating_sub(dy as usize);
+            if logs.scroll_from_end == 0 {
+                logs.follow = true;
+            }
+        }
+        return;
+    }
     if state.active_tab == Tab::Playlists {
         let len = playlists_view_len(state);
         if len == 0 {
@@ -565,6 +590,16 @@ fn current_view_len(state: &AppState) -> usize {
 }
 
 fn jump_selection(state: &mut AppState, first: bool) {
+    if state.active_tab == Tab::Logs {
+        if first {
+            state.logs.follow = false;
+            state.logs.scroll_from_end = crate::config::logging::buffer().map_or(0, |b| b.len());
+        } else {
+            state.logs.follow = true;
+            state.logs.scroll_from_end = 0;
+        }
+        return;
+    }
     if state.active_tab != Tab::Global && state.active_tab != Tab::Playlists {
         return not_yet(state, "Navigation in this view");
     }
@@ -737,6 +772,10 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.global.stack.clear();
         }
         Tab::Playlists => state.playlists.opened = None,
+        Tab::Logs => {
+            state.logs.follow = true;
+            state.logs.scroll_from_end = 0;
+        }
         Tab::Queue | Tab::Devices => {}
     }
 }
@@ -797,7 +836,7 @@ mod tests {
     fn tab_cycling_wraps() {
         let mut state = AppState::default();
         update(&mut state, Action::PrevTab);
-        assert_eq!(state.active_tab, Tab::Devices);
+        assert_eq!(state.active_tab, Tab::Logs);
         update(&mut state, Action::NextTab);
         assert_eq!(state.active_tab, Tab::Global);
     }

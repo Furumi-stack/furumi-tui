@@ -180,11 +180,15 @@ pub fn spawn_sso_exchange(form: &mut LoginForm, runtime: &Runtime, code: String)
 fn login_event(result: Result<auth::AuthSession, client::ApiError>) -> AppEvent {
     match result {
         Ok(session) => {
+            tracing::info!(user = %session.user.name, server = %session.server_base_url, "signed in");
             if let Err(err) = auth::save_session(&session) {
                 tracing::warn!(%err, "failed to persist credentials");
             }
             AppEvent::LoginSucceeded(Box::new(session))
         }
-        Err(err) => AppEvent::LoginFailed(err.to_string()),
+        Err(err) => {
+            tracing::warn!(%err, "login failed");
+            AppEvent::LoginFailed(err.to_string())
+        }
     }
 }

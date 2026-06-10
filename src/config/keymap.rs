@@ -21,6 +21,7 @@ pub enum KeyContext {
     Playlists,
     Queue,
     Devices,
+    Logs,
 }
 
 impl KeyContext {
@@ -32,6 +33,7 @@ impl KeyContext {
             KeyContext::Playlists => "playlists",
             KeyContext::Queue => "queue",
             KeyContext::Devices => "devices",
+            KeyContext::Logs => "logs",
         }
     }
 }

@@ -1,4 +1,4 @@
-# Default keybindings for furumi-cli.
+# Default keybindings for furumi.
 #
 # To customize, copy entries into <config dir>/furumi/keymap.toml
 # (~/.config/furumi/keymap.toml on Linux/macOS). A user binding replaces the
@@ -46,6 +46,10 @@ command = { GoToTab = 2 }
 [[keymaps]]
 key_sequence = "4"
 command = { GoToTab = 3 }
+
+[[keymaps]]
+key_sequence = "5"
+command = { GoToTab = 4 }
 
 [[keymaps]]
 key_sequence = "a"

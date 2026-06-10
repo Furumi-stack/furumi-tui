@@ -702,6 +702,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             global.artists.extend(page.items);
         }
         AppEvent::ArtistsLoaded(Err(message)) => {
+            tracing::warn!(%message, "artists page load failed");
             state.global.loading = false;
             state.global.error = Some(message.clone());
             state.status_message = Some(message);
@@ -709,14 +710,20 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::ArtistViewLoaded { id, result } => {
             let entry = match result {
                 Ok(detail) => state::Loadable::Ready(detail),
-                Err(message) => state::Loadable::Failed(message),
+                Err(message) => {
+                    tracing::warn!(artist = id, %message, "artist view load failed");
+                    state::Loadable::Failed(message)
+                }
             };
             state.artist_views.insert(id, entry);
         }
         AppEvent::ReleaseViewLoaded { id, result } => {
             let entry = match result {
                 Ok(detail) => state::Loadable::Ready(detail),
-                Err(message) => state::Loadable::Failed(message),
+                Err(message) => {
+                    tracing::warn!(release = id, %message, "release view load failed");
+                    state::Loadable::Failed(message)
+                }
             };
             state.release_views.insert(id, entry);
         }
@@ -770,6 +777,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             push_state_now(state, runtime);
         }
         AppEvent::Player(player::PlayerEvent::Failed(message)) => {
+            tracing::error!(%message, "playback failed");
             state.player.playing = false;
             state.player.paused = false;
             state.status_message = Some(message);
