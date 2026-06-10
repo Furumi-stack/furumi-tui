@@ -412,6 +412,7 @@ fn play_current(state: &mut AppState, runtime: &Runtime) {
                 previous.id,
                 state.player.track_started_at,
                 state.player.position_secs.round() as i32,
+                false,
             );
         }
     }
@@ -518,7 +519,13 @@ fn push_state_now(state: &AppState, runtime: &mut Runtime) {
 }
 
 /// Fire-and-forget history report; listens shorter than 5s are noise.
-fn report_history(runtime: &Runtime, track_id: i64, started_at: Option<i64>, listened: i32) {
+fn report_history(
+    runtime: &Runtime,
+    track_id: i64,
+    started_at: Option<i64>,
+    listened: i32,
+    completed: bool,
+) {
     if listened < 5 {
         return;
     }
@@ -526,7 +533,10 @@ fn report_history(runtime: &Runtime, track_id: i64, started_at: Option<i64>, lis
         return;
     };
     tokio::spawn(async move {
-        if let Err(err) = api.report_history(track_id, started_at, listened).await {
+        if let Err(err) = api
+            .report_history(track_id, started_at, listened, completed)
+            .await
+        {
             tracing::warn!(%err, "history report failed");
         }
     });
@@ -745,13 +755,14 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.art.insert(key, entry);
         }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
-            // The finished track gets a full-duration history entry.
+            // The finished track gets a full-duration, completed entry.
             if let Some(finished) = state.player.current.clone() {
                 report_history(
                     runtime,
                     finished.id,
                     state.player.track_started_at,
                     finished.duration_seconds.round() as i32,
+                    true,
                 );
             }
             if has_next {

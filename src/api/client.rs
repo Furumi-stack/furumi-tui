@@ -301,17 +301,21 @@ impl ApiClient {
     }
 
     /// Report a finished/aborted listen to the play history.
+    /// Body shape is the backend's HistoryEntry; `completed` marks a full
+    /// play (vs a manual skip).
     pub async fn report_history(
         &self,
         track_id: i64,
         started_at: Option<i64>,
         listened_seconds: i32,
+        completed: bool,
     ) -> Result<(), ApiError> {
         #[derive(Serialize)]
         struct Body {
             track_id: i64,
             started_at: Option<i64>,
-            listened_seconds: i32,
+            duration_listened: Option<i32>,
+            completed: bool,
         }
         let _: serde_json::Value = self
             .post_json(
@@ -319,7 +323,8 @@ impl ApiClient {
                 &Body {
                     track_id,
                     started_at,
-                    listened_seconds,
+                    duration_listened: Some(listened_seconds),
+                    completed,
                 },
             )
             .await?;
