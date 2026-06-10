@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{art, theme};
 use crate::api::models::{ArtistCard, ReleaseCard};
@@ -11,6 +12,10 @@ use crate::app::state::{
     GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, release_groups,
 };
 use crate::art::cache_key;
+
+const TILE_MARQUEE_STEP_MS: u128 = 250;
+const TILE_MARQUEE_PAUSE_STEPS: u128 = 4;
+const TILE_MARQUEE_GAP: &str = "   ";
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     match state.global.stack.last() {
@@ -102,7 +107,10 @@ fn draw_tile(
             height: 1,
             ..inner
         };
-        frame.render_widget(Paragraph::new(Line::raw(title.to_string())), name_area);
+        frame.render_widget(
+            Paragraph::new(Line::raw(tile_title(title, name_area.width, selected))),
+            name_area,
+        );
         if selected {
             frame.buffer_mut().set_style(name_area, theme::tab_active());
         }
@@ -120,6 +128,73 @@ fn draw_tile(
         if selected {
             frame.buffer_mut().set_style(meta_area, theme::tab_active());
         }
+    }
+}
+
+fn tile_title(title: &str, width: u16, selected: bool) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
+    }
+    if !selected || UnicodeWidthStr::width(title) <= width {
+        return title.to_string();
+    }
+    marquee_window(title, width)
+}
+
+fn marquee_window(title: &str, width: usize) -> String {
+    let stream = format!("{title}{TILE_MARQUEE_GAP}");
+    let cells: Vec<(char, usize)> = stream
+        .chars()
+        .map(|ch| (ch, UnicodeWidthChar::width(ch).unwrap_or(0)))
+        .collect();
+    let total_width: usize = cells.iter().map(|(_, width)| *width).sum();
+    if total_width == 0 {
+        return title.to_string();
+    }
+
+    let phase = marquee_phase(total_width);
+    let mut skipped = 0usize;
+    let mut index = 0usize;
+    while index < cells.len() {
+        let next = skipped + cells[index].1;
+        if next > phase {
+            break;
+        }
+        skipped = next;
+        index += 1;
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut steps = 0usize;
+    while used < width && steps < cells.len() + width {
+        let (ch, ch_width) = cells[(index + steps) % cells.len()];
+        steps += 1;
+        if ch_width == 0 {
+            out.push(ch);
+            continue;
+        }
+        if used + ch_width > width {
+            continue;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
+}
+
+fn marquee_phase(total_width: usize) -> usize {
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() / TILE_MARQUEE_STEP_MS)
+        .unwrap_or(0);
+    let cycle = total_width as u128 + TILE_MARQUEE_PAUSE_STEPS;
+    let phase = tick % cycle;
+    if phase < TILE_MARQUEE_PAUSE_STEPS {
+        0
+    } else {
+        (phase - TILE_MARQUEE_PAUSE_STEPS) as usize
     }
 }
 

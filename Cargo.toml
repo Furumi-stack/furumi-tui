@@ -28,6 +28,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-width = "0.2.2"
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.1"
