@@ -30,7 +30,7 @@ jobs:
             asset_name: furumi-linux-x86_64
             archive_name: furumi-linux-x86_64.tar.gz
             binary_name: furumi
-          - os: macos-13
+          - os: macos-latest
             asset_name: furumi-macos-x86_64
             archive_name: furumi-macos-x86_64.tar.gz
             binary_name: furumi
