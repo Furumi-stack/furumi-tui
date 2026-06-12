@@ -76,21 +76,42 @@ pub async fn login_password(
     username: &str,
     password: &str,
 ) -> Result<AuthSession, ApiError> {
-    let response = http
+    let device_name = device_name();
+    tracing::info!(%base_url, %device_name, "password login request started");
+    let response = match http
         .post(format!("{base_url}/api/auth/password"))
         .json(&PasswordLoginRequest {
             username,
             password,
-            device_name: device_name(),
+            device_name,
         })
         .send()
-        .await?;
-    let login: LoginResponse = parse_response(response).await?;
-    Ok(AuthSession::new(
-        base_url.to_string(),
-        login.user,
-        login.tokens,
-    ))
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(%base_url, %err, "password login request failed");
+            return Err(ApiError::Network(err));
+        }
+    };
+    let status = response.status();
+    let login: LoginResponse = match parse_response(response).await {
+        Ok(login) => login,
+        Err(err) => {
+            tracing::warn!(%base_url, %status, %err, "password login rejected");
+            return Err(err);
+        }
+    };
+    let session = AuthSession::new(base_url.to_string(), login.user, login.tokens);
+    tracing::info!(
+        %base_url,
+        user_id = session.user.id,
+        user = %session.user.name,
+        expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+        seconds_until_expiry = session.seconds_until_access_expiry(),
+        "password login succeeded"
+    );
+    Ok(session)
 }
 
 pub async fn login_sso_exchange(
@@ -98,20 +119,38 @@ pub async fn login_sso_exchange(
     base_url: &str,
     code: &str,
 ) -> Result<AuthSession, ApiError> {
-    let response = http
+    let device_name = device_name();
+    tracing::info!(%base_url, %device_name, "SSO exchange request started");
+    let response = match http
         .post(format!("{base_url}/api/auth/sso/exchange"))
-        .json(&SsoExchangeRequest {
-            code,
-            device_name: device_name(),
-        })
+        .json(&SsoExchangeRequest { code, device_name })
         .send()
-        .await?;
-    let login: LoginResponse = parse_response(response).await?;
-    Ok(AuthSession::new(
-        base_url.to_string(),
-        login.user,
-        login.tokens,
-    ))
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(%base_url, %err, "SSO exchange request failed");
+            return Err(ApiError::Network(err));
+        }
+    };
+    let status = response.status();
+    let login: LoginResponse = match parse_response(response).await {
+        Ok(login) => login,
+        Err(err) => {
+            tracing::warn!(%base_url, %status, %err, "SSO exchange rejected");
+            return Err(err);
+        }
+    };
+    let session = AuthSession::new(base_url.to_string(), login.user, login.tokens);
+    tracing::info!(
+        %base_url,
+        user_id = session.user.id,
+        user = %session.user.name,
+        expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+        seconds_until_expiry = session.seconds_until_access_expiry(),
+        "SSO exchange succeeded"
+    );
+    Ok(session)
 }
 
 /// Browser entry point for SSO. redirect_uri is either our loopback
@@ -130,15 +169,38 @@ async fn refresh_tokens(
     base_url: &str,
     refresh_token: &str,
 ) -> Result<TokensResponse, ApiError> {
-    let response = http
+    tracing::info!(%base_url, "refresh token request started");
+    let response = match http
         .post(format!("{base_url}/api/auth/refresh"))
         .json(&RefreshRequest { refresh_token })
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(%base_url, %err, "refresh token request failed");
+            return Err(ApiError::Network(err));
+        }
+    };
+    let status = response.status();
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        tracing::warn!(%base_url, %status, "refresh token rejected by server");
         return Err(ApiError::SessionExpired);
     }
-    parse_response(response).await
+    let tokens: TokensResponse = match parse_response(response).await {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            tracing::warn!(%base_url, %status, %err, "refresh token request returned error");
+            return Err(err);
+        }
+    };
+    tracing::info!(
+        %base_url,
+        %status,
+        expires_in_seconds = tokens.expires_in_seconds,
+        "refresh token request succeeded"
+    );
+    Ok(tokens)
 }
 
 /// Mirrors the backend's PlaybackStateDto.
@@ -201,6 +263,16 @@ async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Res
     Err(ApiError::Server(message))
 }
 
+fn stream_error_is_auth_related(err: &ApiError) -> bool {
+    let ApiError::Server(message) = err else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("401")
+        || message.contains("unauthorized")
+        || message.contains("authentication")
+}
+
 /// Authenticated API client. Owns the session; refreshes the access token
 /// proactively (60s skew) and once more on 401, persisting rotated tokens.
 /// The session mutex makes concurrent refreshes single-flight.
@@ -259,12 +331,42 @@ impl ApiClient {
         &self,
         path: &str,
     ) -> Result<(crate::player::TrackReader, Option<u64>), ApiError> {
+        let url: reqwest::Url = format!("{}{path}", self.base_url)
+            .parse()
+            .map_err(|err| ApiError::Server(format!("bad stream url: {err}")))?;
+        tracing::info!(path, "opening authenticated stream");
+        let token = self.fresh_access_token().await?;
+        match self.open_stream_with_token(url.clone(), &token).await {
+            Ok(stream) => {
+                tracing::debug!(path, "authenticated stream opened");
+                Ok(stream)
+            }
+            Err(err) if stream_error_is_auth_related(&err) => {
+                tracing::warn!(path, %err, "stream rejected bearer token; refreshing and retrying");
+                let retry_token = self.refresh_after_rejection(&token).await?;
+                let result = self.open_stream_with_token(url, &retry_token).await;
+                if let Err(retry_err) = &result {
+                    tracing::warn!(path, %retry_err, "stream open failed after auth refresh");
+                }
+                result
+            }
+            Err(err) => {
+                tracing::warn!(path, %err, "stream open failed");
+                Err(err)
+            }
+        }
+    }
+
+    async fn open_stream_with_token(
+        &self,
+        url: reqwest::Url,
+        token: &str,
+    ) -> Result<(crate::player::TrackReader, Option<u64>), ApiError> {
         use stream_download::Settings;
         use stream_download::http::HttpStream;
         use stream_download::source::SourceStream as _;
         use stream_download::storage::temp::TempStorageProvider;
 
-        let token = self.fresh_access_token().await?;
         let mut headers = reqwest::header::HeaderMap::new();
         let value = format!("Bearer {token}")
             .parse()
@@ -275,9 +377,6 @@ impl ApiClient {
             .build()
             .map_err(ApiError::Network)?;
 
-        let url = format!("{}{path}", self.base_url)
-            .parse()
-            .map_err(|err| ApiError::Server(format!("bad stream url: {err}")))?;
         let stream = HttpStream::new(client, url)
             .await
             .map_err(|err| ApiError::Server(format!("stream open failed: {err}")))?;
@@ -480,6 +579,7 @@ impl ApiClient {
             let session = self.session.lock().await;
             (session.access_token.clone(), session.refresh_token.clone())
         };
+        tracing::info!(base_url = %self.base_url, "logout request started");
         let response = self
             .http
             .post(format!("{}/api/auth/logout", self.base_url))
@@ -489,12 +589,20 @@ impl ApiClient {
             })
             .send()
             .await?;
+        let status = response.status();
 
         #[derive(serde::Deserialize)]
         struct LogoutResponse {
             revoked: bool,
         }
-        let body: LogoutResponse = parse_response(response).await?;
+        let body: LogoutResponse = match parse_response(response).await {
+            Ok(body) => body,
+            Err(err) => {
+                tracing::warn!(base_url = %self.base_url, %status, %err, "logout request failed");
+                return Err(err);
+            }
+        };
+        tracing::info!(base_url = %self.base_url, %status, revoked = body.revoked, "logout request succeeded");
         Ok(body.revoked)
     }
 
@@ -564,15 +672,28 @@ impl ApiClient {
         let token = self.fresh_access_token().await?;
         let response = build(&self.http, url, &token).send().await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tracing::warn!(%url, "authenticated request returned 401; refreshing token and retrying");
             let token = self.refresh_after_rejection(&token).await?;
-            return Ok(build(&self.http, url, &token).send().await?);
+            let response = build(&self.http, url, &token).send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                tracing::warn!(%url, "authenticated request still returned 401 after token refresh");
+            }
+            return Ok(response);
         }
         Ok(response)
     }
 
     async fn fresh_access_token(&self) -> Result<String, ApiError> {
         let mut session = self.session.lock().await;
+        let seconds_until_expiry = session.seconds_until_access_expiry();
         if session.access_token_expired() {
+            tracing::info!(
+                user_id = session.user.id,
+                user = %session.user.name,
+                expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+                seconds_until_expiry,
+                "access token expired or near expiry; refreshing"
+            );
             self.refresh_locked(&mut session).await?;
         }
         Ok(session.access_token.clone())
@@ -583,28 +704,75 @@ impl ApiClient {
     async fn refresh_after_rejection(&self, rejected_token: &str) -> Result<String, ApiError> {
         let mut session = self.session.lock().await;
         if session.access_token != rejected_token {
+            tracing::info!(
+                user_id = session.user.id,
+                user = %session.user.name,
+                "rejected access token was already rotated by another task"
+            );
             return Ok(session.access_token.clone());
         }
+        tracing::warn!(
+            user_id = session.user.id,
+            user = %session.user.name,
+            seconds_until_expiry = session.seconds_until_access_expiry(),
+            "access token was rejected; refreshing"
+        );
         self.refresh_locked(&mut session).await?;
         Ok(session.access_token.clone())
     }
 
     async fn refresh_locked(&self, session: &mut AuthSession) -> Result<(), ApiError> {
+        let user_id = session.user.id;
+        let user = session.user.name.clone();
+        let previous_expires_at = session.expires_at_epoch_seconds;
+        let previous_seconds_until_expiry = session.seconds_until_access_expiry();
+        tracing::info!(
+            user_id,
+            user = %user,
+            server = %self.base_url,
+            previous_expires_at_epoch_seconds = previous_expires_at,
+            previous_seconds_until_expiry,
+            "refreshing access token"
+        );
         let result = refresh_tokens(&self.http, &self.base_url, &session.refresh_token).await;
         match result {
             Ok(tokens) => {
+                let expires_in_seconds = tokens.expires_in_seconds;
                 session.apply_tokens(tokens);
                 if let Err(err) = auth::save_session(session) {
                     tracing::warn!(%err, "failed to persist rotated tokens");
                 }
-                tracing::debug!("access token refreshed");
+                tracing::info!(
+                    user_id = session.user.id,
+                    user = %session.user.name,
+                    server = %self.base_url,
+                    expires_in_seconds,
+                    expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+                    seconds_until_expiry = session.seconds_until_access_expiry(),
+                    "access token refreshed"
+                );
                 Ok(())
             }
             Err(ApiError::SessionExpired) => {
+                tracing::warn!(
+                    user_id,
+                    user = %user,
+                    server = %self.base_url,
+                    "refresh token expired or rejected; clearing stored session"
+                );
                 auth::delete_session();
                 Err(ApiError::SessionExpired)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    user_id,
+                    user = %user,
+                    server = %self.base_url,
+                    %err,
+                    "access token refresh failed"
+                );
+                Err(err)
+            }
         }
     }
 }

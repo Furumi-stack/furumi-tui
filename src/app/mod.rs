@@ -637,9 +637,21 @@ fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f
                 }
             }
             Err(ApiError::SessionExpired) => {
+                tracing::warn!(
+                    track_id = track.id,
+                    title = %track.title,
+                    "playback stream open reported expired session"
+                );
                 let _ = tx.send(AppEvent::SessionExpired);
             }
             Err(err) => {
+                tracing::warn!(
+                    track_id = track.id,
+                    title = %track.title,
+                    stream_url = %track.stream_url,
+                    %err,
+                    "playback stream open failed"
+                );
                 let _ = tx.send(AppEvent::StatusMessage(format!("playback failed: {err}")));
             }
         }
@@ -682,6 +694,14 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     tokio::spawn(async move {
         match api.open_stream(&next.stream_url).await {
             Ok((reader, byte_len)) => controller.enqueue(reader, byte_len),
+            Err(ApiError::SessionExpired) => {
+                tracing::warn!(
+                    track_id = next.id,
+                    title = %next.title,
+                    "prefetch reported expired session"
+                );
+                let _ = tx.send(AppEvent::SessionExpired);
+            }
             Err(err) => {
                 tracing::warn!(%err, "prefetch failed; falling back to a normal switch");
                 let _ = tx.send(AppEvent::PrefetchFailed { pos: next_pos });

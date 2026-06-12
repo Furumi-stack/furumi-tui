@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +45,10 @@ impl AuthSession {
     pub fn access_token_expired(&self) -> bool {
         now_epoch_seconds() + EXPIRY_SKEW_SECONDS >= self.expires_at_epoch_seconds
     }
+
+    pub fn seconds_until_access_expiry(&self) -> i64 {
+        self.expires_at_epoch_seconds - now_epoch_seconds()
+    }
 }
 
 pub fn now_epoch_seconds() -> i64 {
@@ -58,10 +63,34 @@ pub fn session_path() -> Option<PathBuf> {
 }
 
 pub fn load_session() -> Option<AuthSession> {
-    let path = session_path()?;
-    let text = fs::read_to_string(&path).ok()?;
-    match serde_json::from_str(&text) {
-        Ok(session) => Some(session),
+    let Some(path) = session_path() else {
+        tracing::warn!("cannot determine config directory; no stored auth session loaded");
+        return None;
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            tracing::debug!(path = %path.display(), "credentials file not found");
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to read credentials file");
+            return None;
+        }
+    };
+    match serde_json::from_str::<AuthSession>(&text) {
+        Ok(session) => {
+            tracing::info!(
+                path = %path.display(),
+                user_id = session.user.id,
+                user = %session.user.name,
+                server = %session.server_base_url,
+                expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+                seconds_until_expiry = session.seconds_until_access_expiry(),
+                "loaded stored auth session"
+            );
+            Some(session)
+        }
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ignoring unreadable credentials file");
             None
@@ -75,12 +104,31 @@ pub fn save_session(session: &AuthSession) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(session)?;
-    write_private(&path, &text).with_context(|| format!("writing {}", path.display()))
+    tracing::info!(
+        path = %path.display(),
+        user_id = session.user.id,
+        user = %session.user.name,
+        server = %session.server_base_url,
+        expires_at_epoch_seconds = session.expires_at_epoch_seconds,
+        seconds_until_expiry = session.seconds_until_access_expiry(),
+        "persisting auth session"
+    );
+    write_private(&path, &text).with_context(|| format!("writing {}", path.display()))?;
+    tracing::debug!(path = %path.display(), "auth session persisted");
+    Ok(())
 }
 
 pub fn delete_session() {
     if let Some(path) = session_path() {
-        let _ = fs::remove_file(path);
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!(path = %path.display(), "deleted stored auth session"),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                tracing::debug!(path = %path.display(), "stored auth session already absent");
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to delete stored auth session")
+            }
+        }
     }
 }
 
