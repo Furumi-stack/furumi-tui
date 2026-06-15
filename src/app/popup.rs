@@ -23,6 +23,11 @@ pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
             busy,
         } => handle_name_entry(state, runtime, for_track, input, busy, key),
         Popup::Devices { cursor } => handle_devices(state, runtime, cursor, key),
+        Popup::TrackInfo {
+            tracks,
+            cursor,
+            scroll,
+        } => handle_track_info(state, tracks, cursor, scroll, key),
         Popup::LogDetail(entry) => match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::LogDetail(entry)),
@@ -71,6 +76,58 @@ fn handle_devices(state: &mut AppState, runtime: &Runtime, cursor: usize, key: K
             state.popup = Some(Popup::Devices {
                 cursor: cursor.min(len.saturating_sub(1)),
             })
+        }
+    }
+}
+
+fn handle_track_info(
+    state: &mut AppState,
+    tracks: Vec<TrackItem>,
+    cursor: usize,
+    scroll: usize,
+    key: KeyEvent,
+) {
+    let len = tracks.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor,
+                scroll: scroll.saturating_sub(1),
+            });
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor,
+                scroll: scroll + 1,
+            });
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor: cursor.saturating_sub(1),
+                scroll: 0,
+            });
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor: if len == 0 {
+                    0
+                } else {
+                    (cursor + 1).min(len - 1)
+                },
+                scroll: 0,
+            });
+        }
+        _ => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor: cursor.min(len.saturating_sub(1)),
+                scroll,
+            });
         }
     }
 }

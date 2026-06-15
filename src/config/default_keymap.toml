@@ -61,6 +61,16 @@ command = "ClearQueue"
 context = "queue"
 
 [[keymaps]]
+key_sequence = "d"
+command = "RemoveFromQueue"
+context = "queue"
+
+[[keymaps]]
+key_sequence = "delete"
+command = "RemoveFromQueue"
+context = "queue"
+
+[[keymaps]]
 key_sequence = "shift-j"
 command = "GoToRelease"
 
@@ -184,6 +194,14 @@ command = "CycleRepeat"
 [[keymaps]]
 key_sequence = "x"
 command = "ToggleLike"
+
+[[keymaps]]
+key_sequence = "shift-v"
+command = "ToggleTrackSelection"
+
+[[keymaps]]
+key_sequence = "i"
+command = "OpenTrackInfo"
 
 [[keymaps]]
 key_sequence = "shift-l"

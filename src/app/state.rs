@@ -186,6 +186,71 @@ pub struct QueueTab {
     pub cursor: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackSelectionScope {
+    ArtistTop(i64),
+    ArtistFeatured(i64),
+    Release(i64),
+    Playlist(i64),
+    Queue,
+}
+
+/// Vim-like Shift-V selection for line-oriented track lists. The selected
+/// range is always contiguous: anchor is where visual mode started, cursor is
+/// extended by normal navigation.
+#[derive(Debug, Clone, Default)]
+pub struct TrackSelection {
+    pub scope: Option<TrackSelectionScope>,
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl TrackSelection {
+    pub fn is_active(&self) -> bool {
+        self.scope.is_some()
+    }
+
+    pub fn is_active_for(&self, scope: &TrackSelectionScope) -> bool {
+        self.scope.as_ref() == Some(scope)
+    }
+
+    pub fn start(&mut self, scope: TrackSelectionScope, cursor: usize) {
+        self.scope = Some(scope);
+        self.anchor = cursor;
+        self.cursor = cursor;
+    }
+
+    pub fn clear(&mut self) {
+        self.scope = None;
+        self.anchor = 0;
+        self.cursor = 0;
+    }
+
+    pub fn set_cursor(&mut self, scope: TrackSelectionScope, cursor: usize) {
+        if self.scope.as_ref() == Some(&scope) {
+            self.cursor = cursor;
+        }
+    }
+
+    pub fn contains(&self, scope: &TrackSelectionScope, index: usize) -> bool {
+        if self.scope.as_ref() != Some(scope) {
+            return false;
+        }
+        let start = self.anchor.min(self.cursor);
+        let end = self.anchor.max(self.cursor);
+        (start..=end).contains(&index)
+    }
+
+    pub fn indices(&self, scope: &TrackSelectionScope, len: usize) -> Option<Vec<usize>> {
+        if len == 0 || self.scope.as_ref() != Some(scope) {
+            return None;
+        }
+        let start = self.anchor.min(self.cursor).min(len - 1);
+        let end = self.anchor.max(self.cursor).min(len - 1);
+        Some((start..=end).collect())
+    }
+}
+
 /// Severity steps for the Logs tab filter, cycled with the view-toggle key.
 pub const LOG_LEVELS: [tracing::Level; 5] = [
     tracing::Level::ERROR,
@@ -263,6 +328,12 @@ pub enum Popup {
     },
     /// Connected devices list; Enter transfers active playback to the row.
     Devices { cursor: usize },
+    /// Track metadata viewer; left/right switch between selected tracks.
+    TrackInfo {
+        tracks: Vec<TrackItem>,
+        cursor: usize,
+        scroll: usize,
+    },
     /// Full, wrapped view of one log entry (Enter on the Logs tab).
     LogDetail(crate::config::logging::LogEntry),
 }
@@ -519,6 +590,7 @@ pub struct AppState {
     pub logs: LogsTab,
     pub devices: DevicesState,
     pub queue_tab: QueueTab,
+    pub track_selection: TrackSelection,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.
     pub pending_release_focus: Option<(i64, i64)>,

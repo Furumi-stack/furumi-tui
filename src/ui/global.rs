@@ -490,11 +490,25 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         cursor_item,
         &mut |frame, rect, item| match item {
             PlanItem::Track { cursor_index } => {
-                let (track, number) = if *cursor_index < tracks {
-                    (&detail.top_tracks[*cursor_index], cursor_index + 1)
+                let (track, number, visual_selected) = if *cursor_index < tracks {
+                    (
+                        &detail.top_tracks[*cursor_index],
+                        cursor_index + 1,
+                        state.track_selection.contains(
+                            &crate::app::state::TrackSelectionScope::ArtistTop(id),
+                            *cursor_index,
+                        ),
+                    )
                 } else {
                     let offset = cursor_index - tracks - releases_len;
-                    (&detail.featured_tracks[offset], offset + 1)
+                    (
+                        &detail.featured_tracks[offset],
+                        offset + 1,
+                        state.track_selection.contains(
+                            &crate::app::state::TrackSelectionScope::ArtistFeatured(id),
+                            offset,
+                        ),
+                    )
                 };
                 super::track_row(
                     frame,
@@ -503,6 +517,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                     track,
                     number.to_string(),
                     cursor == *cursor_index,
+                    visual_selected,
                 );
             }
             PlanItem::TileRow(row) => {
@@ -678,7 +693,17 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
             .track_number
             .map(|n| n.to_string())
             .unwrap_or_else(|| (offset + 1).to_string());
-        super::track_row(frame, rect, state, track, number, cursor == offset);
+        super::track_row(
+            frame,
+            rect,
+            state,
+            track,
+            number,
+            cursor == offset,
+            state
+                .track_selection
+                .contains(&crate::app::state::TrackSelectionScope::Release(id), offset),
+        );
     }
 }
 

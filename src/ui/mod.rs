@@ -12,7 +12,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
-use crate::app::state::{AppState, Screen, Tab};
+use crate::app::state::{AppState, Screen, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
@@ -63,6 +63,7 @@ pub(crate) fn track_row(
     track: &crate::api::models::TrackItem,
     index_label: String,
     selected: bool,
+    visual_selected: bool,
 ) {
     let heart = if state.likes.contains(&track.id) {
         Span::styled("♥ ", theme::accent())
@@ -82,6 +83,9 @@ pub(crate) fn track_row(
         Paragraph::new(Line::styled(right, theme::dim())).alignment(Alignment::Right),
         area,
     );
+    if visual_selected {
+        frame.buffer_mut().set_style(area, theme::selection());
+    }
     if selected {
         frame.buffer_mut().set_style(area, theme::tab_active());
     }
@@ -125,7 +129,7 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     let player = &state.player;
     let block = Block::bordered()
         .title(format!(
-            " Queue — {} tracks · enter: play · shift-c: clear ",
+            " Queue — {} tracks · enter: play · d: remove · shift-v: select · shift-c: clear ",
             player.queue.len()
         ))
         .title_style(theme::header())
@@ -168,10 +172,21 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             (index + 1).to_string()
         };
-        track_row(frame, row, state, track, label, index == cursor);
+        let visual_selected = state
+            .track_selection
+            .contains(&TrackSelectionScope::Queue, index);
+        track_row(
+            frame,
+            row,
+            state,
+            track,
+            label,
+            index == cursor,
+            visual_selected,
+        );
         // Tracks before the playing one are history: greyed out unless the
         // cursor is on them.
-        if index < player.queue_pos && index != cursor {
+        if index < player.queue_pos && index != cursor && !visual_selected {
             frame.buffer_mut().set_style(row, played_style);
         }
     }

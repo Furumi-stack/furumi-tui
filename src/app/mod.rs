@@ -431,7 +431,7 @@ fn spawn_art_fetch(
 
 /// Execute a side effect requested by update().
 fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
-    if perform_remote_effect(state, runtime, effect) {
+    if perform_remote_effect(state, runtime, &effect) {
         return;
     }
     match effect {
@@ -480,27 +480,52 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 }
             });
         }
-        Effect::ToggleLike { track_id } => {
+        Effect::ToggleLikes { track_ids } => {
+            if track_ids.is_empty() {
+                return;
+            }
             let Some(api) = runtime.api.clone() else {
                 return;
             };
             let tx = runtime.event_tx.clone();
             tokio::spawn(async move {
-                match api.toggle_like(track_id).await {
-                    Ok(liked) => {
-                        let _ = tx.send(AppEvent::LikeToggled { track_id, liked });
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, track_id, "like toggle failed");
-                        let _ = tx.send(AppEvent::StatusMessage(format!("like failed: {err}")));
+                for track_id in track_ids {
+                    match api.toggle_like(track_id).await {
+                        Ok(liked) => {
+                            let _ = tx.send(AppEvent::LikeToggled { track_id, liked });
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, track_id, "like toggle failed");
+                            let _ = tx.send(AppEvent::StatusMessage(format!("like failed: {err}")));
+                            break;
+                        }
                     }
                 }
             });
         }
+        Effect::RemoveQueueIndices {
+            restart_paused,
+            stop,
+            ..
+        } => {
+            if stop {
+                runtime.player.stop();
+                push_state_now(state, runtime);
+                push_media_update(state, runtime, true);
+            } else if let Some(paused) = restart_paused {
+                start_current_audio(state, runtime, 0.0, paused);
+                push_state_now(state, runtime);
+                push_media_metadata(state, runtime);
+                push_media_update(state, runtime, true);
+            } else {
+                push_state_now(state, runtime);
+                push_media_update(state, runtime, true);
+            }
+        }
     }
 }
 
-fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: Effect) -> bool {
+fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: &Effect) -> bool {
     let Some(target) = state.devices.remote_target_id().map(str::to_string) else {
         return false;
     };
@@ -528,7 +553,7 @@ fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: Effect
             true
         }
         Effect::SeekBy(delta) => {
-            let target_time = (state.player.position_secs + delta as f64).max(0.0);
+            let target_time = (state.player.position_secs + *delta as f64).max(0.0);
             state.player.position_secs = target_time;
             send_device_command(
                 runtime,
@@ -543,7 +568,7 @@ fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: Effect
                 runtime,
                 target,
                 "set_volume",
-                serde_json::json!({ "volume": f64::from(volume) / 100.0 }),
+                serde_json::json!({ "volume": f64::from(*volume) / 100.0 }),
             );
             true
         }
@@ -559,7 +584,20 @@ fn perform_remote_effect(state: &mut AppState, runtime: &Runtime, effect: Effect
             );
             true
         }
-        Effect::EnqueueRelease { .. } | Effect::ToggleLike { .. } => false,
+        Effect::RemoveQueueIndices { indices, .. } => {
+            let mut indices = indices.clone();
+            indices.sort_unstable_by(|a, b| b.cmp(a));
+            for index in indices {
+                send_device_command(
+                    runtime,
+                    target.clone(),
+                    "queue_remove",
+                    serde_json::json!({ "index": index }),
+                );
+            }
+            true
+        }
+        Effect::EnqueueRelease { .. } | Effect::ToggleLikes { .. } => false,
     }
 }
 
@@ -1181,15 +1219,26 @@ fn apply_options_payload(state: &mut AppState, payload: &serde_json::Value) {
     }
 }
 
-fn remove_queue_index(state: &mut AppState, runtime: &Runtime, index: usize) {
+fn remove_queue_index(state: &mut AppState, runtime: &mut Runtime, index: usize) {
     if index >= state.player.queue.len() {
         return;
     }
     let current_id = state.player.current.as_ref().map(|track| track.id);
+    let removed_current = state
+        .player
+        .queue
+        .get(index)
+        .is_some_and(|track| Some(track.id) == current_id);
+    let was_loaded = state.player.playing;
+    let was_paused = state.player.paused;
     state.player.queue.remove(index);
+    state.player.prefetched_pos = None;
+    state.track_selection.clear();
     if state.player.queue.is_empty() {
         state.player = state::PlayerBar::default();
         runtime.player.stop();
+        push_state_now(state, runtime);
+        push_media_update(state, runtime, true);
         return;
     }
     state.player.queue_pos = current_id
@@ -1197,6 +1246,12 @@ fn remove_queue_index(state: &mut AppState, runtime: &Runtime, index: usize) {
         .unwrap_or_else(|| state.player.queue_pos.min(state.player.queue.len() - 1));
     state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
     state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+    if removed_current && was_loaded {
+        start_current_audio(state, runtime, 0.0, was_paused);
+        push_media_metadata(state, runtime);
+        push_media_update(state, runtime, true);
+    }
+    push_state_now(state, runtime);
 }
 
 fn move_queue_index(state: &mut AppState, from: usize, to: usize) {

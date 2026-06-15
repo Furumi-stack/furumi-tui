@@ -28,8 +28,11 @@ pub enum Action {
     ToggleShuffle,
     CycleRepeat,
     ToggleLike,
+    ToggleTrackSelection,
+    OpenTrackInfo,
     QueueAddNext,
     QueueAddLast,
+    RemoveFromQueue,
     ClearQueue,
     GoToRelease,
     AddToPlaylist,
@@ -86,10 +89,13 @@ impl Action {
             | Action::CycleRepeat => Category::Playback,
             Action::QueueAddNext
             | Action::QueueAddLast
+            | Action::RemoveFromQueue
             | Action::ClearQueue
             | Action::AddToPlaylist
             | Action::NewPlaylist
-            | Action::ToggleLike => Category::Queue,
+            | Action::ToggleLike
+            | Action::ToggleTrackSelection
+            | Action::OpenTrackInfo => Category::Queue,
             Action::MoveUp
             | Action::MoveDown
             | Action::MoveLeft
@@ -157,8 +163,11 @@ impl Action {
             Action::ToggleShuffle => "Toggle shuffle".into(),
             Action::CycleRepeat => "Cycle repeat mode".into(),
             Action::ToggleLike => "Like / unlike".into(),
+            Action::ToggleTrackSelection => "Track line selection".into(),
+            Action::OpenTrackInfo => "Track info".into(),
             Action::QueueAddNext => "Queue: add next".into(),
             Action::QueueAddLast => "Queue: add to end".into(),
+            Action::RemoveFromQueue => "Queue: remove selected".into(),
             Action::ClearQueue => "Queue: clear".into(),
             Action::GoToRelease => "Open the track's release".into(),
             Action::AddToPlaylist => "Add track to a playlist…".into(),

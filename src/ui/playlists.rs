@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::{theme, track_row};
-use crate::app::state::{AppState, Loadable};
+use crate::app::state::{AppState, Loadable, TrackSelectionScope};
 use crate::app::update::playlist_tracks;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -158,6 +158,9 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             track,
             (index + 1).to_string(),
             index == cursor,
+            state
+                .track_selection
+                .contains(&TrackSelectionScope::Playlist(id), index),
         );
     }
 }

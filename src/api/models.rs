@@ -78,6 +78,8 @@ pub struct TrackItem {
     /// Absent in the artist-appearance variant of track payloads.
     #[serde(default)]
     pub track_number: Option<i32>,
+    #[serde(default)]
+    pub disc_number: Option<i32>,
     pub duration_seconds: f64,
     #[serde(default)]
     pub artists: Vec<ArtistRef>,
@@ -95,12 +97,18 @@ pub struct TrackItem {
     pub stream_url: String,
     #[allow(dead_code, reason = "now-playing artwork in milestone 3")]
     pub cover_url: Option<String>,
+    #[serde(default)]
+    pub uploader_name: String,
     pub audio_format: Option<String>,
     pub audio_bitrate: Option<i32>,
     pub audio_sample_rate: Option<i32>,
+    pub audio_bit_depth: Option<i32>,
     pub file_size_bytes: Option<i64>,
+    pub lastfm_listeners: Option<i64>,
     #[allow(dead_code, reason = "popularity column later")]
     pub lastfm_playcount: Option<i64>,
+    pub lastfm_rating: Option<f64>,
+    pub lastfm_updated_at: Option<String>,
 }
 
 impl TrackItem {

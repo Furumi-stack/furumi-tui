@@ -18,6 +18,10 @@ pub fn tab_active() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+pub fn selection() -> Style {
+    Style::new().fg(Color::White).bg(Color::Rgb(24, 68, 72))
+}
+
 pub fn header() -> Style {
     Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
