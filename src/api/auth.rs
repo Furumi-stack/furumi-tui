@@ -58,6 +58,13 @@ pub fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn now_epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn session_path() -> Option<PathBuf> {
     crate::config::project_dirs().map(|dirs| dirs.config_dir().join("credentials.json"))
 }

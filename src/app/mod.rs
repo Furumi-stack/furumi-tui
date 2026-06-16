@@ -403,7 +403,7 @@ fn device_playback_state(state: &AppState) -> Option<crate::api::models::DeviceP
         shuffle: player.shuffle,
         repeat_mode: player.repeat.label().to_string(),
         volume: f64::from(player.volume) / 100.0,
-        updated_at_ms: 0,
+        updated_at_ms: auth::now_epoch_millis(),
     })
 }
 
@@ -752,6 +752,7 @@ fn resume_current_audio(state: &mut AppState, runtime: &mut Runtime) {
             position_secs,
             "reopening playback stream after a long pause"
         );
+        runtime.player.stop();
         start_current_audio(state, runtime, position_secs, false);
     } else {
         runtime.player.resume();

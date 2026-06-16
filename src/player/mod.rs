@@ -252,7 +252,7 @@ fn handle(
             }
         }
         Command::Stop => {
-            if let Some(out) = output {
+            if let Some(out) = output.take() {
                 out.player.stop();
             }
             *track_loaded = false;
