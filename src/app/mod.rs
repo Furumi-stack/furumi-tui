@@ -9,7 +9,7 @@ pub mod state;
 pub mod update;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crokey::KeyCombination;
@@ -30,6 +30,10 @@ use update::{Effect, update};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// A paused StreamDownload can later issue Range requests with the bearer it
+// captured at open time. Reopen after idle so resume gets a freshly refreshed
+// token instead of reviving a stale HTTP stream.
+const STALE_STREAM_PAUSE_REOPEN_AFTER: Duration = Duration::from_secs(30);
 
 /// Handles shared by background tasks; AppState stays pure UI data.
 pub struct Runtime {
@@ -42,6 +46,8 @@ pub struct Runtime {
     /// Monotonic sequence for live search; stale responses are dropped.
     pub search_seq: Arc<std::sync::atomic::AtomicU64>,
     pub player: player::Controller,
+    pub player_start_pending: bool,
+    pub player_paused_since: Option<Instant>,
     pub last_state_push: Option<std::time::Instant>,
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
@@ -76,6 +82,8 @@ pub async fn run(
         player: player::spawn(move |event| {
             let _ = player_events.send(AppEvent::Player(event));
         }),
+        player_start_pending: false,
+        player_paused_since: None,
         last_state_push: None,
         media_tx,
         last_media_push: None,
@@ -110,7 +118,10 @@ pub async fn run(
             Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
             _ = tick.tick() => {
                 expire_quit_confirmation(&mut state);
-                if state.player.current.is_some() && state.devices.is_playback_device() {
+                if state.player.current.is_some()
+                    && state.devices.is_playback_device()
+                    && !runtime.player_start_pending
+                {
                     state.player.position_secs = runtime.player.shared.position().as_secs_f64();
                     state.player.paused = runtime.player.shared.paused();
                 } else if state.player.current.is_some()
@@ -442,10 +453,16 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             push_media_update(state, runtime, true);
         }
         Effect::TogglePause => {
-            runtime.player.toggle_pause();
+            if state.player.paused {
+                pause_current_audio(state, runtime);
+            } else {
+                resume_current_audio(state, runtime);
+            }
             push_media_update(state, runtime, true);
         }
         Effect::StopPlayback => {
+            runtime.player_start_pending = false;
+            runtime.player_paused_since = None;
             runtime.player.stop();
             push_media_update(state, runtime, true);
         }
@@ -509,6 +526,8 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             ..
         } => {
             if stop {
+                runtime.player_start_pending = false;
+                runtime.player_paused_since = None;
                 runtime.player.stop();
                 push_state_now(state, runtime);
                 push_media_update(state, runtime, true);
@@ -626,11 +645,16 @@ fn send_device_command(
 
 /// Start streaming `queue[queue_pos]`: open the authenticated HTTP stream in
 /// a background task and hand the reader to the audio thread.
-fn play_current(state: &mut AppState, runtime: &Runtime) {
+fn play_current(state: &mut AppState, runtime: &mut Runtime) {
     start_current_audio(state, runtime, 0.0, false);
 }
 
-fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f64, paused: bool) {
+fn start_current_audio(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    position_secs: f64,
+    paused: bool,
+) {
     let Some(track) = state.player.queue.get(state.player.queue_pos).cloned() else {
         return;
     };
@@ -638,7 +662,9 @@ fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f
         return;
     };
     // The track that was playing until now was cut short by this switch.
-    if let Some(previous) = state.player.current.take() {
+    let previous_started_at = state.player.track_started_at;
+    let same_track_started_at = if let Some(previous) = state.player.current.take() {
+        let same_track = previous.id == track.id;
         if state.player.playing && previous.id != track.id {
             report_history(
                 runtime,
@@ -648,18 +674,28 @@ fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f
                 false,
             );
         }
-    }
+        same_track.then_some(previous_started_at).flatten()
+    } else {
+        None
+    };
     state.player.current = Some(track.clone());
     state.player.playing = true;
     state.player.paused = paused;
     state.player.position_secs = position_secs.max(0.0);
-    state.player.track_started_at = Some(auth::now_epoch_seconds());
+    state.player.track_started_at =
+        same_track_started_at.or_else(|| Some(auth::now_epoch_seconds()));
     state.player.prefetched_pos = None;
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
     if !paused {
         report_now_playing(runtime, track.id);
     }
 
+    runtime.player_start_pending = true;
+    if paused {
+        runtime.player_paused_since = Some(Instant::now());
+    } else {
+        runtime.player_paused_since = None;
+    }
     let controller = runtime.player.clone();
     let volume = player::amplitude(state.player.volume);
     let tx = runtime.event_tx.clone();
@@ -683,6 +719,7 @@ fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f
                 let _ = tx.send(AppEvent::SessionExpired);
             }
             Err(err) => {
+                let message = format!("playback failed: {err}");
                 tracing::warn!(
                     track_id = track.id,
                     title = %track.title,
@@ -690,10 +727,35 @@ fn start_current_audio(state: &mut AppState, runtime: &Runtime, position_secs: f
                     %err,
                     "playback stream open failed"
                 );
-                let _ = tx.send(AppEvent::StatusMessage(format!("playback failed: {err}")));
+                let _ = tx.send(AppEvent::Player(player::PlayerEvent::Failed(message)));
             }
         }
     });
+}
+
+fn pause_current_audio(state: &mut AppState, runtime: &mut Runtime) {
+    state.player.paused = true;
+    runtime.player.pause();
+    runtime.player_paused_since.get_or_insert_with(Instant::now);
+}
+
+fn resume_current_audio(state: &mut AppState, runtime: &mut Runtime) {
+    state.player.paused = false;
+    let paused_for = runtime
+        .player_paused_since
+        .take()
+        .map(|elapsed| elapsed.elapsed());
+    if paused_for.is_some_and(|elapsed| elapsed >= STALE_STREAM_PAUSE_REOPEN_AFTER) {
+        let position_secs = state.player.position_secs;
+        tracing::info!(
+            paused_for_seconds = paused_for.map_or(0.0, |elapsed| elapsed.as_secs_f64()),
+            position_secs,
+            "reopening playback stream after a long pause"
+        );
+        start_current_audio(state, runtime, position_secs, false);
+    } else {
+        runtime.player.resume();
+    }
 }
 
 /// Start streaming the next queue item ~30s before the current track ends
@@ -983,6 +1045,8 @@ fn apply_devices_response(
 
     let is_playback_device = state.devices.is_playback_device();
     if was_playback_device && !is_playback_device {
+        runtime.player_start_pending = false;
+        runtime.player_paused_since = None;
         runtime.player.stop();
     }
 
@@ -990,6 +1054,8 @@ fn apply_devices_response(
         if let Some(playback_state) = &response.playback_state {
             apply_device_playback_state(state, runtime, playback_state, false);
         } else {
+            runtime.player_start_pending = false;
+            runtime.player_paused_since = None;
             runtime.player.stop();
         }
     } else if from_activation {
@@ -1063,6 +1129,8 @@ fn apply_device_playback_state(
         push_media_metadata(state, runtime);
         push_media_update(state, runtime, true);
     } else {
+        runtime.player_start_pending = false;
+        runtime.player_paused_since = None;
         runtime.player.stop();
     }
 }
@@ -1132,13 +1200,11 @@ fn execute_device_command(
             apply_device_playback_state(state, runtime, &playback_state, start_audio);
         }
         "pause" => {
-            state.player.paused = true;
-            runtime.player.pause();
+            pause_current_audio(state, runtime);
             push_media_update(state, runtime, true);
         }
         "resume" | "play" => {
-            state.player.paused = false;
-            runtime.player.resume();
+            resume_current_audio(state, runtime);
             push_media_update(state, runtime, true);
         }
         "seek" => {
@@ -1236,6 +1302,8 @@ fn remove_queue_index(state: &mut AppState, runtime: &mut Runtime, index: usize)
     state.track_selection.clear();
     if state.player.queue.is_empty() {
         state.player = state::PlayerBar::default();
+        runtime.player_start_pending = false;
+        runtime.player_paused_since = None;
         runtime.player.stop();
         push_state_now(state, runtime);
         push_media_update(state, runtime, true);
@@ -1303,6 +1371,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
         }
         AppEvent::SessionExpired => {
+            runtime.player_start_pending = false;
+            runtime.player_paused_since = None;
             runtime.device_poll_in_flight = false;
             state.user = None;
             state.login = state::LoginForm::default();
@@ -1386,6 +1456,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             };
             state.art.insert(key, entry);
         }
+        AppEvent::Player(player::PlayerEvent::Started) => {
+            runtime.player_start_pending = false;
+        }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
             // The finished track gets a full-duration, completed entry.
             if let Some(finished) = state.player.current.clone() {
@@ -1423,6 +1496,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             push_state_now(state, runtime);
         }
         AppEvent::Player(player::PlayerEvent::Failed(message)) => {
+            runtime.player_start_pending = false;
+            runtime.player_paused_since = None;
             tracing::error!(%message, "playback failed");
             state.player.playing = false;
             state.player.paused = false;
@@ -1573,12 +1648,20 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             use crate::media::MediaCommand;
             tracing::debug!(?command, "media key");
             let action = match command {
-                MediaCommand::TogglePause | MediaCommand::Play | MediaCommand::Pause => {
+                MediaCommand::TogglePause => action::Action::PlayPause,
+                MediaCommand::Play if state.player.paused || state.player.current.is_none() => {
                     action::Action::PlayPause
                 }
+                MediaCommand::Play => return,
+                MediaCommand::Pause if state.player.current.is_some() && !state.player.paused => {
+                    action::Action::PlayPause
+                }
+                MediaCommand::Pause => return,
                 MediaCommand::Next => action::Action::NextTrack,
                 MediaCommand::Previous => action::Action::PrevTrack,
                 MediaCommand::Stop => {
+                    runtime.player_start_pending = false;
+                    runtime.player_paused_since = None;
                     state.player.playing = false;
                     state.player.paused = false;
                     state.player.current = None;

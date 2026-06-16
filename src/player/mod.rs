@@ -25,6 +25,8 @@ pub fn amplitude(percent: u8) -> f32 {
 
 #[derive(Debug)]
 pub enum PlayerEvent {
+    /// A newly requested source was decoded and handed to rodio.
+    Started,
     /// A track played to its end. `has_next` is true when a prefetched
     /// source was already queued and is now playing gaplessly.
     TrackFinished {
@@ -45,7 +47,6 @@ enum Command {
         reader: Box<TrackReader>,
         byte_len: Option<u64>,
     },
-    TogglePause,
     Pause,
     Resume,
     Stop,
@@ -90,10 +91,6 @@ impl Controller {
             reader: Box::new(reader),
             byte_len,
         });
-    }
-
-    pub fn toggle_pause(&self) {
-        let _ = self.tx.send(Command::TogglePause);
     }
 
     pub fn pause(&self) {
@@ -217,6 +214,7 @@ fn handle(
                     out.player.append(decoder);
                     out.player.play();
                     *track_loaded = true;
+                    on_event(PlayerEvent::Started);
                 }
                 Err(err) => {
                     on_event(PlayerEvent::Failed(format!("cannot decode track: {err}")));
@@ -240,15 +238,6 @@ fn handle(
                     on_event(PlayerEvent::Failed(format!(
                         "cannot decode next track: {err}"
                     )));
-                }
-            }
-        }
-        Command::TogglePause => {
-            if let Some(out) = output {
-                if out.player.is_paused() {
-                    out.player.play();
-                } else {
-                    out.player.pause();
                 }
             }
         }
