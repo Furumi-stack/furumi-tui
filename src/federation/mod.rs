@@ -495,6 +495,7 @@ impl Federation {
             let import_path = downloaded.path.clone();
             let import_metadata = downloaded.metadata.clone();
             let import_cover = downloaded.cover.clone();
+            let artist_image = downloaded.artist_image.clone();
             let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
                 let mut import = crate::library::import::read_file(&import_path)?;
                 // The owner's database is more authoritative than whatever
@@ -508,6 +509,14 @@ impl Federation {
                     import.cover = import_cover;
                 }
                 let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
+                // The owner's artist image fills the gap for a freshly
+                // created (or still image-less) main artist.
+                if let (Some((bytes, extension)), Some(artist_name)) =
+                    (&artist_image, import.artists.first())
+                    && let Err(err) = save_artist_image(&library, artist_name, bytes, extension)
+                {
+                    tracing::warn!(%err, "saving the artist image failed");
+                }
                 Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
             })
             .await?;
@@ -548,6 +557,28 @@ impl Federation {
             imported: false,
         })
     }
+}
+
+/// Writes a received artist image into the covers directory and attaches it
+/// to the artist unless one is already set.
+fn save_artist_image(
+    library: &Library,
+    artist_name: &str,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<()> {
+    let covers_dir = library.covers_dir();
+    std::fs::create_dir_all(covers_dir)?;
+    let path = covers_dir.join(format!(
+        "artist-{}.{extension}",
+        sanitize_file_stem(artist_name)
+    ));
+    // Write only if the artist actually lacks an image, to avoid litter.
+    if library.artist_image_missing(artist_name)? {
+        std::fs::write(&path, bytes)?;
+        library.set_artist_image_if_missing(artist_name, &path.to_string_lossy())?;
+    }
+    Ok(())
 }
 
 /// Overlays the peer-supplied metadata onto tag-derived import data. Every

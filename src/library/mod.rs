@@ -663,6 +663,13 @@ impl Library {
             "UPDATE tracks SET title = ?2, track_number = ?3, disc_number = ?4 WHERE id = ?1",
             params![id, edit.title, edit.track_number, edit.disc_number],
         )?;
+        // The cover is a release attribute; editing it from a track updates
+        // the release cover (what every view shows for this track).
+        tx.execute(
+            "UPDATE releases SET cover_path = ?2
+             WHERE id = (SELECT release_id FROM tracks WHERE id = ?1)",
+            params![id, edit.cover_path],
+        )?;
         tx.execute("DELETE FROM track_artists WHERE track_id = ?1", [id])?;
         link_track_artists(&tx, id, &edit.artists, "main")?;
         link_track_artists(&tx, id, &edit.featured_artists, "featured")?;
@@ -710,6 +717,44 @@ impl Library {
             params![id, name, image_path],
         )?;
         Ok(())
+    }
+
+    /// Image of one artist, for the federation metadata exchange.
+    pub fn artist_image(&self, artist_id: i64) -> Result<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT image_path FROM artists WHERE id = ?1",
+                [artist_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// `true` when the artist exists and has no image yet.
+    pub fn artist_image_missing(&self, name: &str) -> Result<bool> {
+        let conn = self.lock();
+        let missing: Option<bool> = conn
+            .query_row(
+                "SELECT image_path IS NULL FROM artists WHERE name = ?1 COLLATE NOCASE",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(missing.unwrap_or(false))
+    }
+
+    /// Sets an artist's image (matched by name) unless one is already set.
+    /// Returns whether the image was applied.
+    pub fn set_artist_image_if_missing(&self, name: &str, image_path: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE artists SET image_path = ?2
+             WHERE name = ?1 COLLATE NOCASE AND image_path IS NULL",
+            params![name, image_path],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn delete_track(&self, id: i64) -> Result<()> {
@@ -976,6 +1021,7 @@ mod tests {
                 featured_artists: vec!["Guest".into()],
                 track_number: Some(2),
                 disc_number: None,
+                cover_path: None,
             },
         )
         .unwrap();

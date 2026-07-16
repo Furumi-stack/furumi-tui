@@ -422,6 +422,7 @@ fn track_edit_popup(track: &TrackItem) -> super::state::Popup {
                 "Disc #",
                 track.disc_number.map(|n| n.to_string()).unwrap_or_default(),
             ),
+            EditField::new("Cover path", track.cover_path.clone().unwrap_or_default()),
         ],
         focus: 0,
         error: None,

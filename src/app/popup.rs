@@ -215,12 +215,14 @@ fn save_edit(
             if artists.is_empty() {
                 return Err("at least one artist is required".to_string());
             }
+            let cover_path = value("Cover path");
             let edit = TrackEdit {
                 title,
                 artists,
                 featured_artists: names("Featured"),
                 track_number: number("Track #")?,
                 disc_number: number("Disc #")?,
+                cover_path: (!cover_path.is_empty()).then_some(cover_path),
             };
             library.update_track(id, &edit)
         }

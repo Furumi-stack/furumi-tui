@@ -56,6 +56,12 @@ struct AudioResponseHeader {
     cover_size: u64,
     #[serde(default)]
     cover_mime: String,
+    /// Size of the main artist's image segment, sent after the cover and
+    /// before the audio; 0 = none. Governed by the same `want_cover` flag.
+    #[serde(default)]
+    artist_image_size: u64,
+    #[serde(default)]
+    artist_image_mime: String,
 }
 
 /// Covers above this size are skipped rather than transferred.
@@ -198,6 +204,8 @@ pub struct Downloaded {
     pub metadata: Option<TrackMetadata>,
     /// Cover art (bytes, file extension) sent by the owner, if any.
     pub cover: Option<(Vec<u8>, &'static str)>,
+    /// The main artist's image (bytes, file extension), if any.
+    pub artist_image: Option<(Vec<u8>, &'static str)>,
 }
 
 /// Downloads a whole track (with metadata and cover art) from `owner` into
@@ -233,24 +241,31 @@ pub async fn download_track(
         );
     }
 
-    // The cover segment precedes the audio bytes and is read regardless of
-    // the cache state — it sits first in the stream.
-    let cover = if header.cover_size > 0 {
+    // The image segments precede the audio bytes and are read regardless of
+    // the cache state — they sit first in the stream.
+    let mut read_image = async |size: u64, mime: &str, what: &str| -> Result<Option<(Vec<u8>, &'static str)>> {
+        if size == 0 {
+            return Ok(None);
+        }
         anyhow::ensure!(
-            header.cover_size <= MAX_COVER_BYTES,
-            "cover of {} bytes exceeds the {MAX_COVER_BYTES} byte limit",
-            header.cover_size
+            size <= MAX_COVER_BYTES,
+            "{what} of {size} bytes exceeds the {MAX_COVER_BYTES} byte limit"
         );
-        let mut bytes = vec![0u8; header.cover_size as usize];
+        let mut bytes = vec![0u8; size as usize];
         stream
             .recv
             .read_exact(&mut bytes)
             .await
-            .context("stream ended inside the cover segment")?;
-        Some((bytes, image_extension(&header.cover_mime)))
-    } else {
-        None
+            .with_context(|| format!("stream ended inside the {what} segment"))?;
+        Ok(Some((bytes, image_extension(mime))))
     };
+    let cover = read_image(header.cover_size, &header.cover_mime, "cover").await?;
+    let artist_image = read_image(
+        header.artist_image_size,
+        &header.artist_image_mime,
+        "artist image",
+    )
+    .await?;
 
     let extension = extension_for_mime(&header.mime_type);
     let path = dir.join(format!("{stem}.{extension}"));
@@ -264,6 +279,7 @@ pub async fn download_track(
             mime_type: header.mime_type,
             metadata: header.metadata,
             cover,
+            artist_image,
         });
     }
 
@@ -291,6 +307,7 @@ pub async fn download_track(
         mime_type: header.mime_type,
         metadata: header.metadata,
         cover,
+        artist_image,
     })
 }
 
@@ -319,6 +336,7 @@ struct Served {
     file_path: String,
     metadata: TrackMetadata,
     cover_path: Option<String>,
+    artist_image_path: Option<String>,
 }
 
 /// Resolves the item to the audio file, metadata and cover.
@@ -356,8 +374,13 @@ fn resolve_for_serving(
         track_number: track.track_number,
         disc_number: track.disc_number,
     };
+    let artist_image_path = track
+        .artists
+        .first()
+        .and_then(|artist| library.artist_image(artist.id).ok().flatten());
     Ok(Some(Served {
         cover_path: track.cover_path.clone(),
+        artist_image_path,
         file_path: track.file_path,
         metadata,
     }))
@@ -417,11 +440,14 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
         file.seek(std::io::SeekFrom::Start(offset)).await?;
     }
 
-    // Cover art rides between the header and the audio, when asked for.
-    let cover = if request.want_cover {
-        load_cover(served.cover_path.as_deref()).await
+    // Images ride between the header and the audio, when asked for.
+    let (cover, artist_image) = if request.want_cover {
+        (
+            load_cover(served.cover_path.as_deref()).await,
+            load_cover(served.artist_image_path.as_deref()).await,
+        )
     } else {
-        None
+        (None, None)
     };
     write_line(
         &mut stream.send,
@@ -437,10 +463,20 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
                 .as_ref()
                 .map(|(_, mime)| mime.to_string())
                 .unwrap_or_default(),
+            artist_image_size: artist_image
+                .as_ref()
+                .map_or(0, |(bytes, _)| bytes.len() as u64),
+            artist_image_mime: artist_image
+                .as_ref()
+                .map(|(_, mime)| mime.to_string())
+                .unwrap_or_default(),
         },
     )
     .await?;
     if let Some((bytes, _)) = &cover {
+        stream.send.write_all(bytes).await?;
+    }
+    if let Some((bytes, _)) = &artist_image {
         stream.send.write_all(bytes).await?;
     }
     tokio::io::copy(&mut file, &mut stream.send).await?;
@@ -475,6 +511,8 @@ async fn refuse(mut stream: ByteStream, message: String) -> Result<()> {
             metadata: None,
             cover_size: 0,
             cover_mime: String::new(),
+            artist_image_size: 0,
+            artist_image_mime: String::new(),
         },
     )
     .await?;

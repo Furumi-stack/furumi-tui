@@ -162,6 +162,9 @@ pub struct TrackEdit {
     pub featured_artists: Vec<String>,
     pub track_number: Option<i32>,
     pub disc_number: Option<i32>,
+    /// Cover image path; the cover lives on the track's release (the same
+    /// image every view shows for the track). None clears it.
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
