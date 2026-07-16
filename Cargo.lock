@@ -1484,6 +1484,7 @@ dependencies = [
 [[package]]
 name = "federation-net"
 version = "0.1.0"
+source = "git+https://gt.hexor.cy/ab/frid.git#555222d6d7527a1da8188814b0f308ee1562cb5d"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3038,6 +3039,7 @@ dependencies = [
 [[package]]
 name = "music-dht"
 version = "0.1.0"
+source = "git+https://gt.hexor.cy/ab/frid.git#555222d6d7527a1da8188814b0f308ee1562cb5d"
 dependencies = [
  "blake3",
  "data-encoding",

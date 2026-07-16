@@ -1,3 +1,0 @@
-# Local development override for the frid workspace; delete after pushing frid.
-[patch.'https://gt.hexor.cy/ab/frid.git']
-music-dht = { path = "../../frid/crates/music-dht" }
