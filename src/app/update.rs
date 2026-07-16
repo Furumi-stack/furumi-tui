@@ -313,7 +313,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             } else {
                 state.track_selection.clear();
                 state.status_message = Some(format!(
-                    "federation: скачивание {} трек(ов) в библиотеку…",
+                    "federation: downloading {} track(s) to the library…",
                     tracks.len()
                 ));
                 Some(Effect::FedDownload { tracks })
@@ -1764,7 +1764,7 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
         }
         Outcome::DownloadFed(tracks) => {
             state.status_message = Some(format!(
-                "federation: скачивание {} трек(ов) в библиотеку…",
+                "federation: downloading {} track(s) to the library…",
                 tracks.len()
             ));
             Some(Effect::FedDownload { tracks })

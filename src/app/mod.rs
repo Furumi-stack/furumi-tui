@@ -686,7 +686,7 @@ pub(crate) fn fed_download_spawn(
         let mut failed = 0usize;
         for (index, track) in tracks.iter().enumerate() {
             let _ = tx.send(AppEvent::StatusMessage(format!(
-                "federation: скачивание {}/{total}: {}",
+                "federation: downloading {}/{total}: {}",
                 index + 1,
                 track.title
             )));
@@ -698,9 +698,9 @@ pub(crate) fn fed_download_spawn(
                 }
             }
         }
-        let mut message = format!("federation: скачано {} из {total}", imported_ids.len());
+        let mut message = format!("federation: downloaded {} of {total}", imported_ids.len());
         if failed > 0 {
-            message.push_str(&format!(" ({failed} с ошибкой)"));
+            message.push_str(&format!(" ({failed} failed)"));
         }
         if let Some((playlist_id, playlist_title)) = playlist
             && !imported_ids.is_empty()

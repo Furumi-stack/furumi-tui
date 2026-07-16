@@ -815,7 +815,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
                 Line::from(vec![
                     Span::styled("⇅ ", theme::accent()),
                     Span::raw(hit.name.clone()),
-                    Span::styled("  артист · открыть карточку", theme::dim()),
+                    Span::styled("  artist · open the card", theme::dim()),
                 ]),
                 Some(format!(
                     "{} peer{}",
@@ -910,7 +910,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
             return centered_line(
                 frame,
                 inner,
-                Line::styled("собираем карточку с пиров…", theme::dim()),
+                Line::styled("assembling the card from peers…", theme::dim()),
             );
         }
         Loadable::Failed(message) => {
@@ -944,14 +944,14 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         Line::default(),
         Line::styled(
             format!(
-                "{} релизов · {} треков · с {} пиров",
+                "{} releases · {} tracks · from {} peers",
                 card.releases.len(),
                 tracks_total,
                 card.peers
             ),
             theme::dim(),
         ),
-        Line::styled("enter: открыть релиз · esc: назад", theme::dim()),
+        Line::styled("enter: open a release · esc: back", theme::dim()),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
@@ -959,7 +959,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         return centered_line(
             frame,
             content_area,
-            Line::styled("пиры не отдали ни одного релиза", theme::dim()),
+            Line::styled("the peers returned no releases", theme::dim()),
         );
     }
 
@@ -1038,7 +1038,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
         meta.push_str(&format!(" · {year}"));
     }
     meta.push_str(&format!(
-        " · {} треков · с {} пиров",
+        " · {} tracks · from {} peers",
         release.tracks.len(),
         release.owners.len().max(1)
     ));
@@ -1053,10 +1053,10 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
         Line::styled(meta, theme::dim()),
         Line::default(),
         Line::styled(
-            format!(" ⤓ Скачать релиз целиком ({}) ", release.tracks.len()),
+            format!(" ⤓ Download the whole release ({}) ", release.tracks.len()),
             button_style,
         ),
-        Line::styled("shift+v: выделение · y: скачать · p: в плейлист", theme::dim()),
+        Line::styled("shift+v: select · y: download · p: add to playlist", theme::dim()),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
@@ -1093,7 +1093,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
             })
             .unwrap_or_default();
         let right = if track.sources.len() > 1 {
-            format!("{duration} · {} пиров", track.sources.len())
+            format!("{duration} · {} peers", track.sources.len())
         } else {
             duration
         };
