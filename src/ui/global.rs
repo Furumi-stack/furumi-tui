@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{art, theme};
-use crate::api::models::{ArtistCard, ReleaseCard};
+use crate::library::models::{ArtistCard, ReleaseCard, SearchResults};
 use crate::app::state::{
     ART_CELL_HEIGHT, ART_CELL_WIDTH, ART_HEADER_HEIGHT, ART_HEADER_WIDTH, AppState, ArtState,
     GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, release_groups,
@@ -315,7 +315,7 @@ fn draw_grid_tiles(frame: &mut Frame, inner: Rect, state: &AppState) {
         draw_tile(
             frame,
             tile,
-            tile_art(state, artist.image_url.as_ref()),
+            tile_art(state, artist.image_path.as_ref()),
             &artist.name,
             &artist_tile_meta(artist),
             index == global.selected,
@@ -395,7 +395,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             height: ART_HEADER_HEIGHT.min(art_area.height),
             ..art_area
         },
-        header_art(state, detail.image_url.as_ref()),
+        header_art(state, detail.image_path.as_ref()),
     );
     let mut about = format!("{} releases", detail.releases.len());
     if !detail.featured_tracks.is_empty() {
@@ -536,7 +536,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                     draw_tile(
                         frame,
                         tile,
-                        tile_art(state, release.cover_url.as_ref()),
+                        tile_art(state, release.cover_path.as_ref()),
                         &release.title,
                         &release_tile_meta(release),
                         cursor == tracks + position,
@@ -648,13 +648,12 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
             height: ART_HEADER_HEIGHT.min(art_area.height),
             ..art_area
         },
-        header_art(state, detail.cover_url.as_ref()),
+        header_art(state, detail.cover_path.as_ref()),
     );
 
     let artists: Vec<&str> = detail.artists.iter().map(|a| a.name.as_str()).collect();
     let year = detail.year.map(|y| format!(" · {y}")).unwrap_or_default();
-    let uploaders: Vec<&str> = detail.uploaders.iter().map(|u| u.name.as_str()).collect();
-    let mut info = vec![
+    let info = vec![
         Line::default(),
         Line::styled(detail.title.clone(), theme::header()),
         Line::raw(artists.join(", ")),
@@ -668,12 +667,6 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
             theme::dim(),
         ),
     ];
-    if !uploaders.is_empty() {
-        info.push(Line::styled(
-            format!("uploaded by {}", uploaders.join(", ")),
-            theme::dim(),
-        ));
-    }
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Track list with centered scrolling.
@@ -719,15 +712,20 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     }
     let inner = bordered(frame, area, title);
 
-    let Some(results) = &search.results else {
-        let hint = if search.query.is_empty() {
-            "type to search artists, releases and tracks"
-        } else {
-            "searching…"
-        };
-        return centered_line(frame, inner, Line::styled(hint, theme::dim()));
+    let empty_results = SearchResults::default();
+    let results = match &search.results {
+        Some(results) => results,
+        None if !state.search.fed_tracks.is_empty() || state.search.fed_loading => &empty_results,
+        None => {
+            let hint = if search.query.is_empty() {
+                "type to search artists, releases and tracks"
+            } else {
+                "searching…"
+            };
+            return centered_line(frame, inner, Line::styled(hint, theme::dim()));
+        }
     };
-    if results.len() == 0 {
+    if results.len() == 0 && state.search.fed_tracks.is_empty() && !state.search.fed_loading {
         return centered_line(frame, inner, Line::styled("nothing found", theme::dim()));
     }
 
@@ -779,6 +777,45 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
                     ),
                 ]),
                 Some(super::track_meta_suffix(track, true)),
+                Some(index),
+            ));
+            index += 1;
+        }
+    }
+    // Tracks found on the federated network, marked with the owning peer.
+    if !state.search.fed_tracks.is_empty() || state.search.fed_loading {
+        if !rows.is_empty() {
+            rows.push((Line::default(), None, None));
+        }
+        let header = if state.search.fed_loading {
+            "Federation · searching…"
+        } else {
+            "Federation"
+        };
+        rows.push((Line::styled(header, theme::header()), None, None));
+        for fed in &state.search.fed_tracks {
+            let origin = if fed.own {
+                "your library".to_string()
+            } else {
+                format!("peer {}…", fed.owner_short())
+            };
+            let mut meta = fed.duration_label();
+            if let Some(year) = fed.year {
+                if !meta.is_empty() {
+                    meta.push_str(" · ");
+                }
+                meta.push_str(&year.to_string());
+            }
+            rows.push((
+                Line::from(vec![
+                    Span::styled("⇅ ", theme::accent()),
+                    Span::raw(fed.title.clone()),
+                    Span::styled(
+                        format!("  {} · {}", fed.artist_line(), origin),
+                        theme::dim(),
+                    ),
+                ]),
+                Some(meta),
                 Some(index),
             ));
             index += 1;

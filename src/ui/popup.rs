@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use super::theme;
-use crate::api::models::{ArtistRef, TrackItem};
-use crate::app::state::{AppState, Loadable, Popup, addable_playlists};
+use crate::app::state::{AppState, EditField, Loadable, Popup, addable_playlists};
+use crate::library::models::{ArtistRef, TrackItem};
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     match state.popup.as_ref() {
@@ -13,100 +13,154 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             draw_picker(frame, state, &track.title, *cursor)
         }
         Some(Popup::NewPlaylist { input, busy, .. }) => draw_name_entry(frame, input, *busy),
-        Some(Popup::Devices { cursor }) => draw_devices(frame, state, *cursor),
+        Some(Popup::Edit {
+            title,
+            fields,
+            focus,
+            error,
+            ..
+        }) => draw_edit(frame, title, fields, *focus, error.as_deref()),
+        Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, label),
         Some(Popup::TrackInfo {
             tracks,
             cursor,
             scroll,
         }) => draw_track_info(frame, tracks, *cursor, *scroll),
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
+        Some(Popup::FedInput { field, input }) => draw_fed_input(frame, field.title(), input),
+        Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
         None => {}
     }
 }
 
-fn draw_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
-    let rows = state.devices.devices.len().max(1);
-    let height = (rows as u16 + 4)
-        .min(frame.area().height.saturating_sub(2))
-        .max(7);
-    let area = centered(frame.area(), 64, height);
+/// One-line text entry on the Federation tab (network id / peer ticket).
+fn draw_fed_input(frame: &mut Frame, title: &str, input: &str) {
+    let area = centered(frame.area(), 64, 5);
     let block = Block::bordered()
-        .title(" Connected devices ")
+        .title(format!(" {title} "))
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [entry_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    // Keep the tail visible when the value (a ticket) exceeds the width.
+    let visible: String = {
+        let width = usize::from(entry_area.width.saturating_sub(2));
+        let chars: Vec<char> = input.chars().collect();
+        let skip = chars.len().saturating_sub(width);
+        chars[skip..].iter().collect()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(visible),
+            Span::styled("█", theme::accent()),
+        ])),
+        entry_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("enter: apply · esc: cancel", theme::dim()))
+            .alignment(Alignment::Center),
+        hint_area,
+    );
+}
+
+/// Read-only wrapped text (this peer's federation ticket).
+fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
+    let width = frame.area().width.saturating_sub(8).clamp(24, 90);
+    let text_width = usize::from(width.saturating_sub(2));
+    let lines_needed = (text.chars().count() / text_width.max(1) + 3) as u16;
+    let area = centered(frame.area(), width, lines_needed.clamp(5, frame.area().height));
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(text.to_string()).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Metadata edit form: one bordered input per field, the focused field gets
+/// the accent border and a cursor block.
+fn draw_edit(
+    frame: &mut Frame,
+    title: &str,
+    fields: &[EditField],
+    focus: usize,
+    error: Option<&str>,
+) {
+    let height = (fields.len() as u16 * 3 + 4).min(frame.area().height.saturating_sub(2));
+    let area = centered(frame.area(), 60, height);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
         .title_style(theme::header())
         .border_style(theme::accent());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let [list_area, _, footer] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    let mut constraints: Vec<Constraint> = fields.iter().map(|_| Constraint::Length(3)).collect();
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
+    let areas = Layout::vertical(constraints).split(inner);
 
-    if state.devices.devices.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled("waiting for device poll…", theme::dim()))
-                .alignment(Alignment::Center),
-            list_area,
-        );
-    } else {
-        let visible = usize::from(list_area.height.max(1));
-        let cursor = cursor.min(state.devices.devices.len() - 1);
-        let first = cursor
-            .saturating_sub(visible / 2)
-            .min(state.devices.devices.len().saturating_sub(visible));
-        for (index, device) in state
-            .devices
-            .devices
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(visible)
-        {
-            let row = Rect {
-                x: list_area.x,
-                y: list_area.y + (index - first) as u16,
-                width: list_area.width,
-                height: 1,
-            };
-            let marker = if device.is_active {
-                Span::styled("▶ ", theme::accent())
-            } else {
-                Span::styled("  ", theme::dim())
-            };
-            let current = if device.is_current {
-                " · this TUI"
-            } else {
-                ""
-            };
-            let switching = if state.devices.switching_to.as_deref() == Some(device.id.as_str()) {
-                " · switching"
-            } else {
-                ""
-            };
-            let line = Line::from(vec![
-                marker,
-                Span::raw(device.name.clone()),
-                Span::styled(
-                    format!(" · {}{current}{switching}", device.kind),
-                    theme::dim(),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), row);
-            if index == cursor {
-                frame.buffer_mut().set_style(row, theme::tab_active());
-            }
+    for (index, field) in fields.iter().enumerate() {
+        let focused = index == focus;
+        let field_block = Block::bordered().title(field.label).border_style(if focused {
+            theme::accent()
+        } else {
+            theme::dim()
+        });
+        let field_inner = field_block.inner(areas[index]);
+        frame.render_widget(field_block, areas[index]);
+        let width = usize::from(field_inner.width.saturating_sub(1));
+        let mut shown: String = field
+            .value
+            .chars()
+            .skip(field.value.chars().count().saturating_sub(width))
+            .collect();
+        if focused {
+            shown.push('█');
         }
+        frame.render_widget(Paragraph::new(shown), field_inner);
     }
 
-    let hint = if let Some(error) = &state.devices.poll_error {
-        Line::styled(format!("sync error: {error}"), theme::dim())
-    } else {
-        Line::styled("enter make active · esc close", theme::dim())
+    let footer = areas[areas.len() - 1];
+    let hint = match error {
+        Some(error) => Line::styled(error.to_string(), theme::accent()),
+        None => Line::styled("tab/↑↓ field · enter save · esc cancel", theme::dim()),
     };
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
+}
+
+fn draw_confirm_delete(frame: &mut Frame, label: &str) {
+    let width = 64.min(frame.area().width.saturating_sub(4)).max(30);
+    let area = centered(frame.area(), width, 7);
+    let block = Block::bordered()
+        .title(" Delete? ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(format!("Delete {label}?"))
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Center),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("enter/y delete · esc/n cancel", theme::dim()))
+            .alignment(Alignment::Center),
+        footer,
+    );
 }
 
 fn draw_log_detail(frame: &mut Frame, entry: &crate::config::logging::LogEntry) {
@@ -203,7 +257,6 @@ fn track_info_lines(track: &TrackItem) -> Vec<Line<'static>> {
                 track.duration_seconds
             ),
         ),
-        field("Uploader", empty_dash(&track.uploader_name)),
         field("Audio format", opt_string(track.audio_format.clone())),
         field(
             "Bitrate",
@@ -220,18 +273,9 @@ fn track_info_lines(track: &TrackItem) -> Vec<Line<'static>> {
             opt_map(track.audio_bit_depth, |v| format!("{v} bit")),
         ),
         field("File size", file_size(track.file_size_bytes)),
-        field("Last.fm listeners", opt_display(track.lastfm_listeners)),
-        field("Last.fm plays", opt_display(track.lastfm_playcount)),
-        field(
-            "Last.fm rating",
-            opt_map(track.lastfm_rating, |v| format!("{v:.3}")),
-        ),
-        field(
-            "Last.fm updated",
-            opt_string(track.lastfm_updated_at.clone()),
-        ),
-        field("Stream URL", empty_dash(&track.stream_url)),
-        field("Cover URL", opt_string(track.cover_url.clone())),
+        field("Plays", track.play_count.to_string()),
+        field("File path", empty_dash(&track.file_path)),
+        field("Cover path", opt_string(track.cover_path.clone())),
     ]
 }
 

@@ -1,25 +1,24 @@
 use std::sync::Arc;
 
-use crate::api::auth::AuthSession;
-use crate::api::models::{
-    ArtistDetail, ArtistsPage, DevicePollResponse, PlaylistCard, PlaylistDetail, ReleaseDetail,
-    SearchResults, TrackItem,
-};
 use crate::art::ArtImage;
+use crate::library::models::{
+    ArtistDetail, ArtistsPage, PlaylistCard, PlaylistDetail, ReleaseDetail, SearchResults,
+    TrackItem,
+};
 
-/// Events delivered to the main loop by background tasks (API fetches, the
-/// playback engine, device sync). Tasks never touch AppState directly.
+/// Events delivered to the main loop by background tasks (library queries,
+/// the playback engine, imports). Tasks never touch AppState directly.
 #[derive(Debug)]
 pub enum AppEvent {
     StatusMessage(String),
-    LoginSucceeded(Box<AuthSession>),
-    LoginFailed(String),
-    /// Loopback listener received the browser SSO callback.
-    SsoCallback(Result<String, String>),
-    /// Refresh token rejected — stored credentials were deleted.
-    SessionExpired,
-    /// A page of the Global artists list arrived (or failed).
+    /// A page of the artists list arrived (or failed).
     ArtistsLoaded(Result<ArtistsPage, String>),
+    /// A full reload after a library change: replaces the loaded artist
+    /// list wholesale, so the grid never flashes empty.
+    ArtistsReloaded {
+        page: ArtistsPage,
+        limit: i64,
+    },
     ArtistViewLoaded {
         id: i64,
         result: Result<ArtistDetail, String>,
@@ -33,7 +32,7 @@ pub enum AppEvent {
         seq: u64,
         result: Result<SearchResults, String>,
     },
-    /// Artwork fetched and decoded for the shared art cache.
+    /// Artwork loaded and decoded for the shared art cache.
     ArtLoaded {
         key: String,
         art: Option<Arc<ArtImage>>,
@@ -41,7 +40,7 @@ pub enum AppEvent {
     Player(crate::player::PlayerEvent),
     /// A command from the OS media keys.
     Media(crate::media::MediaCommand),
-    /// Gapless prefetch could not open the stream; the normal track-switch
+    /// Gapless prefetch could not open the file; the normal track-switch
     /// path takes over when the current track ends.
     PrefetchFailed {
         pos: usize,
@@ -57,11 +56,6 @@ pub enum AppEvent {
         track_id: i64,
         liked: bool,
     },
-    /// Connected-devices poll result; carries device list, active id,
-    /// remote playback state and commands for this TUI.
-    DevicesPolled(Result<DevicePollResponse, String>),
-    /// Response from switching the active device.
-    DeviceActivated(Result<DevicePollResponse, String>),
     /// A release fetched for queueing (a / shift-a on a release).
     EnqueueTracks {
         tracks: Vec<TrackItem>,
@@ -77,4 +71,33 @@ pub enum AppEvent {
         playlist_title: String,
         result: Result<(), String>,
     },
+    /// The library was mutated (import, edit, delete): cached views must be
+    /// dropped and reloaded lazily.
+    LibraryChanged {
+        message: Option<String>,
+    },
+    /// Progress of a running import, shown in the status bar.
+    ImportProgress {
+        done: usize,
+        total: usize,
+        current: String,
+    },
+    /// Fresh copies of the queued tracks after a library change. Tracks
+    /// missing from the result were deleted and leave the queue.
+    QueueTracksRefreshed {
+        tracks: Vec<TrackItem>,
+    },
+    /// A status snapshot for the Federation tab.
+    FederationStatus(crate::federation::FedStatus),
+    /// Tracks found on the federated network for the live search.
+    FedSearchLoaded {
+        seq: u64,
+        result: Result<Vec<crate::federation::FedTrack>, String>,
+    },
+    /// A federated track finished downloading and is ready to play.
+    FedPlayReady {
+        result: Result<crate::federation::FedPlayable, String>,
+    },
+    /// This peer's connection ticket, requested from the Federation tab.
+    FedTicket(Result<String, String>),
 }

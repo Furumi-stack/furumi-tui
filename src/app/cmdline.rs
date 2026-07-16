@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::api::client::ApiError;
 use crate::app::Runtime;
 use crate::app::command::{self, Command, Parsed};
 use crate::app::event::AppEvent;
@@ -59,7 +58,7 @@ fn apply_live(state: &mut AppState, runtime: &Runtime, command: Command) {
     match command {
         // One-shot commands have no live effect.
         Command::Quit
-        | Command::Logout
+        | Command::Import(_)
         | Command::Volume(_)
         | Command::Seek(_)
         | Command::SeekTo(_)
@@ -70,7 +69,6 @@ fn apply_live(state: &mut AppState, runtime: &Runtime, command: Command) {
         | Command::Prev
         | Command::PlayPause
         | Command::Help
-        | Command::Devices
         | Command::Logs(_) => {}
         Command::Search(query) => {
             state.active_tab = Tab::Global;
@@ -96,17 +94,17 @@ fn set_view_cursor_zero(state: &mut AppState) {
 /// Debounced, race-free search: every edit bumps the global sequence; the
 /// spawned task only queries if it is still the latest after the debounce,
 /// and the receiver drops responses that arrive out of date.
-fn schedule_search(state: &mut AppState, runtime: &Runtime) {
+pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     let seq = runtime.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let query = state.search.query.clone();
     if query.is_empty() {
         state.search.loading = false;
         state.search.results = None;
+        state.search.fed_tracks.clear();
+        state.search.fed_loading = false;
         return;
     }
-    let Some(api) = runtime.api.clone() else {
-        return;
-    };
+    let library = Arc::clone(&runtime.library);
     state.search.loading = true;
     let tx = runtime.event_tx.clone();
     let latest = Arc::clone(&runtime.search_seq);
@@ -115,19 +113,32 @@ fn schedule_search(state: &mut AppState, runtime: &Runtime) {
         if latest.load(Ordering::SeqCst) != seq {
             return;
         }
-        let event = match api.search(&query, SEARCH_LIMIT).await {
-            Ok(results) => AppEvent::SearchLoaded {
-                seq,
-                result: Ok(results),
-            },
-            Err(ApiError::SessionExpired) => AppEvent::SessionExpired,
-            Err(err) => AppEvent::SearchLoaded {
-                seq,
-                result: Err(err.to_string()),
-            },
-        };
-        let _ = tx.send(event);
+        let result = tokio::task::spawn_blocking(move || library.search(&query, SEARCH_LIMIT))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+        let _ = tx.send(AppEvent::SearchLoaded { seq, result });
     });
+
+    // The same query also runs against the federated network (when the
+    // node is up); its results render as a separate, marked section.
+    state.search.fed_tracks.clear();
+    state.search.fed_loading = false;
+    if runtime.federation.settings().enabled {
+        state.search.fed_loading = true;
+        let fed = Arc::clone(&runtime.federation);
+        let query = state.search.query.clone();
+        let tx = runtime.event_tx.clone();
+        let latest = Arc::clone(&runtime.search_seq);
+        tokio::spawn(async move {
+            tokio::time::sleep(SEARCH_DEBOUNCE).await;
+            if latest.load(Ordering::SeqCst) != seq {
+                return;
+            }
+            let result = fed.search(&query).await.map_err(|err| format!("{err:#}"));
+            let _ = tx.send(AppEvent::FedSearchLoaded { seq, result });
+        });
+    }
 }
 
 /// Enter: close the line. Live commands already took effect (their view
@@ -161,7 +172,7 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
     match command {
         Command::Search(_) => {}
         Command::Quit => state.should_quit = true,
-        Command::Logout => super::perform_logout(state, runtime),
+        Command::Import(path) => super::spawn_import(state, runtime, &path),
         Command::Volume(value) => {
             state.player.volume = value;
             super::perform_effect(state, runtime, Effect::SetVolume(value));
@@ -194,7 +205,6 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
         Command::Prev => run_action(state, runtime, Action::PrevTrack),
         Command::PlayPause => run_action(state, runtime, Action::PlayPause),
         Command::Help => state.help_visible = true,
-        Command::Devices => run_action(state, runtime, Action::OpenDevices),
         Command::Logs(level) => {
             if let Some(index) = level {
                 state.logs.level_index = index.min(LOG_LEVELS.len() - 1);

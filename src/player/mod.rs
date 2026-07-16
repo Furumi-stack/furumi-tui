@@ -10,10 +10,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, Player, stream::MixerDeviceSink};
-use stream_download::StreamDownload;
-use stream_download::storage::temp::TempStorageProvider;
 
-pub type TrackReader = StreamDownload<TempStorageProvider>;
+/// Local audio files are read straight from disk.
+pub type TrackReader = std::io::BufReader<std::fs::File>;
 
 /// Perceptual volume: cubic mapping from percent to linear amplitude, so
 /// equal percent steps sound like equal loudness steps and low percentages
@@ -258,11 +257,10 @@ fn handle(
             *track_loaded = false;
         }
         Command::Seek(position) => {
-            if let Some(out) = output {
-                if let Err(err) = out.player.try_seek(position) {
+            if let Some(out) = output
+                && let Err(err) = out.player.try_seek(position) {
                     tracing::warn!(%err, "seek failed");
                 }
-            }
         }
         Command::SetVolume(volume) => {
             if let Some(out) = output {

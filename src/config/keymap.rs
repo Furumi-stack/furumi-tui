@@ -20,7 +20,7 @@ pub enum KeyContext {
     Search,
     Playlists,
     Queue,
-    Devices,
+    Federation,
     Logs,
 }
 
@@ -32,7 +32,7 @@ impl KeyContext {
             KeyContext::Search => "search",
             KeyContext::Playlists => "playlists",
             KeyContext::Queue => "queue",
-            KeyContext::Devices => "devices",
+            KeyContext::Federation => "federation",
             KeyContext::Logs => "logs",
         }
     }
@@ -81,8 +81,8 @@ impl Keymap {
         let mut bindings =
             parse_bindings(DEFAULT_KEYMAP).expect("embedded default keymap must parse");
         let mut warning = None;
-        if let Some(path) = user_keymap_path() {
-            if path.exists() {
+        if let Some(path) = user_keymap_path()
+            && path.exists() {
                 match fs::read_to_string(&path)
                     .map_err(anyhow::Error::from)
                     .and_then(|text| parse_bindings(&text))
@@ -96,7 +96,6 @@ impl Keymap {
                     }
                 }
             }
-        }
         let keymap = Self {
             bindings,
             pending: Vec::new(),
@@ -219,11 +218,10 @@ enum Lookup {
 /// Letters (of any alphabet) keep SHIFT (that is how "shift-g" works);
 /// symbols drop it so a "?" binding matches everywhere.
 fn normalize(key: KeyCombination) -> KeyCombination {
-    if let crokey::OneToThree::One(KeyCode::Char(c)) = key.codes {
-        if !c.is_alphabetic() && key.modifiers.contains(KeyModifiers::SHIFT) {
+    if let crokey::OneToThree::One(KeyCode::Char(c)) = key.codes
+        && !c.is_alphabetic() && key.modifiers.contains(KeyModifiers::SHIFT) {
             return KeyCombination::new(KeyCode::Char(c), key.modifiers - KeyModifiers::SHIFT);
         }
-    }
     key
 }
 
@@ -303,8 +301,8 @@ fn parse_chord(chord: &str) -> Result<KeyCombination> {
     // crokey only parses single-byte characters; non-ASCII keys (Cyrillic
     // bindings) are built directly.
     let mut chars = chord.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if !c.is_ascii() {
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && !c.is_ascii() {
             let modifiers = if c.is_uppercase() {
                 KeyModifiers::SHIFT
             } else {
@@ -312,7 +310,6 @@ fn parse_chord(chord: &str) -> Result<KeyCombination> {
             };
             return Ok(KeyCombination::new(KeyCode::Char(c), modifiers));
         }
-    }
     KeyCombination::from_str(chord)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .map(normalize)

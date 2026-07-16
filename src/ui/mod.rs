@@ -1,6 +1,6 @@
 pub mod art;
+mod federation;
 mod global;
-mod login;
 mod logs;
 mod playlists;
 mod popup;
@@ -12,14 +12,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
-use crate::app::state::{AppState, Screen, Tab, TrackSelectionScope};
+use crate::app::state::{AppState, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
-    if state.screen == Screen::Login {
-        login::draw(frame, &state.login);
-        return;
-    }
     let [tabs_area, main_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -32,6 +28,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Global => global::draw(frame, main_area, state),
         Tab::Playlists => playlists::draw(frame, main_area, state),
         Tab::Queue => draw_queue(frame, main_area, state),
+        Tab::Federation => federation::draw(frame, main_area, state),
         Tab::Logs => logs::draw(frame, main_area, state),
     }
     draw_status(frame, status_area, state);
@@ -60,7 +57,7 @@ pub(crate) fn track_row(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
-    track: &crate::api::models::TrackItem,
+    track: &crate::library::models::TrackItem,
     index_label: String,
     selected: bool,
     visual_selected: bool,
@@ -92,7 +89,7 @@ pub(crate) fn track_row(
 }
 
 pub(crate) fn track_meta_suffix(
-    track: &crate::api::models::TrackItem,
+    track: &crate::library::models::TrackItem,
     include_tech: bool,
 ) -> String {
     let has_tech = track.audio_format.is_some()
@@ -201,8 +198,8 @@ fn format_secs(secs: f64) -> String {
 /// Wider consoles get a longer bar and full flags; narrow ones drop pieces.
 fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if let Some(track) = &player.current {
-        if player.playing {
+    if let Some(track) = &player.current
+        && player.playing {
             let bar_width: usize = match width {
                 0..=59 => 0,
                 60..=79 => 8,
@@ -227,7 +224,6 @@ fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<
                 ));
             }
         }
-    }
     if width >= 80 {
         let volume_cells = usize::from(player.volume / 10);
         spans.extend([
@@ -260,65 +256,21 @@ fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<
     Line::from(spans)
 }
 
-fn truncate_chars(value: &str, max: usize) -> String {
-    let mut out: String = value.chars().take(max).collect();
-    if value.chars().count() > max {
-        out.push('…');
-    }
-    out
-}
-
-fn device_status_line(state: &AppState) -> Line<'static> {
-    if state.devices.is_playback_device() {
-        return Line::from(vec![Span::styled("playing here", theme::accent())]);
-    }
-    let name = state
-        .devices
-        .active_device_name()
-        .map(|name| truncate_chars(name, 26))
-        .unwrap_or_else(|| "remote device".to_string());
-    Line::from(vec![
-        Span::styled("controlling ", theme::dim()),
-        Span::styled(name, theme::accent()),
-    ])
-}
-
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let [player_row, message_row] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     let player = &state.player;
-    // Layout: track title left, time/progress/flags centered, user right.
-    // The center block is built first and gets a fixed width; the title
+    // Layout: track title left, time/progress/flags on the right. The
+    // right block is built first and gets a fixed width; the title
     // truncates into whatever is left.
     let center = player_right_line(player, area.width);
     let center_width = (center.width() as u16).min(area.width);
-    let device_line = device_status_line(state);
-    let device_width = (device_line.width() as u16).min(32);
-    let user_line = state.user.as_ref().map(|user| {
-        Line::from(vec![
-            Span::styled("◉ ", theme::accent()),
-            Span::raw(user.name.clone()),
-        ])
-    });
-    let user_width = user_line.as_ref().map_or(0, |l| l.width() as u16);
-    let [title_area, right_area, device_area, user_area] = Layout::horizontal([
+    let [title_area, right_area] = Layout::horizontal([
         Constraint::Min(8),
         Constraint::Length(center_width),
-        Constraint::Length(device_width.saturating_add(2)),
-        Constraint::Length(user_width),
     ])
     .areas(player_row);
-    frame.render_widget(
-        Paragraph::new(device_line).alignment(Alignment::Right),
-        device_area,
-    );
-    if let Some(user_line) = user_line {
-        frame.render_widget(
-            Paragraph::new(user_line).alignment(Alignment::Right),
-            user_area,
-        );
-    }
 
     let mut spans = Vec::new();
     match &player.current {

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::api::models::{
-    ArtistCard, ArtistDetail, DeviceDto, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
-    SearchResults, TrackItem, User,
-};
 use crate::art::ArtImage;
 use crate::config::keymap::KeyContext;
+use crate::library::models::{
+    ArtistCard, ArtistDetail, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
+    SearchResults, TrackItem,
+};
 
 /// Remote data that a view renders: spinner, content, or error.
 #[derive(Debug)]
@@ -83,9 +83,12 @@ pub struct GlobalTab {
     pub selected: usize,
     pub view: ViewMode,
     pub stack: Vec<GlobalView>,
-    /// Page size, fixed at the first request — the server's offset is
+    /// Page size, fixed at the first request — the offset is
     /// `(page-1) * limit`, so it must not change between pages.
     pub page_limit: Option<i64>,
+    /// A full atomic reload is in flight (after a library change); incoming
+    /// pages of the old pagination are dropped until it lands.
+    pub reloading: bool,
 }
 
 impl Default for GlobalTab {
@@ -101,6 +104,7 @@ impl Default for GlobalTab {
             view: ViewMode::default(),
             stack: Vec::new(),
             page_limit: None,
+            reloading: false,
         }
     }
 }
@@ -161,8 +165,8 @@ pub fn release_rows(releases: &[ReleaseCard], columns: usize) -> Vec<Vec<usize>>
     rows
 }
 
-/// The virtual server-side Likes playlist id (`kind == "likes"`).
-pub const LIKES_PLAYLIST_ID: i64 = -1;
+/// The virtual Likes playlist id (`kind == "likes"`).
+pub use crate::library::LIKES_PLAYLIST_ID;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OpenedPlaylist {
@@ -282,42 +286,45 @@ impl Default for LogsTab {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct DevicesState {
-    pub device_id: String,
-    pub active_device_id: Option<String>,
-    pub devices: Vec<DeviceDto>,
-    pub poll_error: Option<String>,
-    pub switching_to: Option<String>,
+/// What an open edit form writes to when saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTarget {
+    Track(i64),
+    Release(i64),
+    Artist(i64),
+    Playlist(i64),
 }
 
-impl DevicesState {
-    pub fn is_playback_device(&self) -> bool {
-        self.active_device_id
-            .as_deref()
-            .is_none_or(|active| active == self.device_id)
-    }
+/// What a confirmed delete removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Track(i64),
+    Release(i64),
+    Artist(i64),
+    Playlist(i64),
+}
 
-    pub fn remote_target_id(&self) -> Option<&str> {
-        self.active_device_id
-            .as_deref()
-            .filter(|active| *active != self.device_id)
-    }
+/// One text field of an edit form.
+#[derive(Debug, Clone)]
+pub struct EditField {
+    pub label: &'static str,
+    pub value: String,
+}
 
-    pub fn active_device_name(&self) -> Option<&str> {
-        let active = self.active_device_id.as_deref()?;
-        self.devices
-            .iter()
-            .find(|device| device.id == active)
-            .map(|device| device.name.as_str())
+impl EditField {
+    pub fn new(label: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            label,
+            value: value.into(),
+        }
     }
 }
 
 /// Modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Popup {
-    /// Pick one of the user's playlists (row 0 = "create new"); the track
-    /// is added on Enter.
+    /// Pick one of the playlists (row 0 = "create new"); the track is added
+    /// on Enter.
     AddToPlaylist { track: TrackItem, cursor: usize },
     /// Name input for a new playlist; when `for_track` is set, the track is
     /// added to it right after creation.
@@ -326,8 +333,16 @@ pub enum Popup {
         input: String,
         busy: bool,
     },
-    /// Connected devices list; Enter transfers active playback to the row.
-    Devices { cursor: usize },
+    /// Metadata edit form for a track, release, artist or playlist.
+    Edit {
+        target: EditTarget,
+        title: String,
+        fields: Vec<EditField>,
+        focus: usize,
+        error: Option<String>,
+    },
+    /// Delete confirmation; Enter/y deletes, Esc/n cancels.
+    ConfirmDelete { target: DeleteTarget, label: String },
     /// Track metadata viewer; left/right switch between selected tracks.
     TrackInfo {
         tracks: Vec<TrackItem>,
@@ -336,15 +351,67 @@ pub enum Popup {
     },
     /// Full, wrapped view of one log entry (Enter on the Logs tab).
     LogDetail(crate::config::logging::LogEntry),
+    /// One-line text entry on the Federation tab (network id, peer ticket).
+    FedInput {
+        field: FedInputField,
+        input: String,
+    },
+    /// Wrapped read-only text (this peer's connection ticket).
+    FedText { title: String, text: String },
 }
 
-/// User's own playlists eligible as add-targets (the virtual Likes playlist
-/// is managed through likes, not direct adds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FedInputField {
+    NetworkId,
+    ConnectTicket,
+}
+
+impl FedInputField {
+    pub fn title(self) -> &'static str {
+        match self {
+            FedInputField::NetworkId => "Network ID",
+            FedInputField::ConnectTicket => "Connect to peer (paste ticket)",
+        }
+    }
+}
+
+/// Rows of the Federation tab, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FedRow {
+    Toggle,
+    NetworkId,
+    SaveOnListen,
+    SyncNow,
+    ShowTicket,
+    Connect,
+}
+
+impl FedRow {
+    pub const ALL: [FedRow; 6] = [
+        FedRow::Toggle,
+        FedRow::NetworkId,
+        FedRow::SaveOnListen,
+        FedRow::SyncNow,
+        FedRow::ShowTicket,
+        FedRow::Connect,
+    ];
+}
+
+/// The Federation tab: settings mirror + the latest status snapshot.
+#[derive(Debug, Default)]
+pub struct FederationTab {
+    pub cursor: usize,
+    pub settings: crate::federation::FedSettings,
+    pub status: Option<crate::federation::FedStatus>,
+}
+
+/// Playlists eligible as add-targets (the virtual Likes playlist is managed
+/// through likes, not direct adds).
 pub fn addable_playlists(state: &AppState) -> Vec<(i64, String)> {
     match &state.playlists.list {
         Some(Loadable::Ready(list)) => list
             .iter()
-            .filter(|p| p.is_own && p.kind != "likes")
+            .filter(|p| p.kind != "likes")
             .map(|p| (p.id, p.title.clone()))
             .collect(),
         _ => Vec::new(),
@@ -367,85 +434,10 @@ pub struct SearchState {
     pub query: String,
     pub loading: bool,
     pub results: Option<SearchResults>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Screen {
-    #[default]
-    Main,
-    Login,
-}
-
-/// SSO is the primary sign-in path, so it sits right under the server URL;
-/// the password fields below are the rare fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LoginField {
-    #[default]
-    ServerUrl,
-    SsoButton,
-    Username,
-    Password,
-    SignInButton,
-}
-
-impl LoginField {
-    const ORDER: [LoginField; 5] = [
-        LoginField::ServerUrl,
-        LoginField::SsoButton,
-        LoginField::Username,
-        LoginField::Password,
-        LoginField::SignInButton,
-    ];
-
-    pub fn next(self) -> LoginField {
-        let i = Self::ORDER.iter().position(|f| *f == self).unwrap();
-        Self::ORDER[(i + 1) % Self::ORDER.len()]
-    }
-
-    pub fn prev(self) -> LoginField {
-        let i = Self::ORDER.iter().position(|f| *f == self).unwrap();
-        Self::ORDER[(i + Self::ORDER.len() - 1) % Self::ORDER.len()]
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LoginMode {
-    /// Server / username / password fields plus the SSO button.
-    #[default]
-    Form,
-    /// Browser SSO started; waiting for the pasted callback link or code.
-    SsoPending,
-}
-
-#[derive(Debug)]
-pub struct LoginForm {
-    pub server_url: String,
-    pub username: String,
-    pub password: String,
-    pub sso_paste: String,
-    pub sso_url: String,
-    pub sso_port: Option<u16>,
-    pub focus: LoginField,
-    pub mode: LoginMode,
-    pub busy: bool,
-    pub error: Option<String>,
-}
-
-impl Default for LoginForm {
-    fn default() -> Self {
-        Self {
-            server_url: "https://music.hexor.cy".to_string(),
-            username: String::new(),
-            password: String::new(),
-            sso_paste: String::new(),
-            sso_url: String::new(),
-            sso_port: None,
-            focus: LoginField::default(),
-            mode: LoginMode::default(),
-            busy: false,
-            error: None,
-        }
-    }
+    /// Tracks found on the federated network (empty while federation is
+    /// off); rendered as a separate, marked section.
+    pub fed_tracks: Vec<crate::federation::FedTrack>,
+    pub fed_loading: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -454,17 +446,25 @@ pub enum Tab {
     Global,
     Playlists,
     Queue,
+    Federation,
     Logs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Global, Tab::Playlists, Tab::Queue, Tab::Logs];
+    pub const ALL: [Tab; 5] = [
+        Tab::Global,
+        Tab::Playlists,
+        Tab::Queue,
+        Tab::Federation,
+        Tab::Logs,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Global => "Global",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
+            Tab::Federation => "Federation",
             Tab::Logs => "Logs",
         }
     }
@@ -490,6 +490,7 @@ impl Tab {
             Tab::Global => KeyContext::Library,
             Tab::Playlists => KeyContext::Playlists,
             Tab::Queue => KeyContext::Queue,
+            Tab::Federation => KeyContext::Federation,
             Tab::Logs => KeyContext::Logs,
         }
     }
@@ -567,7 +568,6 @@ impl Default for PlayerBar {
 /// event handlers in the main loop; views render from `&AppState`.
 #[derive(Debug, Default)]
 pub struct AppState {
-    pub screen: Screen,
     pub active_tab: Tab,
     pub should_quit: bool,
     /// Double-press quit confirmation: set by the first Quit press, expires
@@ -577,8 +577,6 @@ pub struct AppState {
     pub pending_keys: Option<String>,
     pub status_message: Option<String>,
     pub player: PlayerBar,
-    pub login: LoginForm,
-    pub user: Option<User>,
     pub global: GlobalTab,
     pub artist_views: HashMap<i64, Loadable<ArtistDetail>>,
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,
@@ -588,8 +586,8 @@ pub struct AppState {
     pub likes: std::collections::HashSet<i64>,
     pub likes_loaded: bool,
     pub logs: LogsTab,
-    pub devices: DevicesState,
     pub queue_tab: QueueTab,
+    pub federation: FederationTab,
     pub track_selection: TrackSelection,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.

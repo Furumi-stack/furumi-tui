@@ -78,26 +78,8 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             Span::raw("  ")
         };
-        let mut flags = Vec::new();
-        if !playlist.is_own {
-            if let Some(owner) = &playlist.owner_name {
-                flags.push(format!("by {owner}"));
-            }
-        }
-        if playlist.is_public {
-            flags.push("public".to_string());
-        }
-        let suffix = if flags.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", flags.join(" · "))
-        };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                marker,
-                Span::raw(playlist.title.clone()),
-                Span::styled(suffix, theme::dim()),
-            ])),
+            Paragraph::new(Line::from(vec![marker, Span::raw(playlist.title.clone())])),
             row,
         );
         frame.render_widget(

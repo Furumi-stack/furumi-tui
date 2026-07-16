@@ -1,13 +1,18 @@
-//! Modal dialog input: the add-to-playlist picker and new-playlist name
-//! entry. The popup is taken out of the state, handled as an owned value
-//! and put back unless the action closed it.
+//! Modal dialog input: the add-to-playlist picker, new-playlist name entry,
+//! metadata edit forms and delete confirmations. The popup is taken out of
+//! the state, handled as an owned value and put back unless the action
+//! closed it.
+
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::api::models::TrackItem;
 use crate::app::Runtime;
 use crate::app::event::AppEvent;
-use crate::app::state::{AppState, Popup, addable_playlists};
+use crate::app::state::{
+    AppState, DeleteTarget, EditField, EditTarget, FedInputField, Popup, addable_playlists,
+};
+use crate::library::models::{ReleaseEdit, TrackEdit, TrackItem};
 
 pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
     let Some(popup) = state.popup.take() else {
@@ -22,7 +27,16 @@ pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
             input,
             busy,
         } => handle_name_entry(state, runtime, for_track, input, busy, key),
-        Popup::Devices { cursor } => handle_devices(state, runtime, cursor, key),
+        Popup::Edit {
+            target,
+            title,
+            fields,
+            focus,
+            error,
+        } => handle_edit(state, runtime, target, title, fields, focus, error, key),
+        Popup::ConfirmDelete { target, label } => {
+            handle_confirm_delete(state, runtime, target, label, key);
+        }
         Popup::TrackInfo {
             tracks,
             cursor,
@@ -32,53 +46,268 @@ pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::LogDetail(entry)),
         },
+        Popup::FedInput { field, input } => handle_fed_input(state, runtime, field, input, key),
+        Popup::FedText { title, text } => match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
+            _ => state.popup = Some(Popup::FedText { title, text }),
+        },
     }
 }
 
-/// Pasted text goes into the name field when it is open.
-pub fn handle_paste(state: &mut AppState, pasted: &str) {
-    if let Some(Popup::NewPlaylist { input, busy, .. }) = &mut state.popup {
-        if !*busy {
-            input.extend(pasted.chars().filter(|c| !c.is_control()));
-        }
-    }
-}
-
-fn handle_devices(state: &mut AppState, runtime: &Runtime, cursor: usize, key: KeyEvent) {
-    let len = state.devices.devices.len();
+/// One-line text entry on the Federation tab (network id / peer ticket).
+fn handle_fed_input(
+    state: &mut AppState,
+    runtime: &Runtime,
+    field: FedInputField,
+    mut input: String,
+    key: KeyEvent,
+) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {}
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.popup = Some(Popup::Devices {
-                cursor: cursor.saturating_sub(1),
-            });
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.popup = Some(Popup::Devices {
-                cursor: if len == 0 {
-                    0
-                } else {
-                    (cursor + 1).min(len - 1)
-                },
-            });
-        }
+        KeyCode::Esc => {}
         KeyCode::Enter => {
-            if let Some(device) = state.devices.devices.get(cursor.min(len.saturating_sub(1))) {
-                let target = device.id.clone();
-                state.devices.switching_to = Some(target.clone());
-                state.popup = Some(Popup::Devices { cursor });
-                spawn_select_device(runtime, target);
-            } else {
-                state.popup = Some(Popup::Devices { cursor: 0 });
+            let value = input.trim().to_string();
+            match field {
+                FedInputField::NetworkId => {
+                    state.federation.settings.network_id = value;
+                    // An empty id turns federation off rather than leaving a
+                    // node bound to an unnamed network; a freshly set id
+                    // enables it right away.
+                    state.federation.settings.enabled =
+                        !state.federation.settings.network_id.is_empty();
+                    super::fed_apply_settings(state, runtime);
+                }
+                FedInputField::ConnectTicket => {
+                    if value.is_empty() {
+                        state.status_message = Some("ticket is empty".into());
+                    } else {
+                        super::fed_connect(runtime, value);
+                    }
+                }
             }
         }
-        _ => {
-            state.popup = Some(Popup::Devices {
-                cursor: cursor.min(len.saturating_sub(1)),
-            })
+        KeyCode::Backspace => {
+            input.pop();
+            state.popup = Some(Popup::FedInput { field, input });
         }
+        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            input.push(c);
+            state.popup = Some(Popup::FedInput { field, input });
+        }
+        _ => state.popup = Some(Popup::FedInput { field, input }),
     }
 }
+
+/// Pasted text goes into the focused text field when one is open.
+pub fn handle_paste(state: &mut AppState, pasted: &str) {
+    let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
+    match &mut state.popup {
+        Some(Popup::NewPlaylist { input, busy, .. }) if !*busy => input.push_str(&cleaned),
+        Some(Popup::FedInput { input, .. }) => input.push_str(&cleaned),
+        Some(Popup::Edit { fields, focus, .. }) => {
+            if let Some(field) = fields.get_mut(*focus) {
+                field.value.push_str(&cleaned);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edit form
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments, reason = "owned popup state passed back in")]
+fn handle_edit(
+    state: &mut AppState,
+    runtime: &Runtime,
+    target: EditTarget,
+    title: String,
+    mut fields: Vec<EditField>,
+    mut focus: usize,
+    error: Option<String>,
+    key: KeyEvent,
+) {
+    match key.code {
+        KeyCode::Esc => return,
+        KeyCode::Enter => {
+            match save_edit(runtime, target, &fields) {
+                Ok(message) => {
+                    state.status_message = Some(message);
+                    return;
+                }
+                Err(message) => {
+                    state.popup = Some(Popup::Edit {
+                        target,
+                        title,
+                        fields,
+                        focus,
+                        error: Some(message),
+                    });
+                    return;
+                }
+            };
+        }
+        KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % fields.len().max(1),
+        KeyCode::BackTab | KeyCode::Up => {
+            let len = fields.len().max(1);
+            focus = (focus + len - 1) % len;
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = fields.get_mut(focus) {
+                field.value.pop();
+            }
+        }
+        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            if let Some(field) = fields.get_mut(focus) {
+                field.value.push(c);
+            }
+        }
+        _ => {}
+    }
+    state.popup = Some(Popup::Edit {
+        target,
+        title,
+        fields,
+        focus,
+        error,
+    });
+}
+
+/// Validate the form and write it to the library. Returns the status
+/// message on success, the error text to show in the form otherwise.
+fn save_edit(
+    runtime: &Runtime,
+    target: EditTarget,
+    fields: &[EditField],
+) -> Result<String, String> {
+    let value = |label: &str| {
+        fields
+            .iter()
+            .find(|field| field.label == label)
+            .map(|field| field.value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let number = |label: &str| -> Result<Option<i32>, String> {
+        let raw = value(label);
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        raw.parse::<i32>()
+            .map(Some)
+            .map_err(|_| format!("{label} must be a number"))
+    };
+    let names = |label: &str| -> Vec<String> {
+        value(label)
+            .split(';')
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
+    };
+
+    let library = Arc::clone(&runtime.library);
+    let result = match target {
+        EditTarget::Track(id) => {
+            let title = value("Title");
+            if title.is_empty() {
+                return Err("title is empty".to_string());
+            }
+            let artists = names("Artists");
+            if artists.is_empty() {
+                return Err("at least one artist is required".to_string());
+            }
+            let edit = TrackEdit {
+                title,
+                artists,
+                featured_artists: names("Featured"),
+                track_number: number("Track #")?,
+                disc_number: number("Disc #")?,
+            };
+            library.update_track(id, &edit)
+        }
+        EditTarget::Release(id) => {
+            let title = value("Title");
+            if title.is_empty() {
+                return Err("title is empty".to_string());
+            }
+            let release_type = value("Type").to_lowercase();
+            let release_type = if release_type.is_empty() {
+                "album".to_string()
+            } else {
+                release_type
+            };
+            let edit = ReleaseEdit {
+                title,
+                release_type,
+                year: number("Year")?,
+                artists: Vec::new(),
+            };
+            library.update_release(id, &edit)
+        }
+        EditTarget::Artist(id) => {
+            let name = value("Name");
+            if name.is_empty() {
+                return Err("name is empty".to_string());
+            }
+            let image = value("Image path");
+            let image = (!image.is_empty()).then_some(image);
+            library.update_artist(id, &name, image.as_deref())
+        }
+        EditTarget::Playlist(id) => {
+            let title = value("Title");
+            if title.is_empty() {
+                return Err("title is empty".to_string());
+            }
+            library.update_playlist(id, &title, None)
+        }
+    };
+    match result {
+        Ok(()) => {
+            let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
+                message: Some("saved".to_string()),
+            });
+            Ok("saved".to_string())
+        }
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delete confirmation
+// ---------------------------------------------------------------------------
+
+fn handle_confirm_delete(
+    state: &mut AppState,
+    runtime: &Runtime,
+    target: DeleteTarget,
+    label: String,
+    key: KeyEvent,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+        KeyCode::Enter | KeyCode::Char('y') => {
+            let library = Arc::clone(&runtime.library);
+            let result = match target {
+                DeleteTarget::Track(id) => library.delete_track(id),
+                DeleteTarget::Release(id) => library.delete_release(id),
+                DeleteTarget::Artist(id) => library.delete_artist(id),
+                DeleteTarget::Playlist(id) => library.delete_playlist(id),
+            };
+            match result {
+                Ok(()) => {
+                    let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
+                        message: Some(format!("deleted {label}")),
+                    });
+                }
+                Err(err) => state.status_message = Some(format!("delete failed: {err:#}")),
+            }
+        }
+        _ => state.popup = Some(Popup::ConfirmDelete { target, label }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Track info
+// ---------------------------------------------------------------------------
 
 fn handle_track_info(
     state: &mut AppState,
@@ -131,6 +360,10 @@ fn handle_track_info(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Add-to-playlist picker & new playlist
+// ---------------------------------------------------------------------------
 
 fn handle_picker(
     state: &mut AppState,
@@ -236,35 +469,13 @@ fn handle_name_entry(
     }
 }
 
-fn spawn_select_device(runtime: &Runtime, target_device_id: String) {
-    let Some(api) = runtime.api.clone() else {
-        return;
-    };
-    let current_device_id = runtime.device_id.clone();
-    let tx = runtime.event_tx.clone();
-    tokio::spawn(async move {
-        let event = match api
-            .select_device(&target_device_id, &current_device_id)
-            .await
-        {
-            Ok(response) => AppEvent::DeviceActivated(Ok(response)),
-            Err(crate::api::client::ApiError::SessionExpired) => AppEvent::SessionExpired,
-            Err(err) => AppEvent::DeviceActivated(Err(err.to_string())),
-        };
-        let _ = tx.send(event);
-    });
-}
-
 fn spawn_add_track(runtime: &Runtime, playlist_id: i64, playlist_title: String, track: TrackItem) {
-    let Some(api) = runtime.api.clone() else {
-        return;
-    };
+    let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
-    tokio::spawn(async move {
-        let result = api
+    tokio::task::spawn_blocking(move || {
+        let result = library
             .add_tracks_to_playlist(playlist_id, &[track.id])
-            .await
-            .map_err(|e| e.to_string());
+            .map_err(|err| format!("{err:#}"));
         let _ = tx.send(AppEvent::PlaylistTracksAdded {
             playlist_id,
             playlist_title,
@@ -274,12 +485,12 @@ fn spawn_add_track(runtime: &Runtime, playlist_id: i64, playlist_title: String, 
 }
 
 fn spawn_create_playlist(runtime: &Runtime, title: String, add_track: Option<TrackItem>) {
-    let Some(api) = runtime.api.clone() else {
-        return;
-    };
+    let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
-    tokio::spawn(async move {
-        let result = api.create_playlist(&title).await.map_err(|e| e.to_string());
+    tokio::task::spawn_blocking(move || {
+        let result = library
+            .create_playlist(&title)
+            .map_err(|err| format!("{err:#}"));
         let _ = tx.send(AppEvent::PlaylistCreated { result, add_track });
     });
 }

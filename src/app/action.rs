@@ -39,10 +39,10 @@ pub enum Action {
     NewPlaylist,
     ToggleHelp,
     ToggleViewMode,
-    OpenDevices,
     OpenCommandLine,
     OpenSearch,
-    Logout,
+    EditSelected,
+    DeleteSelected,
 }
 
 /// Help-window sections, in display order.
@@ -50,15 +50,17 @@ pub enum Action {
 pub enum Category {
     Playback,
     Queue,
+    Library,
     Navigation,
     Search,
     System,
 }
 
 impl Category {
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::Playback,
         Category::Queue,
+        Category::Library,
         Category::Navigation,
         Category::Search,
         Category::System,
@@ -68,6 +70,7 @@ impl Category {
         match self {
             Category::Playback => "Playback",
             Category::Queue => "Queue & playlists",
+            Category::Library => "Library",
             Category::Navigation => "Navigation",
             Category::Search => "Search & commands",
             Category::System => "System",
@@ -111,9 +114,9 @@ impl Action {
             | Action::GoToTab(_)
             | Action::GoToRelease
             | Action::ToggleViewMode => Category::Navigation,
+            Action::EditSelected | Action::DeleteSelected => Category::Library,
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
-            Action::OpenDevices => Category::System,
-            Action::ToggleHelp | Action::Logout | Action::Quit => Category::System,
+            Action::ToggleHelp | Action::Quit => Category::System,
         }
     }
 
@@ -121,7 +124,7 @@ impl Action {
     pub fn command_hint(&self) -> Option<&'static str> {
         match self {
             Action::Quit => Some(":q"),
-            Action::Logout => Some(":logout"),
+            Action::EditSelected => Some(":import <path> adds files"),
             Action::PlayPause => Some(":play"),
             Action::NextTrack => Some(":next"),
             Action::PrevTrack => Some(":prev"),
@@ -130,7 +133,6 @@ impl Action {
             Action::ToggleShuffle => Some(":shuffle"),
             Action::CycleRepeat => Some(":repeat [off|one|all]"),
             Action::ClearQueue => Some(":clear"),
-            Action::OpenDevices => Some(":devices"),
             Action::ToggleHelp => Some(":help"),
             Action::OpenSearch => Some("/text"),
             _ => None,
@@ -174,10 +176,10 @@ impl Action {
             Action::NewPlaylist => "Create a playlist".into(),
             Action::ToggleHelp => "Show / hide keybindings".into(),
             Action::ToggleViewMode => "Toggle tiles / table view".into(),
-            Action::OpenDevices => "Connected devices".into(),
             Action::OpenCommandLine => "Command line (:help for commands)".into(),
             Action::OpenSearch => "Search artists, releases, tracks".into(),
-            Action::Logout => "Sign out".into(),
+            Action::EditSelected => "Edit the selected item".into(),
+            Action::DeleteSelected => "Delete the selected item".into(),
         }
     }
 }

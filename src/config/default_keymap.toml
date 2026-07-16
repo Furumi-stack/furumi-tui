@@ -9,7 +9,7 @@
 # command: an Action name, optionally with parameters:
 #   command = { SeekForward = { seconds = 30 } }
 # context: optional view filter — global (default), library, search,
-#   playlists, queue, devices.
+#   playlists, queue, logs.
 
 [[keymaps]]
 key_sequence = "q"
@@ -46,6 +46,10 @@ command = { GoToTab = 2 }
 [[keymaps]]
 key_sequence = "4"
 command = { GoToTab = 3 }
+
+[[keymaps]]
+key_sequence = "5"
+command = { GoToTab = 4 }
 
 [[keymaps]]
 key_sequence = "a"
@@ -204,12 +208,12 @@ key_sequence = "i"
 command = "OpenTrackInfo"
 
 [[keymaps]]
-key_sequence = "shift-l"
-command = "Logout"
+key_sequence = "e"
+command = "EditSelected"
 
 [[keymaps]]
 key_sequence = "shift-d"
-command = "OpenDevices"
+command = "DeleteSelected"
 
 [[keymaps]]
 key_sequence = "v"

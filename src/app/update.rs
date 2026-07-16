@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::action::Action;
-use crate::api::models::TrackItem;
+use crate::library::models::TrackItem;
 
 use super::state::{
     AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, TILE_HEIGHT, TILE_WIDTH, Tab,
@@ -31,11 +31,24 @@ pub enum Effect {
     ToggleLikes {
         track_ids: Vec<i64>,
     },
+    /// Remove tracks from a stored playlist in the library.
+    RemoveFromPlaylist {
+        playlist_id: i64,
+        track_ids: Vec<i64>,
+    },
     RemoveQueueIndices {
         indices: Vec<usize>,
         restart_paused: Option<bool>,
         stop: bool,
     },
+    /// Persist the Federation-tab settings and start/stop the node.
+    FedApplySettings,
+    /// Force an immediate library publish into the DHT.
+    FedSyncNow,
+    /// Fetch this peer's ticket and show it in a popup.
+    FedShowTicket,
+    /// Download (or resolve) a federated track and play it.
+    FedPlay(crate::federation::FedTrack),
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -195,18 +208,6 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
             None
         }
-        Action::OpenDevices => {
-            let cursor = state
-                .devices
-                .devices
-                .iter()
-                .position(|device| {
-                    device.id == state.devices.active_device_id.clone().unwrap_or_default()
-                })
-                .unwrap_or(0);
-            state.popup = Some(super::state::Popup::Devices { cursor });
-            None
-        }
         Action::Select => select_current(state),
         Action::Back if state.track_selection.is_active() => {
             state.track_selection.clear();
@@ -310,9 +311,243 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 None
             }
         }
-        // Needs the Runtime, so it is intercepted in app::handle_main_key
-        // before reaching update().
-        Action::Logout => None,
+        Action::EditSelected => {
+            open_edit_popup(state);
+            None
+        }
+        Action::DeleteSelected => delete_selected(state),
+    }
+}
+
+/// `e`: open the metadata edit form for whatever is under the cursor —
+/// an artist tile, a release, a track or a playlist.
+fn open_edit_popup(state: &mut AppState) {
+    use super::state::{EditField, EditTarget, Popup};
+
+    if state.active_tab == Tab::Playlists && state.playlists.opened.is_none() {
+        let card = match &state.playlists.list {
+            Some(Loadable::Ready(list)) => list.get(state.playlists.selected).cloned(),
+            _ => None,
+        };
+        let Some(card) = card else {
+            return;
+        };
+        if card.kind == "likes" {
+            state.status_message = Some("the Likes playlist cannot be edited".into());
+            return;
+        }
+        state.popup = Some(Popup::Edit {
+            target: EditTarget::Playlist(card.id),
+            title: format!("Edit playlist — {}", card.title),
+            fields: vec![EditField::new("Title", card.title.clone())],
+            focus: 0,
+            error: None,
+        });
+        return;
+    }
+    if state.active_tab == Tab::Global && state.global.stack.is_empty() {
+        let Some(artist) = state.global.artists.get(state.global.selected).cloned() else {
+            return;
+        };
+        state.popup = Some(artist_edit_popup(artist.id, &artist.name, artist.image_path));
+        return;
+    }
+    if let Some(artist) = selected_search_artist(state) {
+        state.popup = Some(artist_edit_popup(artist.id, &artist.name, artist.image_path));
+        return;
+    }
+    if let Some(release) = selected_release_card(state) {
+        state.popup = Some(Popup::Edit {
+            target: EditTarget::Release(release.id),
+            title: format!("Edit release — {}", release.title),
+            fields: vec![
+                EditField::new("Title", release.title.clone()),
+                EditField::new("Type", release.release_type.clone()),
+                EditField::new(
+                    "Year",
+                    release.year.map(|y| y.to_string()).unwrap_or_default(),
+                ),
+            ],
+            focus: 0,
+            error: None,
+        });
+        return;
+    }
+    if let Some(track) = selected_track(state).or_else(|| state.player.current.clone()) {
+        state.popup = Some(track_edit_popup(&track));
+        return;
+    }
+    state.status_message = Some("nothing to edit here".into());
+}
+
+fn artist_edit_popup(
+    id: i64,
+    name: &str,
+    image_path: Option<String>,
+) -> super::state::Popup {
+    use super::state::{EditField, EditTarget, Popup};
+    Popup::Edit {
+        target: EditTarget::Artist(id),
+        title: format!("Edit artist — {name}"),
+        fields: vec![
+            EditField::new("Name", name),
+            EditField::new("Image path", image_path.unwrap_or_default()),
+        ],
+        focus: 0,
+        error: None,
+    }
+}
+
+fn track_edit_popup(track: &TrackItem) -> super::state::Popup {
+    use super::state::{EditField, EditTarget, Popup};
+    let join = |artists: &[crate::library::models::ArtistRef]| {
+        artists
+            .iter()
+            .map(|a| a.name.clone())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    Popup::Edit {
+        target: EditTarget::Track(track.id),
+        title: format!("Edit track — {}", track.title),
+        fields: vec![
+            EditField::new("Title", track.title.clone()),
+            EditField::new("Artists", join(&track.artists)),
+            EditField::new("Featured", join(&track.featured_artists)),
+            EditField::new(
+                "Track #",
+                track.track_number.map(|n| n.to_string()).unwrap_or_default(),
+            ),
+            EditField::new(
+                "Disc #",
+                track.disc_number.map(|n| n.to_string()).unwrap_or_default(),
+            ),
+        ],
+        focus: 0,
+        error: None,
+    }
+}
+
+/// shift-d: delete whatever is under the cursor. Library entities ask for
+/// confirmation; playlist/queue rows are removed directly.
+fn delete_selected(state: &mut AppState) -> Option<Effect> {
+    use super::state::{DeleteTarget, Popup};
+
+    if state.active_tab == Tab::Queue {
+        return remove_selected_from_queue(state);
+    }
+    if state.active_tab == Tab::Playlists {
+        match state.playlists.opened {
+            None => {
+                let card = match &state.playlists.list {
+                    Some(Loadable::Ready(list)) => list.get(state.playlists.selected).cloned(),
+                    _ => None,
+                };
+                let card = card?;
+                if card.kind == "likes" {
+                    state.status_message = Some("the Likes playlist cannot be deleted".into());
+                    return None;
+                }
+                state.popup = Some(Popup::ConfirmDelete {
+                    target: DeleteTarget::Playlist(card.id),
+                    label: format!("playlist \"{}\"", card.title),
+                });
+                return None;
+            }
+            Some(opened) => {
+                let tracks = selected_tracks(state);
+                if tracks.is_empty() {
+                    state.status_message = Some("no track selected".into());
+                    return None;
+                }
+                let track_ids: Vec<i64> = tracks.iter().map(|track| track.id).collect();
+                state.track_selection.clear();
+                if opened.id == super::state::LIKES_PLAYLIST_ID {
+                    let liked: Vec<i64> = track_ids
+                        .into_iter()
+                        .filter(|id| state.likes.contains(id))
+                        .collect();
+                    state.status_message = Some(format!("removing {} like(s)", liked.len()));
+                    return Some(Effect::ToggleLikes { track_ids: liked });
+                }
+                state.status_message =
+                    Some(format!("removing {} track(s) from playlist", track_ids.len()));
+                return Some(Effect::RemoveFromPlaylist {
+                    playlist_id: opened.id,
+                    track_ids,
+                });
+            }
+        }
+    }
+    if state.active_tab != Tab::Global {
+        return None;
+    }
+    if state.global.stack.is_empty() {
+        let artist = state.global.artists.get(state.global.selected).cloned()?;
+        state.popup = Some(Popup::ConfirmDelete {
+            target: DeleteTarget::Artist(artist.id),
+            label: format!("artist \"{}\" with all their releases and tracks", artist.name),
+        });
+        return None;
+    }
+    if let Some(artist) = selected_search_artist(state) {
+        state.popup = Some(Popup::ConfirmDelete {
+            target: DeleteTarget::Artist(artist.id),
+            label: format!("artist \"{}\" with all their releases and tracks", artist.name),
+        });
+        return None;
+    }
+    if let Some(release) = selected_release_card(state) {
+        state.popup = Some(Popup::ConfirmDelete {
+            target: DeleteTarget::Release(release.id),
+            label: format!("release \"{}\" with all its tracks", release.title),
+        });
+        return None;
+    }
+    if let Some(track) = selected_track(state) {
+        state.popup = Some(Popup::ConfirmDelete {
+            target: DeleteTarget::Track(track.id),
+            label: format!("track \"{}\" (the audio file stays on disk)", track.title),
+        });
+    } else {
+        state.status_message = Some("nothing to delete here".into());
+    }
+    None
+}
+
+/// The artist under the cursor in the search view, if any.
+fn selected_search_artist(state: &AppState) -> Option<crate::library::models::ArtistCard> {
+    if state.active_tab != Tab::Global {
+        return None;
+    }
+    let Some(GlobalView::Search { cursor }) = state.global.stack.last() else {
+        return None;
+    };
+    state.search.results.as_ref()?.artists.get(*cursor).cloned()
+}
+
+/// The release card under the cursor (artist view tiles/rows or search).
+fn selected_release_card(state: &AppState) -> Option<crate::library::models::ReleaseCard> {
+    if state.active_tab != Tab::Global {
+        return None;
+    }
+    match state.global.stack.last()? {
+        GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
+            Loadable::Ready(detail) => {
+                let position = cursor.checked_sub(detail.top_tracks.len())?;
+                let order = release_display_order(&detail.releases);
+                order
+                    .get(position)
+                    .map(|&index| detail.releases[index].clone())
+            }
+            _ => None,
+        },
+        GlobalView::Search { cursor } => {
+            let results = state.search.results.as_ref()?;
+            let offset = cursor.checked_sub(results.artists.len())?;
+            results.releases.get(offset).cloned()
+        }
+        GlobalView::Release { .. } => None,
     }
 }
 
@@ -386,11 +621,10 @@ fn set_track_scope_cursor(state: &mut AppState, scope: &TrackSelectionScope, val
             }
         }
         TrackSelectionScope::Playlist(id) => {
-            if let Some(opened) = &mut state.playlists.opened {
-                if opened.id == *id {
+            if let Some(opened) = &mut state.playlists.opened
+                && opened.id == *id {
                     opened.cursor = value;
                 }
-            }
         }
         TrackSelectionScope::Queue => {
             state.queue_tab.cursor = value;
@@ -438,7 +672,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
             state.queue_tab.cursor,
             state.player.queue.len(),
         )),
-        Tab::Logs => None,
+        Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -487,7 +721,7 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
             state.queue_tab.cursor,
             &state.player.queue,
         )),
-        Tab::Logs => None,
+        Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -653,7 +887,7 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 .cloned()
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
-        Tab::Logs => None,
+        Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -769,11 +1003,10 @@ pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) 
     for (offset, track) in tracks.into_iter().enumerate() {
         player.queue.insert(insert_at + offset, track);
     }
-    if let Some(prefetched) = &mut player.prefetched_pos {
-        if insert_at <= *prefetched {
+    if let Some(prefetched) = &mut player.prefetched_pos
+        && insert_at <= *prefetched {
             *prefetched += count;
         }
-    }
     if insert_at <= player.queue_pos && player.current.is_some() {
         player.queue_pos += count;
     }
@@ -885,7 +1118,7 @@ pub fn restore_queue_order(player: &mut super::state::PlayerBar) {
     }
     let tail = player.queue.split_off(start);
     let mut used = vec![false; order.len()];
-    let mut keyed: Vec<(usize, usize, crate::api::models::TrackItem)> = tail
+    let mut keyed: Vec<(usize, usize, crate::library::models::TrackItem)> = tail
         .into_iter()
         .enumerate()
         .map(|(position, track)| {
@@ -954,6 +1187,14 @@ fn page_step(state: &AppState) -> isize {
 }
 
 fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
+    if state.active_tab == Tab::Federation {
+        if dy != 0 {
+            let last = super::state::FedRow::ALL.len() as isize - 1;
+            state.federation.cursor =
+                (state.federation.cursor as isize + dy).clamp(0, last) as usize;
+        }
+        return;
+    }
     if state.active_tab == Tab::Logs {
         // The cursor anchors to an entry's seq, so freshly appended log
         // lines (including ones caused by this very keypress) don't shift
@@ -1138,6 +1379,9 @@ fn current_view_len(state: &AppState) -> usize {
     if state.active_tab == Tab::Queue {
         return state.player.queue.len();
     }
+    if state.active_tab == Tab::Federation {
+        return super::state::FedRow::ALL.len();
+    }
     match state.global.stack.last() {
         None => state.global.artists.len(),
         Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
@@ -1150,7 +1394,9 @@ fn current_view_len(state: &AppState) -> usize {
             Some(Loadable::Ready(d)) => d.tracks.len(),
             _ => 0,
         },
-        Some(GlobalView::Search { .. }) => state.search.results.as_ref().map_or(0, |r| r.len()),
+        Some(GlobalView::Search { .. }) => {
+            state.search.results.as_ref().map_or(0, |r| r.len()) + state.search.fed_tracks.len()
+        }
     }
 }
 
@@ -1173,15 +1419,19 @@ fn jump_selection(state: &mut AppState, first: bool) {
         }
         return;
     }
+    if state.active_tab == Tab::Federation {
+        let last = super::state::FedRow::ALL.len() - 1;
+        state.federation.cursor = if first { 0 } else { last };
+        return;
+    }
     if state.active_tab == Tab::Logs {
         if first {
             let level = super::state::LOG_LEVELS[state.logs.level_index];
-            if let Some(buffer) = crate::config::logging::buffer() {
-                if let Some((seq, _)) = buffer.move_selection(level, None, isize::MIN) {
+            if let Some(buffer) = crate::config::logging::buffer()
+                && let Some((seq, _)) = buffer.move_selection(level, None, isize::MIN) {
                     state.logs.selected_seq = Some(seq);
                     state.logs.follow = false;
                 }
-            }
         } else {
             state.logs.follow = true;
             state.logs.selected_seq = None;
@@ -1257,6 +1507,9 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
         }
         return None;
     }
+    if state.active_tab == Tab::Federation {
+        return federation_select(state);
+    }
     // Queue: jump playback to the track under the cursor. Earlier tracks
     // stay in the queue as "played"; picking one of them just moves the
     // playing position back.
@@ -1274,9 +1527,10 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     enum Outcome {
         Push(GlobalView),
         Play {
-            tracks: Vec<crate::api::models::TrackItem>,
+            tracks: Vec<crate::library::models::TrackItem>,
             start: usize,
         },
+        PlayFed(crate::federation::FedTrack),
         Nothing,
     }
     let outcome = match state.global.stack.last().copied() {
@@ -1347,10 +1601,17 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
                         start: cursor - artists - releases,
                     }
                 } else {
-                    Outcome::Nothing
+                    let fed_index = cursor - artists - releases - results.tracks.len();
+                    match state.search.fed_tracks.get(fed_index) {
+                        Some(fed) => Outcome::PlayFed(fed.clone()),
+                        None => Outcome::Nothing,
+                    }
                 }
             }
-            None => Outcome::Nothing,
+            None => match state.search.fed_tracks.get(cursor) {
+                Some(fed) => Outcome::PlayFed(fed.clone()),
+                None => Outcome::Nothing,
+            },
         },
     };
     match outcome {
@@ -1364,13 +1625,57 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             on_new_queue(state);
             Some(Effect::PlayCurrent)
         }
+        Outcome::PlayFed(fed) => {
+            state.status_message = Some(format!("federation: fetching \"{}\"…", fed.title));
+            Some(Effect::FedPlay(fed))
+        }
         Outcome::Nothing => None,
+    }
+}
+
+/// Enter on the Federation tab: toggle switches, open text inputs, run
+/// one-shot operations. The heavy lifting happens in perform_effect().
+fn federation_select(state: &mut AppState) -> Option<Effect> {
+    use super::state::{FedInputField, FedRow, Popup};
+    match FedRow::ALL.get(state.federation.cursor)? {
+        FedRow::Toggle => {
+            let settings = &mut state.federation.settings;
+            if !settings.enabled && settings.network_id.trim().is_empty() {
+                state.popup = Some(Popup::FedInput {
+                    field: FedInputField::NetworkId,
+                    input: String::new(),
+                });
+                return None;
+            }
+            settings.enabled = !settings.enabled;
+            Some(Effect::FedApplySettings)
+        }
+        FedRow::NetworkId => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::NetworkId,
+                input: state.federation.settings.network_id.clone(),
+            });
+            None
+        }
+        FedRow::SaveOnListen => {
+            state.federation.settings.save_on_listen = !state.federation.settings.save_on_listen;
+            Some(Effect::FedApplySettings)
+        }
+        FedRow::SyncNow => Some(Effect::FedSyncNow),
+        FedRow::ShowTicket => Some(Effect::FedShowTicket),
+        FedRow::Connect => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::ConnectTicket,
+                input: String::new(),
+            });
+            None
+        }
     }
 }
 
 /// A freshly created play context: drop the stale pre-shuffle snapshot and,
 /// if shuffle is on, shuffle everything after the chosen track right away.
-fn on_new_queue(state: &mut AppState) {
+pub(super) fn on_new_queue(state: &mut AppState) {
     let player = &mut state.player;
     player.original_order = None;
     if player.shuffle && !player.queue.is_empty() {
@@ -1409,19 +1714,17 @@ fn go_back(state: &mut AppState) {
         Tab::Global => {
             // Esc on a view opened by Shift-J from another tab goes back to
             // that tab, not down the Global stack.
-            if let Some((origin, depth)) = state.jump_origin {
-                if state.global.stack.len() == depth + 1 {
+            if let Some((origin, depth)) = state.jump_origin
+                && state.global.stack.len() == depth + 1 {
                     state.global.stack.pop();
                     state.jump_origin = None;
                     state.active_tab = origin;
                     return;
                 }
-            }
-            if let Some(popped) = state.global.stack.pop() {
-                if matches!(popped, GlobalView::Search { .. }) {
+            if let Some(popped) = state.global.stack.pop()
+                && matches!(popped, GlobalView::Search { .. }) {
                     state.search = SearchState::default();
                 }
-            }
         }
         _ => {}
     }
@@ -1450,6 +1753,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.global.stack.clear();
         }
         Tab::Playlists => state.playlists.opened = None,
+        Tab::Federation => state.federation.cursor = 0,
         Tab::Logs => {
             state.logs.follow = true;
             state.logs.selected_seq = None;
@@ -1465,7 +1769,7 @@ fn not_yet(state: &mut AppState, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::{ArtistCard, ArtistDetail, TrackItem};
+    use crate::library::models::{ArtistCard, ArtistDetail, TrackItem};
 
     fn with_artists(n: usize) -> AppState {
         let mut state = AppState::default();
@@ -1473,7 +1777,7 @@ mod tests {
             .map(|i| ArtistCard {
                 id: i as i64,
                 name: format!("artist {i}"),
-                image_url: None,
+                image_path: None,
                 release_count: 1,
                 track_count: 2,
             })
@@ -1493,18 +1797,14 @@ mod tests {
             release_id: 1,
             release_title: "r".into(),
             release_year: None,
-            cover_url: None,
-            stream_url: format!("/s/{id}"),
-            uploader_name: String::new(),
+            cover_path: None,
+            file_path: format!("/s/{id}"),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
             audio_bit_depth: None,
             file_size_bytes: None,
-            lastfm_listeners: None,
-            lastfm_playcount: None,
-            lastfm_rating: None,
-            lastfm_updated_at: None,
+            play_count: 0,
         }
     }
 
@@ -1619,14 +1919,14 @@ mod tests {
 
     #[test]
     fn artist_tiles_move_by_visual_rows_across_groups() {
-        use crate::api::models::{ArtistDetail, ReleaseCard};
+        use crate::library::models::{ArtistDetail, ReleaseCard};
 
         let release = |id: i64, kind: &str| ReleaseCard {
             id,
             title: format!("r{id}"),
             release_type: kind.to_string(),
             year: None,
-            cover_url: None,
+            cover_path: None,
             track_count: 1,
         };
         // columns = 3 in tests (no tty → 80 wide): albums rows [0,1,2],[3],
@@ -1634,7 +1934,7 @@ mod tests {
         let detail = ArtistDetail {
             id: 1,
             name: "a".into(),
-            image_url: None,
+            image_path: None,
             total_track_count: 0,
             total_play_count: 0,
             top_tracks: vec![],
@@ -1707,7 +2007,7 @@ mod tests {
 
     #[test]
     fn queue_advances_and_respects_repeat() {
-        use crate::api::models::TrackItem;
+        use crate::library::models::TrackItem;
         use crate::app::state::RepeatMode;
 
         let track = |id: i64| TrackItem {
@@ -1721,18 +2021,14 @@ mod tests {
             release_id: 1,
             release_title: "r".into(),
             release_year: None,
-            cover_url: None,
-            stream_url: format!("/api/player/stream/{id}"),
-            uploader_name: String::new(),
+            cover_path: None,
+            file_path: format!("/api/player/stream/{id}"),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
             audio_bit_depth: None,
             file_size_bytes: None,
-            lastfm_listeners: None,
-            lastfm_playcount: None,
-            lastfm_rating: None,
-            lastfm_updated_at: None,
+            play_count: 0,
         };
         let mut state = AppState::default();
         state.player.queue = vec![track(1), track(2)];
@@ -1776,7 +2072,7 @@ mod tests {
 
     #[test]
     fn queue_tab_select_and_clear() {
-        use crate::api::models::TrackItem;
+        use crate::library::models::TrackItem;
         let track = |id: i64| TrackItem {
             id,
             title: format!("t{id}"),
@@ -1788,18 +2084,14 @@ mod tests {
             release_id: 1,
             release_title: "r".into(),
             release_year: None,
-            cover_url: None,
-            stream_url: format!("/s/{id}"),
-            uploader_name: String::new(),
+            cover_path: None,
+            file_path: format!("/s/{id}"),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
             audio_bit_depth: None,
             file_size_bytes: None,
-            lastfm_listeners: None,
-            lastfm_playcount: None,
-            lastfm_rating: None,
-            lastfm_updated_at: None,
+            play_count: 0,
         };
         let mut state = AppState {
             active_tab: Tab::Queue,
@@ -1870,7 +2162,7 @@ mod tests {
             Loadable::Ready(ArtistDetail {
                 id: 9,
                 name: "artist".into(),
-                image_url: None,
+                image_path: None,
                 total_track_count: 3,
                 total_play_count: 0,
                 top_tracks: (1..=3).map(test_track).collect(),
@@ -1942,7 +2234,7 @@ mod tests {
 
     #[test]
     fn shuffle_reorders_tail_and_restores() {
-        use crate::api::models::TrackItem;
+        use crate::library::models::TrackItem;
         let track = |id: i64| TrackItem {
             id,
             title: format!("t{id}"),
@@ -1954,18 +2246,14 @@ mod tests {
             release_id: 1,
             release_title: "r".into(),
             release_year: None,
-            cover_url: None,
-            stream_url: format!("/s/{id}"),
-            uploader_name: String::new(),
+            cover_path: None,
+            file_path: format!("/s/{id}"),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
             audio_bit_depth: None,
             file_size_bytes: None,
-            lastfm_listeners: None,
-            lastfm_playcount: None,
-            lastfm_rating: None,
-            lastfm_updated_at: None,
+            play_count: 0,
         };
         let mut state = AppState::default();
         state.player.queue = (1..=8).map(track).collect();
@@ -1991,7 +2279,7 @@ mod tests {
 
     #[test]
     fn shift_j_opens_release_from_queue() {
-        use crate::api::models::{ReleaseDetail, TrackItem};
+        use crate::library::models::{ReleaseDetail, TrackItem};
         let track = |id: i64, release_id: i64| TrackItem {
             id,
             title: format!("t{id}"),
@@ -2003,18 +2291,14 @@ mod tests {
             release_id,
             release_title: "r".into(),
             release_year: None,
-            cover_url: None,
-            stream_url: format!("/s/{id}"),
-            uploader_name: String::new(),
+            cover_path: None,
+            file_path: format!("/s/{id}"),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
             audio_bit_depth: None,
             file_size_bytes: None,
-            lastfm_listeners: None,
-            lastfm_playcount: None,
-            lastfm_rating: None,
-            lastfm_updated_at: None,
+            play_count: 0,
         };
         let mut state = AppState {
             active_tab: Tab::Queue,
@@ -2048,10 +2332,9 @@ mod tests {
                 title: "r".into(),
                 release_type: "album".into(),
                 year: None,
-                cover_url: None,
+                cover_path: None,
                 artists: vec![],
                 tracks: vec![track(1, 7), track(2, 7)],
-                uploaders: vec![],
             }),
         );
         state.active_tab = Tab::Queue;

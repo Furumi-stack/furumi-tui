@@ -22,8 +22,9 @@ pub enum Command {
     /// `:q` / `:quit` — exit immediately (explicit enough to skip the
     /// double-press confirmation).
     Quit,
-    /// `:logout` — sign out and return to the login screen.
-    Logout,
+    /// `:import <path>` — import an audio file or a directory into the
+    /// library.
+    Import(String),
     /// `:volume 40` (also `:vol`) — set the volume precisely.
     Volume(u8),
     /// `:seek +30` / `:seek -10` — relative seek in seconds.
@@ -43,8 +44,6 @@ pub enum Command {
     PlayPause,
     /// `:help` — open the keybinding help.
     Help,
-    /// `:devices` — open the connected-devices picker.
-    Devices,
     /// `:logs [error|warn|info|debug|trace]` — jump to the Logs tab,
     /// optionally setting the severity filter.
     Logs(Option<usize>),
@@ -74,7 +73,15 @@ pub fn parse(input: &str) -> Parsed {
     let arg = parts.next();
     match name {
         "q" | "quit" => Parsed::Command(Command::Quit),
-        "logout" => Parsed::Command(Command::Logout),
+        "import" | "add" => {
+            let path = input.trim_start().split_once(char::is_whitespace);
+            match path.map(|(_, rest)| rest.trim()) {
+                Some(path) if !path.is_empty() => {
+                    Parsed::Command(Command::Import(path.to_string()))
+                }
+                _ => Parsed::Invalid("usage: :import <file or directory>".to_string()),
+            }
+        }
         "volume" | "vol" => match arg.and_then(|a| a.parse::<u8>().ok()) {
             Some(value) if value <= 100 => Parsed::Command(Command::Volume(value)),
             _ => Parsed::Invalid("usage: :volume 0-100".to_string()),
@@ -96,7 +103,6 @@ pub fn parse(input: &str) -> Parsed {
         "prev" => Parsed::Command(Command::Prev),
         "pause" | "play" => Parsed::Command(Command::PlayPause),
         "help" => Parsed::Command(Command::Help),
-        "devices" | "device" => Parsed::Command(Command::Devices),
         "logs" => match arg {
             None => Parsed::Command(Command::Logs(None)),
             Some(level) => match ["error", "warn", "info", "debug", "trace"]
@@ -152,7 +158,11 @@ mod tests {
     fn parses_word_commands() {
         assert_eq!(parse("q"), Parsed::Command(Command::Quit));
         assert_eq!(parse("quit"), Parsed::Command(Command::Quit));
-        assert_eq!(parse("logout"), Parsed::Command(Command::Logout));
+        assert_eq!(
+            parse("import ~/Music/My Album"),
+            Parsed::Command(Command::Import("~/Music/My Album".to_string()))
+        );
+        assert!(matches!(parse("import"), Parsed::Invalid(_)));
         assert_eq!(parse("volume 40"), Parsed::Command(Command::Volume(40)));
         assert_eq!(parse("vol 0"), Parsed::Command(Command::Volume(0)));
         assert_eq!(parse("shuffle"), Parsed::Command(Command::Shuffle));
@@ -162,7 +172,6 @@ mod tests {
             Parsed::Command(Command::Repeat(Some(RepeatArg::All)))
         );
         assert_eq!(parse("clear"), Parsed::Command(Command::ClearQueue));
-        assert_eq!(parse("devices"), Parsed::Command(Command::Devices));
         assert_eq!(parse("logs debug"), Parsed::Command(Command::Logs(Some(3))));
     }
 

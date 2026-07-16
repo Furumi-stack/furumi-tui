@@ -1,7 +1,8 @@
-mod api;
 mod app;
 mod art;
 mod config;
+mod federation;
+mod library;
 mod media;
 mod player;
 mod ui;
