@@ -39,6 +39,34 @@ struct AudioResponseHeader {
     total_size: u64,
     #[serde(default)]
     offset: u64,
+    /// Full track metadata from the owner's database — richer and more
+    /// authoritative than whatever tags the file itself carries. Absent
+    /// when the peer predates the field (the header is extensible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<TrackMetadata>,
+}
+
+/// Track metadata exchanged alongside the audio bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackMetadata {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artists: Vec<String>,
+    #[serde(default)]
+    pub featured_artists: Vec<String>,
+    #[serde(default)]
+    pub album_artists: Vec<String>,
+    #[serde(default)]
+    pub release_title: String,
+    #[serde(default)]
+    pub release_type: Option<String>,
+    #[serde(default)]
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub track_number: Option<i32>,
+    #[serde(default)]
+    pub disc_number: Option<i32>,
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -122,15 +150,16 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &impl Seria
 // ---------------------------------------------------------------------------
 
 /// Downloads a whole track from `owner` into `dir/<stem>.<ext>`; returns
-/// the file path and the mime type the peer reported. An already complete
-/// cached file is reused.
+/// the file path, the mime type and the track metadata the peer reported.
+/// An already complete cached file is reused (the metadata still comes
+/// fresh from the header).
 pub async fn download_track(
     service: &MusicDhtService,
     owner: EndpointId,
     item_id_hex: &str,
     dir: &Path,
     stem: &str,
-) -> Result<(PathBuf, String)> {
+) -> Result<(PathBuf, String, Option<TrackMetadata>)> {
     let mut stream = service
         .open_stream(owner, AUDIO_ALPN)
         .await
@@ -160,7 +189,7 @@ pub async fn download_track(
         && header.total_size > 0
     {
         // Already fully downloaded earlier; no need to fetch again.
-        return Ok((path, header.mime_type));
+        return Ok((path, header.mime_type, header.metadata));
     }
 
     let temp_path = dir.join(format!(".{stem}.{extension}.part"));
@@ -182,7 +211,7 @@ pub async fn download_track(
         );
     }
     tokio::fs::rename(&temp_path, &path).await?;
-    Ok((path, header.mime_type))
+    Ok((path, header.mime_type, header.metadata))
 }
 
 // ---------------------------------------------------------------------------
@@ -205,19 +234,42 @@ pub fn resolve_local_track_id(
     Ok(None)
 }
 
-fn resolve_local_file(
+/// Resolves the item to (file path, full metadata from the database).
+fn resolve_for_serving(
     library: &Library,
     own: EndpointId,
     item_id: ItemId,
-) -> Result<Option<String>> {
-    let export = library.federation_export()?;
-    for track in export.tracks {
-        let derived = ItemId::derive(&own, ItemKind::Track, &format!("track:{}", track.id));
-        if derived == item_id {
-            return Ok(Some(track.file_path));
-        }
-    }
-    Ok(None)
+) -> Result<Option<(String, TrackMetadata)>> {
+    let Some(track_id) = resolve_local_track_id(library, own, item_id)? else {
+        return Ok(None);
+    };
+    let Some(track) = library.tracks_by_ids(&[track_id])?.into_iter().next() else {
+        return Ok(None);
+    };
+    // Release type and album artists live on the release row.
+    let (release_type, album_artists) = match library.release(track.release_id) {
+        Ok(detail) => (
+            Some(detail.release_type),
+            detail.artists.iter().map(|a| a.name.clone()).collect(),
+        ),
+        Err(_) => (None, Vec::new()),
+    };
+    let metadata = TrackMetadata {
+        title: track.title.clone(),
+        artists: track.artists.iter().map(|a| a.name.clone()).collect(),
+        featured_artists: track
+            .featured_artists
+            .iter()
+            .map(|a| a.name.clone())
+            .collect(),
+        album_artists,
+        release_title: track.release_title.clone(),
+        release_type,
+        year: track.release_year,
+        track_number: track.track_number,
+        disc_number: track.disc_number,
+    };
+    Ok(Some((track.file_path, metadata)))
 }
 
 /// Runs the accept loop of the audio protocol until the acceptor closes.
@@ -247,10 +299,10 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
     let resolved = match hex_decode_item_id(&request.item_id) {
         Some(item_id) => {
             let library = Arc::clone(&library);
-            match tokio::task::spawn_blocking(move || resolve_local_file(&library, own, item_id))
+            match tokio::task::spawn_blocking(move || resolve_for_serving(&library, own, item_id))
                 .await
             {
-                Ok(Ok(Some(path))) => Ok(path),
+                Ok(Ok(Some(found))) => Ok(found),
                 Ok(Ok(None)) => Err("track not found in the library".to_string()),
                 Ok(Err(err)) => Err(format!("library lookup failed: {err:#}")),
                 Err(err) => Err(format!("lookup task failed: {err}")),
@@ -258,8 +310,8 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
         }
         None => Err("malformed item_id".to_string()),
     };
-    let file_path = match resolved {
-        Ok(path) => path,
+    let (file_path, metadata) = match resolved {
+        Ok(found) => found,
         Err(message) => return refuse(stream, message).await,
     };
 
@@ -281,6 +333,7 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
             mime_type: guess_mime(&path).to_string(),
             total_size,
             offset,
+            metadata: Some(metadata),
         },
     )
     .await?;
@@ -302,6 +355,7 @@ async fn refuse(mut stream: ByteStream, message: String) -> Result<()> {
             mime_type: String::new(),
             total_size: 0,
             offset: 0,
+            metadata: None,
         },
     )
     .await?;

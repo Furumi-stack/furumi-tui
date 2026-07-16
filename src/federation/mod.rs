@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::library::Library;
 use crate::library::models::{ArtistRef, TrackItem};
 
-pub use audio::AUDIO_ALPN;
+pub use audio::{AUDIO_ALPN, TrackMetadata};
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -481,15 +481,21 @@ impl Federation {
         let dir = if save { &self.media_dir } else { &self.cache_dir };
         tokio::fs::create_dir_all(dir).await?;
 
-        let (path, mime) =
+        let (path, mime, metadata) =
             audio::download_track(&service, owner, &fed.item_id, dir, &download_stem(fed)).await?;
         tracing::info!(path = %path.display(), %mime, "federated track downloaded");
 
         if save {
             let library = Arc::clone(&self.library);
             let import_path = path.clone();
+            let import_metadata = metadata.clone();
             let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
-                let import = crate::library::import::read_file(&import_path)?;
+                let mut import = crate::library::import::read_file(&import_path)?;
+                // The owner's database is more authoritative than whatever
+                // tags the file happens to carry (often none at all).
+                if let Some(meta) = &import_metadata {
+                    apply_remote_metadata(&mut import, meta);
+                }
                 let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
                 Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
             })
@@ -509,9 +515,45 @@ impl Federation {
         }
 
         Ok(FedPlayable {
-            track: ephemeral_track(fed, &path),
+            track: ephemeral_track(fed, metadata.as_ref(), &path),
             imported: false,
         })
+    }
+}
+
+/// Overlays the peer-supplied metadata onto tag-derived import data. Every
+/// non-empty peer field wins; file tags only fill the gaps.
+fn apply_remote_metadata(import: &mut crate::library::import::TrackImport, meta: &TrackMetadata) {
+    let title = meta.title.trim();
+    if !title.is_empty() {
+        import.title = title.to_string();
+    }
+    if !meta.artists.is_empty() {
+        import.artists = meta.artists.clone();
+    }
+    if !meta.featured_artists.is_empty() {
+        import.featured_artists = meta.featured_artists.clone();
+    }
+    if !meta.album_artists.is_empty() {
+        import.album_artists = meta.album_artists.clone();
+    } else if !meta.artists.is_empty() {
+        import.album_artists = meta.artists.clone();
+    }
+    let release_title = meta.release_title.trim();
+    if !release_title.is_empty() {
+        import.release_title = release_title.to_string();
+    }
+    if meta.release_type.is_some() {
+        import.release_type = meta.release_type.clone();
+    }
+    if meta.year.is_some() {
+        import.year = meta.year;
+    }
+    if meta.track_number.is_some() {
+        import.track_number = meta.track_number;
+    }
+    if meta.disc_number.is_some() {
+        import.disc_number = meta.disc_number;
     }
 }
 
@@ -594,27 +636,47 @@ fn download_stem(fed: &FedTrack) -> String {
 }
 
 /// A playable TrackItem for a downloaded-but-not-imported federated track.
-fn ephemeral_track(fed: &FedTrack, path: &std::path::Path) -> TrackItem {
+fn ephemeral_track(
+    fed: &FedTrack,
+    metadata: Option<&TrackMetadata>,
+    path: &std::path::Path,
+) -> TrackItem {
     let id = NEXT_EPHEMERAL_ID.fetch_sub(1, Ordering::Relaxed);
     let file_size = std::fs::metadata(path).map(|m| m.len() as i64).ok();
-    TrackItem {
-        id,
-        title: fed.title.clone(),
-        track_number: None,
-        disc_number: None,
-        duration_seconds: fed.duration_seconds.unwrap_or(0) as f64,
-        artists: fed
-            .artist_names
+    let refs = |names: &[String]| -> Vec<ArtistRef> {
+        names
             .iter()
             .map(|name| ArtistRef {
                 id: -1,
                 name: name.clone(),
             })
-            .collect(),
-        featured_artists: Vec::new(),
+            .collect()
+    };
+    let title = metadata
+        .map(|m| m.title.trim())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&fed.title)
+        .to_string();
+    let artists = match metadata {
+        Some(meta) if !meta.artists.is_empty() => refs(&meta.artists),
+        _ => refs(&fed.artist_names),
+    };
+    let release_title = metadata
+        .map(|m| m.release_title.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| format!("federation · {}", fed.owner_short()));
+    TrackItem {
+        id,
+        title,
+        track_number: metadata.and_then(|m| m.track_number),
+        disc_number: metadata.and_then(|m| m.disc_number),
+        duration_seconds: fed.duration_seconds.unwrap_or(0) as f64,
+        artists,
+        featured_artists: metadata.map(|m| refs(&m.featured_artists)).unwrap_or_default(),
         release_id: -1,
-        release_title: format!("federation · {}", fed.owner_short()),
-        release_year: fed.year,
+        release_title,
+        release_year: metadata.and_then(|m| m.year).or(fed.year),
         file_path: path.to_string_lossy().into_owned(),
         cover_path: None,
         audio_format: path

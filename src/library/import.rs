@@ -24,6 +24,9 @@ pub struct TrackImport {
     pub featured_artists: Vec<String>,
     pub album_artists: Vec<String>,
     pub release_title: String,
+    /// Release type ("album", "single", ...) when known from a richer
+    /// source than file tags (e.g. federation metadata); None = "album".
+    pub release_type: Option<String>,
     pub year: Option<i32>,
     pub track_number: Option<i32>,
     pub disc_number: Option<i32>,
@@ -186,6 +189,7 @@ pub fn read_file(path: &Path) -> Result<TrackImport> {
         featured_artists: featured,
         album_artists,
         release_title: album.unwrap_or_else(|| "Unknown Album".to_string()),
+        release_type: None,
         year,
         track_number,
         disc_number,
@@ -243,8 +247,12 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
         }
         None => {
             tx.execute(
-                "INSERT INTO releases (title, release_type, year) VALUES (?1, 'album', ?2)",
-                params![import.release_title, import.year],
+                "INSERT INTO releases (title, release_type, year) VALUES (?1, ?2, ?3)",
+                params![
+                    import.release_title,
+                    import.release_type.as_deref().unwrap_or("album"),
+                    import.year,
+                ],
             )?;
             let id = tx.last_insert_rowid();
             for (position, name) in import.album_artists.iter().enumerate() {

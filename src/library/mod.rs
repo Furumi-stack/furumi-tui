@@ -130,7 +130,6 @@ pub struct ExportTrack {
     pub title: String,
     pub year: Option<i32>,
     pub duration_seconds: f64,
-    pub file_path: String,
     pub artist_names: Vec<String>,
 }
 
@@ -434,7 +433,7 @@ impl Library {
             track_artists.entry(id).or_default().push(name);
         }
         let mut statement = conn.prepare(
-            "SELECT t.id, t.title, r.year, t.duration_seconds, t.file_path
+            "SELECT t.id, t.title, r.year, t.duration_seconds
              FROM tracks t JOIN releases r ON r.id = t.release_id",
         )?;
         let tracks = statement
@@ -444,7 +443,6 @@ impl Library {
                     title: row.get(1)?,
                     year: row.get(2)?,
                     duration_seconds: row.get(3)?,
-                    file_path: row.get(4)?,
                     artist_names: Vec::new(),
                 })
             })?
@@ -883,6 +881,7 @@ mod tests {
 
     fn add_track(lib: &Library, title: &str, artist: &str, album: &str) -> i64 {
         let import = import::TrackImport {
+            release_type: None,
             file_path: format!("/music/{artist}/{album}/{title}.mp3"),
             title: title.to_string(),
             artists: vec![artist.to_string()],
