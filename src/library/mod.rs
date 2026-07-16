@@ -719,6 +719,18 @@ impl Library {
         Ok(())
     }
 
+    /// Artist id by display name (case-insensitive), for catalog requests.
+    pub fn artist_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM artists WHERE name = ?1 COLLATE NOCASE",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Image of one artist, for the federation metadata exchange.
     pub fn artist_image(&self, artist_id: i64) -> Result<Option<String>> {
         let conn = self.lock();

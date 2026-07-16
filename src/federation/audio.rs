@@ -168,7 +168,7 @@ fn extension_for_mime(mime: &str) -> &'static str {
 }
 
 /// Reads one `\n`-terminated line, bounded by [`MAX_PROTOCOL_LINE`].
-async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+pub(super) async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {

@@ -34,7 +34,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 }
 
 /// One-line text entry on the Federation tab (network id / peer ticket).
-fn draw_fed_input(frame: &mut Frame, title: &str, input: &str) {
+fn draw_fed_input(frame: &mut Frame, title: &str, input: &crate::app::input::LineEdit) {
     let area = centered(frame.area(), 64, 5);
     let block = Block::bordered()
         .title(format!(" {title} "))
@@ -45,20 +45,8 @@ fn draw_fed_input(frame: &mut Frame, title: &str, input: &str) {
     frame.render_widget(block, area);
     let [entry_area, hint_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
-    // Keep the tail visible when the value (a ticket) exceeds the width.
-    let visible: String = {
-        let width = usize::from(entry_area.width.saturating_sub(2));
-        let chars: Vec<char> = input.chars().collect();
-        let skip = chars.len().saturating_sub(width);
-        chars[skip..].iter().collect()
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(visible),
-            Span::styled("█", theme::accent()),
-        ])),
-        entry_area,
-    );
+    let spans = super::line_edit_spans(input, usize::from(entry_area.width.saturating_sub(1)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), entry_area);
     frame.render_widget(
         Paragraph::new(Line::styled("enter: apply · esc: cancel", theme::dim()))
             .alignment(Alignment::Center),
@@ -118,16 +106,18 @@ fn draw_edit(
         });
         let field_inner = field_block.inner(areas[index]);
         frame.render_widget(field_block, areas[index]);
-        let width = usize::from(field_inner.width.saturating_sub(1));
-        let mut shown: String = field
-            .value
-            .chars()
-            .skip(field.value.chars().count().saturating_sub(width))
-            .collect();
+        let width = usize::from(field_inner.width);
         if focused {
-            shown.push('█');
+            let spans = super::line_edit_spans(&field.value, width);
+            frame.render_widget(Paragraph::new(Line::from(spans)), field_inner);
+        } else {
+            let shown: String = field
+                .value
+                .chars()
+                .skip(field.value.chars().count().saturating_sub(width))
+                .collect();
+            frame.render_widget(Paragraph::new(shown), field_inner);
         }
-        frame.render_widget(Paragraph::new(shown), field_inner);
     }
 
     let footer = areas[areas.len() - 1];
@@ -394,7 +384,7 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
     );
 }
 
-fn draw_name_entry(frame: &mut Frame, input: &str, busy: bool) {
+fn draw_name_entry(frame: &mut Frame, input: &crate::app::input::LineEdit, busy: bool) {
     let area = centered(frame.area(), 44, 7);
     let block = Block::bordered()
         .title(" New playlist ")
@@ -416,13 +406,8 @@ fn draw_name_entry(frame: &mut Frame, input: &str, busy: bool) {
         .border_style(theme::accent());
     let name_inner = name_block.inner(field);
     frame.render_widget(name_block, field);
-    let width = usize::from(name_inner.width.saturating_sub(1));
-    let mut shown: String = input
-        .chars()
-        .skip(input.chars().count().saturating_sub(width))
-        .collect();
-    shown.push('█');
-    frame.render_widget(Paragraph::new(shown), name_inner);
+    let spans = super::line_edit_spans(input, usize::from(name_inner.width));
+    frame.render_widget(Paragraph::new(Line::from(spans)), name_inner);
 
     let hint = if busy {
         Line::styled("creating…", theme::accent())

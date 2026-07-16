@@ -89,10 +89,16 @@ pub enum AppEvent {
     },
     /// A status snapshot for the Federation tab.
     FederationStatus(crate::federation::FedStatus),
-    /// Tracks found on the federated network for the live search.
+    /// Federated live-search results (artists a card can be opened for,
+    /// plus matching tracks).
     FedSearchLoaded {
         seq: u64,
-        result: Result<Vec<crate::federation::FedTrack>, String>,
+        result: Result<crate::federation::FedSearchResults, String>,
+    },
+    /// A federated artist card finished assembling.
+    FedArtistLoaded {
+        name: String,
+        result: Result<crate::federation::FedArtistCard, String>,
     },
     /// A federated track finished downloading and is ready to play.
     FedPlayReady {

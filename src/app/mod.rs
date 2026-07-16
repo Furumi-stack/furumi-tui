@@ -1,5 +1,6 @@
 pub mod action;
 mod cmdline;
+pub mod input;
 pub mod command;
 pub mod event;
 mod popup;
@@ -244,7 +245,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
                     });
                 }
             }
-            state::GlobalView::Search { .. } => {}
+            state::GlobalView::Search { .. } | state::GlobalView::FedArtist { .. } => {}
         }
     }
 
@@ -423,6 +424,17 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             tokio::spawn(async move {
                 let result = fed.ticket().await.map_err(|err| format!("{err:#}"));
                 let _ = tx.send(AppEvent::FedTicket(result));
+            });
+        }
+        Effect::FedOpenArtist(name) => {
+            let fed = Arc::clone(&runtime.federation);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let result = fed
+                    .artist_card(&name)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(AppEvent::FedArtistLoaded { name, result });
             });
         }
         Effect::FedPlay(fed_track) => {
@@ -900,7 +912,10 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             state.search.fed_loading = false;
             match result {
-                Ok(tracks) => state.search.fed_tracks = tracks,
+                Ok(results) => {
+                    state.search.fed_artists = results.artists;
+                    state.search.fed_tracks = results.tracks;
+                }
                 Err(message) => tracing::warn!(%message, "federated search failed"),
             }
         }
@@ -920,6 +935,16 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             Err(message) => state.status_message = Some(format!("federation: {message}")),
         },
+        AppEvent::FedArtistLoaded { name, result } => {
+            if let Some((current, data)) = &mut state.fed_artist_view
+                && *current == name
+            {
+                *data = match result {
+                    Ok(card) => state::Loadable::Ready(card),
+                    Err(message) => state::Loadable::Failed(message),
+                };
+            }
+        }
         AppEvent::FedTicket(result) => match result {
             Ok(ticket) => {
                 state.popup = Some(state::Popup::FedText {

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::Runtime;
 use crate::app::event::AppEvent;
@@ -59,7 +59,7 @@ fn handle_fed_input(
     state: &mut AppState,
     runtime: &Runtime,
     field: FedInputField,
-    mut input: String,
+    mut input: crate::app::input::LineEdit,
     key: KeyEvent,
 ) {
     match key.code {
@@ -85,15 +85,10 @@ fn handle_fed_input(
                 }
             }
         }
-        KeyCode::Backspace => {
-            input.pop();
+        _ => {
+            input.handle_key(key);
             state.popup = Some(Popup::FedInput { field, input });
         }
-        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-            input.push(c);
-            state.popup = Some(Popup::FedInput { field, input });
-        }
-        _ => state.popup = Some(Popup::FedInput { field, input }),
     }
 }
 
@@ -101,11 +96,11 @@ fn handle_fed_input(
 pub fn handle_paste(state: &mut AppState, pasted: &str) {
     let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
     match &mut state.popup {
-        Some(Popup::NewPlaylist { input, busy, .. }) if !*busy => input.push_str(&cleaned),
-        Some(Popup::FedInput { input, .. }) => input.push_str(&cleaned),
+        Some(Popup::NewPlaylist { input, busy, .. }) if !*busy => input.insert_str(&cleaned),
+        Some(Popup::FedInput { input, .. }) => input.insert_str(&cleaned),
         Some(Popup::Edit { fields, focus, .. }) => {
             if let Some(field) = fields.get_mut(*focus) {
-                field.value.push_str(&cleaned);
+                field.value.insert_str(&cleaned);
             }
         }
         _ => {}
@@ -152,17 +147,11 @@ fn handle_edit(
             let len = fields.len().max(1);
             focus = (focus + len - 1) % len;
         }
-        KeyCode::Backspace => {
+        _ => {
             if let Some(field) = fields.get_mut(focus) {
-                field.value.pop();
+                field.value.handle_key(key);
             }
         }
-        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-            if let Some(field) = fields.get_mut(focus) {
-                field.value.push(c);
-            }
-        }
-        _ => {}
     }
     state.popup = Some(Popup::Edit {
         target,
@@ -393,7 +382,7 @@ fn handle_picker(
             if cursor == 0 {
                 state.popup = Some(Popup::NewPlaylist {
                     for_track: Some(track),
-                    input: String::new(),
+                    input: crate::app::input::LineEdit::default(),
                     busy: false,
                 });
             } else if let Some((id, title)) = options.get(cursor - 1).cloned() {
@@ -408,7 +397,7 @@ fn handle_name_entry(
     state: &mut AppState,
     runtime: &Runtime,
     for_track: Option<TrackItem>,
-    mut input: String,
+    mut input: crate::app::input::LineEdit,
     busy: bool,
     key: KeyEvent,
 ) {
@@ -445,23 +434,8 @@ fn handle_name_entry(
                 busy: true,
             });
         }
-        KeyCode::Backspace => {
-            input.pop();
-            state.popup = Some(Popup::NewPlaylist {
-                for_track,
-                input,
-                busy: false,
-            });
-        }
-        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-            input.push(c);
-            state.popup = Some(Popup::NewPlaylist {
-                for_track,
-                input,
-                busy: false,
-            });
-        }
         _ => {
+            input.handle_key(key);
             state.popup = Some(Popup::NewPlaylist {
                 for_track,
                 input,

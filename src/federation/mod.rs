@@ -13,6 +13,7 @@
 //! the network too).
 
 mod audio;
+pub mod catalog;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -31,6 +32,7 @@ use crate::library::Library;
 use crate::library::models::{ArtistRef, TrackItem};
 
 pub use audio::{AUDIO_ALPN, TrackMetadata};
+pub use catalog::{CATALOG_ALPN, FedArtistCard, FedCardTrack, FedRelease};
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -84,6 +86,23 @@ fn save_settings(settings: &FedSettings) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Data shapes for the UI
 // ---------------------------------------------------------------------------
+
+/// An artist surfaced by federated search — either an artist record, or
+/// derived from the artist names of matching tracks/releases (so searching
+/// a track title still leads to the artist's card).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedArtistHit {
+    pub name: String,
+    /// Distinct peers (other than this instance) holding the artist.
+    pub peers: usize,
+}
+
+/// Federated search results for the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FedSearchResults {
+    pub artists: Vec<FedArtistHit>,
+    pub tracks: Vec<FedTrack>,
+}
 
 /// A track found through federated search.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +280,8 @@ impl Federation {
             .rendezvous(RendezvousConfig::default())
             // Peers stream each other's audio over this protocol.
             .stream_protocol(AUDIO_ALPN)
+            // ...and browse each other's per-artist catalogs over this one.
+            .stream_protocol(CATALOG_ALPN)
             .build()
             .map_err(|err| anyhow::anyhow!("invalid federation config: {err}"))?;
         let (service, mut events) = MusicDhtService::start(config)
@@ -298,11 +319,20 @@ impl Federation {
             Arc::clone(&self.library),
             service.endpoint_id(),
         ));
+        // Serve per-artist catalog requests (the federated artist card).
+        let catalog_acceptor = service
+            .stream_acceptor(CATALOG_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take the catalog acceptor: {err}"))?;
+        let catalog_task = tokio::spawn(catalog::serve_peers(
+            catalog_acceptor,
+            Arc::clone(&self.library),
+            service.endpoint_id(),
+        ));
 
         *guard = Some(Running {
             service,
             network_name,
-            tasks: vec![event_task, sync_task, audio_task],
+            tasks: vec![event_task, sync_task, audio_task, catalog_task],
         });
         self.set_error(None);
         Ok(())
@@ -403,15 +433,17 @@ impl Federation {
         status
     }
 
-    /// Searches the federated network for tracks matching `query`.
-    pub async fn search(&self, query: &str) -> Result<Vec<FedTrack>> {
+    /// Searches the federated network: matching tracks plus the artists a
+    /// card can be assembled for (from artist records and from the artist
+    /// names of matching tracks/releases).
+    pub async fn search(&self, query: &str) -> Result<FedSearchResults> {
         let service = self.service().await?;
         let outcome = service
             .search_network(query)
             .await
             .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
         let own = service.endpoint_id();
-        Ok(outcome
+        let tracks: Vec<FedTrack> = outcome
             .network_results
             .iter()
             .filter(|item| item.kind == ItemKind::Track)
@@ -424,7 +456,106 @@ impl Federation {
                 year: item.year,
                 duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
             })
-            .collect())
+            .collect();
+
+        // Artists: normalized name -> (display name, distinct non-own peers).
+        let mut artists: std::collections::HashMap<
+            String,
+            (String, std::collections::HashSet<EndpointId>),
+        > = Default::default();
+        for item in &outcome.network_results {
+            if item.owner == own {
+                continue;
+            }
+            let mut note = |name: &str| {
+                let key = music_dht::normalize_name(name);
+                if key.is_empty() {
+                    return;
+                }
+                let entry = artists
+                    .entry(key)
+                    .or_insert_with(|| (name.to_string(), Default::default()));
+                entry.1.insert(item.owner);
+            };
+            if item.kind == ItemKind::Artist {
+                note(&item.name);
+            }
+            for artist in &item.artist_names {
+                note(artist);
+            }
+        }
+        let mut artists: Vec<FedArtistHit> = artists
+            .into_values()
+            .map(|(name, owners)| FedArtistHit {
+                name,
+                peers: owners.len(),
+            })
+            .collect();
+        artists.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| a.name.cmp(&b.name)));
+
+        Ok(FedSearchResults { artists, tracks })
+    }
+
+    /// Assembles the federated artist card: finds the peers holding the
+    /// artist through the DHT, asks each for its catalog slice directly and
+    /// merges the answers (missing/slow peers are skipped).
+    pub async fn artist_card(&self, name: &str) -> Result<FedArtistCard> {
+        let service = self.service().await?;
+        let own = service.endpoint_id();
+        let normalized = music_dht::normalize_name(name);
+        let outcome = service
+            .search_network(name)
+            .await
+            .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
+        let owners: std::collections::HashSet<EndpointId> = outcome
+            .network_results
+            .iter()
+            .filter(|item| {
+                (item.kind == ItemKind::Artist && item.normalized_name == normalized)
+                    || item
+                        .artist_names
+                        .iter()
+                        .any(|artist| music_dht::normalize_name(artist) == normalized)
+            })
+            .map(|item| item.owner)
+            .filter(|owner| *owner != own)
+            .collect();
+        anyhow::ensure!(!owners.is_empty(), "no peers hold artist \"{name}\"");
+
+        let mut requests = Vec::new();
+        for owner in owners {
+            let service = Arc::clone(&service);
+            let name = name.to_string();
+            requests.push(tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    catalog::fetch_catalog(&service, owner, &name),
+                )
+                .await;
+                match result {
+                    Ok(Ok(catalog)) => Some((owner.to_string(), catalog)),
+                    Ok(Err(err)) => {
+                        tracing::warn!(peer = %owner, "catalog fetch failed: {err:#}");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(peer = %owner, "catalog fetch timed out");
+                        None
+                    }
+                }
+            }));
+        }
+        let mut catalogs = Vec::new();
+        for request in requests {
+            if let Ok(Some(catalog)) = request.await {
+                catalogs.push(catalog);
+            }
+        }
+        anyhow::ensure!(
+            !catalogs.is_empty(),
+            "none of the peers answered the catalog request"
+        );
+        Ok(catalog::merge_catalogs(name, catalogs))
     }
 
     pub async fn ticket(&self) -> Result<String> {

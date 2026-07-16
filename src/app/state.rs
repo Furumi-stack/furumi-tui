@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::app::input::LineEdit;
 use crate::art::ArtImage;
 use crate::config::keymap::KeyContext;
 use crate::library::models::{
@@ -67,6 +68,10 @@ pub enum GlobalView {
     },
     /// Linear cursor over search results: artists, then releases, then tracks.
     Search {
+        cursor: usize,
+    },
+    /// A federated artist card (data lives in `AppState::fed_artist_view`).
+    FedArtist {
         cursor: usize,
     },
 }
@@ -308,14 +313,14 @@ pub enum DeleteTarget {
 #[derive(Debug, Clone)]
 pub struct EditField {
     pub label: &'static str,
-    pub value: String,
+    pub value: LineEdit,
 }
 
 impl EditField {
     pub fn new(label: &'static str, value: impl Into<String>) -> Self {
         Self {
             label,
-            value: value.into(),
+            value: LineEdit::new(value),
         }
     }
 }
@@ -330,7 +335,7 @@ pub enum Popup {
     /// added to it right after creation.
     NewPlaylist {
         for_track: Option<TrackItem>,
-        input: String,
+        input: LineEdit,
         busy: bool,
     },
     /// Metadata edit form for a track, release, artist or playlist.
@@ -354,7 +359,7 @@ pub enum Popup {
     /// One-line text entry on the Federation tab (network id, peer ticket).
     FedInput {
         field: FedInputField,
-        input: String,
+        input: LineEdit,
     },
     /// Wrapped read-only text (this peer's connection ticket).
     FedText { title: String, text: String },
@@ -422,7 +427,7 @@ pub fn addable_playlists(state: &AppState) -> Vec<(i64, String)> {
 #[derive(Debug, Default)]
 pub struct Cmdline {
     pub active: bool,
-    pub input: String,
+    pub input: LineEdit,
     /// A live command (search) applied effects during this session; Esc
     /// undoes them, Enter keeps them.
     pub live: bool,
@@ -437,6 +442,9 @@ pub struct SearchState {
     /// Tracks found on the federated network (empty while federation is
     /// off); rendered as a separate, marked section.
     pub fed_tracks: Vec<crate::federation::FedTrack>,
+    /// Artists a federated card can be opened for — from artist records and
+    /// from the artist names of matching tracks.
+    pub fed_artists: Vec<crate::federation::FedArtistHit>,
     pub fed_loading: bool,
 }
 
@@ -588,6 +596,9 @@ pub struct AppState {
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
     pub federation: FederationTab,
+    /// The one federated artist card being viewed (name + loading state);
+    /// opening another card replaces it.
+    pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,
     pub track_selection: TrackSelection,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.

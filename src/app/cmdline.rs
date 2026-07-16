@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::Runtime;
 use crate::app::command::{self, Command, Parsed};
@@ -17,30 +17,20 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => cancel(state),
         KeyCode::Enter => commit(state, runtime),
-        KeyCode::Backspace => {
-            if state.cmdline.input.pop().is_none() {
-                // Backspace on an empty line closes it, like vim.
-                cancel(state);
-                return;
+        // Backspace on an empty line closes it, like vim.
+        KeyCode::Backspace if state.cmdline.input.is_empty() => cancel(state),
+        _ => {
+            if state.cmdline.input.handle_key(key) {
+                after_change(state, runtime);
             }
-            after_change(state, runtime);
         }
-        KeyCode::Char(c) if is_typing(key) => {
-            state.cmdline.input.push(c);
-            after_change(state, runtime);
-        }
-        _ => {}
     }
 }
 
 pub fn handle_paste(state: &mut AppState, runtime: &Runtime, pasted: &str) {
     let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
-    state.cmdline.input.push_str(&cleaned);
+    state.cmdline.input.insert_str(&cleaned);
     after_change(state, runtime);
-}
-
-fn is_typing(key: KeyEvent) -> bool {
-    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 /// Re-evaluate the input after every edit; live commands (search) take
@@ -101,6 +91,7 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
         state.search.loading = false;
         state.search.results = None;
         state.search.fed_tracks.clear();
+        state.search.fed_artists.clear();
         state.search.fed_loading = false;
         return;
     }
@@ -123,6 +114,7 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     // The same query also runs against the federated network (when the
     // node is up); its results render as a separate, marked section.
     state.search.fed_tracks.clear();
+    state.search.fed_artists.clear();
     state.search.fed_loading = false;
     if runtime.federation.settings().enabled {
         state.search.fed_loading = true;

@@ -12,6 +12,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
+use crate::app::input::LineEdit;
 use crate::app::state::{AppState, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
 
@@ -298,12 +299,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if state.cmdline.active {
         // Vim-style command line takes over the message row.
-        let line = Line::from(vec![
-            Span::styled(":", theme::header()),
-            Span::raw(state.cmdline.input.clone()),
-            Span::styled("█", theme::accent()),
-        ]);
-        frame.render_widget(Paragraph::new(line), message_row);
+        let mut spans = vec![Span::styled(":", theme::header())];
+        spans.extend(line_edit_spans(
+            &state.cmdline.input,
+            usize::from(message_row.width.saturating_sub(2)),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), message_row);
         draw_version(frame, message_row);
         return;
     }
@@ -447,4 +448,35 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         .flex(ratatui::layout::Flex::Center)
         .areas(rect);
     rect
+}
+
+/// Renders a [`LineEdit`] as spans with a visible cursor, windowed so the
+/// cursor always stays on screen when the value is wider than `width`.
+pub(crate) fn line_edit_spans(edit: &LineEdit, width: usize) -> Vec<Span<'static>> {
+    let width = width.max(2);
+    let chars: Vec<char> = edit.as_str().chars().collect();
+    let cursor = edit.cursor().min(chars.len());
+    // Window start: keep the cursor within the visible slice (one cell is
+    // reserved for the cursor block itself when it sits at the end).
+    let start = (cursor + 1).saturating_sub(width);
+    let end = (start + width.saturating_sub(1)).min(chars.len());
+    let before: String = chars[start..cursor].iter().collect();
+    let (under, after): (String, String) = if cursor < chars.len() {
+        (
+            chars[cursor].to_string(),
+            chars[cursor + 1..end.max(cursor + 1)].iter().collect(),
+        )
+    } else {
+        ("█".to_string(), String::new())
+    };
+    let cursor_style = if cursor < chars.len() {
+        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+    } else {
+        theme::accent()
+    };
+    vec![
+        Span::raw(before),
+        Span::styled(under, cursor_style),
+        Span::raw(after),
+    ]
 }

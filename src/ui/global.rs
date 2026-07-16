@@ -23,6 +23,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
         Some(GlobalView::Artist { id, cursor }) => draw_artist(frame, area, state, *id, *cursor),
         Some(GlobalView::Release { id, cursor }) => draw_release(frame, area, state, *id, *cursor),
         Some(GlobalView::Search { cursor }) => draw_search(frame, area, state, *cursor),
+        Some(GlobalView::FedArtist { cursor }) => draw_fed_artist(frame, area, state, *cursor),
     }
 }
 
@@ -715,7 +716,12 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     let empty_results = SearchResults::default();
     let results = match &search.results {
         Some(results) => results,
-        None if !state.search.fed_tracks.is_empty() || state.search.fed_loading => &empty_results,
+        None if !state.search.fed_tracks.is_empty()
+            || !state.search.fed_artists.is_empty()
+            || state.search.fed_loading =>
+        {
+            &empty_results
+        }
         None => {
             let hint = if search.query.is_empty() {
                 "type to search artists, releases and tracks"
@@ -725,7 +731,11 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             return centered_line(frame, inner, Line::styled(hint, theme::dim()));
         }
     };
-    if results.len() == 0 && state.search.fed_tracks.is_empty() && !state.search.fed_loading {
+    if results.len() == 0
+        && state.search.fed_tracks.is_empty()
+        && state.search.fed_artists.is_empty()
+        && !state.search.fed_loading
+    {
         return centered_line(frame, inner, Line::styled("nothing found", theme::dim()));
     }
 
@@ -782,8 +792,12 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             index += 1;
         }
     }
-    // Tracks found on the federated network, marked with the owning peer.
-    if !state.search.fed_tracks.is_empty() || state.search.fed_loading {
+    // Federated section: artists whose card can be assembled, then tracks
+    // (both marked with the owning peers).
+    if !state.search.fed_tracks.is_empty()
+        || !state.search.fed_artists.is_empty()
+        || state.search.fed_loading
+    {
         if !rows.is_empty() {
             rows.push((Line::default(), None, None));
         }
@@ -793,6 +807,22 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             "Federation"
         };
         rows.push((Line::styled(header, theme::header()), None, None));
+        for hit in &state.search.fed_artists {
+            rows.push((
+                Line::from(vec![
+                    Span::styled("⇅ ", theme::accent()),
+                    Span::raw(hit.name.clone()),
+                    Span::styled("  артист · открыть карточку", theme::dim()),
+                ]),
+                Some(format!(
+                    "{} peer{}",
+                    hit.peers,
+                    if hit.peers == 1 { "" } else { "s" }
+                )),
+                Some(index),
+            ));
+            index += 1;
+        }
         for fed in &state.search.fed_tracks {
             let origin = if fed.own {
                 "your library".to_string()
@@ -816,6 +846,109 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
                     ),
                 ]),
                 Some(meta),
+                Some(index),
+            ));
+            index += 1;
+        }
+    }
+
+    let cursor_row = rows
+        .iter()
+        .position(|(_, _, c)| *c == Some(cursor))
+        .unwrap_or(0);
+    let visible = usize::from(inner.height.max(1));
+    let first = cursor_row
+        .saturating_sub(visible / 2)
+        .min(rows.len().saturating_sub(visible));
+    for (offset, (line, right, row_cursor)) in
+        rows.into_iter().enumerate().skip(first).take(visible)
+    {
+        let rect = Rect {
+            x: inner.x,
+            y: inner.y + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        draw_row(frame, rect, line, right, row_cursor == Some(cursor));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Federated artist card (assembled from peer catalogs)
+// ---------------------------------------------------------------------------
+
+fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
+    let Some((name, data)) = &state.fed_artist_view else {
+        return centered_line(frame, area, Line::styled("no card is open", theme::dim()));
+    };
+    let inner = bordered(frame, area, format!(" {name} — federation "));
+    let card = match data {
+        Loadable::Loading => {
+            return centered_line(
+                frame,
+                inner,
+                Line::styled("собираем карточку с пиров…", theme::dim()),
+            );
+        }
+        Loadable::Failed(message) => {
+            return centered_line(frame, inner, Line::styled(message.clone(), error_style()));
+        }
+        Loadable::Ready(card) => card,
+    };
+
+    // All rows are one line tall: (line, right column, cursor index).
+    let mut rows: Vec<(Line, Option<String>, Option<usize>)> = Vec::new();
+    rows.push((
+        Line::styled(
+            format!(
+                "{} релизов · {} треков · с {} пиров",
+                card.releases.len(),
+                card.releases.iter().map(|r| r.tracks.len()).sum::<usize>(),
+                card.peers
+            ),
+            theme::dim(),
+        ),
+        None,
+        None,
+    ));
+    let mut index = 0;
+    for release in &card.releases {
+        rows.push((Line::default(), None, None));
+        let mut header = release.title.clone();
+        if let Some(year) = release.year {
+            header.push_str(&format!(" ({year})"));
+        }
+        rows.push((
+            Line::from(vec![
+                Span::styled(header, theme::header()),
+                Span::styled(format!("  {}", release.release_type), theme::dim()),
+            ]),
+            None,
+            None,
+        ));
+        for track in &release.tracks {
+            let number = track
+                .track_number
+                .map(|n| format!("{n:>2}. "))
+                .unwrap_or_else(|| "    ".to_string());
+            let duration = track
+                .duration_seconds
+                .map(|d| {
+                    let total = d.round() as i64;
+                    format!("{}:{:02}", total / 60, total % 60)
+                })
+                .unwrap_or_default();
+            let sources = if track.sources.len() > 1 {
+                format!("{} · {} пиров", duration, track.sources.len())
+            } else {
+                duration
+            };
+            rows.push((
+                Line::from(vec![
+                    Span::styled("⇅ ", theme::accent()),
+                    Span::raw(format!("{number}{}", track.title)),
+                ]),
+                Some(sources),
                 Some(index),
             ));
             index += 1;

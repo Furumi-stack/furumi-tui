@@ -49,6 +49,8 @@ pub enum Effect {
     FedShowTicket,
     /// Download (or resolve) a federated track and play it.
     FedPlay(crate::federation::FedTrack),
+    /// Assemble the federated artist card (fan-out to the owning peers).
+    FedOpenArtist(String),
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -199,7 +201,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             // The command line opens pre-filled with "/": typing continues
             // the live search, exactly as if `:` then `/` were pressed.
             state.cmdline.active = true;
-            state.cmdline.input = "/".to_string();
+            state.cmdline.input = crate::app::input::LineEdit::new("/");
             state.cmdline.live = true;
             state.search = SearchState::default();
             state.active_tab = Tab::Global;
@@ -288,7 +290,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::NewPlaylist => {
             state.popup = Some(super::state::Popup::NewPlaylist {
                 for_track: None,
-                input: String::new(),
+                input: crate::app::input::LineEdit::default(),
                 busy: false,
             });
             None
@@ -548,7 +550,7 @@ fn selected_release_card(state: &AppState) -> Option<crate::library::models::Rel
             let offset = cursor.checked_sub(results.artists.len())?;
             results.releases.get(offset).cloned()
         }
-        GlobalView::Release { .. } => None,
+        GlobalView::Release { .. } | GlobalView::FedArtist { .. } => None,
     }
 }
 
@@ -880,6 +882,7 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 let offset = cursor.checked_sub(results.artists.len() + results.releases.len())?;
                 results.tracks.get(offset).cloned()
             }
+            GlobalView::FedArtist { .. } => None,
         },
         Tab::Playlists => {
             let opened = state.playlists.opened.as_ref()?;
@@ -919,7 +922,7 @@ fn selected_release_id(state: &AppState) -> Option<i64> {
             let offset = cursor.checked_sub(results.artists.len())?;
             results.releases.get(offset).map(|r| r.id)
         }
-        GlobalView::Release { .. } => None,
+        GlobalView::Release { .. } | GlobalView::FedArtist { .. } => None,
     }
 }
 
@@ -1183,7 +1186,9 @@ fn page_step(state: &AppState) -> isize {
                 lines
             }
         }
-        Some(GlobalView::Release { .. }) | Some(GlobalView::Search { .. }) => lines,
+        Some(GlobalView::Release { .. })
+        | Some(GlobalView::Search { .. })
+        | Some(GlobalView::FedArtist { .. }) => lines,
     }
 }
 
@@ -1343,7 +1348,17 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
         Some(GlobalView::Search { cursor }) => {
             // Local results plus the federated section below them.
             let total = (state.search.results.as_ref().map_or(0, |r| r.len())
+                + state.search.fed_artists.len()
                 + state.search.fed_tracks.len()) as isize;
+            if total == 0 {
+                return;
+            }
+            let next = (cursor as isize + dy).clamp(0, total - 1);
+            set_view_cursor(state, next as usize);
+            state.track_selection.clear();
+        }
+        Some(GlobalView::FedArtist { cursor }) => {
+            let total = fed_card_len(state) as isize;
             if total == 0 {
                 return;
             }
@@ -1354,12 +1369,23 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
     }
 }
 
+/// Selectable rows of the open federated artist card (its tracks).
+pub(crate) fn fed_card_len(state: &AppState) -> usize {
+    match &state.fed_artist_view {
+        Some((_, Loadable::Ready(card))) => {
+            card.releases.iter().map(|r| r.tracks.len()).sum()
+        }
+        _ => 0,
+    }
+}
+
 fn set_view_cursor(state: &mut AppState, value: usize) {
     if let Some(view) = state.global.stack.last_mut() {
         match view {
             GlobalView::Artist { cursor, .. }
             | GlobalView::Release { cursor, .. }
-            | GlobalView::Search { cursor } => *cursor = value,
+            | GlobalView::Search { cursor }
+            | GlobalView::FedArtist { cursor } => *cursor = value,
         }
     }
 }
@@ -1398,8 +1424,11 @@ fn current_view_len(state: &AppState) -> usize {
             _ => 0,
         },
         Some(GlobalView::Search { .. }) => {
-            state.search.results.as_ref().map_or(0, |r| r.len()) + state.search.fed_tracks.len()
+            state.search.results.as_ref().map_or(0, |r| r.len())
+                + state.search.fed_artists.len()
+                + state.search.fed_tracks.len()
         }
+        Some(GlobalView::FedArtist { .. }) => fed_card_len(state),
     }
 }
 
@@ -1527,15 +1556,6 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
         not_yet(state, "Navigation in this view");
         return None;
     }
-    enum Outcome {
-        Push(GlobalView),
-        Play {
-            tracks: Vec<crate::library::models::TrackItem>,
-            start: usize,
-        },
-        PlayFed(crate::federation::FedTrack),
-        Nothing,
-    }
     let outcome = match state.global.stack.last().copied() {
         None => match state.global.artists.get(state.global.selected) {
             Some(artist) => Outcome::Push(GlobalView::Artist {
@@ -1604,18 +1624,32 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
                         start: cursor - artists - releases,
                     }
                 } else {
-                    let fed_index = cursor - artists - releases - results.tracks.len();
-                    match state.search.fed_tracks.get(fed_index) {
-                        Some(fed) => Outcome::PlayFed(fed.clone()),
+                    fed_outcome(state, cursor - artists - releases - results.tracks.len())
+                }
+            }
+            None => fed_outcome(state, cursor),
+        },
+        Some(GlobalView::FedArtist { cursor }) => {
+            match &state.fed_artist_view {
+                Some((name, Loadable::Ready(card))) => {
+                    match card
+                        .releases
+                        .iter()
+                        .flat_map(|release| release.tracks.iter().map(move |t| (release, t)))
+                        .nth(cursor)
+                    {
+                        Some((release, track)) => {
+                            match fed_track_from_card(name, release, track) {
+                                Some(fed) => Outcome::PlayFed(fed),
+                                None => Outcome::Nothing,
+                            }
+                        }
                         None => Outcome::Nothing,
                     }
                 }
+                _ => Outcome::Nothing,
             }
-            None => match state.search.fed_tracks.get(cursor) {
-                Some(fed) => Outcome::PlayFed(fed.clone()),
-                None => Outcome::Nothing,
-            },
-        },
+        }
     };
     match outcome {
         Outcome::Push(view) => {
@@ -1632,8 +1666,58 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             state.status_message = Some(format!("federation: fetching \"{}\"…", fed.title));
             Some(Effect::FedPlay(fed))
         }
+        Outcome::OpenFedArtist(name) => {
+            state.fed_artist_view = Some((name.clone(), Loadable::Loading));
+            state.global.stack.push(GlobalView::FedArtist { cursor: 0 });
+            state.active_tab = Tab::Global;
+            Some(Effect::FedOpenArtist(name))
+        }
         Outcome::Nothing => None,
     }
+}
+
+/// What Enter resolved to in the current view.
+enum Outcome {
+    Push(GlobalView),
+    Play {
+        tracks: Vec<crate::library::models::TrackItem>,
+        start: usize,
+    },
+    PlayFed(crate::federation::FedTrack),
+    OpenFedArtist(String),
+    Nothing,
+}
+
+/// Enter inside the federated section of the search results: artists open
+/// their card, tracks play.
+fn fed_outcome(state: &AppState, fed_index: usize) -> Outcome {
+    let artists = &state.search.fed_artists;
+    if fed_index < artists.len() {
+        return Outcome::OpenFedArtist(artists[fed_index].name.clone());
+    }
+    match state.search.fed_tracks.get(fed_index - artists.len()) {
+        Some(fed) => Outcome::PlayFed(fed.clone()),
+        None => Outcome::Nothing,
+    }
+}
+
+/// A playable FedTrack out of a card row (first source; the rest are
+/// fallbacks for a later improvement).
+fn fed_track_from_card(
+    artist: &str,
+    release: &crate::federation::FedRelease,
+    track: &crate::federation::FedCardTrack,
+) -> Option<crate::federation::FedTrack> {
+    let (owner, item_id) = track.sources.first()?.clone();
+    Some(crate::federation::FedTrack {
+        item_id,
+        owner,
+        own: false,
+        title: track.title.clone(),
+        artist_names: vec![artist.to_string()],
+        year: release.year,
+        duration_seconds: track.duration_seconds.map(|d| d.round() as i64),
+    })
 }
 
 /// Enter on the Federation tab: toggle switches, open text inputs, run
@@ -1646,7 +1730,7 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             if !settings.enabled && settings.network_id.trim().is_empty() {
                 state.popup = Some(Popup::FedInput {
                     field: FedInputField::NetworkId,
-                    input: String::new(),
+                    input: crate::app::input::LineEdit::default(),
                 });
                 return None;
             }
@@ -1656,7 +1740,9 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
         FedRow::NetworkId => {
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::NetworkId,
-                input: state.federation.settings.network_id.clone(),
+                input: crate::app::input::LineEdit::new(
+                    state.federation.settings.network_id.clone(),
+                ),
             });
             None
         }
@@ -1669,7 +1755,7 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
         FedRow::Connect => {
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::ConnectTicket,
-                input: String::new(),
+                input: crate::app::input::LineEdit::default(),
             });
             None
         }
@@ -1724,10 +1810,14 @@ fn go_back(state: &mut AppState) {
                     state.active_tab = origin;
                     return;
                 }
-            if let Some(popped) = state.global.stack.pop()
-                && matches!(popped, GlobalView::Search { .. }) {
+            if let Some(popped) = state.global.stack.pop() {
+                if matches!(popped, GlobalView::Search { .. }) {
                     state.search = SearchState::default();
                 }
+                if matches!(popped, GlobalView::FedArtist { .. }) {
+                    state.fed_artist_view = None;
+                }
+            }
         }
         _ => {}
     }
@@ -1754,6 +1844,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
                 state.search = SearchState::default();
             }
             state.global.stack.clear();
+            state.fed_artist_view = None;
         }
         Tab::Playlists => state.playlists.opened = None,
         Tab::Federation => state.federation.cursor = 0,
