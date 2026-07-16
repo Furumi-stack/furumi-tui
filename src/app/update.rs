@@ -1340,7 +1340,9 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             refresh_track_selection_cursor(state);
         }
         Some(GlobalView::Search { cursor }) => {
-            let total = state.search.results.as_ref().map_or(0, |r| r.len()) as isize;
+            // Local results plus the federated section below them.
+            let total = (state.search.results.as_ref().map_or(0, |r| r.len())
+                + state.search.fed_tracks.len()) as isize;
             if total == 0 {
                 return;
             }
