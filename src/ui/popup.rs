@@ -9,8 +9,8 @@ use crate::library::models::{ArtistRef, TrackItem};
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     match state.popup.as_ref() {
-        Some(Popup::AddToPlaylist { track, cursor }) => {
-            draw_picker(frame, state, &track.title, *cursor)
+        Some(Popup::AddToPlaylist { target, cursor }) => {
+            draw_picker(frame, state, &target.label(), *cursor)
         }
         Some(Popup::NewPlaylist { input, busy, .. }) => draw_name_entry(frame, input, *busy),
         Some(Popup::Edit {

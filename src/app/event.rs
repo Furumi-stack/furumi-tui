@@ -63,8 +63,8 @@ pub enum AppEvent {
     },
     PlaylistCreated {
         result: Result<PlaylistCard, String>,
-        /// Add this track to the new playlist right away (Shift-P flow).
-        add_track: Option<TrackItem>,
+        /// Add this target to the new playlist right away (Shift-P flow).
+        add_target: Option<crate::app::state::PlaylistAddTarget>,
     },
     PlaylistTracksAdded {
         playlist_id: i64,
@@ -99,6 +99,13 @@ pub enum AppEvent {
     FedArtistLoaded {
         name: String,
         result: Result<crate::federation::FedArtistCard, String>,
+    },
+    /// A streamed image for the open card arrived (artist image when
+    /// `release` is None, a release cover otherwise).
+    FedCardArt {
+        name: String,
+        release: Option<String>,
+        path: String,
     },
     /// A federated track finished downloading and is ready to play.
     FedPlayReady {

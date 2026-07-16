@@ -32,6 +32,8 @@ pub enum Action {
     OpenTrackInfo,
     QueueAddNext,
     QueueAddLast,
+    /// Download the selected federated track(s) into the local library.
+    DownloadSelected,
     RemoveFromQueue,
     ClearQueue,
     GoToRelease,
@@ -92,6 +94,7 @@ impl Action {
             | Action::CycleRepeat => Category::Playback,
             Action::QueueAddNext
             | Action::QueueAddLast
+            | Action::DownloadSelected
             | Action::RemoveFromQueue
             | Action::ClearQueue
             | Action::AddToPlaylist
@@ -169,6 +172,7 @@ impl Action {
             Action::OpenTrackInfo => "Track info".into(),
             Action::QueueAddNext => "Queue: add next".into(),
             Action::QueueAddLast => "Queue: add to end".into(),
+            Action::DownloadSelected => "Federation: download to library".into(),
             Action::RemoveFromQueue => "Queue: remove selected".into(),
             Action::ClearQueue => "Queue: clear".into(),
             Action::GoToRelease => "Open the track's release".into(),

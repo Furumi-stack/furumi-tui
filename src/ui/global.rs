@@ -24,6 +24,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
         Some(GlobalView::Release { id, cursor }) => draw_release(frame, area, state, *id, *cursor),
         Some(GlobalView::Search { cursor }) => draw_search(frame, area, state, *cursor),
         Some(GlobalView::FedArtist { cursor }) => draw_fed_artist(frame, area, state, *cursor),
+        Some(GlobalView::FedRelease { index, cursor }) => {
+            draw_fed_release(frame, area, state, *index, *cursor)
+        }
     }
 }
 
@@ -852,6 +855,20 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         }
     }
 
+    // Absolute cursor indices covered by an active Shift-V range in the
+    // federated tracks section.
+    let fed_scope = crate::app::state::TrackSelectionScope::FedSearch;
+    let mut fed_selected: std::collections::HashSet<usize> = Default::default();
+    if state.track_selection.is_active_for(&fed_scope) {
+        let base = results.len() + state.search.fed_artists.len();
+        if let Some(indices) = state
+            .track_selection
+            .indices(&fed_scope, state.search.fed_tracks.len())
+        {
+            fed_selected.extend(indices.into_iter().map(|i| base + i));
+        }
+    }
+
     let cursor_row = rows
         .iter()
         .position(|(_, _, c)| *c == Some(cursor))
@@ -869,6 +886,12 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             width: inner.width,
             height: 1,
         };
+        if let Some(row_index) = row_cursor
+            && fed_selected.contains(&row_index)
+            && row_index != cursor
+        {
+            frame.buffer_mut().set_style(rect, theme::selection());
+        }
         draw_row(frame, rect, line, right, row_cursor == Some(cursor));
     }
 }
@@ -881,7 +904,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
     let Some((name, data)) = &state.fed_artist_view else {
         return centered_line(frame, area, Line::styled("no card is open", theme::dim()));
     };
-    let inner = bordered(frame, area, format!(" {name} — federation "));
+    let inner = bordered(frame, area, format!(" Federation ▸ {name} "));
     let card = match data {
         Loadable::Loading => {
             return centered_line(
@@ -896,82 +919,192 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         Loadable::Ready(card) => card,
     };
 
-    // All rows are one line tall: (line, right column, cursor index).
-    let mut rows: Vec<(Line, Option<String>, Option<usize>)> = Vec::new();
-    rows.push((
+    // Header: artist image (streamed from a peer) left, stats right.
+    let header_height = (ART_HEADER_HEIGHT + 1).min(inner.height);
+    let [header_area, content_area] =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+    let [art_area, _, info_area] = Layout::horizontal([
+        Constraint::Length(ART_HEADER_WIDTH.min(header_area.width)),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .areas(header_area);
+    draw_art(
+        frame,
+        Rect {
+            height: ART_HEADER_HEIGHT.min(art_area.height),
+            ..art_area
+        },
+        header_art(state, card.image_path.as_ref()),
+    );
+    let tracks_total: usize = card.releases.iter().map(|r| r.tracks.len()).sum();
+    let info = vec![
+        Line::default(),
+        Line::styled(name.clone(), theme::header()),
+        Line::default(),
         Line::styled(
             format!(
                 "{} релизов · {} треков · с {} пиров",
                 card.releases.len(),
-                card.releases.iter().map(|r| r.tracks.len()).sum::<usize>(),
+                tracks_total,
                 card.peers
             ),
             theme::dim(),
         ),
-        None,
-        None,
-    ));
-    let mut index = 0;
-    for release in &card.releases {
-        rows.push((Line::default(), None, None));
-        let mut header = release.title.clone();
-        if let Some(year) = release.year {
-            header.push_str(&format!(" ({year})"));
-        }
-        rows.push((
-            Line::from(vec![
-                Span::styled(header, theme::header()),
-                Span::styled(format!("  {}", release.release_type), theme::dim()),
-            ]),
-            None,
-            None,
-        ));
-        for track in &release.tracks {
-            let number = track
-                .track_number
-                .map(|n| format!("{n:>2}. "))
-                .unwrap_or_else(|| "    ".to_string());
-            let duration = track
-                .duration_seconds
-                .map(|d| {
-                    let total = d.round() as i64;
-                    format!("{}:{:02}", total / 60, total % 60)
-                })
-                .unwrap_or_default();
-            let sources = if track.sources.len() > 1 {
-                format!("{} · {} пиров", duration, track.sources.len())
-            } else {
-                duration
-            };
-            rows.push((
-                Line::from(vec![
-                    Span::styled("⇅ ", theme::accent()),
-                    Span::raw(format!("{number}{}", track.title)),
-                ]),
-                Some(sources),
-                Some(index),
-            ));
-            index += 1;
-        }
+        Line::styled("enter: открыть релиз · esc: назад", theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(info), info_area);
+
+    if card.releases.is_empty() {
+        return centered_line(
+            frame,
+            content_area,
+            Line::styled("пиры не отдали ни одного релиза", theme::dim()),
+        );
     }
 
-    let cursor_row = rows
-        .iter()
-        .position(|(_, _, c)| *c == Some(cursor))
-        .unwrap_or(0);
-    let visible = usize::from(inner.height.max(1));
-    let first = cursor_row
+    // Release tiles: a flat grid ordered by year, scrolled to the cursor.
+    let columns = usize::from((content_area.width / TILE_WIDTH).max(1));
+    let visible_rows = usize::from((content_area.height / TILE_HEIGHT).max(1));
+    let cursor_row = cursor / columns;
+    let total_rows = card.releases.len().div_ceil(columns);
+    let first_row = cursor_row
+        .saturating_sub(visible_rows / 2)
+        .min(total_rows.saturating_sub(visible_rows));
+    for (offset, row) in (first_row..total_rows).take(visible_rows).enumerate() {
+        for column in 0..columns {
+            let index = row * columns + column;
+            let Some(release) = card.releases.get(index) else {
+                break;
+            };
+            let tile = Rect {
+                x: content_area.x + (column as u16) * TILE_WIDTH,
+                y: content_area.y + (offset as u16) * TILE_HEIGHT,
+                width: TILE_WIDTH,
+                height: TILE_HEIGHT.min(content_area.height.saturating_sub((offset as u16) * TILE_HEIGHT)),
+            };
+            if tile.height < 3 {
+                continue;
+            }
+            let mut meta = release.release_type.clone();
+            if let Some(year) = release.year {
+                meta = format!("{meta} · {year}");
+            }
+            draw_tile(
+                frame,
+                tile,
+                tile_art(state, release.cover_path.as_ref()),
+                &release.title,
+                &meta,
+                index == cursor,
+            );
+        }
+    }
+}
+
+fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usize, cursor: usize) {
+    let Some((name, Loadable::Ready(card))) = &state.fed_artist_view else {
+        return centered_line(frame, area, Line::styled("no card is open", theme::dim()));
+    };
+    let Some(release) = card.releases.get(index) else {
+        return centered_line(frame, area, Line::styled("release is gone", theme::dim()));
+    };
+    let inner = bordered(
+        frame,
+        area,
+        format!(" Federation ▸ {name} ▸ {} ", release.title),
+    );
+
+    // Header: cover left; title, meta and the download button right.
+    let header_height = (ART_HEADER_HEIGHT + 1).min(inner.height);
+    let [header_area, content_area] =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+    let [art_area, _, info_area] = Layout::horizontal([
+        Constraint::Length(ART_HEADER_WIDTH.min(header_area.width)),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .areas(header_area);
+    draw_art(
+        frame,
+        Rect {
+            height: ART_HEADER_HEIGHT.min(art_area.height),
+            ..art_area
+        },
+        header_art(state, release.cover_path.as_ref()),
+    );
+    let mut meta = release.release_type.clone();
+    if let Some(year) = release.year {
+        meta.push_str(&format!(" · {year}"));
+    }
+    meta.push_str(&format!(
+        " · {} треков · с {} пиров",
+        release.tracks.len(),
+        release.owners.len().max(1)
+    ));
+    let button_style = if cursor == 0 {
+        theme::tab_active()
+    } else {
+        theme::accent()
+    };
+    let info = vec![
+        Line::default(),
+        Line::styled(release.title.clone(), theme::header()),
+        Line::styled(meta, theme::dim()),
+        Line::default(),
+        Line::styled(
+            format!(" ⤓ Скачать релиз целиком ({}) ", release.tracks.len()),
+            button_style,
+        ),
+        Line::styled("shift+v: выделение · y: скачать · p: в плейлист", theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(info), info_area);
+
+    // Tracklist: rows 1..=n of the cursor space.
+    let scope = crate::app::state::TrackSelectionScope::FedRelease(index);
+    let visible = usize::from(content_area.height.max(1));
+    let cursor_track = cursor.saturating_sub(1);
+    let first = cursor_track
         .saturating_sub(visible / 2)
-        .min(rows.len().saturating_sub(visible));
-    for (offset, (line, right, row_cursor)) in
-        rows.into_iter().enumerate().skip(first).take(visible)
+        .min(release.tracks.len().saturating_sub(visible));
+    for (offset, (position, track)) in release
+        .tracks
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .enumerate()
     {
         let rect = Rect {
-            x: inner.x,
-            y: inner.y + (offset - first) as u16,
-            width: inner.width,
+            x: content_area.x,
+            y: content_area.y + offset as u16,
+            width: content_area.width,
             height: 1,
         };
-        draw_row(frame, rect, line, right, row_cursor == Some(cursor));
+        let number = track
+            .track_number
+            .map(|n| format!("{n:>2}. "))
+            .unwrap_or_else(|| "    ".to_string());
+        let duration = track
+            .duration_seconds
+            .map(|d| {
+                let total = d.round() as i64;
+                format!("{}:{:02}", total / 60, total % 60)
+            })
+            .unwrap_or_default();
+        let right = if track.sources.len() > 1 {
+            format!("{duration} · {} пиров", track.sources.len())
+        } else {
+            duration
+        };
+        let in_selection = state.track_selection.contains(&scope, position);
+        let line = Line::from(vec![
+            Span::styled("⇅ ", theme::accent()),
+            Span::raw(format!("{number}{}", track.title)),
+        ]);
+        if in_selection && cursor != position + 1 {
+            frame.buffer_mut().set_style(rect, theme::selection());
+        }
+        draw_row(frame, rect, line, Some(right), cursor == position + 1);
     }
 }

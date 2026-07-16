@@ -74,6 +74,12 @@ pub enum GlobalView {
     FedArtist {
         cursor: usize,
     },
+    /// One release of the open federated card: row 0 is the
+    /// download-release button, rows 1..=n are its tracks.
+    FedRelease {
+        index: usize,
+        cursor: usize,
+    },
 }
 
 /// The Global tab: the whole server library of artists.
@@ -202,6 +208,10 @@ pub enum TrackSelectionScope {
     Release(i64),
     Playlist(i64),
     Queue,
+    /// The federated section of the search results (its tracks).
+    FedSearch,
+    /// The tracklist of the open federated release view.
+    FedRelease(usize),
 }
 
 /// Vim-like Shift-V selection for line-oriented track lists. The selected
@@ -325,16 +335,41 @@ impl EditField {
     }
 }
 
+/// What an add-to-playlist flow adds: local library tracks directly, or
+/// federated tracks that are downloaded into the library first.
+#[derive(Debug, Clone)]
+pub enum PlaylistAddTarget {
+    Local(Vec<TrackItem>),
+    Fed(Vec<crate::federation::FedTrack>),
+}
+
+impl PlaylistAddTarget {
+    /// Short description for popup titles.
+    pub fn label(&self) -> String {
+        match self {
+            PlaylistAddTarget::Local(tracks) if tracks.len() == 1 => tracks[0].title.clone(),
+            PlaylistAddTarget::Fed(tracks) if tracks.len() == 1 => {
+                format!("{} (federation)", tracks[0].title)
+            }
+            PlaylistAddTarget::Local(tracks) => format!("{} tracks", tracks.len()),
+            PlaylistAddTarget::Fed(tracks) => format!("{} tracks (federation)", tracks.len()),
+        }
+    }
+}
+
 /// Modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Popup {
-    /// Pick one of the playlists (row 0 = "create new"); the track is added
-    /// on Enter.
-    AddToPlaylist { track: TrackItem, cursor: usize },
-    /// Name input for a new playlist; when `for_track` is set, the track is
-    /// added to it right after creation.
+    /// Pick one of the playlists (row 0 = "create new"); the target is
+    /// added on Enter (federated tracks are downloaded first).
+    AddToPlaylist {
+        target: PlaylistAddTarget,
+        cursor: usize,
+    },
+    /// Name input for a new playlist; when `for_target` is set, it is
+    /// added to the playlist right after creation.
     NewPlaylist {
-        for_track: Option<TrackItem>,
+        for_target: Option<PlaylistAddTarget>,
         input: LineEdit,
         busy: bool,
     },

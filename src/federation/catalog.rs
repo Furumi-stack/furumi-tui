@@ -27,7 +27,29 @@ const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
 struct CatalogRequest {
     /// Artist display name; matched case-insensitively by the owner.
     artist: String,
+    /// What is being asked for: `None`/"catalog" — the JSON catalog;
+    /// "artist_image" — the artist's image; "release_cover" — the cover of
+    /// `release`. Image responses are a JSON header line + raw bytes.
+    #[serde(default)]
+    want: Option<String>,
+    #[serde(default)]
+    release: Option<String>,
 }
+
+/// Header line preceding raw image bytes (artist image / release cover).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ImageHeader {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default)]
+    size: u64,
+}
+
+/// Images above this size are skipped rather than transferred.
+const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CatalogResponse {
@@ -94,20 +116,104 @@ pub async fn serve_peers(mut acceptor: StreamAcceptor, library: Arc<Library>, ow
 async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointId) -> Result<()> {
     let request: CatalogRequest =
         serde_json::from_slice(&super::audio::read_line(&mut stream.recv).await?)?;
-    tracing::info!(peer = %stream.peer_id, artist = %request.artist, "peer requested a catalog");
+    tracing::info!(
+        peer = %stream.peer_id,
+        artist = %request.artist,
+        want = request.want.as_deref().unwrap_or("catalog"),
+        "peer requested a catalog"
+    );
 
-    let response = tokio::task::spawn_blocking(move || build_catalog(&library, own, &request.artist))
-        .await?
-        .unwrap_or_else(|err| CatalogResponse {
-            ok: false,
-            error: Some(format!("catalog lookup failed: {err:#}")),
-            artist: None,
-        });
-    let payload = serde_json::to_vec(&response)?;
-    stream.send.write_all(&payload).await?;
+    match request.want.as_deref() {
+        None | Some("catalog") => {
+            let response =
+                tokio::task::spawn_blocking(move || build_catalog(&library, own, &request.artist))
+                    .await?
+                    .unwrap_or_else(|err| CatalogResponse {
+                        ok: false,
+                        error: Some(format!("catalog lookup failed: {err:#}")),
+                        artist: None,
+                    });
+            let payload = serde_json::to_vec(&response)?;
+            stream.send.write_all(&payload).await?;
+        }
+        Some(want @ ("artist_image" | "release_cover")) => {
+            let want_cover = want == "release_cover";
+            let release = request.release.clone().unwrap_or_default();
+            let artist = request.artist.clone();
+            let path = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                if want_cover {
+                    library.release_cover_by_names(&artist, &release)
+                } else {
+                    let Some(artist_id) = library.artist_id_by_name(&artist)? else {
+                        return Ok(None);
+                    };
+                    library.artist_image(artist_id)
+                }
+            })
+            .await??;
+            serve_image(&mut stream, path.as_deref()).await?;
+        }
+        Some(other) => {
+            let response = CatalogResponse {
+                ok: false,
+                error: Some(format!("unknown request kind '{other}'")),
+                artist: None,
+            };
+            stream.send.write_all(&serde_json::to_vec(&response)?).await?;
+        }
+    }
     stream.send.finish()?;
     let _ = stream.send.stopped().await;
     Ok(())
+}
+
+/// Streams one image file: header line, then the raw bytes.
+async fn serve_image(stream: &mut ByteStream, path: Option<&str>) -> Result<()> {
+    let loaded = match path {
+        Some(path) => match tokio::fs::read(path).await {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() as u64 <= MAX_IMAGE_BYTES => {
+                Some((bytes, image_mime_by_path(path)))
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    let header = match &loaded {
+        Some((bytes, mime)) => ImageHeader {
+            ok: true,
+            error: None,
+            mime_type: (*mime).to_string(),
+            size: bytes.len() as u64,
+        },
+        None => ImageHeader {
+            ok: false,
+            error: Some("no image".to_string()),
+            ..ImageHeader::default()
+        },
+    };
+    let mut line = serde_json::to_vec(&header)?;
+    line.push(b'\n');
+    stream.send.write_all(&line).await?;
+    if let Some((bytes, _)) = &loaded {
+        stream.send.write_all(bytes).await?;
+    }
+    Ok(())
+}
+
+fn image_mime_by_path(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
 }
 
 /// Builds this instance's library slice for `artist`.
@@ -173,6 +279,8 @@ pub async fn fetch_catalog(
         .map_err(|err| anyhow::anyhow!("cannot reach the peer: {err}"))?;
     let mut line = serde_json::to_vec(&CatalogRequest {
         artist: artist.to_string(),
+        want: None,
+        release: None,
     })?;
     line.push(b'\n');
     stream.send.write_all(&line).await?;
@@ -200,6 +308,59 @@ pub async fn fetch_catalog(
     response.artist.context("empty catalog response")
 }
 
+/// Fetches an image (artist image or a release cover) from a peer over the
+/// catalog protocol. `release: None` asks for the artist image. Returns the
+/// raw bytes and a file extension, or None when the peer has no image.
+pub async fn fetch_image(
+    service: &MusicDhtService,
+    owner: EndpointId,
+    artist: &str,
+    release: Option<&str>,
+) -> Result<Option<(Vec<u8>, &'static str)>> {
+    let mut stream = service
+        .open_stream(owner, CATALOG_ALPN)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot reach the peer: {err}"))?;
+    let mut line = serde_json::to_vec(&CatalogRequest {
+        artist: artist.to_string(),
+        want: Some(if release.is_some() {
+            "release_cover".to_string()
+        } else {
+            "artist_image".to_string()
+        }),
+        release: release.map(str::to_string),
+    })?;
+    line.push(b'\n');
+    stream.send.write_all(&line).await?;
+    stream.send.finish()?;
+
+    let header: ImageHeader =
+        serde_json::from_slice(&super::audio::read_line(&mut stream.recv).await?)
+            .context("malformed image header")?;
+    if !header.ok || header.size == 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        header.size <= MAX_IMAGE_BYTES,
+        "image of {} bytes exceeds the {MAX_IMAGE_BYTES} byte limit",
+        header.size
+    );
+    let mut bytes = vec![0u8; header.size as usize];
+    stream
+        .recv
+        .read_exact(&mut bytes)
+        .await
+        .context("stream ended inside the image")?;
+    let extension = match header.mime_type.as_str() {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "jpg",
+    };
+    Ok(Some((bytes, extension)))
+}
+
 /// AsyncRead adapter over the receive half of a byte stream.
 struct StreamReader<'a>(&'a mut ByteStream);
 
@@ -224,6 +385,10 @@ pub struct FedArtistCard {
     pub name: String,
     /// Peers whose catalogs contributed to the card.
     pub peers: usize,
+    /// Every contributing peer (hex ids) — where images are fetched from.
+    pub owners: Vec<String>,
+    /// Local cache path of the artist image, streamed from a peer.
+    pub image_path: Option<String>,
     pub releases: Vec<FedRelease>,
 }
 
@@ -232,6 +397,10 @@ pub struct FedRelease {
     pub title: String,
     pub release_type: String,
     pub year: Option<i32>,
+    /// Peers holding this release (hex ids).
+    pub owners: Vec<String>,
+    /// Local cache path of the cover, streamed from a peer.
+    pub cover_path: Option<String>,
     pub tracks: Vec<FedCardTrack>,
 }
 
@@ -254,7 +423,11 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
     let mut releases: Vec<FedRelease> = Vec::new();
     let mut release_index: HashMap<String, usize> = HashMap::new();
 
+    let mut card_owners: Vec<String> = Vec::new();
     for (owner_hex, catalog) in catalogs {
+        if !card_owners.contains(&owner_hex) {
+            card_owners.push(owner_hex.clone());
+        }
         for release in catalog.releases {
             let release_key = music_dht::normalize_name(&release.title);
             let slot = *release_index.entry(release_key).or_insert_with(|| {
@@ -262,11 +435,16 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
                     title: release.title.clone(),
                     release_type: release.release_type.clone(),
                     year: None,
+                    owners: Vec::new(),
+                    cover_path: None,
                     tracks: Vec::new(),
                 });
                 releases.len() - 1
             });
             let merged = &mut releases[slot];
+            if !merged.owners.contains(&owner_hex) {
+                merged.owners.push(owner_hex.clone());
+            }
             if merged.year.is_none() {
                 merged.year = release.year;
             }
@@ -320,6 +498,8 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
     FedArtistCard {
         name: name.to_string(),
         peers,
+        owners: card_owners,
+        image_path: None,
         releases,
     }
 }

@@ -580,10 +580,80 @@ impl Federation {
         Ok(peer.to_string())
     }
 
+    /// Directory for streamed (never library-imported) card artwork.
+    fn art_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("art")
+    }
+
+    /// Returns a cached-or-streamed image for the card: the artist image
+    /// (`release: None`) or a release cover. Peers are tried in order until
+    /// one answers with an image; the result lands in the art cache and its
+    /// local path is returned.
+    pub async fn card_image(
+        &self,
+        owners: &[String],
+        artist: &str,
+        release: Option<&str>,
+    ) -> Option<String> {
+        let dir = self.art_cache_dir();
+        let stem = match release {
+            Some(release) => format!(
+                "cover-{}-{}",
+                sanitize_file_stem(artist),
+                sanitize_file_stem(release)
+            ),
+            None => format!("artist-{}", sanitize_file_stem(artist)),
+        };
+        // Reuse a previously streamed copy of any known image type.
+        for extension in ["jpg", "png", "webp", "gif", "bmp"] {
+            let path = dir.join(format!("{stem}.{extension}"));
+            if path.is_file() {
+                return Some(path.to_string_lossy().into_owned());
+            }
+        }
+        let service = self.service().await.ok()?;
+        tokio::fs::create_dir_all(&dir).await.ok()?;
+        for owner in owners {
+            let Ok(owner) = EndpointId::from_str(owner) else {
+                continue;
+            };
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(5),
+                catalog::fetch_image(&service, owner, artist, release),
+            )
+            .await;
+            match fetched {
+                Ok(Ok(Some((bytes, extension)))) => {
+                    let path = dir.join(format!("{stem}.{extension}"));
+                    if tokio::fs::write(&path, &bytes).await.is_ok() {
+                        return Some(path.to_string_lossy().into_owned());
+                    }
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Err(err)) => tracing::debug!(peer = %owner, "image fetch failed: {err:#}"),
+                Err(_) => tracing::debug!(peer = %owner, "image fetch timed out"),
+            }
+        }
+        None
+    }
+
+    /// Downloads a federated track straight into the local library
+    /// (regardless of the save-on-listen setting) and returns the imported
+    /// track. Own/already-local tracks resolve without downloading.
+    pub async fn download_to_library(self: &Arc<Self>, fed: &FedTrack) -> Result<TrackItem> {
+        let playable = self.fetch_playable(fed, true).await?;
+        Ok(playable.track)
+    }
+
     /// Prepares a federated track for playback: local tracks resolve
     /// straight to the library; remote tracks are downloaded — into the
     /// library when save-on-listen is enabled, into the cache otherwise.
     pub async fn prepare_playback(self: &Arc<Self>, fed: &FedTrack) -> Result<FedPlayable> {
+        let save = self.settings().save_on_listen;
+        self.fetch_playable(fed, save).await
+    }
+
+    async fn fetch_playable(self: &Arc<Self>, fed: &FedTrack, save: bool) -> Result<FedPlayable> {
         let service = self.service().await?;
         let item_id =
             audio::hex_decode_item_id(&fed.item_id).context("malformed item id in the result")?;
@@ -608,7 +678,6 @@ impl Federation {
 
         let owner = EndpointId::from_str(&fed.owner)
             .map_err(|_| anyhow::anyhow!("malformed owner id '{}'", fed.owner))?;
-        let save = self.settings().save_on_listen;
         let dir = if save { &self.media_dir } else { &self.cache_dir };
         tokio::fs::create_dir_all(dir).await?;
 

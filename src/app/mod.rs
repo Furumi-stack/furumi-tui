@@ -245,7 +245,9 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
                     });
                 }
             }
-            state::GlobalView::Search { .. } | state::GlobalView::FedArtist { .. } => {}
+            state::GlobalView::Search { .. }
+            | state::GlobalView::FedArtist { .. }
+            | state::GlobalView::FedRelease { .. } => {}
         }
     }
 
@@ -286,6 +288,17 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
             && let Some(path) = &detail.cover_path {
                 wanted.push((path.clone(), header.0, header.1));
             }
+    }
+    if let Some((_, state::Loadable::Ready(card))) = &state.fed_artist_view {
+        if let Some(path) = &card.image_path {
+            wanted.push((path.clone(), header.0, header.1));
+        }
+        for release in &card.releases {
+            if let Some(path) = &release.cover_path {
+                wanted.push((path.clone(), tile.0, tile.1));
+                wanted.push((path.clone(), header.0, header.1));
+            }
+        }
     }
     for (path, width, height) in wanted {
         let key = crate::art::cache_key(&path, width, height);
@@ -434,9 +447,37 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                     .artist_card(&name)
                     .await
                     .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(AppEvent::FedArtistLoaded { name, result });
+                let card = result.as_ref().ok().cloned();
+                let _ = tx.send(AppEvent::FedArtistLoaded {
+                    name: name.clone(),
+                    result,
+                });
+                // Stream the artwork in after the card is on screen: the
+                // artist image first, then every release cover.
+                let Some(card) = card else { return };
+                if let Some(path) = fed.card_image(&card.owners, &name, None).await {
+                    let _ = tx.send(AppEvent::FedCardArt {
+                        name: name.clone(),
+                        release: None,
+                        path,
+                    });
+                }
+                for release in &card.releases {
+                    let Some(path) = fed
+                        .card_image(&release.owners, &name, Some(&release.title))
+                        .await
+                    else {
+                        continue;
+                    };
+                    let _ = tx.send(AppEvent::FedCardArt {
+                        name: name.clone(),
+                        release: Some(release.title.clone()),
+                        path,
+                    });
+                }
             });
         }
+        Effect::FedDownload { tracks } => fed_download_spawn(runtime, tracks, None),
         Effect::FedPlay(fed_track) => {
             let fed = Arc::clone(&runtime.federation);
             let tx = runtime.event_tx.clone();
@@ -623,6 +664,64 @@ pub(crate) fn fed_connect(runtime: &Runtime, ticket: String) {
         };
         let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
         let _ = tx.send(AppEvent::StatusMessage(message));
+    });
+}
+
+/// Downloads federated tracks into the library one by one (with progress in
+/// the status bar) and optionally links them to a playlist afterwards.
+pub(crate) fn fed_download_spawn(
+    runtime: &Runtime,
+    tracks: Vec<crate::federation::FedTrack>,
+    playlist: Option<(i64, String)>,
+) {
+    if tracks.is_empty() {
+        return;
+    }
+    let fed = Arc::clone(&runtime.federation);
+    let library = Arc::clone(&runtime.library);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let total = tracks.len();
+        let mut imported_ids = Vec::new();
+        let mut failed = 0usize;
+        for (index, track) in tracks.iter().enumerate() {
+            let _ = tx.send(AppEvent::StatusMessage(format!(
+                "federation: скачивание {}/{total}: {}",
+                index + 1,
+                track.title
+            )));
+            match fed.download_to_library(track).await {
+                Ok(imported) => imported_ids.push(imported.id),
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(title = %track.title, "federated download failed: {err:#}");
+                }
+            }
+        }
+        let mut message = format!("federation: скачано {} из {total}", imported_ids.len());
+        if failed > 0 {
+            message.push_str(&format!(" ({failed} с ошибкой)"));
+        }
+        if let Some((playlist_id, playlist_title)) = playlist
+            && !imported_ids.is_empty()
+        {
+            let library = Arc::clone(&library);
+            let tx_add = tx.clone();
+            let title = playlist_title.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = library
+                    .add_tracks_to_playlist(playlist_id, &imported_ids)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx_add.send(AppEvent::PlaylistTracksAdded {
+                    playlist_id,
+                    playlist_title: title,
+                    result,
+                });
+            });
+        }
+        let _ = tx.send(AppEvent::LibraryChanged {
+            message: Some(message),
+        });
     });
 }
 
@@ -945,6 +1044,24 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 };
             }
         }
+        AppEvent::FedCardArt {
+            name,
+            release,
+            path,
+        } => {
+            if let Some((current, state::Loadable::Ready(card))) = &mut state.fed_artist_view
+                && *current == name
+            {
+                match release {
+                    None => card.image_path = Some(path),
+                    Some(title) => {
+                        if let Some(slot) = card.releases.iter_mut().find(|r| r.title == title) {
+                            slot.cover_path = Some(path);
+                        }
+                    }
+                }
+            }
+        }
         AppEvent::FedTicket(result) => match result {
             Ok(ticket) => {
                 state.popup = Some(state::Popup::FedText {
@@ -1144,27 +1261,15 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 format!("{count} tracks queued")
             });
         }
-        AppEvent::PlaylistCreated { result, add_track } => match result {
+        AppEvent::PlaylistCreated { result, add_target } => match result {
             Ok(playlist) => {
                 tracing::info!(title = %playlist.title, "playlist created");
                 state.status_message = Some(format!("playlist \"{}\" created", playlist.title));
                 state.popup = None;
                 // The list is stale; refetch when next needed.
                 state.playlists.list = None;
-                if let Some(track) = add_track {
-                    let library = Arc::clone(&runtime.library);
-                    let tx = runtime.event_tx.clone();
-                    let (id, title) = (playlist.id, playlist.title.clone());
-                    tokio::task::spawn_blocking(move || {
-                        let result = library
-                            .add_tracks_to_playlist(id, &[track.id])
-                            .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(AppEvent::PlaylistTracksAdded {
-                            playlist_id: id,
-                            playlist_title: title,
-                            result,
-                        });
-                    });
+                if let Some(target) = add_target {
+                    popup::spawn_add_target(runtime, playlist.id, playlist.title.clone(), target);
                 }
             }
             Err(message) => {

@@ -731,6 +731,24 @@ impl Library {
             .optional()?)
     }
 
+    /// Cover path of an artist's release, matched by names (for the peer
+    /// catalog image protocol).
+    pub fn release_cover_by_names(&self, artist: &str, release: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT r.cover_path FROM releases r
+                 JOIN release_artists ra ON ra.release_id = r.id
+                 JOIN artists a ON a.id = ra.artist_id
+                 WHERE a.name = ?1 COLLATE NOCASE AND r.title = ?2 COLLATE NOCASE
+                 LIMIT 1",
+                params![artist, release],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Image of one artist, for the federation metadata exchange.
     pub fn artist_image(&self, artist_id: i64) -> Result<Option<String>> {
         let conn = self.lock();

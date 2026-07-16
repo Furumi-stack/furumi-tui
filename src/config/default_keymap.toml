@@ -52,6 +52,10 @@ key_sequence = "5"
 command = { GoToTab = 4 }
 
 [[keymaps]]
+key_sequence = "y"
+command = "DownloadSelected"
+
+[[keymaps]]
 key_sequence = "a"
 command = "QueueAddNext"
 

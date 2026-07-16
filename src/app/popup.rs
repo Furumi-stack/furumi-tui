@@ -19,14 +19,14 @@ pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
         return;
     };
     match popup {
-        Popup::AddToPlaylist { track, cursor } => {
-            handle_picker(state, runtime, track, cursor, key);
+        Popup::AddToPlaylist { target, cursor } => {
+            handle_picker(state, runtime, target, cursor, key);
         }
         Popup::NewPlaylist {
-            for_track,
+            for_target,
             input,
             busy,
-        } => handle_name_entry(state, runtime, for_track, input, busy, key),
+        } => handle_name_entry(state, runtime, for_target, input, busy, key),
         Popup::Edit {
             target,
             title,
@@ -359,7 +359,7 @@ fn handle_track_info(
 fn handle_picker(
     state: &mut AppState,
     runtime: &Runtime,
-    track: TrackItem,
+    target: crate::app::state::PlaylistAddTarget,
     cursor: usize,
     key: KeyEvent,
 ) {
@@ -368,42 +368,42 @@ fn handle_picker(
         KeyCode::Esc => {}
         KeyCode::Up | KeyCode::Char('k') => {
             state.popup = Some(Popup::AddToPlaylist {
-                track,
+                target,
                 cursor: cursor.saturating_sub(1),
             });
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.popup = Some(Popup::AddToPlaylist {
-                track,
+                target,
                 cursor: (cursor + 1).min(options.len()),
             });
         }
         KeyCode::Enter => {
             if cursor == 0 {
                 state.popup = Some(Popup::NewPlaylist {
-                    for_track: Some(track),
+                    for_target: Some(target),
                     input: crate::app::input::LineEdit::default(),
                     busy: false,
                 });
             } else if let Some((id, title)) = options.get(cursor - 1).cloned() {
-                spawn_add_track(runtime, id, title, track);
+                spawn_add_target(runtime, id, title, target);
             }
         }
-        _ => state.popup = Some(Popup::AddToPlaylist { track, cursor }),
+        _ => state.popup = Some(Popup::AddToPlaylist { target, cursor }),
     }
 }
 
 fn handle_name_entry(
     state: &mut AppState,
     runtime: &Runtime,
-    for_track: Option<TrackItem>,
+    for_target: Option<crate::app::state::PlaylistAddTarget>,
     mut input: crate::app::input::LineEdit,
     busy: bool,
     key: KeyEvent,
 ) {
     if busy {
         state.popup = Some(Popup::NewPlaylist {
-            for_track,
+            for_target,
             input,
             busy,
         });
@@ -412,8 +412,8 @@ fn handle_name_entry(
     match key.code {
         KeyCode::Esc => {
             // Reached from the picker → step back to it; otherwise close.
-            if let Some(track) = for_track {
-                state.popup = Some(Popup::AddToPlaylist { track, cursor: 0 });
+            if let Some(target) = for_target {
+                state.popup = Some(Popup::AddToPlaylist { target, cursor: 0 });
             }
         }
         KeyCode::Enter => {
@@ -421,15 +421,15 @@ fn handle_name_entry(
             if title.is_empty() {
                 state.status_message = Some("playlist name is empty".into());
                 state.popup = Some(Popup::NewPlaylist {
-                    for_track,
+                    for_target,
                     input,
                     busy: false,
                 });
                 return;
             }
-            spawn_create_playlist(runtime, title, for_track.clone());
+            spawn_create_playlist(runtime, title, for_target.clone());
             state.popup = Some(Popup::NewPlaylist {
-                for_track,
+                for_target,
                 input,
                 busy: true,
             });
@@ -437,7 +437,7 @@ fn handle_name_entry(
         _ => {
             input.handle_key(key);
             state.popup = Some(Popup::NewPlaylist {
-                for_track,
+                for_target,
                 input,
                 busy: false,
             });
@@ -445,28 +445,47 @@ fn handle_name_entry(
     }
 }
 
-fn spawn_add_track(runtime: &Runtime, playlist_id: i64, playlist_title: String, track: TrackItem) {
-    let library = Arc::clone(&runtime.library);
-    let tx = runtime.event_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let result = library
-            .add_tracks_to_playlist(playlist_id, &[track.id])
-            .map_err(|err| format!("{err:#}"));
-        let _ = tx.send(AppEvent::PlaylistTracksAdded {
-            playlist_id,
-            playlist_title,
-            result,
-        });
-    });
+/// Adds a target to a playlist: local tracks directly; federated ones are
+/// downloaded into the library first, then linked.
+pub(crate) fn spawn_add_target(
+    runtime: &Runtime,
+    playlist_id: i64,
+    playlist_title: String,
+    target: crate::app::state::PlaylistAddTarget,
+) {
+    match target {
+        crate::app::state::PlaylistAddTarget::Local(tracks) => {
+            let library = Arc::clone(&runtime.library);
+            let tx = runtime.event_tx.clone();
+            let ids: Vec<i64> = tracks.iter().map(|t| t.id).filter(|id| *id >= 0).collect();
+            tokio::task::spawn_blocking(move || {
+                let result = library
+                    .add_tracks_to_playlist(playlist_id, &ids)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(AppEvent::PlaylistTracksAdded {
+                    playlist_id,
+                    playlist_title,
+                    result,
+                });
+            });
+        }
+        crate::app::state::PlaylistAddTarget::Fed(tracks) => {
+            super::fed_download_spawn(runtime, tracks, Some((playlist_id, playlist_title)));
+        }
+    }
 }
 
-fn spawn_create_playlist(runtime: &Runtime, title: String, add_track: Option<TrackItem>) {
+fn spawn_create_playlist(
+    runtime: &Runtime,
+    title: String,
+    add_target: Option<crate::app::state::PlaylistAddTarget>,
+) {
     let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
     tokio::task::spawn_blocking(move || {
         let result = library
             .create_playlist(&title)
             .map_err(|err| format!("{err:#}"));
-        let _ = tx.send(AppEvent::PlaylistCreated { result, add_track });
+        let _ = tx.send(AppEvent::PlaylistCreated { result, add_target });
     });
 }
