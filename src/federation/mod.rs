@@ -481,20 +481,31 @@ impl Federation {
         let dir = if save { &self.media_dir } else { &self.cache_dir };
         tokio::fs::create_dir_all(dir).await?;
 
-        let (path, mime, metadata) =
+        let downloaded =
             audio::download_track(&service, owner, &fed.item_id, dir, &download_stem(fed)).await?;
-        tracing::info!(path = %path.display(), %mime, "federated track downloaded");
+        tracing::info!(
+            path = %downloaded.path.display(),
+            mime = %downloaded.mime_type,
+            cover = downloaded.cover.is_some(),
+            "federated track downloaded"
+        );
 
         if save {
             let library = Arc::clone(&self.library);
-            let import_path = path.clone();
-            let import_metadata = metadata.clone();
+            let import_path = downloaded.path.clone();
+            let import_metadata = downloaded.metadata.clone();
+            let import_cover = downloaded.cover.clone();
             let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
                 let mut import = crate::library::import::read_file(&import_path)?;
                 // The owner's database is more authoritative than whatever
                 // tags the file happens to carry (often none at all).
                 if let Some(meta) = &import_metadata {
                     apply_remote_metadata(&mut import, meta);
+                }
+                // Same for the cover: the peer's library cover wins over an
+                // embedded picture; embedded art stays as the fallback.
+                if import_cover.is_some() {
+                    import.cover = import_cover;
                 }
                 let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
                 Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
@@ -514,8 +525,26 @@ impl Federation {
             }
         }
 
+        // Ephemeral playback: put the cover next to the cached audio so the
+        // views can show it.
+        let cover_path = match &downloaded.cover {
+            Some((bytes, extension)) => {
+                let path = downloaded.path.with_extension(format!("cover.{extension}"));
+                match tokio::fs::write(&path, bytes).await {
+                    Ok(()) => Some(path.to_string_lossy().into_owned()),
+                    Err(err) => {
+                        tracing::warn!(%err, "saving the cover failed");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut track =
+            ephemeral_track(fed, downloaded.metadata.as_ref(), &downloaded.path);
+        track.cover_path = cover_path;
         Ok(FedPlayable {
-            track: ephemeral_track(fed, metadata.as_ref(), &path),
+            track,
             imported: false,
         })
     }

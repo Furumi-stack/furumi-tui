@@ -24,8 +24,14 @@ const MAX_PROTOCOL_LINE: usize = 4096;
 struct AudioRequest {
     /// Hex-encoded [`ItemId`] of the track.
     item_id: String,
-    /// Byte offset to start streaming from.
+    /// Byte offset to start streaming from (audio only; the cover, when
+    /// requested, is always sent whole).
     offset: u64,
+    /// Ask the owner to send the cover art between the header and the
+    /// audio bytes. Default false keeps the wire layout compatible with
+    /// older peers in both directions.
+    #[serde(default)]
+    want_cover: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +50,42 @@ struct AudioResponseHeader {
     /// when the peer predates the field (the header is extensible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metadata: Option<TrackMetadata>,
+    /// Size of the cover-art segment sent between this header and the
+    /// audio bytes; 0 = no cover (not requested, not available).
+    #[serde(default)]
+    cover_size: u64,
+    #[serde(default)]
+    cover_mime: String,
+}
+
+/// Covers above this size are skipped rather than transferred.
+const MAX_COVER_BYTES: u64 = 16 * 1024 * 1024;
+
+fn image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+/// File extension for a received cover, from its mime type.
+pub fn image_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "jpg",
+    }
 }
 
 /// Track metadata exchanged alongside the audio bytes.
@@ -149,17 +191,25 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &impl Seria
 // Requesting side: download a track from its owner
 // ---------------------------------------------------------------------------
 
-/// Downloads a whole track from `owner` into `dir/<stem>.<ext>`; returns
-/// the file path, the mime type and the track metadata the peer reported.
-/// An already complete cached file is reused (the metadata still comes
-/// fresh from the header).
+/// Outcome of [`download_track`].
+pub struct Downloaded {
+    pub path: PathBuf,
+    pub mime_type: String,
+    pub metadata: Option<TrackMetadata>,
+    /// Cover art (bytes, file extension) sent by the owner, if any.
+    pub cover: Option<(Vec<u8>, &'static str)>,
+}
+
+/// Downloads a whole track (with metadata and cover art) from `owner` into
+/// `dir/<stem>.<ext>`. An already complete cached audio file is reused;
+/// the metadata and cover still come fresh from the header.
 pub async fn download_track(
     service: &MusicDhtService,
     owner: EndpointId,
     item_id_hex: &str,
     dir: &Path,
     stem: &str,
-) -> Result<(PathBuf, String, Option<TrackMetadata>)> {
+) -> Result<Downloaded> {
     let mut stream = service
         .open_stream(owner, AUDIO_ALPN)
         .await
@@ -169,6 +219,7 @@ pub async fn download_track(
         &AudioRequest {
             item_id: item_id_hex.to_string(),
             offset: 0,
+            want_cover: true,
         },
     )
     .await?;
@@ -182,14 +233,38 @@ pub async fn download_track(
         );
     }
 
+    // The cover segment precedes the audio bytes and is read regardless of
+    // the cache state — it sits first in the stream.
+    let cover = if header.cover_size > 0 {
+        anyhow::ensure!(
+            header.cover_size <= MAX_COVER_BYTES,
+            "cover of {} bytes exceeds the {MAX_COVER_BYTES} byte limit",
+            header.cover_size
+        );
+        let mut bytes = vec![0u8; header.cover_size as usize];
+        stream
+            .recv
+            .read_exact(&mut bytes)
+            .await
+            .context("stream ended inside the cover segment")?;
+        Some((bytes, image_extension(&header.cover_mime)))
+    } else {
+        None
+    };
+
     let extension = extension_for_mime(&header.mime_type);
     let path = dir.join(format!("{stem}.{extension}"));
     if let Ok(metadata) = tokio::fs::metadata(&path).await
         && metadata.len() == header.total_size
         && header.total_size > 0
     {
-        // Already fully downloaded earlier; no need to fetch again.
-        return Ok((path, header.mime_type, header.metadata));
+        // Audio already fully downloaded earlier; no need to fetch again.
+        return Ok(Downloaded {
+            path,
+            mime_type: header.mime_type,
+            metadata: header.metadata,
+            cover,
+        });
     }
 
     let temp_path = dir.join(format!(".{stem}.{extension}.part"));
@@ -211,7 +286,12 @@ pub async fn download_track(
         );
     }
     tokio::fs::rename(&temp_path, &path).await?;
-    Ok((path, header.mime_type, header.metadata))
+    Ok(Downloaded {
+        path,
+        mime_type: header.mime_type,
+        metadata: header.metadata,
+        cover,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -234,12 +314,19 @@ pub fn resolve_local_track_id(
     Ok(None)
 }
 
-/// Resolves the item to (file path, full metadata from the database).
+/// What the serving side needs to answer one audio request.
+struct Served {
+    file_path: String,
+    metadata: TrackMetadata,
+    cover_path: Option<String>,
+}
+
+/// Resolves the item to the audio file, metadata and cover.
 fn resolve_for_serving(
     library: &Library,
     own: EndpointId,
     item_id: ItemId,
-) -> Result<Option<(String, TrackMetadata)>> {
+) -> Result<Option<Served>> {
     let Some(track_id) = resolve_local_track_id(library, own, item_id)? else {
         return Ok(None);
     };
@@ -269,7 +356,11 @@ fn resolve_for_serving(
         track_number: track.track_number,
         disc_number: track.disc_number,
     };
-    Ok(Some((track.file_path, metadata)))
+    Ok(Some(Served {
+        cover_path: track.cover_path.clone(),
+        file_path: track.file_path,
+        metadata,
+    }))
 }
 
 /// Runs the accept loop of the audio protocol until the acceptor closes.
@@ -310,12 +401,12 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
         }
         None => Err("malformed item_id".to_string()),
     };
-    let (file_path, metadata) = match resolved {
+    let served = match resolved {
         Ok(found) => found,
         Err(message) => return refuse(stream, message).await,
     };
 
-    let path = PathBuf::from(&file_path);
+    let path = PathBuf::from(&served.file_path);
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(err) => return refuse(stream, format!("audio file is not readable: {err}")).await,
@@ -325,6 +416,13 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
     if offset > 0 {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
     }
+
+    // Cover art rides between the header and the audio, when asked for.
+    let cover = if request.want_cover {
+        load_cover(served.cover_path.as_deref()).await
+    } else {
+        None
+    };
     write_line(
         &mut stream.send,
         &AudioResponseHeader {
@@ -333,16 +431,35 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
             mime_type: guess_mime(&path).to_string(),
             total_size,
             offset,
-            metadata: Some(metadata),
+            metadata: Some(served.metadata),
+            cover_size: cover.as_ref().map_or(0, |(bytes, _)| bytes.len() as u64),
+            cover_mime: cover
+                .as_ref()
+                .map(|(_, mime)| mime.to_string())
+                .unwrap_or_default(),
         },
     )
     .await?;
+    if let Some((bytes, _)) = &cover {
+        stream.send.write_all(bytes).await?;
+    }
     tokio::io::copy(&mut file, &mut stream.send).await?;
     stream.send.finish()?;
     // Wait until the peer read everything (or gave up) before dropping the
     // stream, otherwise the tail of the file is lost.
     let _ = stream.send.stopped().await;
     Ok(())
+}
+
+/// Reads a cover image from disk, skipping unreadable or oversized files.
+async fn load_cover(cover_path: Option<&str>) -> Option<(Vec<u8>, &'static str)> {
+    let path = PathBuf::from(cover_path?);
+    let size = tokio::fs::metadata(&path).await.ok()?.len();
+    if size == 0 || size > MAX_COVER_BYTES {
+        return None;
+    }
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    Some((bytes, image_mime(&path)))
 }
 
 /// Sends a refusal header and waits until the peer read it.
@@ -356,6 +473,8 @@ async fn refuse(mut stream: ByteStream, message: String) -> Result<()> {
             total_size: 0,
             offset: 0,
             metadata: None,
+            cover_size: 0,
+            cover_mime: String::new(),
         },
     )
     .await?;
