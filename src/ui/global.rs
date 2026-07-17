@@ -405,7 +405,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
     if !detail.featured_tracks.is_empty() {
         about.push_str(&format!(" · appears on {}", detail.featured_tracks.len()));
     }
-    let info = vec![
+    let mut info = vec![
         Line::default(),
         Line::styled(detail.name.clone(), theme::header()),
         Line::default(),
@@ -418,6 +418,19 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         ),
         Line::styled(about, theme::dim()),
     ];
+    if state.federation.settings.enabled {
+        // Reached with Up from the first row, like the download button on
+        // a federated release.
+        info.push(Line::default());
+        info.push(Line::styled(
+            " ⌕ Search this artist in the federation ",
+            if state.artist_fed_button {
+                theme::tab_active()
+            } else {
+                theme::accent()
+            },
+        ));
+    }
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Scrollable content: top tracks, releases grouped by type, then the
@@ -827,6 +840,11 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             index += 1;
         }
         for fed in &state.search.fed_tracks {
+            let heart = if state.fed_likes.contains(&fed.item_id) {
+                Span::styled("♥ ", theme::accent())
+            } else {
+                Span::raw("  ")
+            };
             let origin = if fed.own {
                 "your library".to_string()
             } else {
@@ -841,6 +859,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             }
             rows.push((
                 Line::from(vec![
+                    heart,
                     Span::styled("⇅ ", theme::accent()),
                     Span::raw(fed.title.clone()),
                     Span::styled(
@@ -1098,7 +1117,17 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
             duration
         };
         let in_selection = state.track_selection.contains(&scope, position);
+        let liked = track
+            .sources
+            .iter()
+            .any(|(_, item_id)| state.fed_likes.contains(item_id));
+        let heart = if liked {
+            Span::styled("♥ ", theme::accent())
+        } else {
+            Span::raw("  ")
+        };
         let line = Line::from(vec![
+            heart,
             Span::styled("⇅ ", theme::accent()),
             Span::raw(format!("{number}{}", track.title)),
         ]);

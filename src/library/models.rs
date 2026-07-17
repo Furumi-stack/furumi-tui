@@ -40,9 +40,18 @@ pub struct TrackItem {
     pub file_size_bytes: Option<i64>,
     /// Completed local plays, from the history table.
     pub play_count: i64,
+    /// Set for federated tracks that are not in the local library (yet):
+    /// carries everything needed to download them from the owning peer.
+    /// With an empty `file_path` the player resolves the track on demand.
+    pub fed: Option<crate::federation::FedTrack>,
 }
 
 impl TrackItem {
+    /// A federated track that still needs downloading before playback.
+    pub fn is_fed_pending(&self) -> bool {
+        self.fed.is_some() && self.file_path.is_empty()
+    }
+
     pub fn artist_line(&self) -> String {
         let mut names: Vec<&str> = self.artists.iter().map(|a| a.name.as_str()).collect();
         if !self.featured_artists.is_empty() {

@@ -63,14 +63,24 @@ pub(crate) fn track_row(
     selected: bool,
     visual_selected: bool,
 ) {
-    let heart = if state.likes.contains(&track.id) {
+    let fed_liked = track
+        .fed
+        .as_ref()
+        .is_some_and(|fed| state.fed_likes.contains(&fed.item_id));
+    let heart = if state.likes.contains(&track.id) || fed_liked {
         Span::styled("♥ ", theme::accent())
     } else {
         Span::raw("  ")
     };
+    let fed_marker = if track.fed.is_some() {
+        Span::styled("⇅ ", theme::accent())
+    } else {
+        Span::raw("")
+    };
     let line = Line::from(vec![
         Span::styled(format!("{index_label:>3} "), theme::dim()),
         heart,
+        fed_marker,
         Span::raw(track.title.clone()),
         Span::styled(format!("  {}", track.artist_line()), theme::dim()),
     ]);

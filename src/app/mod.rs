@@ -36,6 +36,8 @@ pub struct Runtime {
     pub federation: Arc<crate::federation::Federation>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
+    /// Placeholder ids of federated tracks being downloaded right now.
+    pub fed_resolving: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// Caps concurrent artwork loads so they never starve the disk.
     pub art_semaphore: Arc<tokio::sync::Semaphore>,
     /// Monotonic sequence for live search; stale responses are dropped.
@@ -82,6 +84,7 @@ pub async fn run(
         library,
         federation,
         fed_status_at: None,
+        fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
         art_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         player: player::spawn(move |event| {
@@ -185,6 +188,8 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         tokio::task::spawn_blocking(move || {
             let result = library.likes().map_err(err_string);
             let _ = tx.send(AppEvent::LikesLoaded(result));
+            let result = library.fed_like_ids().map_err(err_string);
+            let _ = tx.send(AppEvent::FedLikesLoaded(result));
         });
     }
 
@@ -378,10 +383,12 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 }
             });
         }
-        Effect::ToggleLikes { track_ids } => {
-            // Ephemeral federated tracks (negative ids) are not in the DB.
+        Effect::ToggleLikes {
+            track_ids,
+            fed_tracks,
+        } => {
             let track_ids: Vec<i64> = track_ids.into_iter().filter(|id| *id >= 0).collect();
-            if track_ids.is_empty() {
+            if track_ids.is_empty() && fed_tracks.is_empty() {
                 return;
             }
             let library = Arc::clone(&runtime.library);
@@ -394,6 +401,22 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                         }
                         Err(err) => {
                             tracing::warn!(%err, track_id, "like toggle failed");
+                            let _ =
+                                tx.send(AppEvent::StatusMessage(format!("like failed: {err:#}")));
+                            break;
+                        }
+                    }
+                }
+                for fed in fed_tracks {
+                    match library.toggle_fed_like(&fed) {
+                        Ok(liked) => {
+                            let _ = tx.send(AppEvent::FedLikeToggled {
+                                item_id: fed.item_id.clone(),
+                                liked,
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, title = %fed.title, "federated like toggle failed");
                             let _ =
                                 tx.send(AppEvent::StatusMessage(format!("like failed: {err:#}")));
                             break;
@@ -478,17 +501,6 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             });
         }
         Effect::FedDownload { tracks } => fed_download_spawn(runtime, tracks, None),
-        Effect::FedPlay(fed_track) => {
-            let fed = Arc::clone(&runtime.federation);
-            let tx = runtime.event_tx.clone();
-            tokio::spawn(async move {
-                let result = fed
-                    .prepare_playback(&fed_track)
-                    .await
-                    .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(AppEvent::FedPlayReady { result });
-            });
-        }
         Effect::RemoveQueueIndices {
             restart_paused,
             stop,
@@ -550,6 +562,14 @@ fn start_current_audio(
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
 
     runtime.player_start_pending = true;
+    if track.is_fed_pending() {
+        // A federated track that is not on disk yet: silence the previous
+        // audio, download it and resume through FedTrackResolved.
+        runtime.player.stop();
+        state.status_message = Some(format!("federation: fetching \"{}\"…", track.title));
+        spawn_fed_resolve(runtime, &track);
+        return;
+    }
     let controller = runtime.player.clone();
     let volume = player::amplitude(state.player.volume);
     let tx = runtime.event_tx.clone();
@@ -606,6 +626,12 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     let Some(next) = player.queue.get(next_pos).cloned() else {
         return;
     };
+    if next.is_fed_pending() {
+        // Download the upcoming federated track ahead of time; the gapless
+        // enqueue happens on a later tick once it resolved to a file.
+        spawn_fed_resolve(runtime, &next);
+        return;
+    }
     state.player.prefetched_pos = Some(next_pos);
     tracing::debug!(title = %next.title, "prefetching next track");
     let controller = runtime.player.clone();
@@ -664,6 +690,38 @@ pub(crate) fn fed_connect(runtime: &Runtime, ticket: String) {
         };
         let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
         let _ = tx.send(AppEvent::StatusMessage(message));
+    });
+}
+
+/// Downloads one pending federated track (into the cache, or the library
+/// when save-on-listen is enabled) and reports back with the placeholder id
+/// so the queue can swap the resolved track in.
+fn spawn_fed_resolve(runtime: &Runtime, track: &crate::library::models::TrackItem) {
+    let Some(fed_track) = track.fed.clone() else {
+        return;
+    };
+    {
+        let mut resolving = runtime
+            .fed_resolving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !resolving.insert(track.id) {
+            return;
+        }
+    }
+    let placeholder_id = track.id;
+    let fed = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let result = fed
+            .prepare_playback(&fed_track)
+            .await
+            .map(Box::new)
+            .map_err(|err| format!("{err:#}"));
+        let _ = tx.send(AppEvent::FedTrackResolved {
+            placeholder_id,
+            result,
+        });
     });
 }
 
@@ -893,8 +951,16 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
     // until then.
     state.likes_loaded = false;
 
-    // Fresh copies of whatever sits in the queue.
-    let ids: Vec<i64> = state.player.queue.iter().map(|track| track.id).collect();
+    // Fresh copies of whatever sits in the queue. Federated placeholders
+    // and ephemeral tracks (negative ids) are not library rows and keep
+    // their in-memory copies.
+    let ids: Vec<i64> = state
+        .player
+        .queue
+        .iter()
+        .map(|track| track.id)
+        .filter(|id| *id >= 0)
+        .collect();
     if !ids.is_empty() {
         let library = Arc::clone(&runtime.library);
         let tx = runtime.event_tx.clone();
@@ -956,9 +1022,12 @@ fn apply_queue_refresh(
         .player
         .queue
         .iter()
-        .any(|track| !by_id.contains_key(&track.id));
+        .any(|track| track.id >= 0 && !by_id.contains_key(&track.id));
     if had_missing {
-        state.player.queue.retain(|track| by_id.contains_key(&track.id));
+        state
+            .player
+            .queue
+            .retain(|track| track.id < 0 || by_id.contains_key(&track.id));
         state.player.prefetched_pos = None;
     }
     if state.player.queue.is_empty() {
@@ -1018,22 +1087,72 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Err(message) => tracing::warn!(%message, "federated search failed"),
             }
         }
-        AppEvent::FedPlayReady { result } => match result {
-            Ok(playable) => {
-                if playable.imported {
-                    // Save-on-listen imported the file; refresh the library
-                    // views through the standard change path.
-                    let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
-                        message: Some(format!("saved \"{}\" to the library", playable.track.title)),
-                    });
+        AppEvent::FedTrackResolved {
+            placeholder_id,
+            result,
+        } => {
+            runtime
+                .fed_resolving
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&placeholder_id);
+            match result {
+                Ok(playable) => {
+                    if playable.imported {
+                        // Save-on-listen imported the file; refresh the
+                        // library views through the standard change path.
+                        let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
+                            message: Some(format!(
+                                "saved \"{}\" to the library",
+                                playable.track.title
+                            )),
+                        });
+                    }
+                    let resolved = playable.track.clone();
+                    // Swap the placeholder for the real track everywhere it
+                    // sits in the queue.
+                    for slot in &mut state.player.queue {
+                        if slot.id == placeholder_id {
+                            *slot = resolved.clone();
+                        }
+                    }
+                    let waiting = state
+                        .player
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.id == placeholder_id);
+                    if waiting {
+                        // Playback was parked on this track; start it now.
+                        let paused = state.player.paused;
+                        start_current_audio(state, runtime, 0.0, paused);
+                        push_media_metadata(state, runtime);
+                        push_media_update(state, runtime, true);
+                    }
                 }
-                state.player.queue = vec![playable.track];
-                state.player.queue_pos = 0;
-                update::on_new_queue(state);
-                perform_effect(state, runtime, Effect::PlayCurrent);
+                Err(message) => {
+                    state.status_message = Some(format!("federation: {message}"));
+                    let waiting = state
+                        .player
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.id == placeholder_id);
+                    if waiting {
+                        // Skip the failed track instead of stalling the queue.
+                        if state.player.queue_pos + 1 < state.player.queue.len() {
+                            state.player.queue_pos += 1;
+                            start_current_audio(state, runtime, 0.0, state.player.paused);
+                            push_media_metadata(state, runtime);
+                            push_media_update(state, runtime, true);
+                        } else {
+                            runtime.player_start_pending = false;
+                            state.player.playing = false;
+                            state.player.current = None;
+                            runtime.player.stop();
+                        }
+                    }
+                }
             }
-            Err(message) => state.status_message = Some(format!("federation: {message}")),
-        },
+        }
         AppEvent::FedArtistLoaded { name, result } => {
             if let Some((current, data)) = &mut state.fed_artist_view
                 && *current == name
@@ -1237,6 +1356,25 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             Err(message) => tracing::warn!(%message, "likes load failed"),
         },
+        AppEvent::FedLikesLoaded(result) => match result {
+            Ok(ids) => state.fed_likes = ids.into_iter().collect(),
+            Err(message) => tracing::warn!(%message, "federated likes load failed"),
+        },
+        AppEvent::FedLikeToggled { item_id, liked } => {
+            if liked {
+                state.fed_likes.insert(item_id);
+            } else {
+                state.fed_likes.remove(&item_id);
+            }
+            // The virtual Likes playlist is stale now; refetch on next open.
+            state.playlist_views.remove(&state::LIKES_PLAYLIST_ID);
+            state.playlists.list = None;
+            state.status_message = Some(if liked {
+                "♥ liked (federation)".to_string()
+            } else {
+                "like removed".to_string()
+            });
+        }
         AppEvent::LikeToggled { track_id, liked } => {
             if liked {
                 state.likes.insert(track_id);

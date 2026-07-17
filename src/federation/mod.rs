@@ -117,6 +117,10 @@ pub struct FedTrack {
     pub artist_names: Vec<String>,
     pub year: Option<i32>,
     pub duration_seconds: Option<i64>,
+    /// Release context, known when the track came from an artist card.
+    pub release_title: Option<String>,
+    pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
 }
 
 impl FedTrack {
@@ -388,14 +392,22 @@ impl Federation {
         match service.sync_library(specs).await {
             Ok(stats) => {
                 *lock(&self.last_sync) = Some(format!(
-                    "{} (+{} ~{} −{}, unchanged {})",
+                    "{} (+{} ~{} −{}, unchanged {}, failed {})",
                     now_label(),
                     stats.added,
                     stats.updated,
                     stats.removed,
-                    stats.unchanged
+                    stats.unchanged,
+                    stats.failed
                 ));
-                self.set_error(None);
+                if stats.failed > 0 {
+                    self.set_error(Some(format!(
+                        "{} item(s) failed to publish in the last sync",
+                        stats.failed
+                    )));
+                } else {
+                    self.set_error(None);
+                }
             }
             Err(err) => {
                 tracing::warn!("federation sync failed: {err}");
@@ -455,6 +467,9 @@ impl Federation {
                 artist_names: item.artist_names.clone(),
                 year: item.year,
                 duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
+                release_title: None,
+                track_number: None,
+                disc_number: None,
             })
             .collect();
 
@@ -696,6 +711,7 @@ impl Federation {
             let import_metadata = downloaded.metadata.clone();
             let import_cover = downloaded.cover.clone();
             let artist_image = downloaded.artist_image.clone();
+            let fed_item_id = fed.item_id.clone();
             let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
                 let mut import = crate::library::import::read_file(&import_path)?;
                 // The owner's database is more authoritative than whatever
@@ -709,6 +725,11 @@ impl Federation {
                     import.cover = import_cover;
                 }
                 let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
+                // A like that referenced the federated track moves onto the
+                // freshly imported local row.
+                if let Err(err) = library.transfer_fed_like(&fed_item_id, track_id) {
+                    tracing::warn!(%err, "federated like transfer failed");
+                }
                 // The owner's artist image fills the gap for a freshly
                 // created (or still image-less) main artist.
                 if let (Some((bytes, extension)), Some(artist_name)) =
@@ -895,6 +916,46 @@ fn download_stem(fed: &FedTrack) -> String {
     }
 }
 
+/// A queueable placeholder for a federated track that has not been
+/// downloaded yet: it behaves like a regular track everywhere (queue, info,
+/// selection) and resolves to a local file when playback reaches it.
+pub fn pending_track(fed: &FedTrack) -> TrackItem {
+    let id = NEXT_EPHEMERAL_ID.fetch_sub(1, Ordering::Relaxed);
+    let refs = |names: &[String]| -> Vec<ArtistRef> {
+        names
+            .iter()
+            .map(|name| ArtistRef {
+                id: -1,
+                name: name.clone(),
+            })
+            .collect()
+    };
+    TrackItem {
+        id,
+        title: fed.title.clone(),
+        track_number: fed.track_number,
+        disc_number: fed.disc_number,
+        duration_seconds: fed.duration_seconds.unwrap_or(0) as f64,
+        artists: refs(&fed.artist_names),
+        featured_artists: Vec::new(),
+        release_id: -1,
+        release_title: fed
+            .release_title
+            .clone()
+            .unwrap_or_else(|| format!("federation · {}", fed.owner_short())),
+        release_year: fed.year,
+        file_path: String::new(),
+        cover_path: None,
+        audio_format: None,
+        audio_bitrate: None,
+        audio_sample_rate: None,
+        audio_bit_depth: None,
+        file_size_bytes: None,
+        play_count: 0,
+        fed: Some(fed.clone()),
+    }
+}
+
 /// A playable TrackItem for a downloaded-but-not-imported federated track.
 fn ephemeral_track(
     fed: &FedTrack,
@@ -948,5 +1009,8 @@ fn ephemeral_track(
         audio_bit_depth: None,
         file_size_bytes: file_size,
         play_count: 0,
+        // Keep the federation reference: the cached track can still be
+        // liked, re-downloaded and marked as federated in the lists.
+        fed: Some(fed.clone()),
     }
 }

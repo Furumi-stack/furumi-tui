@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS likes (
     track_id  INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
     liked_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS fed_likes (
+    item_id          TEXT PRIMARY KEY,
+    owner            TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    artist_names     TEXT NOT NULL DEFAULT '',
+    year             INTEGER,
+    duration_seconds REAL,
+    release_title    TEXT,
+    track_number     INTEGER,
+    disc_number      INTEGER,
+    liked_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS history (
     id                INTEGER PRIMARY KEY,
     track_id          INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
@@ -155,6 +167,7 @@ impl Library {
             .with_context(|| format!("opening database {}", db_path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        register_norm_function(&conn)?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
         let covers_dir = db_path
             .parent()
@@ -337,13 +350,19 @@ impl Library {
         if query.is_empty() {
             return Ok(SearchResults::default());
         }
-        let pattern = format!("%{}%", like_escape(query));
+        // instr over norm() folds case for every script, unlike LIKE/NOCASE
+        // which only handle ASCII.
+        let pattern = music_dht::normalize_name(query);
+        if pattern.is_empty() {
+            // Punctuation-only queries (e.g. "%") normalize to nothing.
+            return Ok(SearchResults::default());
+        }
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT a.id, a.name, a.image_path,
                 (SELECT COUNT(*) FROM release_artists ra WHERE ra.artist_id = a.id),
                 (SELECT COUNT(*) FROM track_artists ta WHERE ta.artist_id = a.id)
-             FROM artists a WHERE a.name LIKE ?1 ESCAPE '\\'
+             FROM artists a WHERE instr(norm(a.name), ?1) > 0
              ORDER BY a.name COLLATE NOCASE LIMIT ?2",
         )?;
         let artists = statement
@@ -360,7 +379,7 @@ impl Library {
         let mut statement = conn.prepare(
             "SELECT r.id, r.title, r.release_type, r.year, r.cover_path,
                 (SELECT COUNT(*) FROM tracks t WHERE t.release_id = r.id)
-             FROM releases r WHERE r.title LIKE ?1 ESCAPE '\\'
+             FROM releases r WHERE instr(norm(r.title), ?1) > 0
              ORDER BY r.title COLLATE NOCASE LIMIT ?2",
         )?;
         let releases = statement
@@ -371,7 +390,7 @@ impl Library {
             &format!(
                 "SELECT {TRACK_COLUMNS} FROM tracks t
                  JOIN releases r ON r.id = t.release_id
-                 WHERE t.title LIKE ?1 ESCAPE '\\'
+                 WHERE instr(norm(t.title), ?1) > 0
                  ORDER BY t.title COLLATE NOCASE LIMIT ?2"
             ),
             params![pattern, limit],
@@ -485,7 +504,11 @@ impl Library {
 
     pub fn playlists(&self) -> Result<Vec<PlaylistCard>> {
         let conn = self.lock();
-        let liked: i64 = conn.query_row("SELECT COUNT(*) FROM likes", [], |row| row.get(0))?;
+        let liked: i64 = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM likes) + (SELECT COUNT(*) FROM fed_likes)",
+            [],
+            |row| row.get(0),
+        )?;
         let mut list = vec![PlaylistCard {
             id: LIKES_PLAYLIST_ID,
             title: "Liked tracks".to_string(),
@@ -514,7 +537,7 @@ impl Library {
     pub fn playlist(&self, id: i64) -> Result<PlaylistDetail> {
         let conn = self.lock();
         if id == LIKES_PLAYLIST_ID {
-            let tracks = query_tracks(
+            let mut tracks = query_tracks(
                 &conn,
                 &format!(
                     "SELECT {TRACK_COLUMNS} FROM tracks t
@@ -524,6 +547,12 @@ impl Library {
                 ),
                 params![],
             )?;
+            drop(conn);
+            // Liked federated tracks follow the local ones as queueable
+            // placeholders (downloaded on playback like everywhere else).
+            for fed in self.fed_likes()? {
+                tracks.push(crate::federation::pending_track(&fed));
+            }
             return Ok(PlaylistDetail {
                 id,
                 title: "Liked tracks".to_string(),
@@ -614,6 +643,89 @@ impl Library {
             )?;
         }
         Ok(())
+    }
+
+    /// Liked federated tracks, newest first, as playable references.
+    pub fn fed_likes(&self) -> Result<Vec<crate::federation::FedTrack>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT item_id, owner, title, artist_names, year, duration_seconds,
+                    release_title, track_number, disc_number
+             FROM fed_likes ORDER BY liked_at DESC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let artists: String = row.get(3)?;
+                Ok(crate::federation::FedTrack {
+                    item_id: row.get(0)?,
+                    owner: row.get(1)?,
+                    own: false,
+                    title: row.get(2)?,
+                    artist_names: artists
+                        .split("; ")
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    year: row.get(4)?,
+                    duration_seconds: row.get::<_, Option<f64>>(5)?.map(|d| d.round() as i64),
+                    release_title: row.get(6)?,
+                    track_number: row.get(7)?,
+                    disc_number: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Item ids of every liked federated track (for the ♥ markers).
+    pub fn fed_like_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT item_id FROM fed_likes")?;
+        let rows = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Toggles a like on a federated track; returns the resulting state.
+    pub fn toggle_fed_like(&self, fed: &crate::federation::FedTrack) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [&fed.item_id])?;
+        if removed > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO fed_likes (item_id, owner, title, artist_names, year,
+                duration_seconds, release_title, track_number, disc_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                fed.item_id,
+                fed.owner,
+                fed.title,
+                fed.artist_names.join("; "),
+                fed.year,
+                fed.duration_seconds.map(|d| d as f64),
+                fed.release_title,
+                fed.track_number,
+                fed.disc_number,
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Moves a federated like onto a freshly imported local track. Returns
+    /// whether a transfer happened.
+    pub fn transfer_fed_like(&self, item_id: &str, track_id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [item_id])?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
+            [track_id],
+        )?;
+        Ok(true)
     }
 
     pub fn likes(&self) -> Result<Vec<i64>> {
@@ -724,7 +836,7 @@ impl Library {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT id FROM artists WHERE name = ?1 COLLATE NOCASE",
+                "SELECT id FROM artists WHERE norm(name) = norm(?1) LIMIT 1",
                 [name],
                 |row| row.get(0),
             )
@@ -740,7 +852,7 @@ impl Library {
                 "SELECT r.cover_path FROM releases r
                  JOIN release_artists ra ON ra.release_id = r.id
                  JOIN artists a ON a.id = ra.artist_id
-                 WHERE a.name = ?1 COLLATE NOCASE AND r.title = ?2 COLLATE NOCASE
+                 WHERE norm(a.name) = norm(?1) AND norm(r.title) = norm(?2)
                  LIMIT 1",
                 params![artist, release],
                 |row| row.get(0),
@@ -767,7 +879,7 @@ impl Library {
         let conn = self.lock();
         let missing: Option<bool> = conn
             .query_row(
-                "SELECT image_path IS NULL FROM artists WHERE name = ?1 COLLATE NOCASE",
+                "SELECT image_path IS NULL FROM artists WHERE norm(name) = norm(?1)",
                 [name],
                 |row| row.get(0),
             )
@@ -781,7 +893,7 @@ impl Library {
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE artists SET image_path = ?2
-             WHERE name = ?1 COLLATE NOCASE AND image_path IS NULL",
+             WHERE norm(name) = norm(?1) AND image_path IS NULL",
             params![name, image_path],
         )?;
         Ok(changed > 0)
@@ -850,7 +962,7 @@ pub(crate) fn find_or_create_artist(conn: &Connection, name: &str) -> Result<i64
     anyhow::ensure!(!name.is_empty(), "artist name is empty");
     if let Some(id) = conn
         .query_row(
-            "SELECT id FROM artists WHERE name = ?1 COLLATE NOCASE",
+            "SELECT id FROM artists WHERE norm(name) = norm(?1) LIMIT 1",
             [name],
             |row| row.get(0),
         )
@@ -901,6 +1013,7 @@ fn query_tracks(
                 play_count: row.get(15)?,
                 artists: Vec::new(),
                 featured_artists: Vec::new(),
+                fed: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -933,11 +1046,22 @@ fn query_tracks(
 }
 
 /// Escape LIKE wildcards in user input; queries use `ESCAPE '\'`.
-fn like_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+/// Registers `norm(text)` — Unicode-aware case folding and normalization
+/// (NFKC, lowercase, punctuation stripped). SQLite's own LIKE/NOCASE only
+/// fold ASCII, so Cyrillic and other non-Latin names were unsearchable
+/// without it. Shares the exact algorithm with the federation DHT.
+fn register_norm_function(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "norm",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: String = ctx.get(0)?;
+            Ok(music_dht::normalize_name(&value))
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -947,6 +1071,7 @@ mod tests {
     fn test_library() -> Library {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        register_norm_function(&conn).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         Library {
             conn: Mutex::new(conn),
@@ -1016,6 +1141,17 @@ mod tests {
         assert_eq!(results.tracks.len(), 1);
         // LIKE wildcards in the query must not match everything.
         assert_eq!(lib.search("%", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn search_folds_case_beyond_ascii() {
+        let lib = test_library();
+        add_track(&lib, "Nothing Else Matters", "Металлика", "Чёрный альбом");
+        // SQLite's LIKE/NOCASE only fold ASCII; norm() folds every script.
+        assert_eq!(lib.search("металлика", 10).unwrap().artists.len(), 1);
+        assert_eq!(lib.search("МЕТАЛЛИКА", 10).unwrap().artists.len(), 1);
+        assert_eq!(lib.search("чёрный", 10).unwrap().releases.len(), 1);
+        assert_eq!(lib.search("matters", 10).unwrap().tracks.len(), 1);
     }
 
     #[test]

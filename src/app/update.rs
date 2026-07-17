@@ -30,6 +30,7 @@ pub enum Effect {
     },
     ToggleLikes {
         track_ids: Vec<i64>,
+        fed_tracks: Vec<crate::federation::FedTrack>,
     },
     /// Remove tracks from a stored playlist in the library.
     RemoveFromPlaylist {
@@ -47,8 +48,6 @@ pub enum Effect {
     FedSyncNow,
     /// Fetch this peer's ticket and show it in a popup.
     FedShowTicket,
-    /// Download (or resolve) a federated track and play it.
-    FedPlay(crate::federation::FedTrack),
     /// Assemble the federated artist card (fan-out to the owning peers).
     FedOpenArtist(String),
     /// Download federated tracks into the local library, one by one.
@@ -225,32 +224,52 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::ToggleLike => {
-            let tracks = selected_tracks(state);
-            let track_ids: Vec<i64> = if tracks.is_empty() {
-                state
+            let mut tracks = selected_tracks(state);
+            if tracks.is_empty() {
+                tracks = state
                     .player
                     .current
                     .as_ref()
-                    .map(|track| vec![track.id])
-                    .unwrap_or_default()
-            } else {
-                tracks.into_iter().map(|track| track.id).collect()
-            };
-            if track_ids.is_empty() {
+                    .map(|track| vec![track.clone()])
+                    .unwrap_or_default();
+            }
+            // Local library rows are liked by id; federated tracks (pending
+            // or cached) are liked as references into the federation.
+            let mut track_ids: Vec<i64> = Vec::new();
+            let mut fed_tracks: Vec<crate::federation::FedTrack> = Vec::new();
+            for track in tracks {
+                match &track.fed {
+                    Some(fed) => fed_tracks.push(fed.clone()),
+                    None if track.id >= 0 => track_ids.push(track.id),
+                    None => {}
+                }
+            }
+            if track_ids.is_empty() && fed_tracks.is_empty() {
                 state.status_message = Some("no track selected".into());
                 None
             } else {
-                let should_like = track_ids.iter().any(|id| !state.likes.contains(id));
+                let should_like = track_ids.iter().any(|id| !state.likes.contains(id))
+                    || fed_tracks
+                        .iter()
+                        .any(|fed| !state.fed_likes.contains(&fed.item_id));
                 let toggles: Vec<i64> = track_ids
                     .into_iter()
                     .filter(|id| state.likes.contains(id) != should_like)
                     .collect();
+                let fed_toggles: Vec<crate::federation::FedTrack> = fed_tracks
+                    .into_iter()
+                    .filter(|fed| state.fed_likes.contains(&fed.item_id) != should_like)
+                    .collect();
+                let total = toggles.len() + fed_toggles.len();
                 state.status_message = Some(if should_like {
-                    format!("liking {} track(s)", toggles.len())
+                    format!("liking {total} track(s)")
                 } else {
-                    format!("removing like from {} track(s)", toggles.len())
+                    format!("removing like from {total} track(s)")
                 });
-                Some(Effect::ToggleLikes { track_ids: toggles })
+                Some(Effect::ToggleLikes {
+                    track_ids: toggles,
+                    fed_tracks: fed_toggles,
+                })
             }
         }
         Action::ToggleTrackSelection => {
@@ -503,7 +522,10 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
                         .filter(|id| state.likes.contains(id))
                         .collect();
                     state.status_message = Some(format!("removing {} like(s)", liked.len()));
-                    return Some(Effect::ToggleLikes { track_ids: liked });
+                    return Some(Effect::ToggleLikes {
+                        track_ids: liked,
+                        fed_tracks: vec![],
+                    });
                 }
                 state.status_message =
                     Some(format!("removing {} track(s) from playlist", track_ids.len()));
@@ -676,6 +698,9 @@ fn set_track_scope_cursor(state: &mut AppState, scope: &TrackSelectionScope, val
 }
 
 fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, usize, usize)> {
+    if state.artist_fed_button {
+        return None;
+    }
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
@@ -786,6 +811,17 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
 }
 
 pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
+    if state.artist_fed_button {
+        return Vec::new();
+    }
+    // Federated contexts produce queueable placeholders that behave like
+    // regular tracks (queue, info, playback-on-demand).
+    {
+        let fed = selected_fed_tracks(state);
+        if !fed.is_empty() {
+            return fed.iter().map(crate::federation::pending_track).collect();
+        }
+    }
     let Some((scope, cursor, tracks)) = current_track_list(state) else {
         return selected_track(state).into_iter().collect();
     };
@@ -915,6 +951,9 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
 
 /// The track under the cursor in whatever view is showing tracks.
 pub fn selected_track(state: &AppState) -> Option<TrackItem> {
+    if state.artist_fed_button {
+        return None;
+    }
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
@@ -937,9 +976,31 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
             GlobalView::Search { cursor } => {
                 let results = state.search.results.as_ref()?;
                 let offset = cursor.checked_sub(results.artists.len() + results.releases.len())?;
-                results.tracks.get(offset).cloned()
+                match results.tracks.get(offset) {
+                    Some(track) => Some(track.clone()),
+                    // Below the local tracks: the federated section.
+                    None => {
+                        let fed_offset = offset
+                            .checked_sub(results.tracks.len() + state.search.fed_artists.len())?;
+                        state
+                            .search
+                            .fed_tracks
+                            .get(fed_offset)
+                            .map(crate::federation::pending_track)
+                    }
+                }
             }
-            GlobalView::FedArtist { .. } | GlobalView::FedRelease { .. } => None,
+            GlobalView::FedArtist { .. } => None,
+            GlobalView::FedRelease { index, cursor } => {
+                let name = state.fed_artist_view.as_ref().map(|(name, _)| name.clone())?;
+                let release = fed_card_release(state, *index)?;
+                release
+                    .tracks
+                    .get(cursor.checked_sub(1)?)
+                    .and_then(|track| fed_track_from_card(&name, release, track))
+                    .as_ref()
+                    .map(crate::federation::pending_track)
+            }
         },
         Tab::Playlists => {
             let opened = state.playlists.opened.as_ref()?;
@@ -1013,6 +1074,10 @@ fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
 /// track. If the release view is still loading, the focus is applied when
 /// it arrives (`pending_release_focus`).
 fn open_release_for_track(state: &mut AppState, track: &TrackItem) {
+    if track.release_id < 0 {
+        state.status_message = Some("this federated track has no local release".into());
+        return;
+    }
     let release_id = track.release_id;
     let cursor = match state.release_views.get(&release_id) {
         Some(Loadable::Ready(detail)) => detail
@@ -1338,6 +1403,17 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             state.track_selection.clear();
         }
         Some(GlobalView::Artist { id, cursor }) => {
+            if state.artist_fed_button {
+                // Down leaves the federation-search button; other keys stay.
+                if dy > 0 {
+                    state.artist_fed_button = false;
+                }
+                return;
+            }
+            if cursor == 0 && dy < 0 && state.federation.settings.enabled {
+                state.artist_fed_button = true;
+                return;
+            }
             let Some(Loadable::Ready(detail)) = state.artist_views.get(&id) else {
                 return;
             };
@@ -1503,6 +1579,7 @@ fn current_view_len(state: &AppState) -> usize {
 }
 
 fn jump_selection(state: &mut AppState, first: bool) {
+    state.artist_fed_button = false;
     if state.track_selection.is_active()
         && let Some((scope, _, len)) = current_track_list_context(state)
     {
@@ -1634,6 +1711,15 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             }),
             None => Outcome::Nothing,
         },
+        Some(GlobalView::Artist { id, cursor: _ }) if state.artist_fed_button => {
+            match state.artist_views.get(&id) {
+                Some(Loadable::Ready(detail)) => {
+                    state.artist_fed_button = false;
+                    Outcome::OpenFedArtist(detail.name.clone())
+                }
+                _ => Outcome::Nothing,
+            }
+        }
         Some(GlobalView::Artist { id, cursor }) => match state.artist_views.get(&id) {
             Some(Loadable::Ready(detail)) => {
                 let tracks = detail.top_tracks.len();
@@ -1723,19 +1809,20 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
                     tracks => Outcome::DownloadFed(tracks),
                 }
             }
-            Some(release) => {
-                let name = state
-                    .fed_artist_view
-                    .as_ref()
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_default();
-                match release
-                    .tracks
-                    .get(cursor - 1)
-                    .and_then(|track| fed_track_from_card(&name, release, track))
-                {
-                    Some(fed) => Outcome::PlayFed(fed),
-                    None => Outcome::Nothing,
+            Some(_) => {
+                // Play the whole release starting at the selected track,
+                // exactly like a local release view.
+                let tracks: Vec<_> = fed_release_tracks(state, index)
+                    .iter()
+                    .map(crate::federation::pending_track)
+                    .collect();
+                if tracks.is_empty() || cursor > tracks.len() {
+                    Outcome::Nothing
+                } else {
+                    Outcome::Play {
+                        tracks,
+                        start: cursor - 1,
+                    }
                 }
             }
             None => Outcome::Nothing,
@@ -1743,6 +1830,7 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     };
     match outcome {
         Outcome::Push(view) => {
+            state.artist_fed_button = false;
             state.global.stack.push(view);
             None
         }
@@ -1751,10 +1839,6 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             state.player.queue_pos = start;
             on_new_queue(state);
             Some(Effect::PlayCurrent)
-        }
-        Outcome::PlayFed(fed) => {
-            state.status_message = Some(format!("federation: fetching \"{}\"…", fed.title));
-            Some(Effect::FedPlay(fed))
         }
         Outcome::OpenFedArtist(name) => {
             state.fed_artist_view = Some((name.clone(), Loadable::Loading));
@@ -1853,22 +1937,30 @@ enum Outcome {
         tracks: Vec<crate::library::models::TrackItem>,
         start: usize,
     },
-    PlayFed(crate::federation::FedTrack),
     OpenFedArtist(String),
     DownloadFed(Vec<crate::federation::FedTrack>),
     Nothing,
 }
 
 /// Enter inside the federated section of the search results: artists open
-/// their card, tracks play.
+/// their card, tracks queue up like a local track list.
 fn fed_outcome(state: &AppState, fed_index: usize) -> Outcome {
     let artists = &state.search.fed_artists;
     if fed_index < artists.len() {
         return Outcome::OpenFedArtist(artists[fed_index].name.clone());
     }
-    match state.search.fed_tracks.get(fed_index - artists.len()) {
-        Some(fed) => Outcome::PlayFed(fed.clone()),
-        None => Outcome::Nothing,
+    let start = fed_index - artists.len();
+    if start >= state.search.fed_tracks.len() {
+        return Outcome::Nothing;
+    }
+    Outcome::Play {
+        tracks: state
+            .search
+            .fed_tracks
+            .iter()
+            .map(crate::federation::pending_track)
+            .collect(),
+        start,
     }
 }
 
@@ -1888,6 +1980,9 @@ fn fed_track_from_card(
         artist_names: vec![artist.to_string()],
         year: release.year,
         duration_seconds: track.duration_seconds.map(|d| d.round() as i64),
+        release_title: Some(release.title.clone()),
+        track_number: track.track_number,
+        disc_number: track.disc_number,
     })
 }
 
@@ -1966,6 +2061,7 @@ fn shuffle_range(player: &mut super::state::PlayerBar, start: usize) {
 /// Esc/Backspace: pop the navigation stack; leaving a search view resets the
 /// search so the next `:/` starts clean.
 fn go_back(state: &mut AppState) {
+    state.artist_fed_button = false;
     state.track_selection.clear();
     match state.active_tab {
         Tab::Playlists => {
@@ -1995,6 +2091,7 @@ fn go_back(state: &mut AppState) {
 }
 
 fn switch_tab(state: &mut AppState, tab: Tab) {
+    state.artist_fed_button = false;
     state.active_tab = tab;
     state.help_visible = false;
     state.track_selection.clear();
@@ -2070,6 +2167,7 @@ mod tests {
             audio_bit_depth: None,
             file_size_bytes: None,
             play_count: 0,
+            fed: None,
         }
     }
 
@@ -2294,6 +2392,7 @@ mod tests {
             audio_bit_depth: None,
             file_size_bytes: None,
             play_count: 0,
+            fed: None,
         };
         let mut state = AppState::default();
         state.player.queue = vec![track(1), track(2)];
@@ -2357,6 +2456,7 @@ mod tests {
             audio_bit_depth: None,
             file_size_bytes: None,
             play_count: 0,
+            fed: None,
         };
         let mut state = AppState {
             active_tab: Tab::Queue,
@@ -2485,6 +2585,7 @@ mod tests {
             update(&mut state, Action::ToggleLike),
             Some(Effect::ToggleLikes {
                 track_ids: vec![2, 3],
+                fed_tracks: vec![],
             })
         );
 
@@ -2493,6 +2594,7 @@ mod tests {
             update(&mut state, Action::ToggleLike),
             Some(Effect::ToggleLikes {
                 track_ids: vec![1, 2, 3],
+                fed_tracks: vec![],
             })
         );
     }
@@ -2519,6 +2621,7 @@ mod tests {
             audio_bit_depth: None,
             file_size_bytes: None,
             play_count: 0,
+            fed: None,
         };
         let mut state = AppState::default();
         state.player.queue = (1..=8).map(track).collect();
@@ -2564,6 +2667,7 @@ mod tests {
             audio_bit_depth: None,
             file_size_bytes: None,
             play_count: 0,
+            fed: None,
         };
         let mut state = AppState {
             active_tab: Tab::Queue,

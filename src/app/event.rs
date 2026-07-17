@@ -56,6 +56,12 @@ pub enum AppEvent {
         track_id: i64,
         liked: bool,
     },
+    /// Liked federated item ids for the ♥ markers.
+    FedLikesLoaded(Result<Vec<String>, String>),
+    FedLikeToggled {
+        item_id: String,
+        liked: bool,
+    },
     /// A release fetched for queueing (a / shift-a on a release).
     EnqueueTracks {
         tracks: Vec<TrackItem>,
@@ -107,9 +113,11 @@ pub enum AppEvent {
         release: Option<String>,
         path: String,
     },
-    /// A federated track finished downloading and is ready to play.
-    FedPlayReady {
-        result: Result<crate::federation::FedPlayable, String>,
+    /// A pending federated track finished downloading (or failed); the
+    /// queue swaps the placeholder for the resolved track.
+    FedTrackResolved {
+        placeholder_id: i64,
+        result: Result<Box<crate::federation::FedPlayable>, String>,
     },
     /// This peer's connection ticket, requested from the Federation tab.
     FedTicket(Result<String, String>),

@@ -627,6 +627,9 @@ pub struct AppState {
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
     /// Liked track ids, for the ♥ markers everywhere tracks are shown.
     pub likes: std::collections::HashSet<i64>,
+    /// Liked federated tracks (DHT item ids) — likes that reference peers'
+    /// tracks without downloading them.
+    pub fed_likes: std::collections::HashSet<String>,
     pub likes_loaded: bool,
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
@@ -634,6 +637,10 @@ pub struct AppState {
     /// The one federated artist card being viewed (name + loading state);
     /// opening another card replaces it.
     pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,
+    /// The "search this artist in the federation" button of the open local
+    /// artist view has the focus (reached by pressing Up from the first
+    /// row, like the download button on a federated release).
+    pub artist_fed_button: bool,
     pub track_selection: TrackSelection,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.
