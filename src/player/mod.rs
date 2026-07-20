@@ -258,9 +258,10 @@ fn handle(
         }
         Command::Seek(position) => {
             if let Some(out) = output
-                && let Err(err) = out.player.try_seek(position) {
-                    tracing::warn!(%err, "seek failed");
-                }
+                && let Err(err) = out.player.try_seek(position)
+            {
+                tracing::warn!(%err, "seek failed");
+            }
         }
         Command::SetVolume(volume) => {
             if let Some(out) = output {

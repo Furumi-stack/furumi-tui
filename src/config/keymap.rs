@@ -82,20 +82,21 @@ impl Keymap {
             parse_bindings(DEFAULT_KEYMAP).expect("embedded default keymap must parse");
         let mut warning = None;
         if let Some(path) = user_keymap_path()
-            && path.exists() {
-                match fs::read_to_string(&path)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|text| parse_bindings(&text))
-                {
-                    Ok(user) => merge(&mut bindings, user),
-                    Err(err) => {
-                        warning = Some(format!(
-                            "{} ignored: {err:#}; using default keybindings",
-                            path.display()
-                        ));
-                    }
+            && path.exists()
+        {
+            match fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| parse_bindings(&text))
+            {
+                Ok(user) => merge(&mut bindings, user),
+                Err(err) => {
+                    warning = Some(format!(
+                        "{} ignored: {err:#}; using default keybindings",
+                        path.display()
+                    ));
                 }
             }
+        }
         let keymap = Self {
             bindings,
             pending: Vec::new(),
@@ -219,9 +220,11 @@ enum Lookup {
 /// symbols drop it so a "?" binding matches everywhere.
 fn normalize(key: KeyCombination) -> KeyCombination {
     if let crokey::OneToThree::One(KeyCode::Char(c)) = key.codes
-        && !c.is_alphabetic() && key.modifiers.contains(KeyModifiers::SHIFT) {
-            return KeyCombination::new(KeyCode::Char(c), key.modifiers - KeyModifiers::SHIFT);
-        }
+        && !c.is_alphabetic()
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return KeyCombination::new(KeyCode::Char(c), key.modifiers - KeyModifiers::SHIFT);
+    }
     key
 }
 
@@ -302,14 +305,15 @@ fn parse_chord(chord: &str) -> Result<KeyCombination> {
     // bindings) are built directly.
     let mut chars = chord.chars();
     if let (Some(c), None) = (chars.next(), chars.next())
-        && !c.is_ascii() {
-            let modifiers = if c.is_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            return Ok(KeyCombination::new(KeyCode::Char(c), modifiers));
-        }
+        && !c.is_ascii()
+    {
+        let modifiers = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        return Ok(KeyCombination::new(KeyCode::Char(c), modifiers));
+    }
     KeyCombination::from_str(chord)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .map(normalize)

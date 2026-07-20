@@ -1,6 +1,6 @@
 //! The peer catalog protocol: one peer asks another for its library slice
-//! of a single artist (releases with full tracklists), used to assemble a
-//! federated artist card.
+//! of a single artist (releases with full tracklists plus featured
+//! appearances), used to assemble a federated artist card.
 //!
 //! Wire shape on the `furumi-fd/catalog/1` ALPN: the requester sends one
 //! JSON line ([`CatalogRequest`]) and finishes; the owner answers with one
@@ -67,6 +67,10 @@ pub struct CatalogArtist {
     pub name: String,
     #[serde(default)]
     pub releases: Vec<CatalogRelease>,
+    /// Tracks where the requested artist is featured instead of being a
+    /// release/main artist.
+    #[serde(default)]
+    pub appears_on: Vec<CatalogAppearance>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,15 +86,34 @@ pub struct CatalogRelease {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogAppearance {
+    #[serde(default)]
+    pub release_title: String,
+    #[serde(default)]
+    pub release_type: String,
+    #[serde(default)]
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub track: CatalogTrack,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatalogTrack {
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub artists: Vec<String>,
+    #[serde(default)]
+    pub featured_artists: Vec<String>,
     #[serde(default)]
     pub track_number: Option<i32>,
     #[serde(default)]
     pub disc_number: Option<i32>,
     #[serde(default)]
     pub duration_seconds: Option<f64>,
+    /// Stable audio content id (`b3:<64 hex>`) when known.
+    #[serde(default)]
+    pub content_id: Option<String>,
     /// Hex DHT item id — the key the audio is requested by (FedPlay).
     #[serde(default)]
     pub item_id: String,
@@ -159,7 +182,10 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
                 error: Some(format!("unknown request kind '{other}'")),
                 artist: None,
             };
-            stream.send.write_all(&serde_json::to_vec(&response)?).await?;
+            stream
+                .send
+                .write_all(&serde_json::to_vec(&response)?)
+                .await?;
         }
     }
     stream.send.finish()?;
@@ -218,12 +244,28 @@ fn image_mime_by_path(path: &str) -> &'static str {
 
 /// Builds this instance's library slice for `artist`.
 fn build_catalog(library: &Library, own: EndpointId, artist: &str) -> Result<CatalogResponse> {
-    let Some(artist_id) = library.artist_id_by_name(artist)? else {
+    let Some(artist) = build_catalog_artist(library, own, artist)? else {
         return Ok(CatalogResponse {
             ok: false,
             error: Some("artist not found in the library".to_string()),
             artist: None,
         });
+    };
+    Ok(CatalogResponse {
+        ok: true,
+        error: None,
+        artist: Some(artist),
+    })
+}
+
+/// Builds the successful payload for this instance's library slice.
+pub(crate) fn build_catalog_artist(
+    library: &Library,
+    own: EndpointId,
+    artist: &str,
+) -> Result<Option<CatalogArtist>> {
+    let Some(artist_id) = library.artist_id_by_name(artist)? else {
+        return Ok(None);
     };
     let detail = library.artist(artist_id)?;
     let item_id_of = |track_id: i64| -> String {
@@ -242,25 +284,46 @@ fn build_catalog(library: &Library, own: EndpointId, artist: &str) -> Result<Cat
             tracks: release
                 .tracks
                 .iter()
-                .map(|track| CatalogTrack {
-                    title: track.title.clone(),
-                    track_number: track.track_number,
-                    disc_number: track.disc_number,
-                    duration_seconds: (track.duration_seconds > 0.0)
-                        .then_some(track.duration_seconds),
-                    item_id: item_id_of(track.id),
-                })
+                .map(|track| catalog_track(track, item_id_of(track.id)))
                 .collect(),
         });
     }
-    Ok(CatalogResponse {
-        ok: true,
-        error: None,
-        artist: Some(CatalogArtist {
-            name: detail.name,
-            releases,
-        }),
-    })
+    let mut appears_on = Vec::new();
+    for track in &detail.featured_tracks {
+        let release = library.release(track.release_id)?;
+        appears_on.push(CatalogAppearance {
+            release_title: track.release_title.clone(),
+            release_type: release.release_type,
+            year: track.release_year,
+            track: catalog_track(track, item_id_of(track.id)),
+        });
+    }
+    Ok(Some(CatalogArtist {
+        name: detail.name,
+        releases,
+        appears_on,
+    }))
+}
+
+fn catalog_track(track: &crate::library::models::TrackItem, item_id: String) -> CatalogTrack {
+    CatalogTrack {
+        title: track.title.clone(),
+        artists: track
+            .artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        featured_artists: track
+            .featured_artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        track_number: track.track_number,
+        disc_number: track.disc_number,
+        duration_seconds: (track.duration_seconds > 0.0).then_some(track.duration_seconds),
+        content_id: track.content_id.clone(),
+        item_id,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +446,9 @@ impl tokio::io::AsyncRead for StreamReader<'_> {
 pub struct FedArtistCard {
     #[allow(dead_code, reason = "the open card is keyed by name in AppState")]
     pub name: String,
+    /// This node's endpoint id, used to keep own tracks local when an open
+    /// card includes the local catalog alongside remote peers.
+    pub own_owner: Option<String>,
     /// Peers whose catalogs contributed to the card.
     pub peers: usize,
     /// Every contributing peer (hex ids) — where images are fetched from.
@@ -390,6 +456,7 @@ pub struct FedArtistCard {
     /// Local cache path of the artist image, streamed from a peer.
     pub image_path: Option<String>,
     pub releases: Vec<FedRelease>,
+    pub appears_on: Vec<FedAppearsOn>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,11 +472,22 @@ pub struct FedRelease {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct FedAppearsOn {
+    pub release_title: String,
+    pub release_type: String,
+    pub year: Option<i32>,
+    pub track: FedCardTrack,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct FedCardTrack {
     pub title: String,
+    pub artists: Vec<String>,
+    pub featured_artists: Vec<String>,
     pub track_number: Option<i32>,
     pub disc_number: Option<i32>,
     pub duration_seconds: Option<f64>,
+    pub content_id: Option<String>,
     /// Every peer that can serve this track: (owner hex, item id hex).
     /// Duplicates collapse into one row; all sources stay playable.
     pub sources: Vec<(String, String)>,
@@ -422,6 +500,8 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
     let peers = catalogs.len();
     let mut releases: Vec<FedRelease> = Vec::new();
     let mut release_index: HashMap<String, usize> = HashMap::new();
+    let mut appears_on: Vec<FedAppearsOn> = Vec::new();
+    let mut appearance_index: HashMap<String, usize> = HashMap::new();
 
     let mut card_owners: Vec<String> = Vec::new();
     for (owner_hex, catalog) in catalogs {
@@ -463,31 +543,67 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
                 });
                 match existing {
                     Some(t) => {
-                        if t.track_number.is_none() {
-                            t.track_number = track.track_number;
-                        }
-                        if t.duration_seconds.is_none() {
-                            t.duration_seconds = track.duration_seconds;
-                        }
-                        t.sources.push((owner_hex.clone(), track.item_id));
+                        merge_card_track(t, &owner_hex, track);
                     }
-                    None => merged.tracks.push(FedCardTrack {
-                        title: track.title,
-                        track_number: track.track_number,
-                        disc_number: track.disc_number,
-                        duration_seconds: track.duration_seconds,
-                        sources: vec![(owner_hex.clone(), track.item_id)],
-                    }),
+                    None => merged.tracks.push(card_track(owner_hex.clone(), track)),
                 }
+            }
+        }
+        for appearance in catalog.appears_on {
+            if appearance.track.item_id.is_empty() {
+                continue;
+            }
+            let key = format!(
+                "{}:{}:{:?}",
+                music_dht::normalize_name(&appearance.release_title),
+                music_dht::normalize_name(&appearance.track.title),
+                appearance.track.track_number
+            );
+            let slot = *appearance_index.entry(key).or_insert_with(|| {
+                appears_on.push(FedAppearsOn {
+                    release_title: appearance.release_title.clone(),
+                    release_type: appearance.release_type.clone(),
+                    year: appearance.year,
+                    track: FedCardTrack::default(),
+                });
+                appears_on.len() - 1
+            });
+            let merged = &mut appears_on[slot];
+            if merged.release_type.is_empty() {
+                merged.release_type = appearance.release_type.clone();
+            }
+            if merged.year.is_none() {
+                merged.year = appearance.year;
+            }
+            if merged.track.title.is_empty() {
+                merged.track = card_track(owner_hex.clone(), appearance.track);
+            } else {
+                merge_card_track(&mut merged.track, &owner_hex, appearance.track);
             }
         }
     }
 
     for release in &mut releases {
-        release
-            .tracks
-            .sort_by_key(|t| (t.disc_number.unwrap_or(1), t.track_number.unwrap_or(i32::MAX)));
+        release.tracks.sort_by_key(|t| {
+            (
+                t.disc_number.unwrap_or(1),
+                t.track_number.unwrap_or(i32::MAX),
+            )
+        });
     }
+    appears_on.sort_by(|a, b| {
+        b.year
+            .unwrap_or(i32::MIN)
+            .cmp(&a.year.unwrap_or(i32::MIN))
+            .then_with(|| a.release_title.cmp(&b.release_title))
+            .then_with(|| {
+                a.track
+                    .track_number
+                    .unwrap_or(i32::MAX)
+                    .cmp(&b.track.track_number.unwrap_or(i32::MAX))
+            })
+            .then_with(|| a.track.title.cmp(&b.track.title))
+    });
     releases.sort_by(|a, b| {
         a.year
             .unwrap_or(i32::MAX)
@@ -497,10 +613,50 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
 
     FedArtistCard {
         name: name.to_string(),
+        own_owner: None,
         peers,
         owners: card_owners,
         image_path: None,
         releases,
+        appears_on,
+    }
+}
+
+fn card_track(owner_hex: String, track: CatalogTrack) -> FedCardTrack {
+    FedCardTrack {
+        title: track.title,
+        artists: track.artists,
+        featured_artists: track.featured_artists,
+        track_number: track.track_number,
+        disc_number: track.disc_number,
+        duration_seconds: track.duration_seconds,
+        content_id: track.content_id,
+        sources: vec![(owner_hex, track.item_id)],
+    }
+}
+
+fn merge_card_track(target: &mut FedCardTrack, owner_hex: &str, track: CatalogTrack) {
+    if target.artists.is_empty() {
+        target.artists = track.artists;
+    }
+    if target.featured_artists.is_empty() {
+        target.featured_artists = track.featured_artists;
+    }
+    if target.track_number.is_none() {
+        target.track_number = track.track_number;
+    }
+    if target.disc_number.is_none() {
+        target.disc_number = track.disc_number;
+    }
+    if target.duration_seconds.is_none() {
+        target.duration_seconds = track.duration_seconds;
+    }
+    if target.content_id.is_none() {
+        target.content_id = track.content_id;
+    }
+    let source = (owner_hex.to_string(), track.item_id);
+    if !target.sources.contains(&source) {
+        target.sources.push(source);
     }
 }
 
@@ -511,9 +667,12 @@ mod tests {
     fn track(title: &str, number: i32, item: &str) -> CatalogTrack {
         CatalogTrack {
             title: title.into(),
+            artists: vec!["Metallica".into()],
+            featured_artists: Vec::new(),
             track_number: Some(number),
             disc_number: None,
             duration_seconds: Some(100.0),
+            content_id: None,
             item_id: item.into(),
         }
     }
@@ -531,6 +690,7 @@ mod tests {
                     track("Sad But True", 2, &format!("{item_prefix}2")),
                 ],
             }],
+            appears_on: Vec::new(),
         };
         let card = merge_catalogs(
             "Metallica",
@@ -546,5 +706,52 @@ mod tests {
         assert_eq!(release.tracks.len(), 2);
         // Both peers stay as sources of the deduplicated track.
         assert_eq!(release.tracks[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn merges_featured_appearances_across_peers() {
+        let mut featured = track("Guest Verse", 3, "a1");
+        featured.artists = vec!["Host".into()];
+        featured.featured_artists = vec!["Guest".into()];
+        let mut same_featured = featured.clone();
+        same_featured.item_id = "b1".into();
+
+        let card = merge_catalogs(
+            "Guest",
+            vec![
+                (
+                    "peer-a".to_string(),
+                    CatalogArtist {
+                        name: "Guest".into(),
+                        releases: Vec::new(),
+                        appears_on: vec![CatalogAppearance {
+                            release_title: "Host Album".into(),
+                            release_type: "album".into(),
+                            year: Some(2024),
+                            track: featured,
+                        }],
+                    },
+                ),
+                (
+                    "peer-b".to_string(),
+                    CatalogArtist {
+                        name: "Guest".into(),
+                        releases: Vec::new(),
+                        appears_on: vec![CatalogAppearance {
+                            release_title: "Host Album".into(),
+                            release_type: "album".into(),
+                            year: Some(2024),
+                            track: same_featured,
+                        }],
+                    },
+                ),
+            ],
+        );
+
+        assert!(card.releases.is_empty());
+        assert_eq!(card.appears_on.len(), 1);
+        assert_eq!(card.appears_on[0].track.sources.len(), 2);
+        assert_eq!(card.appears_on[0].track.artists, vec!["Host"]);
+        assert_eq!(card.appears_on[0].track.featured_artists, vec!["Guest"]);
     }
 }

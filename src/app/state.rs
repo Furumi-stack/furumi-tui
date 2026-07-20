@@ -120,24 +120,31 @@ impl Default for GlobalTab {
     }
 }
 
-/// Releases of an artist in display order: grouped by type (albums, EPs,
-/// singles, compilations, then anything else), keeping server order within a
+/// Releases of an artist in display order: grouped by type (albums, singles,
+/// EPs, compilations, then anything else), keeping server order within a
 /// group. Returns (group label, indices into the original slice). Cursor
 /// positions use this flattened order, so update() and ui must both go
 /// through here.
 pub fn release_groups(releases: &[ReleaseCard]) -> Vec<(&'static str, Vec<usize>)> {
+    release_type_groups(releases, |release| &release.release_type)
+}
+
+fn release_type_groups<T>(
+    items: &[T],
+    release_type: impl Fn(&T) -> &str,
+) -> Vec<(&'static str, Vec<usize>)> {
     const GROUPS: [(&str, &str); 4] = [
         ("album", "Albums"),
-        ("ep", "EPs"),
         ("single", "Singles"),
+        ("ep", "EPs"),
         ("compilation", "Compilations"),
     ];
     let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
     for (kind, label) in GROUPS {
-        let indices: Vec<usize> = releases
+        let indices: Vec<usize> = items
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.release_type.eq_ignore_ascii_case(kind))
+            .filter(|(_, item)| release_type(item).eq_ignore_ascii_case(kind))
             .map(|(i, _)| i)
             .collect();
         if !indices.is_empty() {
@@ -145,7 +152,7 @@ pub fn release_groups(releases: &[ReleaseCard]) -> Vec<(&'static str, Vec<usize>
         }
     }
     let known: Vec<usize> = groups.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-    let other: Vec<usize> = (0..releases.len()).filter(|i| !known.contains(i)).collect();
+    let other: Vec<usize> = (0..items.len()).filter(|i| !known.contains(i)).collect();
     if !other.is_empty() {
         groups.push(("Other", other));
     }
@@ -164,10 +171,39 @@ pub fn release_display_order(releases: &[ReleaseCard]) -> Vec<usize> {
 /// rows, chunked by the column count. Values are display-order positions.
 /// Vertical cursor movement must follow these rows to match the rendering.
 pub fn release_rows(releases: &[ReleaseCard], columns: usize) -> Vec<Vec<usize>> {
+    grouped_release_rows(release_groups(releases), columns)
+}
+
+pub fn fed_release_groups(
+    releases: &[crate::federation::FedRelease],
+) -> Vec<(&'static str, Vec<usize>)> {
+    release_type_groups(releases, |release| &release.release_type)
+}
+
+/// Flattened display order of federated releases (concatenated groups).
+pub fn fed_release_display_order(releases: &[crate::federation::FedRelease]) -> Vec<usize> {
+    fed_release_groups(releases)
+        .into_iter()
+        .flat_map(|(_, indices)| indices)
+        .collect()
+}
+
+/// Visual tile-grid rows of the federated releases section.
+pub fn fed_release_rows(
+    releases: &[crate::federation::FedRelease],
+    columns: usize,
+) -> Vec<Vec<usize>> {
+    grouped_release_rows(fed_release_groups(releases), columns)
+}
+
+fn grouped_release_rows(
+    groups: Vec<(&'static str, Vec<usize>)>,
+    columns: usize,
+) -> Vec<Vec<usize>> {
     let columns = columns.max(1);
     let mut rows = Vec::new();
     let mut position = 0;
-    for (_, group) in release_groups(releases) {
+    for (_, group) in groups {
         for chunk in group.chunks(columns) {
             rows.push((position..position + chunk.len()).collect());
             position += chunk.len();
@@ -212,6 +248,8 @@ pub enum TrackSelectionScope {
     FedSearch,
     /// The tracklist of the open federated release view.
     FedRelease(usize),
+    /// The appears-on track list of the open federated artist card.
+    FedAppearsOn,
 }
 
 /// Vim-like Shift-V selection for line-oriented track lists. The selected

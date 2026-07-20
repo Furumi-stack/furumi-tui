@@ -5,6 +5,7 @@ mod federation;
 mod library;
 mod media;
 mod player;
+mod share;
 mod ui;
 
 use std::io;

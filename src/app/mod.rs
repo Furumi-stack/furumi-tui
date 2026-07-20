@@ -1,8 +1,8 @@
 pub mod action;
 mod cmdline;
-pub mod input;
 pub mod command;
 pub mod event;
+pub mod input;
 mod popup;
 pub mod state;
 pub mod update;
@@ -290,9 +290,10 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
     }
     for detail in state.release_views.values() {
         if let state::Loadable::Ready(detail) = detail
-            && let Some(path) = &detail.cover_path {
-                wanted.push((path.clone(), header.0, header.1));
-            }
+            && let Some(path) = &detail.cover_path
+        {
+            wanted.push((path.clone(), header.0, header.1));
+        }
     }
     if let Some((_, state::Loadable::Ready(card))) = &state.fed_artist_view {
         if let Some(path) = &card.image_path {
@@ -501,6 +502,26 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             });
         }
         Effect::FedDownload { tracks } => fed_download_spawn(runtime, tracks, None),
+        Effect::FedFetchTrackInfo { tracks } => {
+            for (placeholder_id, fed_track) in tracks {
+                let federation = Arc::clone(&runtime.federation);
+                let tx = runtime.event_tx.clone();
+                tokio::spawn(async move {
+                    let mut preview = crate::federation::pending_track(&fed_track);
+                    preview.id = placeholder_id;
+                    let item_id = fed_track.item_id.clone();
+                    let result = federation
+                        .track_info(preview)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = tx.send(AppEvent::FedTrackInfoLoaded {
+                        placeholder_id,
+                        item_id,
+                        result,
+                    });
+                });
+            }
+        }
         Effect::RemoveQueueIndices {
             restart_paused,
             stop,
@@ -900,9 +921,10 @@ pub(super) fn spawn_import(state: &mut AppState, runtime: &Runtime, path: &str) 
 
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::home_dir() {
-            return home.join(rest);
-        }
+        && let Some(home) = std::env::home_dir()
+    {
+        return home.join(rest);
+    }
     PathBuf::from(path)
 }
 
@@ -1071,11 +1093,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.federation.status = Some(status);
         }
         AppEvent::FedSearchLoaded { seq, result } => {
-            if runtime
-                .search_seq
-                .load(std::sync::atomic::Ordering::SeqCst)
-                != seq
-            {
+            if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {
                 return;
             }
             state.search.fed_loading = false;
@@ -1153,6 +1171,25 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             }
         }
+        AppEvent::FedTrackInfoLoaded {
+            placeholder_id,
+            item_id,
+            result,
+        } => match result {
+            Ok(enriched) => {
+                if let Some(state::Popup::TrackInfo { tracks, .. }) = &mut state.popup
+                    && let Some(slot) = tracks.iter_mut().find(|track| {
+                        track.id == placeholder_id
+                            && track.fed.as_ref().is_some_and(|fed| fed.item_id == item_id)
+                    })
+                {
+                    *slot = enriched;
+                }
+            }
+            Err(message) => {
+                state.status_message = Some(format!("federation metadata: {message}"));
+            }
+        },
         AppEvent::FedArtistLoaded { name, result } => {
             if let Some((current, data)) = &mut state.fed_artist_view
                 && *current == name
@@ -1250,21 +1287,23 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.release_views.insert(id, entry);
             // A Shift-J jump was waiting for this release: focus its track.
             if let Some((release_id, track_id)) = state.pending_release_focus
-                && release_id == id {
-                    state.pending_release_focus = None;
-                    if let Some(state::Loadable::Ready(detail)) = state.release_views.get(&id) {
-                        let position = detail
-                            .tracks
-                            .iter()
-                            .position(|t| t.id == track_id)
-                            .unwrap_or(0);
-                        if let Some(state::GlobalView::Release { id: top, cursor }) =
-                            state.global.stack.last_mut()
-                            && *top == release_id {
-                                *cursor = position;
-                            }
+                && release_id == id
+            {
+                state.pending_release_focus = None;
+                if let Some(state::Loadable::Ready(detail)) = state.release_views.get(&id) {
+                    let position = detail
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == track_id)
+                        .unwrap_or(0);
+                    if let Some(state::GlobalView::Release { id: top, cursor }) =
+                        state.global.stack.last_mut()
+                        && *top == release_id
+                    {
+                        *cursor = position;
                     }
                 }
+            }
         }
         AppEvent::SearchLoaded { seq, result } => {
             if seq != runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) {

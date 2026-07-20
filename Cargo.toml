@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
+blake3 = "1"
 crokey = "1.4.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6.0.0"

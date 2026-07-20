@@ -31,6 +31,8 @@ pub struct TrackItem {
     pub release_year: Option<i32>,
     /// Absolute path to the local audio file.
     pub file_path: String,
+    /// Stable audio content id (`b3:<64 hex>`) when known.
+    pub content_id: Option<String>,
     /// Path to a local cover image (the release cover).
     pub cover_path: Option<String>,
     pub audio_format: Option<String>,
@@ -53,12 +55,24 @@ impl TrackItem {
     }
 
     pub fn artist_line(&self) -> String {
-        let mut names: Vec<&str> = self.artists.iter().map(|a| a.name.as_str()).collect();
-        if !self.featured_artists.is_empty() {
-            names.push("feat.");
-            names.extend(self.featured_artists.iter().map(|a| a.name.as_str()));
+        let artists = self
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let featured = self
+            .featured_artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        match (artists.is_empty(), featured.is_empty()) {
+            (false, false) => format!("{artists} feat. {featured}"),
+            (false, true) => artists,
+            (true, false) => format!("feat. {featured}"),
+            (true, true) => String::new(),
         }
-        names.join(", ")
     }
 
     pub fn duration_label(&self) -> String {
@@ -182,4 +196,44 @@ pub struct ReleaseEdit {
     pub release_type: String,
     pub year: Option<i32>,
     pub artists: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artist(name: &str) -> ArtistRef {
+        ArtistRef {
+            id: 1,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn artist_line_formats_featured_artists() {
+        let track = TrackItem {
+            id: 1,
+            title: "Track".into(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 1.0,
+            artists: vec![artist("Main")],
+            featured_artists: vec![artist("Guest"), artist("Other")],
+            release_id: 1,
+            release_title: "Release".into(),
+            release_year: None,
+            file_path: "/tmp/track.mp3".into(),
+            content_id: None,
+            cover_path: None,
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+        };
+
+        assert_eq!(track.artist_line(), "Main feat. Guest, Other");
+    }
 }

@@ -10,7 +10,7 @@ use lofty::picture::MimeType;
 use lofty::tag::{Accessor as _, ItemKey};
 use rusqlite::{OptionalExtension as _, params};
 
-use super::{Library, find_or_create_artist};
+use super::{Library, audio_content_id, find_or_create_artist};
 
 /// Extensions the playback engine can decode (rodio/symphonia feature set).
 const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "mp4", "aac"];
@@ -213,6 +213,7 @@ pub fn read_file(path: &Path) -> Result<TrackImport> {
 /// Insert or update one track (matching by file path). Returns the track id
 /// and whether a new row was created.
 pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, bool)> {
+    let content_id = audio_content_id(&import.file_path);
     let mut conn = library.lock();
     let tx = conn.transaction()?;
 
@@ -280,7 +281,7 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
                 "UPDATE tracks SET title = ?2, track_number = ?3, disc_number = ?4,
                     duration_seconds = ?5, release_id = ?6, audio_format = ?7,
                     audio_bitrate = ?8, audio_sample_rate = ?9, audio_bit_depth = ?10,
-                    file_size_bytes = ?11
+                    file_size_bytes = ?11, content_id = ?12
                  WHERE id = ?1",
                 params![
                     id,
@@ -294,6 +295,7 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
                     import.audio_sample_rate,
                     import.audio_bit_depth,
                     import.file_size_bytes,
+                    content_id.as_deref(),
                 ],
             )?;
             tx.execute("DELETE FROM track_artists WHERE track_id = ?1", [id])?;
@@ -303,8 +305,8 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
             tx.execute(
                 "INSERT INTO tracks (title, track_number, disc_number, duration_seconds,
                     release_id, file_path, audio_format, audio_bitrate, audio_sample_rate,
-                    audio_bit_depth, file_size_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    audio_bit_depth, file_size_bytes, content_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     import.title,
                     import.track_number,
@@ -317,6 +319,7 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
                     import.audio_sample_rate,
                     import.audio_bit_depth,
                     import.file_size_bytes,
+                    content_id.as_deref(),
                 ],
             )?;
             (tx.last_insert_rowid(), true)
@@ -348,9 +351,7 @@ pub fn upsert_track(library: &Library, import: &TrackImport) -> Result<(i64, boo
             |row| row.get(0),
         )
         .unwrap_or(false);
-    if !has_cover
-        && let Some(cover_path) = resolve_cover(library, release_id, import)
-    {
+    if !has_cover && let Some(cover_path) = resolve_cover(library, release_id, import) {
         tx.execute(
             "UPDATE releases SET cover_path = ?2 WHERE id = ?1",
             params![release_id, cover_path],
@@ -381,7 +382,10 @@ fn resolve_cover(library: &Library, release_id: i64, import: &TrackImport) -> Op
                 Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif")
             );
             if is_image
-                && matches!(stem.as_deref(), Some("cover" | "folder" | "front" | "album"))
+                && matches!(
+                    stem.as_deref(),
+                    Some("cover" | "folder" | "front" | "album")
+                )
             {
                 return Some(path.to_string_lossy().into_owned());
             }

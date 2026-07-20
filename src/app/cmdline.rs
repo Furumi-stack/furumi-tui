@@ -49,6 +49,7 @@ fn apply_live(state: &mut AppState, runtime: &Runtime, command: Command) {
         // One-shot commands have no live effect.
         Command::Quit
         | Command::Import(_)
+        | Command::Open(_)
         | Command::Volume(_)
         | Command::Seek(_)
         | Command::SeekTo(_)
@@ -165,6 +166,7 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
         Command::Search(_) => {}
         Command::Quit => state.should_quit = true,
         Command::Import(path) => super::spawn_import(state, runtime, &path),
+        Command::Open(link) => open_frid_link(state, runtime, link),
         Command::Volume(value) => {
             state.player.volume = value;
             super::perform_effect(state, runtime, Effect::SetVolume(value));
@@ -206,6 +208,26 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
             state.active_tab = Tab::Logs;
         }
     }
+}
+
+fn open_frid_link(state: &mut AppState, runtime: &Runtime, link: String) {
+    let Some(content_id) = crate::share::parse_frid_content_id(&link) else {
+        state.status_message = Some("usage: :open frid://<content_id>".into());
+        return;
+    };
+    state.status_message = Some("federation: opening shared track…".into());
+    let federation = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let event = match federation.track_by_content_id(&content_id).await {
+            Ok(track) => AppEvent::EnqueueTracks {
+                tracks: vec![crate::federation::pending_track(&track)],
+                next: false,
+            },
+            Err(err) => AppEvent::StatusMessage(format!("open failed: {err:#}")),
+        };
+        let _ = tx.send(event);
+    });
 }
 
 /// Esc: close the line and undo any live effect it had.

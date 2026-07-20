@@ -59,11 +59,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
         let label_width = 48usize;
         let line = Line::from(vec![
             Span::styled(marker, theme::accent()),
-            Span::styled(format!("{label:<label_width$}"), if selected {
-                theme::accent()
-            } else {
-                ratatui::style::Style::default()
-            }),
+            Span::styled(
+                format!("{label:<label_width$}"),
+                if selected {
+                    theme::accent()
+                } else {
+                    ratatui::style::Style::default()
+                },
+            ),
             Span::styled(value, theme::dim()),
         ]);
         frame.render_widget(Paragraph::new(line), rect);

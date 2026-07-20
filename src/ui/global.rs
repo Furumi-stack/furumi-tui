@@ -6,12 +6,13 @@ use ratatui::widgets::{Block, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{art, theme};
-use crate::library::models::{ArtistCard, ReleaseCard, SearchResults};
 use crate::app::state::{
     ART_CELL_HEIGHT, ART_CELL_WIDTH, ART_HEADER_HEIGHT, ART_HEADER_WIDTH, AppState, ArtState,
-    GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, release_groups,
+    GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, fed_release_display_order,
+    fed_release_groups, release_groups,
 };
 use crate::art::cache_key;
+use crate::library::models::{ArtistCard, ReleaseCard, SearchResults};
 
 const TILE_MARQUEE_STEP_MS: u128 = 250;
 const TILE_MARQUEE_PAUSE_STEPS: u128 = 4;
@@ -956,68 +957,217 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         },
         header_art(state, card.image_path.as_ref()),
     );
-    let tracks_total: usize = card.releases.iter().map(|r| r.tracks.len()).sum();
+    let release_tracks_total: usize = card.releases.iter().map(|r| r.tracks.len()).sum();
+    let appears_on_len = card.appears_on.len();
+    let mut stats = format!(
+        "{} releases · {} tracks",
+        card.releases.len(),
+        release_tracks_total
+    );
+    if appears_on_len > 0 {
+        stats.push_str(&format!(" · appears on {appears_on_len}"));
+    }
+    stats.push_str(&format!(" · from {} peers", card.peers));
     let info = vec![
         Line::default(),
         Line::styled(name.clone(), theme::header()),
         Line::default(),
-        Line::styled(
-            format!(
-                "{} releases · {} tracks · from {} peers",
-                card.releases.len(),
-                tracks_total,
-                card.peers
-            ),
-            theme::dim(),
-        ),
-        Line::styled("enter: open a release · esc: back", theme::dim()),
+        Line::styled(stats, theme::dim()),
+        Line::styled("enter: open release / play track · esc: back", theme::dim()),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
-    if card.releases.is_empty() {
+    if card.releases.is_empty() && card.appears_on.is_empty() {
         return centered_line(
             frame,
             content_area,
-            Line::styled("the peers returned no releases", theme::dim()),
+            Line::styled(
+                "the peers returned no releases or appearances",
+                theme::dim(),
+            ),
         );
     }
 
-    // Release tiles: a flat grid ordered by year, scrolled to the cursor.
+    // Release tiles grouped by type, then featured appearances as tracks.
     let columns = usize::from((content_area.width / TILE_WIDTH).max(1));
-    let visible_rows = usize::from((content_area.height / TILE_HEIGHT).max(1));
-    let cursor_row = cursor / columns;
-    let total_rows = card.releases.len().div_ceil(columns);
-    let first_row = cursor_row
-        .saturating_sub(visible_rows / 2)
-        .min(total_rows.saturating_sub(visible_rows));
-    for (offset, row) in (first_row..total_rows).take(visible_rows).enumerate() {
-        for column in 0..columns {
-            let index = row * columns + column;
-            let Some(release) = card.releases.get(index) else {
-                break;
-            };
-            let tile = Rect {
-                x: content_area.x + (column as u16) * TILE_WIDTH,
-                y: content_area.y + (offset as u16) * TILE_HEIGHT,
-                width: TILE_WIDTH,
-                height: TILE_HEIGHT.min(content_area.height.saturating_sub((offset as u16) * TILE_HEIGHT)),
-            };
-            if tile.height < 3 {
-                continue;
+    let releases_len = card.releases.len();
+    let mut items = Vec::new();
+    let mut cursor_item = None;
+    let mut position = 0;
+    for (label, group) in fed_release_groups(&card.releases) {
+        items.push(PlanItem::Header(format!("{label} ({})", group.len())));
+        for chunk in group.chunks(columns) {
+            let row: Vec<usize> = (position..position + chunk.len()).collect();
+            if row.contains(&cursor) {
+                cursor_item = Some(items.len());
             }
-            let mut meta = release.release_type.clone();
-            if let Some(year) = release.year {
-                meta = format!("{meta} · {year}");
-            }
-            draw_tile(
-                frame,
-                tile,
-                tile_art(state, release.cover_path.as_ref()),
-                &release.title,
-                &meta,
-                index == cursor,
-            );
+            items.push(PlanItem::TileRow(row));
+            position += chunk.len();
         }
+        items.push(PlanItem::Gap);
+    }
+    if appears_on_len > 0 {
+        items.push(PlanItem::Header(format!("Appears on ({appears_on_len})")));
+        for index in 0..appears_on_len {
+            let flat = releases_len + index;
+            if cursor == flat {
+                cursor_item = Some(items.len());
+            }
+            items.push(PlanItem::Track { cursor_index: flat });
+        }
+        items.push(PlanItem::Gap);
+    }
+
+    let display_order = fed_release_display_order(&card.releases);
+    let appears_scope = crate::app::state::TrackSelectionScope::FedAppearsOn;
+    render_plan(
+        frame,
+        content_area,
+        state,
+        &items,
+        cursor_item,
+        &mut |frame, rect, item| match item {
+            PlanItem::TileRow(row) => {
+                for (column, position) in row.iter().enumerate() {
+                    let release = &card.releases[display_order[*position]];
+                    let tile = Rect {
+                        x: rect.x + column as u16 * TILE_WIDTH,
+                        y: rect.y,
+                        width: TILE_WIDTH
+                            .min(rect.width.saturating_sub(column as u16 * TILE_WIDTH)),
+                        height: rect.height,
+                    };
+                    if tile.width < 3 || tile.height < 3 {
+                        break;
+                    }
+                    let mut meta = release.release_type.clone();
+                    if let Some(year) = release.year {
+                        meta = format!("{meta} · {year}");
+                    }
+                    draw_tile(
+                        frame,
+                        tile,
+                        tile_art(state, release.cover_path.as_ref()),
+                        &release.title,
+                        &meta,
+                        cursor == *position,
+                    );
+                }
+            }
+            PlanItem::Track { cursor_index } => {
+                let index = cursor_index - releases_len;
+                let Some(appearance) = card.appears_on.get(index) else {
+                    return;
+                };
+                draw_fed_appearance_row(
+                    frame,
+                    rect,
+                    state,
+                    appearance,
+                    index + 1,
+                    cursor == *cursor_index,
+                    state.track_selection.contains(&appears_scope, index),
+                );
+            }
+            _ => unreachable!("headers and gaps are rendered by render_plan"),
+        },
+    );
+}
+
+fn draw_fed_appearance_row(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    appearance: &crate::federation::FedAppearsOn,
+    number: usize,
+    selected: bool,
+    visual_selected: bool,
+) {
+    let track = &appearance.track;
+    let liked = track
+        .sources
+        .iter()
+        .any(|(_, item_id)| state.fed_likes.contains(item_id));
+    let heart = if liked {
+        Span::styled("♥ ", theme::accent())
+    } else {
+        Span::raw("  ")
+    };
+    let mut context = fed_card_track_artist_line(track);
+    if !appearance.release_title.is_empty() {
+        if !context.is_empty() {
+            context.push_str(" · ");
+        }
+        context.push_str(&appearance.release_title);
+    }
+    let line = Line::from(vec![
+        Span::styled(format!("{number:>3} "), theme::dim()),
+        heart,
+        Span::styled("⇅ ", theme::accent()),
+        Span::raw(track.title.clone()),
+        Span::styled(format!("  {context}"), theme::dim()),
+    ]);
+    let mut meta = track
+        .duration_seconds
+        .map(|duration| {
+            let total = duration.round() as i64;
+            format!("{}:{:02}", total / 60, total % 60)
+        })
+        .unwrap_or_default();
+    if let Some(year) = appearance.year {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(&year.to_string());
+    }
+    if track.sources.len() > 1 {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(&format!("{} peers", track.sources.len()));
+    }
+    if visual_selected && !selected {
+        frame.buffer_mut().set_style(area, theme::selection());
+    }
+    draw_row(
+        frame,
+        area,
+        line,
+        (!meta.is_empty()).then_some(meta),
+        selected,
+    );
+}
+
+fn fed_card_track_artist_line(track: &crate::federation::FedCardTrack) -> String {
+    let mut main = Vec::new();
+    for artist in &track.artists {
+        push_display_artist(&mut main, artist);
+    }
+    let mut featured_names = Vec::new();
+    for artist in &track.featured_artists {
+        if !main
+            .iter()
+            .any(|name| music_dht::normalize_name(name) == music_dht::normalize_name(artist))
+        {
+            push_display_artist(&mut featured_names, artist);
+        }
+    }
+    let artists = main.join(", ");
+    let featured = featured_names.join(", ");
+    match (artists.is_empty(), featured.is_empty()) {
+        (false, false) => format!("{artists} feat. {featured}"),
+        (false, true) => artists,
+        (true, false) => format!("feat. {featured}"),
+        (true, true) => String::new(),
+    }
+}
+
+fn push_display_artist(names: &mut Vec<String>, artist: &str) {
+    if !names
+        .iter()
+        .any(|name| music_dht::normalize_name(name) == music_dht::normalize_name(artist))
+    {
+        names.push(artist.to_string());
     }
 }
 
@@ -1075,7 +1225,10 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
             format!(" ⤓ Download the whole release ({}) ", release.tracks.len()),
             button_style,
         ),
-        Line::styled("shift+v: select · y: download · p: add to playlist", theme::dim()),
+        Line::styled(
+            "shift+v: select · y: download · p: add to playlist",
+            theme::dim(),
+        ),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 

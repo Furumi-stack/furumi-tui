@@ -119,6 +119,13 @@ pub enum AppEvent {
         placeholder_id: i64,
         result: Result<Box<crate::federation::FedPlayable>, String>,
     },
+    /// Rich metadata for a federated track-info preview arrived without
+    /// downloading the audio file.
+    FedTrackInfoLoaded {
+        placeholder_id: i64,
+        item_id: String,
+        result: Result<TrackItem, String>,
+    },
     /// This peer's connection ticket, requested from the Federation tab.
     FedTicket(Result<String, String>),
 }

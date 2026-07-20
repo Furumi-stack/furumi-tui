@@ -3,6 +3,8 @@
 //! the state, handled as an owned value and put back unless the action
 //! closed it.
 
+use std::io::Write as _;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -111,7 +113,10 @@ pub fn handle_paste(state: &mut AppState, pasted: &str) {
 // Edit form
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments, reason = "owned popup state passed back in")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "owned popup state passed back in"
+)]
 fn handle_edit(
     state: &mut AppState,
     runtime: &Runtime,
@@ -342,6 +347,22 @@ fn handle_track_info(
                 scroll: 0,
             });
         }
+        KeyCode::Char('c') => {
+            if let Some(track) = tracks.get(cursor.min(len.saturating_sub(1))) {
+                match crate::share::track_share_link(track) {
+                    Some(link) => match copy_to_clipboard(&link) {
+                        Ok(()) => state.status_message = Some("frid link copied".into()),
+                        Err(err) => state.status_message = Some(format!("copy failed: {err}")),
+                    },
+                    None => state.status_message = Some("no content id for this track yet".into()),
+                }
+            }
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor: cursor.min(len.saturating_sub(1)),
+                scroll,
+            });
+        }
         _ => {
             state.popup = Some(Popup::TrackInfo {
                 tracks,
@@ -349,6 +370,53 @@ fn handle_track_info(
                 scroll,
             });
         }
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return run_clipboard_command("pbcopy", &[], text);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return run_clipboard_command("cmd", &["/C", "clip"], text);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for (program, args) in [
+            ("wl-copy", &[][..]),
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ] {
+            if run_clipboard_command(program, args, text).is_ok() {
+                return Ok(());
+            }
+        }
+        Err("clipboard command not found (tried wl-copy, xclip, xsel)".into())
+    }
+}
+
+fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("{program}: {err}"))?;
+    let Some(stdin) = child.stdin.as_mut() else {
+        return Err(format!("{program}: stdin unavailable"));
+    };
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|err| format!("{program}: {err}"))?;
+    drop(child.stdin.take());
+    let status = child.wait().map_err(|err| format!("{program}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program}: exited with {status}"))
     }
 }
 

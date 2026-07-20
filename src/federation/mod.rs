@@ -15,7 +15,7 @@
 mod audio;
 pub mod catalog;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use music_dht::{
-    EndpointId, ItemKind, ItemSpec, MusicDhtConfig, MusicDhtService, NetworkId, PeerTicket,
-    RendezvousConfig,
+    EndpointId, ItemKind, ItemSpec, LibraryItem, MusicDhtConfig, MusicDhtService, NetworkId,
+    PeerTicket, PublishStats, RendezvousConfig, SyncStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ use crate::library::Library;
 use crate::library::models::{ArtistRef, TrackItem};
 
 pub use audio::{AUDIO_ALPN, TrackMetadata};
-pub use catalog::{CATALOG_ALPN, FedArtistCard, FedCardTrack, FedRelease};
+pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRelease};
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -115,8 +115,11 @@ pub struct FedTrack {
     pub own: bool,
     pub title: String,
     pub artist_names: Vec<String>,
+    pub featured_artist_names: Vec<String>,
     pub year: Option<i32>,
     pub duration_seconds: Option<i64>,
+    /// Stable audio content id (`b3:<64 hex>`) when the owner published it.
+    pub content_id: Option<String>,
     /// Release context, known when the track came from an artist card.
     pub release_title: Option<String>,
     pub track_number: Option<i32>,
@@ -125,7 +128,7 @@ pub struct FedTrack {
 
 impl FedTrack {
     pub fn artist_line(&self) -> String {
-        self.artist_names.join(", ")
+        artist_line(&self.artist_names, &self.featured_artist_names)
     }
 
     pub fn owner_short(&self) -> String {
@@ -176,14 +179,52 @@ pub struct Federation {
     data_dir: PathBuf,
     cache_dir: PathBuf,
     media_dir: PathBuf,
+    metadata_cache: std::sync::Mutex<std::collections::HashMap<String, CachedTrackMetadata>>,
     settings: std::sync::Mutex<FedSettings>,
     running: tokio::sync::Mutex<Option<Running>>,
     last_sync: std::sync::Mutex<Option<String>>,
     last_error: std::sync::Mutex<Option<String>>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedTrackMetadata {
+    fed: FedTrack,
+    title: String,
+    artists: Vec<String>,
+    featured_artists: Vec<String>,
+    release_title: Option<String>,
+    release_type: Option<String>,
+    year: Option<i32>,
+    duration_seconds: Option<f64>,
+    track_number: Option<i32>,
+    disc_number: Option<i32>,
+}
+
+impl CachedTrackMetadata {
+    fn to_fed_track(&self) -> FedTrack {
+        FedTrack {
+            item_id: self.fed.item_id.clone(),
+            owner: self.fed.owner.clone(),
+            own: self.fed.own,
+            title: self.title.clone(),
+            artist_names: self.artists.clone(),
+            featured_artist_names: self.featured_artists.clone(),
+            year: self.year,
+            duration_seconds: self
+                .duration_seconds
+                .map(|duration| duration.round() as i64),
+            content_id: self.fed.content_id.clone(),
+            release_title: self.release_title.clone(),
+            track_number: self.track_number,
+            disc_number: self.disc_number,
+        }
+    }
+}
+
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_label() -> String {
@@ -221,6 +262,7 @@ impl Federation {
             data_dir,
             cache_dir,
             media_dir,
+            metadata_cache: std::sync::Mutex::new(Default::default()),
             settings: std::sync::Mutex::new(load_settings()),
             running: tokio::sync::Mutex::new(None),
             last_sync: std::sync::Mutex::new(None),
@@ -230,6 +272,10 @@ impl Federation {
 
     pub fn settings(&self) -> FedSettings {
         lock(&self.settings).clone()
+    }
+
+    fn cached_metadata_snapshot(&self) -> Vec<CachedTrackMetadata> {
+        lock(&self.metadata_cache).values().cloned().collect()
     }
 
     fn set_error(&self, message: Option<String>) {
@@ -311,7 +357,7 @@ impl Federation {
             let mut interval = tokio::time::interval(SYNC_INTERVAL);
             loop {
                 interval.tick().await;
-                sync_self.sync_once(&sync_service).await;
+                let _ = sync_self.sync_once(&sync_service).await;
             }
         });
         // Serve audio requests from other peers of the network.
@@ -364,17 +410,28 @@ impl Federation {
     async fn spawn_sync_soon(self: &Arc<Self>) {
         if let Ok(service) = self.service().await {
             let fed = Arc::clone(self);
-            tokio::spawn(async move { fed.sync_once(&service).await });
+            tokio::spawn(async move {
+                let _ = fed.sync_once(&service).await;
+            });
         }
     }
 
     pub async fn sync_now(self: &Arc<Self>) -> Result<()> {
         let service = self.service().await?;
-        self.sync_once(&service).await;
+        let sync_stats = self.sync_once(&service).await?;
+        let publish_stats = match service.republish().await {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!("federation republish failed: {err}");
+                self.set_error(Some(format!("republish failed: {err}")));
+                anyhow::bail!("republish failed: {err}");
+            }
+        };
+        self.record_publish_success(sync_stats, publish_stats);
         Ok(())
     }
 
-    async fn sync_once(&self, service: &MusicDhtService) {
+    async fn sync_once(&self, service: &MusicDhtService) -> Result<SyncStats> {
         let library = Arc::clone(&self.library);
         let specs = tokio::task::spawn_blocking(move || collect_specs(&library)).await;
         let specs = match specs {
@@ -382,24 +439,16 @@ impl Federation {
             Ok(Err(err)) => {
                 tracing::warn!("federation sync: library read failed: {err:#}");
                 self.set_error(Some(format!("library read failed: {err}")));
-                return;
+                anyhow::bail!("library read failed: {err}");
             }
             Err(err) => {
                 tracing::warn!("federation sync task failed: {err}");
-                return;
+                anyhow::bail!("sync task failed: {err}");
             }
         };
         match service.sync_library(specs).await {
             Ok(stats) => {
-                *lock(&self.last_sync) = Some(format!(
-                    "{} (+{} ~{} −{}, unchanged {}, failed {})",
-                    now_label(),
-                    stats.added,
-                    stats.updated,
-                    stats.removed,
-                    stats.unchanged,
-                    stats.failed
-                ));
+                self.record_sync_success(stats);
                 if stats.failed > 0 {
                     self.set_error(Some(format!(
                         "{} item(s) failed to publish in the last sync",
@@ -408,12 +457,42 @@ impl Federation {
                 } else {
                     self.set_error(None);
                 }
+                Ok(stats)
             }
             Err(err) => {
                 tracing::warn!("federation sync failed: {err}");
                 self.set_error(Some(format!("sync failed: {err}")));
+                Err(anyhow::anyhow!("sync failed: {err}"))
             }
         }
+    }
+
+    fn record_sync_success(&self, stats: SyncStats) {
+        *lock(&self.last_sync) = Some(format!(
+            "{} (+{} ~{} −{}, unchanged {}, failed {})",
+            now_label(),
+            stats.added,
+            stats.updated,
+            stats.removed,
+            stats.unchanged,
+            stats.failed
+        ));
+    }
+
+    fn record_publish_success(&self, sync_stats: SyncStats, publish_stats: PublishStats) {
+        *lock(&self.last_sync) = Some(format!(
+            "{} (+{} ~{} −{}, unchanged {}, failed {}; republished {} records, {} keys, remote nodes {})",
+            now_label(),
+            sync_stats.added,
+            sync_stats.updated,
+            sync_stats.removed,
+            sync_stats.unchanged,
+            sync_stats.failed,
+            publish_stats.records,
+            publish_stats.keys,
+            publish_stats.remote_nodes,
+        ));
+        self.set_error(None);
     }
 
     pub async fn status(&self) -> FedStatus {
@@ -450,12 +529,13 @@ impl Federation {
     /// names of matching tracks/releases).
     pub async fn search(&self, query: &str) -> Result<FedSearchResults> {
         let service = self.service().await?;
+        let normalized = music_dht::normalize_name(query);
         let outcome = service
             .search_network(query)
             .await
             .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
         let own = service.endpoint_id();
-        let tracks: Vec<FedTrack> = outcome
+        let mut tracks: Vec<FedTrack> = outcome
             .network_results
             .iter()
             .filter(|item| item.kind == ItemKind::Track)
@@ -465,18 +545,24 @@ impl Federation {
                 own: item.owner == own,
                 title: item.name.clone(),
                 artist_names: item.artist_names.clone(),
+                featured_artist_names: item.featured_artist_names.clone(),
                 year: item.year,
                 duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
-                release_title: None,
-                track_number: None,
-                disc_number: None,
+                content_id: item.content_id.clone(),
+                release_title: item.release_title.clone(),
+                track_number: item.track_number,
+                disc_number: item.disc_number,
             })
+            .collect();
+        let mut seen_tracks: std::collections::HashSet<(String, String)> = tracks
+            .iter()
+            .map(|track| (track.owner.clone(), track.item_id.clone()))
             .collect();
 
         // Artists: normalized name -> (display name, distinct non-own peers).
         let mut artists: std::collections::HashMap<
             String,
-            (String, std::collections::HashSet<EndpointId>),
+            (String, std::collections::HashSet<String>),
         > = Default::default();
         for item in &outcome.network_results {
             if item.owner == own {
@@ -490,13 +576,37 @@ impl Federation {
                 let entry = artists
                     .entry(key)
                     .or_insert_with(|| (name.to_string(), Default::default()));
-                entry.1.insert(item.owner);
+                entry.1.insert(item.owner.to_string());
             };
             if item.kind == ItemKind::Artist {
                 note(&item.name);
             }
             for artist in &item.artist_names {
                 note(artist);
+            }
+            for artist in &item.featured_artist_names {
+                note(artist);
+            }
+        }
+        for cached in self.cached_metadata_snapshot() {
+            if !cached_matches_query(&cached, &normalized) {
+                continue;
+            }
+            let fed = cached.to_fed_track();
+            if seen_tracks.insert((fed.owner.clone(), fed.item_id.clone())) {
+                tracks.push(fed);
+            }
+            if !cached.fed.own {
+                for artist in &cached.featured_artists {
+                    let key = music_dht::normalize_name(artist);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let entry = artists
+                        .entry(key)
+                        .or_insert_with(|| (artist.clone(), Default::default()));
+                    entry.1.insert(cached.fed.owner.clone());
+                }
             }
         }
         let mut artists: Vec<FedArtistHit> = artists
@@ -507,21 +617,59 @@ impl Federation {
             })
             .collect();
         artists.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| a.name.cmp(&b.name)));
+        rank_fed_search_results(&mut artists, &mut tracks, &normalized);
 
         Ok(FedSearchResults { artists, tracks })
     }
 
+    /// Resolves a share-link content id to one playable federated track.
+    pub async fn track_by_content_id(&self, content_id: &str) -> Result<FedTrack> {
+        let service = self.service().await?;
+        let outcome = service
+            .search_content_id(content_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("federated content lookup failed: {err}"))?;
+        let own = service.endpoint_id();
+        outcome
+            .local_results
+            .into_iter()
+            .chain(outcome.network_results.into_iter())
+            .find(|item| item.kind == ItemKind::Track)
+            .map(|item| FedTrack {
+                item_id: audio::hex_encode(item.id.as_bytes()),
+                owner: item.owner.to_string(),
+                own: item.owner == own,
+                title: item.name,
+                artist_names: item.artist_names,
+                featured_artist_names: item.featured_artist_names,
+                year: item.year,
+                duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
+                content_id: item.content_id,
+                release_title: item.release_title,
+                track_number: item.track_number,
+                disc_number: item.disc_number,
+            })
+            .context("no peers published this shared track")
+    }
+
     /// Assembles the federated artist card: finds the peers holding the
     /// artist through the DHT, asks each for its catalog slice directly and
-    /// merges the answers (missing/slow peers are skipped).
+    /// merges the answers (missing/slow peers are skipped). Role-aware DHT
+    /// track records are also folded in, so featured appearances can be shown
+    /// even before a peer's catalog response arrives.
     pub async fn artist_card(&self, name: &str) -> Result<FedArtistCard> {
         let service = self.service().await?;
         let own = service.endpoint_id();
+        let own_hex = own.to_string();
         let normalized = music_dht::normalize_name(name);
         let outcome = service
             .search_network(name)
             .await
             .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
+        let cached_metadata = self.cached_metadata_snapshot();
+        let has_cached_artist = cached_metadata
+            .iter()
+            .any(|cached| cached_has_artist(cached, &normalized));
         let owners: std::collections::HashSet<EndpointId> = outcome
             .network_results
             .iter()
@@ -531,11 +679,37 @@ impl Federation {
                         .artist_names
                         .iter()
                         .any(|artist| music_dht::normalize_name(artist) == normalized)
+                    || item
+                        .featured_artist_names
+                        .iter()
+                        .any(|artist| music_dht::normalize_name(artist) == normalized)
             })
             .map(|item| item.owner)
             .filter(|owner| *owner != own)
             .collect();
-        anyhow::ensure!(!owners.is_empty(), "no peers hold artist \"{name}\"");
+
+        let local_library = Arc::clone(&self.library);
+        let local_name = name.to_string();
+        let mut catalogs = match tokio::task::spawn_blocking(move || {
+            catalog::build_catalog_artist(&local_library, own, &local_name)
+        })
+        .await
+        {
+            Ok(Ok(Some(catalog))) => vec![(own_hex.clone(), catalog)],
+            Ok(Ok(None)) => Vec::new(),
+            Ok(Err(err)) => {
+                tracing::warn!("local catalog lookup failed: {err:#}");
+                Vec::new()
+            }
+            Err(err) => {
+                tracing::warn!("local catalog task failed: {err}");
+                Vec::new()
+            }
+        };
+        anyhow::ensure!(
+            !owners.is_empty() || !catalogs.is_empty() || has_cached_artist,
+            "no peers hold artist \"{name}\""
+        );
 
         let mut requests = Vec::new();
         for owner in owners {
@@ -560,17 +734,20 @@ impl Federation {
                 }
             }));
         }
-        let mut catalogs = Vec::new();
         for request in requests {
             if let Ok(Some(catalog)) = request.await {
                 catalogs.push(catalog);
             }
         }
+        let mut card = catalog::merge_catalogs(name, catalogs);
+        add_dht_appearance_hits(&mut card, &outcome.network_results, &normalized, name);
+        add_cached_appearance_hits(&mut card, &cached_metadata, &normalized, name);
         anyhow::ensure!(
-            !catalogs.is_empty(),
-            "none of the peers answered the catalog request"
+            !card.releases.is_empty() || !card.appears_on.is_empty(),
+            "none of the peers returned releases or appearances"
         );
-        Ok(catalog::merge_catalogs(name, catalogs))
+        card.own_owner = Some(own_hex);
+        Ok(card)
     }
 
     pub async fn ticket(&self) -> Result<String> {
@@ -668,6 +845,45 @@ impl Federation {
         self.fetch_playable(fed, save).await
     }
 
+    /// Fetches rich metadata for a federated track without downloading the
+    /// audio bytes, for the track-info popup.
+    pub async fn track_info(&self, track: TrackItem) -> Result<TrackItem> {
+        let Some(fed) = track.fed.clone() else {
+            return Ok(track);
+        };
+        let service = self.service().await?;
+        let item_id =
+            audio::hex_decode_item_id(&fed.item_id).context("malformed item id in the result")?;
+
+        if fed.own {
+            let library = Arc::clone(&self.library);
+            let own_id = service.endpoint_id();
+            return tokio::task::spawn_blocking(move || -> Result<TrackItem> {
+                let Some(track_id) = audio::resolve_local_track_id(&library, own_id, item_id)?
+                else {
+                    anyhow::bail!("this track is no longer in the local library");
+                };
+                library
+                    .tracks_by_ids(&[track_id])?
+                    .into_iter()
+                    .next()
+                    .context("this track is no longer in the local library")
+            })
+            .await?;
+        }
+
+        let owner = EndpointId::from_str(&fed.owner)
+            .map_err(|_| anyhow::anyhow!("malformed owner id '{}'", fed.owner))?;
+        let fetched = self
+            .fetch_metadata_with_fallback(&service, owner, &fed)
+            .await?;
+        let enriched = metadata_preview_track(&track, &fed, &fetched);
+        if let Some(cached) = cached_track_metadata(&enriched, &fed, &fetched) {
+            lock(&self.metadata_cache).insert(cached_cache_key(&fed), cached);
+        }
+        Ok(enriched)
+    }
+
     async fn fetch_playable(self: &Arc<Self>, fed: &FedTrack, save: bool) -> Result<FedPlayable> {
         let service = self.service().await?;
         let item_id =
@@ -693,11 +909,16 @@ impl Federation {
 
         let owner = EndpointId::from_str(&fed.owner)
             .map_err(|_| anyhow::anyhow!("malformed owner id '{}'", fed.owner))?;
-        let dir = if save { &self.media_dir } else { &self.cache_dir };
+        let dir = if save {
+            &self.media_dir
+        } else {
+            &self.cache_dir
+        };
         tokio::fs::create_dir_all(dir).await?;
 
-        let downloaded =
-            audio::download_track(&service, owner, &fed.item_id, dir, &download_stem(fed)).await?;
+        let downloaded = self
+            .download_track_with_fallback(&service, owner, fed, dir)
+            .await?;
         tracing::info!(
             path = %downloaded.path.display(),
             mime = %downloaded.mime_type,
@@ -750,7 +971,9 @@ impl Federation {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    tracing::warn!("importing the downloaded track failed: {err:#}; playing from the file");
+                    tracing::warn!(
+                        "importing the downloaded track failed: {err:#}; playing from the file"
+                    );
                 }
             }
         }
@@ -770,13 +993,139 @@ impl Federation {
             }
             None => None,
         };
-        let mut track =
-            ephemeral_track(fed, downloaded.metadata.as_ref(), &downloaded.path);
+        let mut track = ephemeral_track(fed, downloaded.metadata.as_ref(), &downloaded.path);
         track.cover_path = cover_path;
         Ok(FedPlayable {
             track,
             imported: false,
         })
+    }
+
+    async fn download_track_with_fallback(
+        &self,
+        service: &MusicDhtService,
+        owner: EndpointId,
+        fed: &FedTrack,
+        dir: &Path,
+    ) -> Result<audio::Downloaded> {
+        let stem = download_stem(fed);
+        match audio::download_track(service, owner, &fed.item_id, dir, &stem).await {
+            Ok(downloaded) => return Ok(downloaded),
+            Err(primary_err) => {
+                let Some(content_id) = fed.content_id.as_deref() else {
+                    return Err(primary_err);
+                };
+                tracing::warn!(
+                    owner = %fed.owner,
+                    item_id = %fed.item_id,
+                    content_id,
+                    "primary federated source failed; searching content-id fallbacks: {primary_err:#}"
+                );
+                let outcome = match service.search_content_id(content_id).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracing::warn!(content_id, "content-id fallback lookup failed: {err}");
+                        return Err(primary_err);
+                    }
+                };
+                for item in outcome.network_results {
+                    if item.kind != ItemKind::Track {
+                        continue;
+                    }
+                    let candidate_item_id = audio::hex_encode(item.id.as_bytes());
+                    if item.owner == owner && candidate_item_id == fed.item_id {
+                        continue;
+                    }
+                    let candidate_owner = item.owner;
+                    match audio::download_track(
+                        service,
+                        candidate_owner,
+                        &candidate_item_id,
+                        dir,
+                        &stem,
+                    )
+                    .await
+                    {
+                        Ok(downloaded) => {
+                            tracing::info!(
+                                owner = %candidate_owner,
+                                item_id = %candidate_item_id,
+                                content_id,
+                                "federated track downloaded from content-id fallback"
+                            );
+                            return Ok(downloaded);
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                owner = %candidate_owner,
+                                item_id = %candidate_item_id,
+                                content_id,
+                                "content-id fallback source failed: {err:#}"
+                            );
+                        }
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
+    async fn fetch_metadata_with_fallback(
+        &self,
+        service: &MusicDhtService,
+        owner: EndpointId,
+        fed: &FedTrack,
+    ) -> Result<audio::FetchedMetadata> {
+        match audio::fetch_metadata(service, owner, &fed.item_id).await {
+            Ok(metadata) => return Ok(metadata),
+            Err(primary_err) => {
+                let Some(content_id) = fed.content_id.as_deref() else {
+                    return Err(primary_err);
+                };
+                tracing::warn!(
+                    owner = %fed.owner,
+                    item_id = %fed.item_id,
+                    content_id,
+                    "primary metadata source failed; searching content-id fallbacks: {primary_err:#}"
+                );
+                let outcome = match service.search_content_id(content_id).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracing::warn!(content_id, "metadata fallback lookup failed: {err}");
+                        return Err(primary_err);
+                    }
+                };
+                for item in outcome.network_results {
+                    if item.kind != ItemKind::Track {
+                        continue;
+                    }
+                    let candidate_item_id = audio::hex_encode(item.id.as_bytes());
+                    if item.owner == owner && candidate_item_id == fed.item_id {
+                        continue;
+                    }
+                    match audio::fetch_metadata(service, item.owner, &candidate_item_id).await {
+                        Ok(metadata) => {
+                            tracing::info!(
+                                owner = %item.owner,
+                                item_id = %candidate_item_id,
+                                content_id,
+                                "federated metadata fetched from content-id fallback"
+                            );
+                            return Ok(metadata);
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                owner = %item.owner,
+                                item_id = %candidate_item_id,
+                                content_id,
+                                "metadata fallback source failed: {err:#}"
+                            );
+                        }
+                    }
+                }
+                Err(primary_err)
+            }
+        }
     }
 }
 
@@ -836,6 +1185,471 @@ fn apply_remote_metadata(import: &mut crate::library::import::TrackImport, meta:
     if meta.disc_number.is_some() {
         import.disc_number = meta.disc_number;
     }
+    if let Some(duration) = meta.duration_seconds {
+        import.duration_seconds = duration;
+    }
+    if meta.audio_format.is_some() {
+        import.audio_format = meta.audio_format.clone();
+    }
+    if meta.audio_bitrate.is_some() {
+        import.audio_bitrate = meta.audio_bitrate;
+    }
+    if meta.audio_sample_rate.is_some() {
+        import.audio_sample_rate = meta.audio_sample_rate;
+    }
+    if meta.audio_bit_depth.is_some() {
+        import.audio_bit_depth = meta.audio_bit_depth;
+    }
+}
+
+fn metadata_preview_track(
+    base: &TrackItem,
+    fed: &FedTrack,
+    fetched: &audio::FetchedMetadata,
+) -> TrackItem {
+    let refs = |names: &[String]| -> Vec<ArtistRef> {
+        names
+            .iter()
+            .map(|name| ArtistRef {
+                id: -1,
+                name: name.clone(),
+            })
+            .collect()
+    };
+    let metadata = fetched.metadata.as_ref();
+    let title = metadata
+        .map(|meta| meta.title.trim())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&base.title)
+        .to_string();
+    let artists = match metadata {
+        Some(meta) if !meta.artists.is_empty() => refs(&meta.artists),
+        _ => base.artists.clone(),
+    };
+    let featured_artists = match metadata {
+        Some(meta) if !meta.featured_artists.is_empty() => refs(&meta.featured_artists),
+        _ => base.featured_artists.clone(),
+    };
+    let release_title = metadata
+        .map(|meta| meta.release_title.trim())
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| base.release_title.clone());
+    TrackItem {
+        id: base.id,
+        title,
+        track_number: metadata
+            .and_then(|meta| meta.track_number)
+            .or(base.track_number),
+        disc_number: metadata
+            .and_then(|meta| meta.disc_number)
+            .or(base.disc_number),
+        duration_seconds: metadata
+            .and_then(|meta| meta.duration_seconds)
+            .or_else(|| fed.duration_seconds.map(|duration| duration as f64))
+            .unwrap_or(base.duration_seconds),
+        artists,
+        featured_artists,
+        release_id: base.release_id,
+        release_title,
+        release_year: metadata
+            .and_then(|meta| meta.year)
+            .or(base.release_year)
+            .or(fed.year),
+        file_path: String::new(),
+        content_id: fed.content_id.clone().or_else(|| base.content_id.clone()),
+        cover_path: base.cover_path.clone(),
+        audio_format: metadata
+            .and_then(|meta| meta.audio_format.clone())
+            .or_else(|| audio::format_for_mime(&fetched.mime_type))
+            .or_else(|| base.audio_format.clone()),
+        audio_bitrate: metadata
+            .and_then(|meta| meta.audio_bitrate)
+            .or(base.audio_bitrate),
+        audio_sample_rate: metadata
+            .and_then(|meta| meta.audio_sample_rate)
+            .or(base.audio_sample_rate),
+        audio_bit_depth: metadata
+            .and_then(|meta| meta.audio_bit_depth)
+            .or(base.audio_bit_depth),
+        file_size_bytes: (fetched.total_size > 0)
+            .then_some(fetched.total_size as i64)
+            .or(base.file_size_bytes),
+        play_count: base.play_count,
+        fed: Some(fed.clone()),
+    }
+}
+
+fn cached_track_metadata(
+    track: &TrackItem,
+    fed: &FedTrack,
+    fetched: &audio::FetchedMetadata,
+) -> Option<CachedTrackMetadata> {
+    let artist_names = |items: &[ArtistRef]| {
+        items
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect::<Vec<_>>()
+    };
+    Some(CachedTrackMetadata {
+        fed: fed.clone(),
+        title: track.title.clone(),
+        artists: artist_names(&track.artists),
+        featured_artists: artist_names(&track.featured_artists),
+        release_title: (!track.release_title.trim().is_empty())
+            .then(|| track.release_title.clone()),
+        release_type: fetched
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.release_type.clone()),
+        year: track.release_year.or(fed.year),
+        duration_seconds: (track.duration_seconds > 0.0).then_some(track.duration_seconds),
+        track_number: track.track_number.or(fed.track_number),
+        disc_number: track.disc_number.or(fed.disc_number),
+    })
+}
+
+fn cached_cache_key(fed: &FedTrack) -> String {
+    format!("{}:{}", fed.owner, fed.item_id)
+}
+
+fn cached_matches_query(cached: &CachedTrackMetadata, normalized_query: &str) -> bool {
+    if normalized_query.is_empty() {
+        return false;
+    }
+    if music_dht::normalize_name(&cached.title) == normalized_query {
+        return true;
+    }
+    if cached
+        .release_title
+        .as_deref()
+        .is_some_and(|title| music_dht::normalize_name(title) == normalized_query)
+    {
+        return true;
+    }
+    let query_tokens = music_dht::tokenize(normalized_query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let item_tokens = cached_search_tokens(cached);
+    query_tokens
+        .iter()
+        .all(|token| item_tokens.iter().any(|candidate| candidate == token))
+}
+
+fn cached_search_tokens(cached: &CachedTrackMetadata) -> Vec<String> {
+    let mut tokens = music_dht::tokenize(&music_dht::normalize_name(&cached.title));
+    for value in cached
+        .artists
+        .iter()
+        .chain(cached.featured_artists.iter())
+        .chain(cached.release_title.iter())
+    {
+        tokens.extend(music_dht::tokenize(&music_dht::normalize_name(value)));
+    }
+    tokens
+}
+
+fn cached_has_artist(cached: &CachedTrackMetadata, normalized_artist: &str) -> bool {
+    cached
+        .featured_artists
+        .iter()
+        .any(|artist| music_dht::normalize_name(artist) == normalized_artist)
+}
+
+fn rank_fed_search_results(
+    artists: &mut [FedArtistHit],
+    tracks: &mut [FedTrack],
+    normalized_query: &str,
+) {
+    artists.sort_by(|a, b| {
+        exact_match_rank(&a.name, normalized_query)
+            .cmp(&exact_match_rank(&b.name, normalized_query))
+            .then_with(|| b.peers.cmp(&a.peers))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    tracks.sort_by_key(|track| fed_track_match_rank(track, normalized_query));
+}
+
+fn exact_match_rank(value: &str, normalized_query: &str) -> u8 {
+    if music_dht::normalize_name(value) == normalized_query {
+        0
+    } else {
+        1
+    }
+}
+
+fn fed_track_match_rank(track: &FedTrack, normalized_query: &str) -> u8 {
+    if music_dht::normalize_name(&track.title) == normalized_query {
+        return 0;
+    }
+    if track
+        .release_title
+        .as_deref()
+        .is_some_and(|title| music_dht::normalize_name(title) == normalized_query)
+    {
+        return 1;
+    }
+    if track
+        .artist_names
+        .iter()
+        .chain(track.featured_artist_names.iter())
+        .any(|artist| music_dht::normalize_name(artist) == normalized_query)
+    {
+        return 2;
+    }
+    3
+}
+
+fn add_dht_appearance_hits(
+    card: &mut FedArtistCard,
+    hits: &[LibraryItem],
+    normalized_artist: &str,
+    display_artist: &str,
+) {
+    let mut changed = false;
+    for item in hits {
+        let Some(appearance) = dht_appearance_hit(item, normalized_artist, display_artist) else {
+            continue;
+        };
+        if add_appearance_to_card(card, appearance) {
+            changed = true;
+        }
+    }
+    if changed {
+        card.peers = card.owners.len();
+        sort_fed_appearances(&mut card.appears_on);
+    }
+}
+
+fn add_cached_appearance_hits(
+    card: &mut FedArtistCard,
+    cached: &[CachedTrackMetadata],
+    normalized_artist: &str,
+    display_artist: &str,
+) {
+    let mut changed = false;
+    for track in cached {
+        let Some(appearance) = cached_appearance_hit(track, normalized_artist, display_artist)
+        else {
+            continue;
+        };
+        if add_appearance_to_card(card, appearance) {
+            changed = true;
+        }
+    }
+    if changed {
+        card.peers = card.owners.len();
+        sort_fed_appearances(&mut card.appears_on);
+    }
+}
+
+fn dht_appearance_hit(
+    item: &LibraryItem,
+    normalized_artist: &str,
+    display_artist: &str,
+) -> Option<FedAppearsOn> {
+    if item.kind != ItemKind::Track {
+        return None;
+    }
+    let appears_as_featured = item
+        .featured_artist_names
+        .iter()
+        .any(|artist| music_dht::normalize_name(artist) == normalized_artist);
+    if !appears_as_featured {
+        return None;
+    }
+    let mut artists = Vec::new();
+    for artist in &item.artist_names {
+        push_artist_once(&mut artists, artist);
+    }
+    let mut featured_artists = Vec::new();
+    for artist in &item.featured_artist_names {
+        push_artist_once(&mut featured_artists, artist);
+    }
+    if featured_artists.is_empty() {
+        push_artist_once(&mut featured_artists, display_artist);
+    }
+    Some(FedAppearsOn {
+        release_title: item.release_title.clone().unwrap_or_default(),
+        release_type: item.release_type.clone().unwrap_or_default(),
+        year: item.year,
+        track: FedCardTrack {
+            title: item.name.clone(),
+            artists,
+            featured_artists,
+            track_number: item.track_number,
+            disc_number: item.disc_number,
+            duration_seconds: item.duration_seconds,
+            content_id: item.content_id.clone(),
+            sources: vec![(
+                item.owner.to_string(),
+                audio::hex_encode(item.id.as_bytes()),
+            )],
+        },
+    })
+}
+
+fn cached_appearance_hit(
+    cached: &CachedTrackMetadata,
+    normalized_artist: &str,
+    display_artist: &str,
+) -> Option<FedAppearsOn> {
+    if !cached_has_artist(cached, normalized_artist) {
+        return None;
+    }
+    let mut featured_artists = cached.featured_artists.clone();
+    if featured_artists.is_empty() {
+        push_artist_once(&mut featured_artists, display_artist);
+    }
+    Some(FedAppearsOn {
+        release_title: cached.release_title.clone().unwrap_or_default(),
+        release_type: cached.release_type.clone().unwrap_or_default(),
+        year: cached.year,
+        track: FedCardTrack {
+            title: cached.title.clone(),
+            artists: cached.artists.clone(),
+            featured_artists,
+            track_number: cached.track_number,
+            disc_number: cached.disc_number,
+            duration_seconds: cached.duration_seconds,
+            content_id: cached.fed.content_id.clone(),
+            sources: vec![(cached.fed.owner.clone(), cached.fed.item_id.clone())],
+        },
+    })
+}
+
+fn add_appearance_to_card(card: &mut FedArtistCard, appearance: FedAppearsOn) -> bool {
+    let Some((owner, item_id)) = appearance.track.sources.first().cloned() else {
+        return false;
+    };
+    if fed_releases_have_source(card, &owner, &item_id) {
+        return false;
+    }
+    if let Some(existing) = card.appears_on.iter_mut().find(|existing| {
+        existing
+            .track
+            .sources
+            .iter()
+            .any(|(source_owner, source_id)| source_owner == &owner && source_id == &item_id)
+    }) {
+        merge_dht_appearance(existing, appearance);
+        return true;
+    }
+    if !card.owners.contains(&owner) {
+        card.owners.push(owner);
+    }
+    if let Some(slot) = card
+        .appears_on
+        .iter_mut()
+        .find(|existing| same_appearance(existing, &appearance))
+    {
+        merge_dht_appearance(slot, appearance);
+    } else {
+        card.appears_on.push(appearance);
+    }
+    true
+}
+
+fn same_appearance(left: &FedAppearsOn, right: &FedAppearsOn) -> bool {
+    let left_release = music_dht::normalize_name(&left.release_title);
+    let right_release = music_dht::normalize_name(&right.release_title);
+    (left_release == right_release || left_release.is_empty() || right_release.is_empty())
+        && music_dht::normalize_name(&left.track.title)
+            == music_dht::normalize_name(&right.track.title)
+        && (left.track.track_number == right.track.track_number
+            || left.track.track_number.is_none()
+            || right.track.track_number.is_none())
+        && (left.year == right.year || left.year.is_none() || right.year.is_none())
+}
+
+fn fed_releases_have_source(card: &FedArtistCard, owner: &str, item_id: &str) -> bool {
+    card.releases
+        .iter()
+        .flat_map(|release| release.tracks.iter())
+        .any(|track| {
+            track
+                .sources
+                .iter()
+                .any(|(source_owner, source_id)| source_owner == owner && source_id == item_id)
+        })
+}
+
+fn merge_dht_appearance(target: &mut FedAppearsOn, appearance: FedAppearsOn) {
+    if target.release_title.is_empty() {
+        target.release_title = appearance.release_title;
+    }
+    if target.release_type.is_empty() {
+        target.release_type = appearance.release_type;
+    }
+    if target.year.is_none() {
+        target.year = appearance.year;
+    }
+    if target.track.duration_seconds.is_none() {
+        target.track.duration_seconds = appearance.track.duration_seconds;
+    }
+    if target.track.content_id.is_none() {
+        target.track.content_id = appearance.track.content_id;
+    }
+    for artist in appearance.track.artists {
+        push_artist_once(&mut target.track.artists, &artist);
+    }
+    for artist in appearance.track.featured_artists {
+        push_artist_once(&mut target.track.featured_artists, &artist);
+    }
+    for source in appearance.track.sources {
+        if !target.track.sources.contains(&source) {
+            target.track.sources.push(source);
+        }
+    }
+}
+
+fn push_artist_once(names: &mut Vec<String>, name: &str) {
+    if names
+        .iter()
+        .any(|existing| music_dht::normalize_name(existing) == music_dht::normalize_name(name))
+    {
+        return;
+    }
+    names.push(name.to_string());
+}
+
+fn artist_line(artists: &[String], featured_artists: &[String]) -> String {
+    let mut main = Vec::new();
+    for artist in artists {
+        push_artist_once(&mut main, artist);
+    }
+    let mut featured = Vec::new();
+    for artist in featured_artists {
+        if !main
+            .iter()
+            .any(|name| music_dht::normalize_name(name) == music_dht::normalize_name(artist))
+        {
+            push_artist_once(&mut featured, artist);
+        }
+    }
+    match (main.is_empty(), featured.is_empty()) {
+        (false, false) => format!("{} feat. {}", main.join(", "), featured.join(", ")),
+        (false, true) => main.join(", "),
+        (true, false) => format!("feat. {}", featured.join(", ")),
+        (true, true) => String::new(),
+    }
+}
+
+fn sort_fed_appearances(appearances: &mut [FedAppearsOn]) {
+    appearances.sort_by(|a, b| {
+        b.year
+            .unwrap_or(i32::MIN)
+            .cmp(&a.year.unwrap_or(i32::MIN))
+            .then_with(|| a.release_title.cmp(&b.release_title))
+            .then_with(|| {
+                a.track
+                    .track_number
+                    .unwrap_or(i32::MAX)
+                    .cmp(&b.track.track_number.unwrap_or(i32::MAX))
+            })
+            .then_with(|| a.track.title.cmp(&b.track.title))
+    });
 }
 
 async fn stop_running(running: Option<Running>) {
@@ -860,9 +1674,14 @@ fn collect_specs(library: &Library) -> Result<Vec<ItemSpec>> {
             kind: ItemKind::Artist,
             name,
             artist_names: Vec::new(),
+            featured_artist_names: Vec::new(),
             year: None,
             release_type: None,
+            release_title: None,
+            track_number: None,
+            disc_number: None,
             duration_seconds: None,
+            content_id: None,
         });
     }
     for release in export.releases {
@@ -871,9 +1690,14 @@ fn collect_specs(library: &Library) -> Result<Vec<ItemSpec>> {
             kind: ItemKind::Release,
             name: release.title,
             artist_names: release.artist_names,
+            featured_artist_names: Vec::new(),
             year: release.year,
             release_type: Some(release.release_type),
+            release_title: None,
+            track_number: None,
+            disc_number: None,
             duration_seconds: None,
+            content_id: None,
         });
     }
     for track in export.tracks {
@@ -882,9 +1706,14 @@ fn collect_specs(library: &Library) -> Result<Vec<ItemSpec>> {
             kind: ItemKind::Track,
             name: track.title,
             artist_names: track.artist_names,
+            featured_artist_names: track.featured_artist_names,
             year: track.year,
-            release_type: None,
+            release_type: Some(track.release_type),
+            release_title: Some(track.release_title),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
             duration_seconds: (track.duration_seconds > 0.0).then_some(track.duration_seconds),
+            content_id: track.content_id,
         });
     }
     Ok(specs)
@@ -937,7 +1766,7 @@ pub fn pending_track(fed: &FedTrack) -> TrackItem {
         disc_number: fed.disc_number,
         duration_seconds: fed.duration_seconds.unwrap_or(0) as f64,
         artists: refs(&fed.artist_names),
-        featured_artists: Vec::new(),
+        featured_artists: refs(&fed.featured_artist_names),
         release_id: -1,
         release_title: fed
             .release_title
@@ -945,6 +1774,7 @@ pub fn pending_track(fed: &FedTrack) -> TrackItem {
             .unwrap_or_else(|| format!("federation · {}", fed.owner_short())),
         release_year: fed.year,
         file_path: String::new(),
+        content_id: fed.content_id.clone(),
         cover_path: None,
         audio_format: None,
         audio_bitrate: None,
@@ -982,35 +1812,148 @@ fn ephemeral_track(
         Some(meta) if !meta.artists.is_empty() => refs(&meta.artists),
         _ => refs(&fed.artist_names),
     };
+    let featured_artists = match metadata {
+        Some(meta) => refs(&meta.featured_artists),
+        None => refs(&fed.featured_artist_names),
+    };
     let release_title = metadata
         .map(|m| m.release_title.trim())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
+        .or_else(|| fed.release_title.clone())
         .unwrap_or_else(|| format!("federation · {}", fed.owner_short()));
     TrackItem {
         id,
         title,
         track_number: metadata.and_then(|m| m.track_number),
         disc_number: metadata.and_then(|m| m.disc_number),
-        duration_seconds: fed.duration_seconds.unwrap_or(0) as f64,
+        duration_seconds: metadata
+            .and_then(|m| m.duration_seconds)
+            .or_else(|| fed.duration_seconds.map(|duration| duration as f64))
+            .unwrap_or(0.0),
         artists,
-        featured_artists: metadata.map(|m| refs(&m.featured_artists)).unwrap_or_default(),
+        featured_artists,
         release_id: -1,
         release_title,
         release_year: metadata.and_then(|m| m.year).or(fed.year),
         file_path: path.to_string_lossy().into_owned(),
+        content_id: fed
+            .content_id
+            .clone()
+            .or_else(|| crate::library::audio_content_id(&path.to_string_lossy())),
         cover_path: None,
-        audio_format: path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_string()),
-        audio_bitrate: None,
-        audio_sample_rate: None,
-        audio_bit_depth: None,
+        audio_format: metadata.and_then(|m| m.audio_format.clone()).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        }),
+        audio_bitrate: metadata.and_then(|m| m.audio_bitrate),
+        audio_sample_rate: metadata.and_then(|m| m.audio_sample_rate),
+        audio_bit_depth: metadata.and_then(|m| m.audio_bit_depth),
         file_size_bytes: file_size,
         play_count: 0,
         // Keep the federation reference: the cached track can still be
         // liked, re-downloaded and marked as federated in the lists.
         fed: Some(fed.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_owner() -> EndpointId {
+        music_dht::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    fn dht_track(main: &[&str], featured: &[&str]) -> LibraryItem {
+        let owner = test_owner();
+        LibraryItem {
+            id: music_dht::ItemId::derive(&owner, ItemKind::Track, "track:1"),
+            owner,
+            kind: ItemKind::Track,
+            name: "Guest Verse".into(),
+            normalized_name: music_dht::normalize_name("Guest Verse"),
+            artist_names: main.iter().map(|name| name.to_string()).collect(),
+            featured_artist_names: featured.iter().map(|name| name.to_string()).collect(),
+            year: Some(2024),
+            release_type: Some("album".into()),
+            release_title: Some("Host Album".into()),
+            track_number: Some(2),
+            disc_number: Some(1),
+            duration_seconds: Some(180.0),
+            content_id: Some(
+                "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            revision: 1,
+            deleted: false,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn dht_appearance_requires_explicit_featured_artist() {
+        let normalized = music_dht::normalize_name("Guest");
+        assert!(dht_appearance_hit(&dht_track(&["Guest"], &[]), &normalized, "Guest").is_none());
+
+        let hit =
+            dht_appearance_hit(&dht_track(&["Host"], &["Guest"]), &normalized, "Guest").unwrap();
+        assert_eq!(hit.release_title, "Host Album");
+        assert_eq!(hit.release_type, "album");
+        assert_eq!(hit.year, Some(2024));
+        assert_eq!(hit.track.artists, vec!["Host"]);
+        assert_eq!(hit.track.featured_artists, vec!["Guest"]);
+        assert_eq!(hit.track.track_number, Some(2));
+        assert_eq!(hit.track.disc_number, Some(1));
+    }
+
+    #[test]
+    fn federation_search_ranks_exact_names_first() {
+        let normalized = music_dht::normalize_name("ежемесячные");
+        let mut artists = vec![
+            FedArtistHit {
+                name: "Booker".into(),
+                peers: 3,
+            },
+            FedArtistHit {
+                name: "Ежемесячные".into(),
+                peers: 1,
+            },
+        ];
+        let mut tracks = vec![
+            FedTrack {
+                item_id: "a".into(),
+                owner: "peer-a".into(),
+                own: false,
+                title: "Гость".into(),
+                artist_names: vec!["Other".into()],
+                featured_artist_names: vec!["Ежемесячные".into()],
+                year: None,
+                duration_seconds: None,
+                content_id: None,
+                release_title: None,
+                track_number: None,
+                disc_number: None,
+            },
+            FedTrack {
+                item_id: "b".into(),
+                owner: "peer-b".into(),
+                own: false,
+                title: "Ежемесячные".into(),
+                artist_names: vec!["Other".into()],
+                featured_artist_names: Vec::new(),
+                year: None,
+                duration_seconds: None,
+                content_id: None,
+                release_title: None,
+                track_number: None,
+                disc_number: None,
+            },
+        ];
+
+        rank_fed_search_results(&mut artists, &mut tracks, &normalized);
+
+        assert_eq!(artists[0].name, "Ежемесячные");
+        assert_eq!(tracks[0].title, "Ежемесячные");
     }
 }

@@ -25,6 +25,8 @@ pub enum Command {
     /// `:import <path>` — import an audio file or a directory into the
     /// library.
     Import(String),
+    /// `:open frid://...` — open a shared federation content link.
+    Open(String),
     /// `:volume 40` (also `:vol`) — set the volume precisely.
     Volume(u8),
     /// `:seek +30` / `:seek -10` — relative seek in seconds.
@@ -80,6 +82,13 @@ pub fn parse(input: &str) -> Parsed {
                     Parsed::Command(Command::Import(path.to_string()))
                 }
                 _ => Parsed::Invalid("usage: :import <file or directory>".to_string()),
+            }
+        }
+        "open" => {
+            let value = input.trim_start().split_once(char::is_whitespace);
+            match value.map(|(_, rest)| rest.trim()) {
+                Some(value) if !value.is_empty() => Parsed::Command(Command::Open(value.into())),
+                _ => Parsed::Invalid("usage: :open frid://<content_id>".to_string()),
             }
         }
         "volume" | "vol" => match arg.and_then(|a| a.parse::<u8>().ok()) {
@@ -162,7 +171,17 @@ mod tests {
             parse("import ~/Music/My Album"),
             Parsed::Command(Command::Import("~/Music/My Album".to_string()))
         );
+        assert_eq!(
+            parse(
+                "open frid://b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?t=A-B"
+            ),
+            Parsed::Command(Command::Open(
+                "frid://b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?t=A-B"
+                    .to_string()
+            ))
+        );
         assert!(matches!(parse("import"), Parsed::Invalid(_)));
+        assert!(matches!(parse("open"), Parsed::Invalid(_)));
         assert_eq!(parse("volume 40"), Parsed::Command(Command::Volume(40)));
         assert_eq!(parse("vol 0"), Parsed::Command(Command::Volume(0)));
         assert_eq!(parse("shuffle"), Parsed::Command(Command::Shuffle));

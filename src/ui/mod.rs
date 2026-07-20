@@ -210,31 +210,32 @@ fn format_secs(secs: f64) -> String {
 fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(track) = &player.current
-        && player.playing {
-            let bar_width: usize = match width {
-                0..=59 => 0,
-                60..=79 => 8,
-                80..=109 => 14,
-                _ => 22,
-            };
-            spans.push(Span::raw(format!("{} ", format_secs(player.position_secs))));
-            if bar_width > 0 && track.duration_seconds > 0.0 {
-                let ratio = (player.position_secs / track.duration_seconds).clamp(0.0, 1.0);
-                let filled = (ratio * bar_width as f64).round() as usize;
-                spans.push(Span::styled("━".repeat(filled), theme::accent()));
-                spans.push(Span::styled("─".repeat(bar_width - filled), theme::dim()));
-                spans.push(Span::raw(" "));
-            } else {
-                spans.push(Span::styled("/ ", theme::dim()));
-            }
-            spans.push(Span::raw(track.duration_label()));
-            if !player.queue.is_empty() && width >= 70 {
-                spans.push(Span::styled(
-                    format!(" [{}/{}]", player.queue_pos + 1, player.queue.len()),
-                    theme::dim(),
-                ));
-            }
+        && player.playing
+    {
+        let bar_width: usize = match width {
+            0..=59 => 0,
+            60..=79 => 8,
+            80..=109 => 14,
+            _ => 22,
+        };
+        spans.push(Span::raw(format!("{} ", format_secs(player.position_secs))));
+        if bar_width > 0 && track.duration_seconds > 0.0 {
+            let ratio = (player.position_secs / track.duration_seconds).clamp(0.0, 1.0);
+            let filled = (ratio * bar_width as f64).round() as usize;
+            spans.push(Span::styled("━".repeat(filled), theme::accent()));
+            spans.push(Span::styled("─".repeat(bar_width - filled), theme::dim()));
+            spans.push(Span::raw(" "));
+        } else {
+            spans.push(Span::styled("/ ", theme::dim()));
         }
+        spans.push(Span::raw(track.duration_label()));
+        if !player.queue.is_empty() && width >= 70 {
+            spans.push(Span::styled(
+                format!(" [{}/{}]", player.queue_pos + 1, player.queue.len()),
+                theme::dim(),
+            ));
+        }
+    }
     if width >= 80 {
         let volume_cells = usize::from(player.volume / 10);
         spans.extend([
@@ -277,11 +278,9 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     // truncates into whatever is left.
     let center = player_right_line(player, area.width);
     let center_width = (center.width() as u16).min(area.width);
-    let [title_area, right_area] = Layout::horizontal([
-        Constraint::Min(8),
-        Constraint::Length(center_width),
-    ])
-    .areas(player_row);
+    let [title_area, right_area] =
+        Layout::horizontal([Constraint::Min(8), Constraint::Length(center_width)])
+            .areas(player_row);
 
     let mut spans = Vec::new();
     match &player.current {

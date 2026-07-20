@@ -2,7 +2,8 @@
 //!
 //! One byte stream per request: the requester sends one JSON line
 //! ([`AudioRequest`]) and receives one JSON line ([`AudioResponseHeader`])
-//! followed by the raw file bytes from the requested offset.
+//! followed by the raw file bytes from the requested offset, unless the
+//! requester asked for metadata only.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +33,11 @@ struct AudioRequest {
     /// older peers in both directions.
     #[serde(default)]
     want_cover: bool,
+    /// Ask only for the response header with metadata and file facts.
+    /// Older peers ignore the field and may start streaming audio; the
+    /// requester simply drops the stream after reading the header.
+    #[serde(default)]
+    metadata_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +121,16 @@ pub struct TrackMetadata {
     pub track_number: Option<i32>,
     #[serde(default)]
     pub disc_number: Option<i32>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub audio_format: Option<String>,
+    #[serde(default)]
+    pub audio_bitrate: Option<i32>,
+    #[serde(default)]
+    pub audio_sample_rate: Option<i32>,
+    #[serde(default)]
+    pub audio_bit_depth: Option<i32>,
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -167,6 +183,13 @@ fn extension_for_mime(mime: &str) -> &'static str {
     }
 }
 
+/// Best-effort audio format label for metadata previews, from the owner's
+/// response mime type.
+pub fn format_for_mime(mime: &str) -> Option<String> {
+    let extension = extension_for_mime(mime);
+    (extension != "bin").then(|| extension.to_string())
+}
+
 /// Reads one `\n`-terminated line, bounded by [`MAX_PROTOCOL_LINE`].
 pub(super) async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut line = Vec::new();
@@ -186,7 +209,10 @@ pub(super) async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Ve
     }
 }
 
-async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &impl Serialize) -> Result<()> {
+async fn write_line<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    value: &impl Serialize,
+) -> Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
     writer.write_all(&line).await?;
@@ -206,6 +232,50 @@ pub struct Downloaded {
     pub cover: Option<(Vec<u8>, &'static str)>,
     /// The main artist's image (bytes, file extension), if any.
     pub artist_image: Option<(Vec<u8>, &'static str)>,
+}
+
+/// Header-only metadata fetched without downloading the audio bytes.
+pub struct FetchedMetadata {
+    pub mime_type: String,
+    pub total_size: u64,
+    pub metadata: Option<TrackMetadata>,
+}
+
+/// Fetches the owner's response header for a track and closes the stream
+/// before audio bytes are read.
+pub async fn fetch_metadata(
+    service: &MusicDhtService,
+    owner: EndpointId,
+    item_id_hex: &str,
+) -> Result<FetchedMetadata> {
+    let mut stream = service
+        .open_stream(owner, AUDIO_ALPN)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot reach the owner peer: {err}"))?;
+    write_line(
+        &mut stream.send,
+        &AudioRequest {
+            item_id: item_id_hex.to_string(),
+            offset: 0,
+            want_cover: false,
+            metadata_only: true,
+        },
+    )
+    .await?;
+    stream.send.finish()?;
+    let header: AudioResponseHeader = serde_json::from_slice(&read_line(&mut stream.recv).await?)
+        .context("malformed response header")?;
+    if !header.ok {
+        anyhow::bail!(
+            "peer refused the metadata: {}",
+            header.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(FetchedMetadata {
+        mime_type: header.mime_type,
+        total_size: header.total_size,
+        metadata: header.metadata,
+    })
 }
 
 /// Downloads a whole track (with metadata and cover art) from `owner` into
@@ -228,6 +298,7 @@ pub async fn download_track(
             item_id: item_id_hex.to_string(),
             offset: 0,
             want_cover: true,
+            metadata_only: false,
         },
     )
     .await?;
@@ -243,22 +314,23 @@ pub async fn download_track(
 
     // The image segments precede the audio bytes and are read regardless of
     // the cache state — they sit first in the stream.
-    let mut read_image = async |size: u64, mime: &str, what: &str| -> Result<Option<(Vec<u8>, &'static str)>> {
-        if size == 0 {
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            size <= MAX_COVER_BYTES,
-            "{what} of {size} bytes exceeds the {MAX_COVER_BYTES} byte limit"
-        );
-        let mut bytes = vec![0u8; size as usize];
-        stream
-            .recv
-            .read_exact(&mut bytes)
-            .await
-            .with_context(|| format!("stream ended inside the {what} segment"))?;
-        Ok(Some((bytes, image_extension(mime))))
-    };
+    let mut read_image =
+        async |size: u64, mime: &str, what: &str| -> Result<Option<(Vec<u8>, &'static str)>> {
+            if size == 0 {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                size <= MAX_COVER_BYTES,
+                "{what} of {size} bytes exceeds the {MAX_COVER_BYTES} byte limit"
+            );
+            let mut bytes = vec![0u8; size as usize];
+            stream
+                .recv
+                .read_exact(&mut bytes)
+                .await
+                .with_context(|| format!("stream ended inside the {what} segment"))?;
+            Ok(Some((bytes, image_extension(mime))))
+        };
     let cover = read_image(header.cover_size, &header.cover_mime, "cover").await?;
     let artist_image = read_image(
         header.artist_image_size,
@@ -373,6 +445,11 @@ fn resolve_for_serving(
         year: track.release_year,
         track_number: track.track_number,
         disc_number: track.disc_number,
+        duration_seconds: Some(track.duration_seconds),
+        audio_format: track.audio_format.clone(),
+        audio_bitrate: track.audio_bitrate,
+        audio_sample_rate: track.audio_sample_rate,
+        audio_bit_depth: track.audio_bit_depth,
     };
     let artist_image_path = track
         .artists
@@ -441,7 +518,7 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
     }
 
     // Images ride between the header and the audio, when asked for.
-    let (cover, artist_image) = if request.want_cover {
+    let (cover, artist_image) = if request.want_cover && !request.metadata_only {
         (
             load_cover(served.cover_path.as_deref()).await,
             load_cover(served.artist_image_path.as_deref()).await,
@@ -473,6 +550,11 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
         },
     )
     .await?;
+    if request.metadata_only {
+        stream.send.finish()?;
+        let _ = stream.send.stopped().await;
+        return Ok(());
+    }
     if let Some((bytes, _)) = &cover {
         stream.send.write_all(bytes).await?;
     }

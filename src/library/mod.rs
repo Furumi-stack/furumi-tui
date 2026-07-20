@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     duration_seconds   REAL NOT NULL DEFAULT 0,
     release_id         INTEGER NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
     file_path          TEXT NOT NULL UNIQUE,
+    content_id         TEXT,
     audio_format       TEXT,
     audio_bitrate      INTEGER,
     audio_sample_rate  INTEGER,
@@ -86,8 +87,10 @@ CREATE TABLE IF NOT EXISTS fed_likes (
     owner            TEXT NOT NULL,
     title            TEXT NOT NULL,
     artist_names     TEXT NOT NULL DEFAULT '',
+    featured_artist_names TEXT NOT NULL DEFAULT '',
     year             INTEGER,
     duration_seconds REAL,
+    content_id       TEXT,
     release_title    TEXT,
     track_number     INTEGER,
     disc_number      INTEGER,
@@ -115,6 +118,7 @@ const TRACK_COLUMNS: &str = "
     t.release_id, r.title, r.year, r.cover_path,
     t.file_path, t.audio_format, t.audio_bitrate, t.audio_sample_rate,
     t.audio_bit_depth, t.file_size_bytes,
+    t.content_id,
     (SELECT COUNT(*) FROM history h WHERE h.track_id = t.id AND h.completed = 1)
 ";
 
@@ -143,6 +147,12 @@ pub struct ExportTrack {
     pub year: Option<i32>,
     pub duration_seconds: f64,
     pub artist_names: Vec<String>,
+    pub featured_artist_names: Vec<String>,
+    pub release_title: String,
+    pub release_type: String,
+    pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
+    pub content_id: Option<String>,
 }
 
 pub struct Library {
@@ -169,6 +179,7 @@ impl Library {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         register_norm_function(&conn)?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
+        ensure_schema_migrations(&conn)?;
         let covers_dir = db_path
             .parent()
             .map(|dir| dir.join("covers"))
@@ -254,7 +265,7 @@ impl Library {
                  JOIN releases r ON r.id = t.release_id
                  JOIN track_artists ta ON ta.track_id = t.id
                  WHERE ta.artist_id = ?1 AND ta.role = 'main'
-                 ORDER BY 16 DESC, t.title COLLATE NOCASE
+                 ORDER BY 17 DESC, t.title COLLATE NOCASE
                  LIMIT 10"
             ),
             params![id],
@@ -395,11 +406,13 @@ impl Library {
             ),
             params![pattern, limit],
         )?;
-        Ok(SearchResults {
+        let mut results = SearchResults {
             artists,
             releases,
             tracks,
-        })
+        };
+        rank_search_results(&mut results, &pattern);
+        Ok(results)
     }
 
     /// Everything the federation publishes into the DHT: plain rows, so the
@@ -417,12 +430,13 @@ impl Library {
              ORDER BY ra.release_id, ra.position",
         )?;
         let mut release_artists: std::collections::HashMap<i64, Vec<String>> = Default::default();
-        for row in statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))? {
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })? {
             let (id, name) = row?;
             release_artists.entry(id).or_default().push(name);
         }
-        let mut statement =
-            conn.prepare("SELECT id, title, year, release_type FROM releases")?;
+        let mut statement = conn.prepare("SELECT id, title, year, release_type FROM releases")?;
         let releases = statement
             .query_map([], |row| {
                 Ok(ExportRelease {
@@ -442,36 +456,76 @@ impl Library {
             .collect();
 
         let mut statement = conn.prepare(
-            "SELECT ta.track_id, a.name FROM track_artists ta
+            "SELECT ta.track_id, a.name, ta.role FROM track_artists ta
              JOIN artists a ON a.id = ta.artist_id
-             ORDER BY ta.track_id, ta.position",
+             WHERE ta.role IN ('main', 'featured')
+             ORDER BY ta.track_id,
+                      CASE ta.role WHEN 'main' THEN 0 ELSE 1 END,
+                      ta.position",
         )?;
         let mut track_artists: std::collections::HashMap<i64, Vec<String>> = Default::default();
-        for row in statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))? {
-            let (id, name) = row?;
-            track_artists.entry(id).or_default().push(name);
+        let mut featured_artists: std::collections::HashMap<i64, Vec<String>> = Default::default();
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, name, role) = row?;
+            if role == "featured" {
+                featured_artists.entry(id).or_default().push(name);
+            } else {
+                track_artists.entry(id).or_default().push(name);
+            }
         }
         let mut statement = conn.prepare(
-            "SELECT t.id, t.title, r.year, t.duration_seconds
+            "SELECT t.id, t.title, r.year, t.duration_seconds,
+                    r.title, r.release_type, t.track_number, t.disc_number,
+                    t.content_id, t.file_path
              FROM tracks t JOIN releases r ON r.id = t.release_id",
         )?;
-        let tracks = statement
+        let track_rows = statement
             .query_map([], |row| {
-                Ok(ExportTrack {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    year: row.get(2)?,
-                    duration_seconds: row.get(3)?,
-                    artist_names: Vec::new(),
-                })
+                Ok((
+                    ExportTrack {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        year: row.get(2)?,
+                        duration_seconds: row.get(3)?,
+                        artist_names: Vec::new(),
+                        featured_artist_names: Vec::new(),
+                        release_title: row.get(4)?,
+                        release_type: row.get(5)?,
+                        track_number: row.get(6)?,
+                        disc_number: row.get(7)?,
+                        content_id: None,
+                    },
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|mut track| {
-                track.artist_names = track_artists.remove(&track.id).unwrap_or_default();
-                track
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut tracks = Vec::with_capacity(track_rows.len());
+        for (mut track, raw_content_id, file_path) in track_rows {
+            let mut content_id = raw_content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id);
+            if content_id.is_none() {
+                content_id = audio_content_id(&file_path);
+            }
+            if content_id != raw_content_id {
+                conn.execute(
+                    "UPDATE tracks SET content_id = ?2 WHERE id = ?1",
+                    params![track.id, content_id.as_deref()],
+                )?;
+            }
+            track.artist_names = track_artists.remove(&track.id).unwrap_or_default();
+            track.featured_artist_names = featured_artists.remove(&track.id).unwrap_or_default();
+            track.content_id = content_id;
+            tracks.push(track);
+        }
 
         Ok(FederationExport {
             artists,
@@ -649,8 +703,8 @@ impl Library {
     pub fn fed_likes(&self) -> Result<Vec<crate::federation::FedTrack>> {
         let conn = self.lock();
         let mut statement = conn.prepare(
-            "SELECT item_id, owner, title, artist_names, year, duration_seconds,
-                    release_title, track_number, disc_number
+            "SELECT item_id, owner, title, artist_names, featured_artist_names,
+                    year, duration_seconds, content_id, release_title, track_number, disc_number
              FROM fed_likes ORDER BY liked_at DESC",
         )?;
         let rows = statement
@@ -666,11 +720,18 @@ impl Library {
                         .filter(|name| !name.is_empty())
                         .map(str::to_string)
                         .collect(),
-                    year: row.get(4)?,
-                    duration_seconds: row.get::<_, Option<f64>>(5)?.map(|d| d.round() as i64),
-                    release_title: row.get(6)?,
-                    track_number: row.get(7)?,
-                    disc_number: row.get(8)?,
+                    featured_artist_names: row
+                        .get::<_, String>(4)?
+                        .split("; ")
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    year: row.get(5)?,
+                    duration_seconds: row.get::<_, Option<f64>>(6)?.map(|d| d.round() as i64),
+                    content_id: row.get(7)?,
+                    release_title: row.get(8)?,
+                    track_number: row.get(9)?,
+                    disc_number: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -695,16 +756,19 @@ impl Library {
             return Ok(false);
         }
         conn.execute(
-            "INSERT INTO fed_likes (item_id, owner, title, artist_names, year,
-                duration_seconds, release_title, track_number, disc_number)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO fed_likes (item_id, owner, title, artist_names,
+                featured_artist_names, year, duration_seconds, content_id,
+                release_title, track_number, disc_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 fed.item_id,
                 fed.owner,
                 fed.title,
                 fed.artist_names.join("; "),
+                fed.featured_artist_names.join("; "),
                 fed.year,
                 fed.duration_seconds.map(|d| d as f64),
+                fed.content_id,
                 fed.release_title,
                 fed.track_number,
                 fed.disc_number,
@@ -985,6 +1049,44 @@ fn release_card_from_row(row: &rusqlite::Row) -> rusqlite::Result<ReleaseCard> {
     })
 }
 
+fn rank_search_results(results: &mut SearchResults, normalized_query: &str) {
+    results
+        .artists
+        .sort_by_key(|artist| exact_match_rank(&artist.name, normalized_query));
+    results
+        .releases
+        .sort_by_key(|release| exact_match_rank(&release.title, normalized_query));
+    results
+        .tracks
+        .sort_by_key(|track| track_match_rank(track, normalized_query));
+}
+
+fn exact_match_rank(value: &str, normalized_query: &str) -> u8 {
+    if music_dht::normalize_name(value) == normalized_query {
+        0
+    } else {
+        1
+    }
+}
+
+fn track_match_rank(track: &TrackItem, normalized_query: &str) -> u8 {
+    if music_dht::normalize_name(&track.title) == normalized_query {
+        return 0;
+    }
+    if music_dht::normalize_name(&track.release_title) == normalized_query {
+        return 1;
+    }
+    if track
+        .artists
+        .iter()
+        .chain(track.featured_artists.iter())
+        .any(|artist| music_dht::normalize_name(&artist.name) == normalized_query)
+    {
+        return 2;
+    }
+    3
+}
+
 /// Run a track query built on TRACK_COLUMNS and attach artist lists.
 fn query_tracks(
     conn: &Connection,
@@ -1010,7 +1112,11 @@ fn query_tracks(
                 audio_sample_rate: row.get(12)?,
                 audio_bit_depth: row.get(13)?,
                 file_size_bytes: row.get(14)?,
-                play_count: row.get(15)?,
+                content_id: row
+                    .get::<_, Option<String>>(15)?
+                    .as_deref()
+                    .and_then(music_dht::normalize_content_id),
+                play_count: row.get(16)?,
                 artists: Vec::new(),
                 featured_artists: Vec::new(),
                 fed: None,
@@ -1062,6 +1168,42 @@ fn register_norm_function(conn: &Connection) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+pub(crate) fn audio_content_id(path: &str) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("b3:{}", hasher.finalize().to_hex()))
+}
+
+fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
+    let fed_like_columns = table_columns(conn, "fed_likes")?;
+    if !fed_like_columns
+        .iter()
+        .any(|column| column == "featured_artist_names")
+    {
+        conn.execute(
+            "ALTER TABLE fed_likes
+             ADD COLUMN featured_artist_names TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !fed_like_columns.iter().any(|column| column == "content_id") {
+        conn.execute("ALTER TABLE fed_likes ADD COLUMN content_id TEXT", [])?;
+    }
+    let track_columns = table_columns(conn, "tracks")?;
+    if !track_columns.iter().any(|column| column == "content_id") {
+        conn.execute("ALTER TABLE tracks ADD COLUMN content_id TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
@@ -1144,6 +1286,18 @@ mod tests {
     }
 
     #[test]
+    fn search_ranks_exact_names_first() {
+        let lib = test_library();
+        add_track(&lib, "A Needle", "A Needle Artist", "A Needle Album");
+        add_track(&lib, "Needle", "Needle", "Needle");
+
+        let results = lib.search("needle", 10).unwrap();
+        assert_eq!(results.artists[0].name, "Needle");
+        assert_eq!(results.releases[0].title, "Needle");
+        assert_eq!(results.tracks[0].title, "Needle");
+    }
+
+    #[test]
     fn search_folds_case_beyond_ascii() {
         let lib = test_library();
         add_track(&lib, "Nothing Else Matters", "Металлика", "Чёрный альбом");
@@ -1159,7 +1313,8 @@ mod tests {
         let lib = test_library();
         let track_id = add_track(&lib, "Song", "Artist", "Album");
         let playlist = lib.create_playlist("Mix").unwrap();
-        lib.add_tracks_to_playlist(playlist.id, &[track_id]).unwrap();
+        lib.add_tracks_to_playlist(playlist.id, &[track_id])
+            .unwrap();
         assert_eq!(lib.playlist(playlist.id).unwrap().tracks.len(), 1);
 
         assert!(lib.toggle_like(track_id).unwrap());

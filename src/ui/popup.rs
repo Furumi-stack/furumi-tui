@@ -59,7 +59,11 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
     let width = frame.area().width.saturating_sub(8).clamp(24, 90);
     let text_width = usize::from(width.saturating_sub(2));
     let lines_needed = (text.chars().count() / text_width.max(1) + 3) as u16;
-    let area = centered(frame.area(), width, lines_needed.clamp(5, frame.area().height));
+    let area = centered(
+        frame.area(),
+        width,
+        lines_needed.clamp(5, frame.area().height),
+    );
     let block = Block::bordered()
         .title(format!(" {title} "))
         .title_style(theme::header())
@@ -99,11 +103,13 @@ fn draw_edit(
 
     for (index, field) in fields.iter().enumerate() {
         let focused = index == focus;
-        let field_block = Block::bordered().title(field.label).border_style(if focused {
-            theme::accent()
-        } else {
-            theme::dim()
-        });
+        let field_block = Block::bordered()
+            .title(field.label)
+            .border_style(if focused {
+                theme::accent()
+            } else {
+                theme::dim()
+            });
         let field_inner = field_block.inner(areas[index]);
         frame.render_widget(field_block, areas[index]);
         let width = usize::from(field_inner.width);
@@ -218,8 +224,13 @@ fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scrol
         body,
     );
 
-    let hint = if tracks.len() > 1 {
+    let can_share = crate::share::track_can_share(track);
+    let hint = if tracks.len() > 1 && can_share {
+        "j/k scroll · h/left previous · l/right next · c copy frid link · esc close"
+    } else if tracks.len() > 1 {
         "j/k scroll · h/left previous · l/right next · esc close"
+    } else if can_share {
+        "j/k scroll · c copy frid link · esc close"
     } else {
         "j/k scroll · esc close"
     };
@@ -230,13 +241,13 @@ fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scrol
 }
 
 fn track_info_lines(track: &TrackItem) -> Vec<Line<'static>> {
-    vec![
-        field("ID", track.id.to_string()),
+    let mut lines = vec![
+        field("ID", row_id(track.id)),
         field("Title", track.title.clone()),
         field("Artists", artist_refs(&track.artists)),
         field("Featured artists", artist_refs(&track.featured_artists)),
         field("Release", release_label(track)),
-        field("Release ID", track.release_id.to_string()),
+        field("Release ID", row_id(track.release_id)),
         field("Disc", opt_display(track.disc_number)),
         field("Track number", opt_display(track.track_number)),
         field(
@@ -264,9 +275,23 @@ fn track_info_lines(track: &TrackItem) -> Vec<Line<'static>> {
         ),
         field("File size", file_size(track.file_size_bytes)),
         field("Plays", track.play_count.to_string()),
+        field(
+            "Content ID",
+            crate::share::track_content_id(track).unwrap_or_else(|| {
+                if !track.file_path.trim().is_empty() {
+                    "press c to compute".to_string()
+                } else {
+                    "—".to_string()
+                }
+            }),
+        ),
         field("File path", empty_dash(&track.file_path)),
         field("Cover path", opt_string(track.cover_path.clone())),
-    ]
+    ];
+    if let Some(link) = crate::share::cached_track_share_link(track) {
+        lines.push(field("Share link", link));
+    }
+    lines
 }
 
 fn field(label: &'static str, value: String) -> Line<'static> {
@@ -282,9 +307,23 @@ fn artist_refs(items: &[ArtistRef]) -> String {
     }
     items
         .iter()
-        .map(|artist| format!("{} ({})", artist.name, artist.id))
+        .map(|artist| {
+            if artist.id >= 0 {
+                format!("{} ({})", artist.name, artist.id)
+            } else {
+                artist.name.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn row_id(id: i64) -> String {
+    if id >= 0 {
+        id.to_string()
+    } else {
+        "—".to_string()
+    }
 }
 
 fn release_label(track: &TrackItem) -> String {

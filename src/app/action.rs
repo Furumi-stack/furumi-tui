@@ -21,8 +21,12 @@ pub enum Action {
     PlayPause,
     NextTrack,
     PrevTrack,
-    SeekForward { seconds: u32 },
-    SeekBackward { seconds: u32 },
+    SeekForward {
+        seconds: u32,
+    },
+    SeekBackward {
+        seconds: u32,
+    },
     VolumeUp,
     VolumeDown,
     ToggleShuffle,
