@@ -149,8 +149,10 @@ pub struct FedStatus {
     pub running: bool,
     pub network: String,
     pub endpoint_id: String,
+    pub dht_node_id: String,
     pub connected_peers: Vec<String>,
     pub known_contacts: usize,
+    pub stored_dht_records: Option<usize>,
     pub published_items: usize,
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
@@ -509,12 +511,14 @@ impl Federation {
             status.running = true;
             status.network = running.network_name.clone();
             status.endpoint_id = service.endpoint_id().to_string();
+            status.dht_node_id = service.node_id().to_string();
             status.connected_peers = service
                 .connected_peers()
                 .iter()
                 .map(|p| p.to_string())
                 .collect();
             status.known_contacts = service.known_peers().len();
+            status.stored_dht_records = service.dht_record_count().await.ok();
             status.published_items = service
                 .list_local_items()
                 .await

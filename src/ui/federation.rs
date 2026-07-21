@@ -109,6 +109,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.push(status_line("Node", "running".to_string()));
             lines.push(status_line("Network", status.network.clone()));
             lines.push(status_line("Endpoint ID", status.endpoint_id.clone()));
+            lines.push(status_line("DHT node ID", status.dht_node_id.clone()));
             let peers = if status.connected_peers.is_empty() {
                 "none yet".to_string()
             } else {
@@ -120,6 +121,13 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.push(status_line(
                 "Known contacts",
                 status.known_contacts.to_string(),
+            ));
+            lines.push(status_line(
+                "Stored DHT records",
+                status
+                    .stored_dht_records
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
             ));
             lines.push(status_line(
                 "Published items",
