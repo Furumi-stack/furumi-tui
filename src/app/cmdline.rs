@@ -211,15 +211,21 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
 }
 
 fn open_frid_link(state: &mut AppState, runtime: &Runtime, link: String) {
-    let Some(content_id) = crate::share::parse_frid_content_id(&link) else {
+    let Some(link) = crate::share::parse_frid_link(&link) else {
         state.status_message = Some("usage: :open frid://<content_id>".into());
         return;
     };
-    state.status_message = Some("federation: opening shared track…".into());
+    state.status_message = Some(match link.label.as_deref() {
+        Some(label) => format!("federation: opening \"{label}\"…"),
+        None => "federation: opening shared track…".into(),
+    });
     let federation = Arc::clone(&runtime.federation);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
-        let event = match federation.track_by_content_id(&content_id).await {
+        let event = match federation
+            .track_by_content_id(&link.content_id, link.label.as_deref())
+            .await
+        {
             Ok(track) => AppEvent::EnqueueTracks {
                 tracks: vec![crate::federation::pending_track(&track)],
                 next: false,

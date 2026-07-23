@@ -1179,6 +1179,51 @@ fn open_release_for_track(state: &mut AppState, track: &TrackItem) {
     }
 }
 
+/// Jumps to an artist page from anywhere: the local view when the artist is
+/// in the library, the federated card otherwise. Returns the effect that
+/// starts the federated fetch, if one is needed.
+pub(crate) fn open_artist_ref(
+    state: &mut AppState,
+    artist: &crate::library::models::ArtistRef,
+) -> Option<Effect> {
+    let origin = state.active_tab;
+    state.active_tab = Tab::Global;
+    state.artist_fed_button = false;
+    let effect = if artist.id >= 0 {
+        match state.global.stack.last() {
+            Some(GlobalView::Artist { id, .. }) if *id == artist.id => {}
+            _ => state.global.stack.push(GlobalView::Artist {
+                id: artist.id,
+                cursor: 0,
+            }),
+        }
+        None
+    } else {
+        state.fed_artist_view = Some((artist.name.clone(), Loadable::Loading));
+        state.global.stack.push(GlobalView::FedArtist { cursor: 0 });
+        Some(Effect::FedOpenArtist(artist.name.clone()))
+    };
+    if origin != Tab::Global {
+        state.jump_origin = Some((origin, state.global.stack.len() - 1));
+    }
+    effect
+}
+
+/// The artists of a track as shown in the info popup: main artists first,
+/// then featured, without duplicates.
+pub(crate) fn track_artist_refs(track: &TrackItem) -> Vec<crate::library::models::ArtistRef> {
+    let mut seen = std::collections::HashSet::new();
+    let mut refs: Vec<crate::library::models::ArtistRef> = Vec::new();
+    for artist in track.artists.iter().chain(track.featured_artists.iter()) {
+        let key = music_dht::normalize_name(&artist.name);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        refs.push(artist.clone());
+    }
+    refs
+}
+
 /// Insert tracks after the playing one (`next`) or at the end. Keeps the
 /// gapless prefetch index pointing at the same track if items shift.
 pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) {
@@ -2024,6 +2069,12 @@ pub(crate) fn fed_appears_on_tracks(state: &AppState) -> Vec<crate::federation::
 /// Federated tracks covered by the active visual selection, or the single
 /// one under the cursor in a federated context.
 pub(crate) fn selected_fed_tracks(state: &AppState) -> Vec<crate::federation::FedTrack> {
+    // Federated cursors and selections live in Global-tab views only; on any
+    // other tab a stale Global cursor must not shadow that tab's own
+    // selection (e.g. `i` on a queue or playlist track).
+    if state.active_tab != Tab::Global {
+        return Vec::new();
+    }
     // An active Shift-V range in a federated scope.
     if let Some(scope) = state.track_selection.scope.clone() {
         match scope {

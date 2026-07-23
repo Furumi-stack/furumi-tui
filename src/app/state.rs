@@ -509,6 +509,14 @@ pub enum Popup {
         cursor: usize,
         scroll: usize,
     },
+    /// Artist picker over the info popup ('a' with several artists):
+    /// Enter jumps to the chosen artist's page, Esc returns to the info.
+    TrackArtists {
+        tracks: Vec<TrackItem>,
+        cursor: usize,
+        scroll: usize,
+        selected: usize,
+    },
     /// Full, wrapped view of one log entry (Enter on the Logs tab).
     LogDetail(crate::config::logging::LogEntry),
     /// One-line text entry on the Federation tab (network id, peer ticket).

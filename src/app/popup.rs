@@ -16,7 +16,7 @@ use crate::app::state::{
 };
 use crate::library::models::{ReleaseEdit, TrackEdit, TrackItem};
 
-pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
+pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     let Some(popup) = state.popup.take() else {
         return;
     };
@@ -43,7 +43,13 @@ pub fn handle_key(state: &mut AppState, runtime: &Runtime, key: KeyEvent) {
             tracks,
             cursor,
             scroll,
-        } => handle_track_info(state, tracks, cursor, scroll, key),
+        } => handle_track_info(state, runtime, tracks, cursor, scroll, key),
+        Popup::TrackArtists {
+            tracks,
+            cursor,
+            scroll,
+            selected,
+        } => handle_track_artists(state, runtime, tracks, cursor, scroll, selected, key),
         Popup::LogDetail(entry) => match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::LogDetail(entry)),
@@ -307,6 +313,7 @@ fn handle_confirm_delete(
 
 fn handle_track_info(
     state: &mut AppState,
+    runtime: &mut Runtime,
     tracks: Vec<TrackItem>,
     cursor: usize,
     scroll: usize,
@@ -315,6 +322,32 @@ fn handle_track_info(
     let len = tracks.len();
     match key.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
+        KeyCode::Char('a') => {
+            let artists = tracks
+                .get(cursor.min(len.saturating_sub(1)))
+                .map(crate::app::update::track_artist_refs)
+                .unwrap_or_default();
+            match artists.len() {
+                0 => {
+                    state.status_message = Some("this track has no artists".into());
+                    state.popup = Some(Popup::TrackInfo {
+                        tracks,
+                        cursor,
+                        scroll,
+                    });
+                }
+                // A single artist opens directly; the popup closes.
+                1 => open_artist(state, runtime, &artists[0]),
+                _ => {
+                    state.popup = Some(Popup::TrackArtists {
+                        tracks,
+                        cursor,
+                        scroll,
+                        selected: 0,
+                    });
+                }
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             state.popup = Some(Popup::TrackInfo {
                 tracks,
@@ -370,6 +403,78 @@ fn handle_track_info(
                 scroll,
             });
         }
+    }
+}
+
+/// The artist picker over the track info: j/k choose, Enter jumps to the
+/// artist page, Esc returns to the info view.
+fn handle_track_artists(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    tracks: Vec<TrackItem>,
+    cursor: usize,
+    scroll: usize,
+    selected: usize,
+    key: KeyEvent,
+) {
+    let artists = tracks
+        .get(cursor.min(tracks.len().saturating_sub(1)))
+        .map(crate::app::update::track_artist_refs)
+        .unwrap_or_default();
+    if artists.is_empty() {
+        state.popup = Some(Popup::TrackInfo {
+            tracks,
+            cursor,
+            scroll,
+        });
+        return;
+    }
+    let last = artists.len() - 1;
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') => {
+            state.popup = Some(Popup::TrackInfo {
+                tracks,
+                cursor,
+                scroll,
+            });
+        }
+        KeyCode::Enter => open_artist(state, runtime, &artists[selected.min(last)]),
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.popup = Some(Popup::TrackArtists {
+                tracks,
+                cursor,
+                scroll,
+                selected: selected.saturating_sub(1),
+            });
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.popup = Some(Popup::TrackArtists {
+                tracks,
+                cursor,
+                scroll,
+                selected: (selected + 1).min(last),
+            });
+        }
+        _ => {
+            state.popup = Some(Popup::TrackArtists {
+                tracks,
+                cursor,
+                scroll,
+                selected: selected.min(last),
+            });
+        }
+    }
+}
+
+/// Closes the popup and jumps to the artist's page (local or federated).
+fn open_artist(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    artist: &crate::library::models::ArtistRef,
+) {
+    state.track_selection.clear();
+    if let Some(effect) = crate::app::update::open_artist_ref(state, artist) {
+        super::perform_effect(state, runtime, effect);
     }
 }
 

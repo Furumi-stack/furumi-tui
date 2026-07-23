@@ -26,6 +26,12 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             cursor,
             scroll,
         }) => draw_track_info(frame, tracks, *cursor, *scroll),
+        Some(Popup::TrackArtists {
+            tracks,
+            cursor,
+            selected,
+            ..
+        }) => draw_track_artists(frame, tracks, *cursor, *selected),
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
         Some(Popup::FedInput { field, input }) => draw_fed_input(frame, field.title(), input),
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
@@ -226,16 +232,87 @@ fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scrol
 
     let can_share = crate::share::track_can_share(track);
     let hint = if tracks.len() > 1 && can_share {
-        "j/k scroll · h/left previous · l/right next · c copy frid link · esc close"
+        "j/k scroll · h/left previous · l/right next · a artist · c copy frid link · esc close"
     } else if tracks.len() > 1 {
-        "j/k scroll · h/left previous · l/right next · esc close"
+        "j/k scroll · h/left previous · l/right next · a artist · esc close"
     } else if can_share {
-        "j/k scroll · c copy frid link · esc close"
+        "j/k scroll · a artist · c copy frid link · esc close"
     } else {
-        "j/k scroll · esc close"
+        "j/k scroll · a artist · esc close"
     };
     frame.render_widget(
         Paragraph::new(Line::styled(hint, theme::dim())).alignment(Alignment::Center),
+        footer,
+    );
+}
+
+fn draw_track_artists(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, selected: usize) {
+    let Some(track) = tracks.get(cursor.min(tracks.len().saturating_sub(1))) else {
+        return;
+    };
+    let artists = crate::app::update::track_artist_refs(track);
+    // Main artists form the prefix of the deduplicated list; everything
+    // after them came from the featured credits.
+    let featured_from = artists
+        .iter()
+        .take_while(|kept| {
+            track
+                .artists
+                .iter()
+                .any(|main| main.id == kept.id && main.name == kept.name)
+        })
+        .count();
+    let height = (artists.len() as u16 + 4)
+        .min(frame.area().height.saturating_sub(2))
+        .max(6);
+    let area = centered(frame.area(), 44, height);
+
+    let block = Block::bordered()
+        .title(" Open artist ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [list_area, _, footer] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let visible = usize::from(list_area.height.max(1));
+    let first = selected
+        .saturating_sub(visible / 2)
+        .min(artists.len().saturating_sub(visible));
+    for (index, artist) in artists.iter().enumerate().skip(first).take(visible) {
+        let row = Rect {
+            x: list_area.x,
+            y: list_area.y + (index - first) as u16,
+            width: list_area.width,
+            height: 1,
+        };
+        let line = if index >= featured_from {
+            Line::from(vec![
+                Span::raw(artist.name.clone()),
+                Span::styled("  feat.", theme::dim()),
+            ])
+        } else {
+            Line::raw(artist.name.clone())
+        };
+        frame.render_widget(Paragraph::new(line), row);
+        if index == selected {
+            frame.buffer_mut().set_style(row, theme::tab_active());
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "enter open card · esc back to info",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
         footer,
     );
 }

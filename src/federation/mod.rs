@@ -37,6 +37,12 @@ pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRe
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How many times a share-link content lookup is retried before the label
+/// fallback kicks in.
+const CONTENT_LOOKUP_ATTEMPTS: usize = 3;
+/// Pause between share-link content lookup attempts.
+const CONTENT_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// Ephemeral (not-in-library) tracks get negative ids so the rest of the
 /// app can tell them apart from library rows (history, likes and release
 /// navigation skip them).
@@ -627,33 +633,88 @@ impl Federation {
     }
 
     /// Resolves a share-link content id to one playable federated track.
-    pub async fn track_by_content_id(&self, content_id: &str) -> Result<FedTrack> {
+    ///
+    /// Resolution order: the in-session metadata cache, the DHT content key
+    /// (retried — the DHT is eventually consistent, so a single lookup can
+    /// transiently come up short), then a name search by the link label:
+    /// records under the name keys carry content ids too, and failing an
+    /// exact match, a track whose artists and title all match the label is
+    /// the same song from another owner.
+    pub async fn track_by_content_id(
+        &self,
+        content_id: &str,
+        label: Option<&str>,
+    ) -> Result<FedTrack> {
         let service = self.service().await?;
-        let outcome = service
-            .search_content_id(content_id)
-            .await
-            .map_err(|err| anyhow::anyhow!("federated content lookup failed: {err}"))?;
         let own = service.endpoint_id();
-        outcome
-            .local_results
-            .into_iter()
-            .chain(outcome.network_results.into_iter())
-            .find(|item| item.kind == ItemKind::Track)
-            .map(|item| FedTrack {
-                item_id: audio::hex_encode(item.id.as_bytes()),
-                owner: item.owner.to_string(),
-                own: item.owner == own,
-                title: item.name,
-                artist_names: item.artist_names,
-                featured_artist_names: item.featured_artist_names,
-                year: item.year,
-                duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
-                content_id: item.content_id,
-                release_title: item.release_title,
-                track_number: item.track_number,
-                disc_number: item.disc_number,
-            })
-            .context("no peers published this shared track")
+
+        for cached in self.cached_metadata_snapshot() {
+            if cached.fed.content_id.as_deref() == Some(content_id) {
+                return Ok(cached.to_fed_track());
+            }
+        }
+
+        let mut queried_nodes = 0usize;
+        for attempt in 0..CONTENT_LOOKUP_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CONTENT_LOOKUP_RETRY_DELAY).await;
+            }
+            let outcome = service
+                .search_content_id(content_id)
+                .await
+                .map_err(|err| anyhow::anyhow!("federated content lookup failed: {err}"))?;
+            queried_nodes = queried_nodes.max(outcome.queried_nodes);
+            if let Some(item) = outcome
+                .local_results
+                .into_iter()
+                .chain(outcome.network_results)
+                .find(|item| item.kind == ItemKind::Track)
+            {
+                return Ok(fed_track_from_item(item, own));
+            }
+        }
+
+        if let Some(label) = label {
+            let normalized = music_dht::normalize_name(label);
+            if !normalized.is_empty() {
+                let outcome = service
+                    .search_network(label)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
+                queried_nodes = queried_nodes.max(outcome.queried_nodes);
+                let candidates: Vec<music_dht::LibraryItem> = outcome
+                    .local_results
+                    .into_iter()
+                    .chain(outcome.network_results)
+                    .filter(|item| item.kind == ItemKind::Track)
+                    .collect();
+                if let Some(item) = candidates
+                    .iter()
+                    .find(|item| item.content_id.as_deref() == Some(content_id))
+                {
+                    return Ok(fed_track_from_item(item.clone(), own));
+                }
+                // "feat" is an artifact of the label format ("A feat. B-Title"),
+                // not a token of any track record.
+                let tokens: Vec<String> = music_dht::tokenize(&normalized)
+                    .into_iter()
+                    .filter(|token| token != "feat")
+                    .collect();
+                if !tokens.is_empty()
+                    && let Some(item) = candidates.into_iter().find(|item| {
+                        let item_tokens = item.search_tokens();
+                        tokens.iter().all(|token| item_tokens.contains(token))
+                    })
+                {
+                    return Ok(fed_track_from_item(item, own));
+                }
+            }
+        }
+
+        if queried_nodes == 0 {
+            anyhow::bail!("no federation peers reachable yet — check the Federation tab and retry");
+        }
+        anyhow::bail!("no peers currently publish this shared track")
     }
 
     /// Assembles the federated artist card: finds the peers holding the
@@ -1492,6 +1553,24 @@ fn dht_appearance_hit(
             )],
         },
     })
+}
+
+/// Converts a raw DHT record into the UI-facing federated track shape.
+fn fed_track_from_item(item: music_dht::LibraryItem, own: EndpointId) -> FedTrack {
+    FedTrack {
+        item_id: audio::hex_encode(item.id.as_bytes()),
+        owner: item.owner.to_string(),
+        own: item.owner == own,
+        title: item.name,
+        artist_names: item.artist_names,
+        featured_artist_names: item.featured_artist_names,
+        year: item.year,
+        duration_seconds: item.duration_seconds.map(|d| d.round() as i64),
+        content_id: item.content_id,
+        release_title: item.release_title,
+        track_number: item.track_number,
+        disc_number: item.disc_number,
+    }
 }
 
 fn cached_appearance_hit(
