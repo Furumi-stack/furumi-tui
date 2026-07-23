@@ -7,9 +7,9 @@ mod popup;
 pub mod state;
 pub mod update;
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +36,7 @@ const VISUALIZER_TICK_INTERVAL: Duration = Duration::from_millis(50);
 pub struct Runtime {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub library: Arc<Library>,
+    pub devices: Arc<crate::devices::DeviceSync>,
     pub federation: Arc<crate::federation::Federation>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
@@ -92,12 +93,16 @@ pub async fn run(
         state.status_message = Some(format!("visualizations disabled: {err:#}"));
     }
 
-    let federation = crate::federation::Federation::new(Arc::clone(&library));
+    let devices = crate::devices::DeviceSync::new(Arc::clone(&library))?;
+    devices.set_event_tx(event_tx.clone());
+    let federation = crate::federation::Federation::new(Arc::clone(&library), Arc::clone(&devices));
     state.federation.settings = federation.settings();
+    state.federation.devices = Some(devices.status());
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
         event_tx,
         library,
+        devices,
         federation,
         fed_status_at: None,
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -114,11 +119,13 @@ pub async fn run(
 
     {
         let fed = Arc::clone(&runtime.federation);
+        let devices = Arc::clone(&runtime.devices);
         let tx = runtime.event_tx.clone();
         tokio::spawn(async move {
             fed.start_if_enabled().await;
             let status = fed.status().await;
             let _ = tx.send(AppEvent::FederationStatus(status));
+            let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
         });
     }
 
@@ -430,11 +437,15 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 return;
             }
             let library = Arc::clone(&runtime.library);
+            let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
                 for track_id in track_ids {
                     match library.toggle_like(track_id) {
                         Ok(liked) => {
+                            if let Err(err) = devices.record_track_like(track_id, liked) {
+                                tracing::warn!(%err, track_id, "recording synced like failed");
+                            }
                             let _ = tx.send(AppEvent::LikeToggled { track_id, liked });
                         }
                         Err(err) => {
@@ -448,6 +459,11 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 for fed in fed_tracks {
                     match library.toggle_fed_like(&fed) {
                         Ok(liked) => {
+                            if let Err(err) =
+                                devices.record_fed_like(fed.content_id.as_deref(), liked)
+                            {
+                                tracing::warn!(%err, title = %fed.title, "recording synced federated like failed");
+                            }
                             let _ = tx.send(AppEvent::FedLikeToggled {
                                 item_id: fed.item_id.clone(),
                                 liked,
@@ -468,12 +484,20 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             track_ids,
         } => {
             let library = Arc::clone(&runtime.library);
+            let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let event = match library.remove_tracks_from_playlist(playlist_id, &track_ids) {
-                    Ok(()) => AppEvent::LibraryChanged {
-                        message: Some(format!("removed {} track(s)", track_ids.len())),
-                    },
+                    Ok(()) => {
+                        if let Err(err) =
+                            devices.record_playlist_tracks_removed(playlist_id, &track_ids)
+                        {
+                            tracing::warn!(%err, playlist_id, "recording synced playlist removal failed");
+                        }
+                        AppEvent::LibraryChanged {
+                            message: Some(format!("removed {} track(s)", track_ids.len())),
+                        }
+                    }
                     Err(err) => AppEvent::StatusMessage(format!("remove failed: {err:#}")),
                 };
                 let _ = tx.send(event);
@@ -498,6 +522,57 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             tokio::spawn(async move {
                 let result = fed.ticket().await.map_err(|err| format!("{err:#}"));
                 let _ = tx.send(AppEvent::FedTicket(result));
+            });
+        }
+        Effect::DeviceShowInvite => {
+            let fed = Arc::clone(&runtime.federation);
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let result = fed.device_invite().await.map_err(|err| format!("{err:#}"));
+                let _ = tx.send(AppEvent::DeviceInvite(result));
+                let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+            });
+        }
+        Effect::DeviceConnectInvite(invite) => device_connect(runtime, invite),
+        Effect::DeviceSyncNow => {
+            let fed = Arc::clone(&runtime.federation);
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let message = match fed.device_sync_now().await {
+                    Ok(()) => "devices: sync complete".to_string(),
+                    Err(err) => format!("devices: {err:#}"),
+                };
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+                let _ = tx.send(AppEvent::StatusMessage(message));
+            });
+        }
+        Effect::DeviceSetName(name) => {
+            let fed = Arc::clone(&runtime.federation);
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let ticket = fed.ticket().await.ok();
+                let message = match devices.set_device_name(&name, ticket.as_deref()) {
+                    Ok(()) => "device name saved".to_string(),
+                    Err(err) => format!("device name: {err:#}"),
+                };
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+                let _ = tx.send(AppEvent::StatusMessage(message));
+            });
+        }
+        Effect::DeviceRevoke(device_id) => {
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let message = match devices.revoke_device(&device_id) {
+                    Ok(()) => format!("device {} revoked", &device_id[..device_id.len().min(10)]),
+                    Err(err) => format!("revoke failed: {err:#}"),
+                };
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+                let _ = tx.send(AppEvent::StatusMessage(message));
             });
         }
         Effect::FedOpenArtist(name) => {
@@ -644,6 +719,45 @@ fn open_visualizer_editor(path: &Path) -> Result<()> {
 fn shell_quote(path: &Path) -> String {
     let value = path.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn copy_text_to_clipboard(text: &str) -> bool {
+    let command: &[&str] = if cfg!(target_os = "macos") {
+        &["pbcopy"]
+    } else if cfg!(target_os = "windows") {
+        &["clip"]
+    } else {
+        &["wl-copy"]
+    };
+    let Some((program, args)) = command.split_first() else {
+        return false;
+    };
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) if !cfg!(target_os = "macos") && !cfg!(target_os = "windows") => {
+            match Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return false,
+            }
+        }
+        Err(_) => return false,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+    child.wait().is_ok_and(|status| status.success())
 }
 
 /// Start playing `queue[queue_pos]`: open the local file in a background
@@ -819,6 +933,22 @@ pub(crate) fn fed_connect(runtime: &Runtime, ticket: String) {
     });
 }
 
+/// Pair with another trusted client by an opaque `frid://i/...` invite.
+pub(crate) fn device_connect(runtime: &Runtime, invite: String) {
+    let fed = Arc::clone(&runtime.federation);
+    let devices = Arc::clone(&runtime.devices);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let result = fed
+            .device_connect(&invite)
+            .await
+            .map_err(|err| format!("{err:#}"));
+        let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+        let _ = tx.send(AppEvent::DeviceConnectResult(result));
+    });
+}
+
 /// Downloads one pending federated track (into the cache, or the library
 /// when save-on-listen is enabled) and reports back with the placeholder id
 /// so the queue can swap the resolved track in.
@@ -863,6 +993,7 @@ pub(crate) fn fed_download_spawn(
     }
     let fed = Arc::clone(&runtime.federation);
     let library = Arc::clone(&runtime.library);
+    let devices = Arc::clone(&runtime.devices);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
         let total = tracks.len();
@@ -890,12 +1021,19 @@ pub(crate) fn fed_download_spawn(
             && !imported_ids.is_empty()
         {
             let library = Arc::clone(&library);
+            let devices = Arc::clone(&devices);
             let tx_add = tx.clone();
             let title = playlist_title.clone();
             tokio::task::spawn_blocking(move || {
                 let result = library
                     .add_tracks_to_playlist(playlist_id, &imported_ids)
                     .map_err(|err| format!("{err:#}"));
+                if result.is_ok()
+                    && let Err(err) =
+                        devices.record_playlist_tracks_added(playlist_id, &imported_ids)
+                {
+                    tracing::warn!(%err, playlist_id, "recording synced playlist add failed");
+                }
                 let _ = tx_add.send(AppEvent::PlaylistTracksAdded {
                     playlist_id,
                     playlist_title: title,
@@ -912,9 +1050,11 @@ pub(crate) fn fed_download_spawn(
 /// Request a fresh status snapshot for the Federation tab.
 fn fed_spawn_status(runtime: &Runtime) {
     let fed = Arc::clone(&runtime.federation);
+    let devices = Arc::clone(&runtime.devices);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
         let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
     });
 }
 
@@ -1220,6 +1360,38 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::StatusMessage(message) => state.status_message = Some(message),
         AppEvent::FederationStatus(status) => {
             state.federation.status = Some(status);
+        }
+        AppEvent::DeviceSyncStatus(status) => {
+            state.federation.devices = Some(status);
+            clamp_settings_cursor(state);
+        }
+        AppEvent::DeviceInvite(result) => match result {
+            Ok(invite) => {
+                let copied = copy_text_to_clipboard(&invite);
+                state.popup = Some(state::Popup::FedText {
+                    title: "Device invite".to_string(),
+                    text: invite,
+                });
+                state.status_message = Some(if copied {
+                    "device invite copied to clipboard".to_string()
+                } else {
+                    "device invite generated".to_string()
+                });
+            }
+            Err(message) => state.status_message = Some(format!("device invite: {message}")),
+        },
+        AppEvent::DeviceConnectResult(result) => match result {
+            Ok(message) => state.status_message = Some(message),
+            Err(message) => state.status_message = Some(format!("connect failed: {message}")),
+        },
+        AppEvent::DevicePairingRequest(request) => {
+            state.popup = Some(state::Popup::DevicePairing {
+                request_id: request.request_id,
+                device_id: request.device_id,
+                name: request.name,
+                client_version: request.client_version,
+            });
+            state.federation.devices = Some(runtime.devices.status());
         }
         AppEvent::FedSearchLoaded { seq, result } => {
             if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {

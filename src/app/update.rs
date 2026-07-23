@@ -49,6 +49,16 @@ pub enum Effect {
     FedSyncNow,
     /// Fetch this peer's ticket and show it in a popup.
     FedShowTicket,
+    /// Generate a personal-device invite and show it in a popup.
+    DeviceShowInvite,
+    /// Connect this client to a trusted device by opaque frid invite.
+    DeviceConnectInvite(String),
+    /// Force an immediate personal-device sync.
+    DeviceSyncNow,
+    /// Persist and publish this device's display name.
+    DeviceSetName(String),
+    /// Revoke a trusted device.
+    DeviceRevoke(String),
     /// Assemble the federated artist card (fan-out to the owning peers).
     FedOpenArtist(String),
     /// Download federated tracks into the local library, one by one.
@@ -2330,6 +2340,48 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::ConnectTicket,
                 input: crate::app::input::LineEdit::default(),
+            });
+            None
+        }
+        SettingsRow::DeviceName => {
+            let name = state
+                .federation
+                .devices
+                .as_ref()
+                .map(|status| status.this_device_name.clone())
+                .unwrap_or_default();
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::DeviceName,
+                input: crate::app::input::LineEdit::new(name),
+            });
+            None
+        }
+        SettingsRow::DeviceInvite => Some(Effect::DeviceShowInvite),
+        SettingsRow::DeviceConnect => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::ConnectInvite,
+                input: crate::app::input::LineEdit::default(),
+            });
+            None
+        }
+        SettingsRow::DeviceSyncNow => Some(Effect::DeviceSyncNow),
+        SettingsRow::Device(index) => {
+            let Some(device) = state
+                .federation
+                .devices
+                .as_ref()
+                .and_then(|status| status.devices.get(index))
+                .cloned()
+            else {
+                return None;
+            };
+            if device.is_self || device.revoked {
+                state.status_message = Some("this device cannot be revoked here".to_string());
+                return None;
+            }
+            state.popup = Some(Popup::ConfirmDeviceRevoke {
+                device_id: device.device_id,
+                name: device.name,
             });
             None
         }

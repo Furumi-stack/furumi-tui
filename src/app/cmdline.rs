@@ -50,6 +50,7 @@ fn apply_live(state: &mut AppState, runtime: &Runtime, command: Command) {
         Command::Quit
         | Command::Import(_)
         | Command::Open(_)
+        | Command::ConnectInvite(_)
         | Command::Volume(_)
         | Command::Seek(_)
         | Command::SeekTo(_)
@@ -167,6 +168,7 @@ fn execute(state: &mut AppState, runtime: &mut Runtime, command: Command) {
         Command::Quit => state.should_quit = true,
         Command::Import(path) => super::spawn_import(state, runtime, &path),
         Command::Open(link) => open_frid_link(state, runtime, link),
+        Command::ConnectInvite(invite) => super::device_connect(runtime, invite),
         Command::Volume(value) => {
             state.player.volume = value;
             super::perform_effect(state, runtime, Effect::SetVolume(value));

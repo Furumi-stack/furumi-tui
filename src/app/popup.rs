@@ -61,6 +61,23 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::FedText { title, text }),
         },
+        Popup::DevicePairing {
+            request_id,
+            device_id,
+            name,
+            client_version,
+        } => handle_device_pairing(
+            state,
+            runtime,
+            request_id,
+            device_id,
+            name,
+            client_version,
+            key,
+        ),
+        Popup::ConfirmDeviceRevoke { device_id, name } => {
+            handle_device_revoke(state, runtime, device_id, name, key);
+        }
     }
 }
 
@@ -84,7 +101,7 @@ fn handle_library_filters(state: &mut AppState, runtime: &Runtime, cursor: usize
 /// One-line text entry on the Federation tab (network id / peer ticket).
 fn handle_fed_input(
     state: &mut AppState,
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     field: FedInputField,
     mut input: crate::app::input::LineEdit,
     key: KeyEvent,
@@ -110,12 +127,91 @@ fn handle_fed_input(
                         super::fed_connect(runtime, value);
                     }
                 }
+                FedInputField::DeviceName => {
+                    if value.is_empty() {
+                        state.status_message = Some("device name is empty".into());
+                    } else {
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::DeviceSetName(value),
+                        );
+                    }
+                }
+                FedInputField::ConnectInvite => {
+                    if value.is_empty() {
+                        state.status_message = Some("invite is empty".into());
+                    } else {
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::DeviceConnectInvite(value),
+                        );
+                    }
+                }
             }
         }
         _ => {
             input.handle_key(key);
             state.popup = Some(Popup::FedInput { field, input });
         }
+    }
+}
+
+fn handle_device_pairing(
+    state: &mut AppState,
+    runtime: &Runtime,
+    request_id: String,
+    device_id: String,
+    name: String,
+    client_version: String,
+    key: KeyEvent,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+            if let Err(err) = runtime.devices.answer_pairing(&request_id, false) {
+                state.status_message = Some(format!("pairing: {err:#}"));
+            } else {
+                state.status_message = Some("device pairing denied".to_string());
+            }
+            state.federation.devices = Some(runtime.devices.status());
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Err(err) = runtime.devices.answer_pairing(&request_id, true) {
+                state.status_message = Some(format!("pairing: {err:#}"));
+            } else {
+                state.status_message = Some(format!("device \"{name}\" accepted"));
+            }
+            state.federation.devices = Some(runtime.devices.status());
+        }
+        _ => {
+            state.popup = Some(Popup::DevicePairing {
+                request_id,
+                device_id,
+                name,
+                client_version,
+            });
+        }
+    }
+}
+
+fn handle_device_revoke(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    device_id: String,
+    name: String,
+    key: KeyEvent,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+        KeyCode::Enter | KeyCode::Char('y') => {
+            super::perform_effect(
+                state,
+                runtime,
+                crate::app::update::Effect::DeviceRevoke(device_id),
+            );
+        }
+        _ => state.popup = Some(Popup::ConfirmDeviceRevoke { device_id, name }),
     }
 }
 
@@ -278,7 +374,13 @@ fn save_edit(
             if title.is_empty() {
                 return Err("title is empty".to_string());
             }
-            library.update_playlist(id, &title, None)
+            let result = library.update_playlist(id, &title, None);
+            if result.is_ok()
+                && let Err(err) = runtime.devices.record_playlist_renamed(id, &title)
+            {
+                tracing::warn!(%err, playlist = id, "recording synced playlist rename failed");
+            }
+            result
         }
     };
     match result {
@@ -311,7 +413,13 @@ fn handle_confirm_delete(
                 DeleteTarget::Track(id) => library.delete_track(id),
                 DeleteTarget::Release(id) => library.delete_release(id),
                 DeleteTarget::Artist(id) => library.delete_artist(id),
-                DeleteTarget::Playlist(id) => library.delete_playlist(id),
+                DeleteTarget::Playlist(id) => match runtime.devices.record_playlist_deleted(id) {
+                    Ok(()) => library.delete_playlist(id),
+                    Err(err) => {
+                        tracing::warn!(%err, playlist = id, "recording synced playlist deletion failed");
+                        library.delete_playlist(id)
+                    }
+                },
             };
             match result {
                 Ok(()) => {
@@ -656,12 +764,18 @@ pub(crate) fn spawn_add_target(
     match target {
         crate::app::state::PlaylistAddTarget::Local(tracks) => {
             let library = Arc::clone(&runtime.library);
+            let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
             let ids: Vec<i64> = tracks.iter().map(|t| t.id).filter(|id| *id >= 0).collect();
             tokio::task::spawn_blocking(move || {
                 let result = library
                     .add_tracks_to_playlist(playlist_id, &ids)
                     .map_err(|err| format!("{err:#}"));
+                if result.is_ok()
+                    && let Err(err) = devices.record_playlist_tracks_added(playlist_id, &ids)
+                {
+                    tracing::warn!(%err, playlist_id, "recording synced playlist add failed");
+                }
                 let _ = tx.send(AppEvent::PlaylistTracksAdded {
                     playlist_id,
                     playlist_title,
@@ -681,11 +795,17 @@ fn spawn_create_playlist(
     add_target: Option<crate::app::state::PlaylistAddTarget>,
 ) {
     let library = Arc::clone(&runtime.library);
+    let devices = Arc::clone(&runtime.devices);
     let tx = runtime.event_tx.clone();
     tokio::task::spawn_blocking(move || {
         let result = library
             .create_playlist(&title)
             .map_err(|err| format!("{err:#}"));
+        if let Ok(playlist) = &result
+            && let Err(err) = devices.record_playlist_created(playlist.id, &playlist.title)
+        {
+            tracing::warn!(%err, playlist = playlist.id, "recording synced playlist creation failed");
+        }
         let _ = tx.send(AppEvent::PlaylistCreated { result, add_target });
     });
 }

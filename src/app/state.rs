@@ -530,12 +530,23 @@ pub enum Popup {
     },
     /// Wrapped read-only text (this peer's connection ticket).
     FedText { title: String, text: String },
+    /// Incoming trusted-device pairing request.
+    DevicePairing {
+        request_id: String,
+        device_id: String,
+        name: String,
+        client_version: String,
+    },
+    /// Confirmation before revoking a trusted device.
+    ConfirmDeviceRevoke { device_id: String, name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FedInputField {
     NetworkId,
     ConnectTicket,
+    DeviceName,
+    ConnectInvite,
 }
 
 impl FedInputField {
@@ -543,6 +554,8 @@ impl FedInputField {
         match self {
             FedInputField::NetworkId => "Network ID",
             FedInputField::ConnectTicket => "Connect to peer (paste ticket)",
+            FedInputField::DeviceName => "Device name",
+            FedInputField::ConnectInvite => "Connect device (paste frid://i invite)",
         }
     }
 }
@@ -575,6 +588,11 @@ impl FedRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     Federation(FedRow),
+    DeviceName,
+    DeviceInvite,
+    DeviceConnect,
+    DeviceSyncNow,
+    Device(usize),
     VisualizationClock,
     VisualizationScript(usize),
     VisualizationNew,
@@ -584,6 +602,13 @@ pub enum SettingsRow {
 pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = Vec::new();
     rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
+    rows.push(SettingsRow::DeviceName);
+    rows.push(SettingsRow::DeviceInvite);
+    rows.push(SettingsRow::DeviceConnect);
+    rows.push(SettingsRow::DeviceSyncNow);
+    if let Some(status) = &state.federation.devices {
+        rows.extend((0..status.devices.len()).map(SettingsRow::Device));
+    }
     rows.push(SettingsRow::VisualizationClock);
     rows.extend(
         state
@@ -605,6 +630,7 @@ pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
 pub struct FederationTab {
     pub settings: crate::federation::FedSettings,
     pub status: Option<crate::federation::FedStatus>,
+    pub devices: Option<crate::devices::DeviceSyncStatus>,
 }
 
 /// Playlists eligible as add-targets (the virtual Likes playlist is managed

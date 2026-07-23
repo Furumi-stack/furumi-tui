@@ -128,4 +128,12 @@ pub enum AppEvent {
     },
     /// This peer's connection ticket, requested from the Federation tab.
     FedTicket(Result<String, String>),
+    /// Fresh personal-device sync status snapshot for Settings.
+    DeviceSyncStatus(crate::devices::DeviceSyncStatus),
+    /// Invite link for pairing another device.
+    DeviceInvite(Result<String, String>),
+    /// Result of `:connect frid://i/...`.
+    DeviceConnectResult(Result<String, String>),
+    /// Incoming pairing request that passed the invite-secret check.
+    DevicePairingRequest(crate::devices::PendingPairing),
 }

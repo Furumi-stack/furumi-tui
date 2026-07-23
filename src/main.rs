@@ -1,6 +1,7 @@
 mod app;
 mod art;
 mod config;
+mod devices;
 mod federation;
 mod library;
 mod media;

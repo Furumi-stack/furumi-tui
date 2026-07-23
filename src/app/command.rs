@@ -27,6 +27,8 @@ pub enum Command {
     Import(String),
     /// `:open frid://...` — open a shared federation content link.
     Open(String),
+    /// `:connect frid://i/...` — pair this client with a trusted device.
+    ConnectInvite(String),
     /// `:volume 40` (also `:vol`) — set the volume precisely.
     Volume(u8),
     /// `:seek +30` / `:seek -10` — relative seek in seconds.
@@ -89,6 +91,15 @@ pub fn parse(input: &str) -> Parsed {
             match value.map(|(_, rest)| rest.trim()) {
                 Some(value) if !value.is_empty() => Parsed::Command(Command::Open(value.into())),
                 _ => Parsed::Invalid("usage: :open frid://<content_id>".to_string()),
+            }
+        }
+        "connect" => {
+            let value = input.trim_start().split_once(char::is_whitespace);
+            match value.map(|(_, rest)| rest.trim()) {
+                Some(value) if !value.is_empty() => {
+                    Parsed::Command(Command::ConnectInvite(value.into()))
+                }
+                _ => Parsed::Invalid("usage: :connect frid://i/<invite>".to_string()),
             }
         }
         "volume" | "vol" => match arg.and_then(|a| a.parse::<u8>().ok()) {
@@ -182,6 +193,10 @@ mod tests {
         );
         assert!(matches!(parse("import"), Parsed::Invalid(_)));
         assert!(matches!(parse("open"), Parsed::Invalid(_)));
+        assert_eq!(
+            parse("connect frid://i/abcd"),
+            Parsed::Command(Command::ConnectInvite("frid://i/abcd".to_string()))
+        );
         assert_eq!(parse("volume 40"), Parsed::Command(Command::Volume(40)));
         assert_eq!(parse("vol 0"), Parsed::Command(Command::Volume(0)));
         assert_eq!(parse("shuffle"), Parsed::Command(Command::Shuffle));

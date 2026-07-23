@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS track_artists (
 );
 CREATE TABLE IF NOT EXISTS playlists (
     id           INTEGER PRIMARY KEY,
+    sync_id      TEXT UNIQUE,
     title        TEXT NOT NULL,
     description  TEXT,
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
@@ -669,8 +670,14 @@ impl Library {
     pub fn create_playlist(&self, title: &str) -> Result<PlaylistCard> {
         let conn = self.lock();
         conn.execute("INSERT INTO playlists (title) VALUES (?1)", [title])?;
+        let id = conn.last_insert_rowid();
+        let sync_id = make_playlist_sync_id(id, title);
+        conn.execute(
+            "UPDATE playlists SET sync_id = ?2 WHERE id = ?1",
+            params![id, sync_id],
+        )?;
         Ok(PlaylistCard {
-            id: conn.last_insert_rowid(),
+            id,
             title: title.to_string(),
             track_count: 0,
             kind: "normal".to_string(),
@@ -690,6 +697,67 @@ impl Library {
         let conn = self.lock();
         conn.execute("DELETE FROM playlists WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    pub fn delete_playlist_by_sync_id(&self, sync_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM playlists WHERE sync_id = ?1", [sync_id])?;
+        Ok(())
+    }
+
+    pub fn playlist_sync_id(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row("SELECT sync_id FROM playlists WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn ensure_playlist_sync_id(&self, id: i64) -> Result<String> {
+        let conn = self.lock();
+        let existing: Option<String> = conn
+            .query_row("SELECT sync_id FROM playlists WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        if let Some(sync_id) = existing {
+            return Ok(sync_id);
+        }
+        let title: String =
+            conn.query_row("SELECT title FROM playlists WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })?;
+        let sync_id = make_playlist_sync_id(id, &title);
+        conn.execute(
+            "UPDATE playlists SET sync_id = ?2 WHERE id = ?1",
+            params![id, sync_id],
+        )?;
+        Ok(sync_id)
+    }
+
+    pub fn upsert_synced_playlist(&self, sync_id: &str, title: &str) -> Result<i64> {
+        let conn = self.lock();
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM playlists WHERE sync_id = ?1",
+                [sync_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            conn.execute(
+                "UPDATE playlists SET title = ?2 WHERE id = ?1",
+                params![id, title],
+            )?;
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO playlists (sync_id, title) VALUES (?1, ?2)",
+            params![sync_id, title],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn add_tracks_to_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<()> {
@@ -722,6 +790,125 @@ impl Library {
                 params![playlist_id, track_id],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn track_content_id_by_id(&self, track_id: i64) -> Result<Option<String>> {
+        let conn = self.lock();
+        let content_id: Option<String> = conn
+            .query_row(
+                "SELECT content_id FROM tracks WHERE id = ?1",
+                [track_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| music_dht::normalize_content_id(&value));
+        Ok(content_id)
+    }
+
+    pub fn track_content_ids(&self, track_ids: &[i64]) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut out = Vec::new();
+        for &track_id in track_ids {
+            let content_id: Option<String> = conn
+                .query_row(
+                    "SELECT content_id FROM tracks WHERE id = ?1",
+                    [track_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .and_then(|value| music_dht::normalize_content_id(&value));
+            if let Some(content_id) = content_id {
+                out.push(content_id);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn track_id_by_content_id(&self, content_id: &str) -> Result<Option<i64>> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(None);
+        };
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM tracks WHERE content_id = ?1 LIMIT 1",
+                [content_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_like(&self, track_id: i64, liked: bool) -> Result<()> {
+        let conn = self.lock();
+        if liked {
+            conn.execute(
+                "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
+                [track_id],
+            )?;
+        } else {
+            conn.execute("DELETE FROM likes WHERE track_id = ?1", [track_id])?;
+        }
+        Ok(())
+    }
+
+    pub fn add_content_id_to_synced_playlist(
+        &self,
+        playlist_sync_id: &str,
+        content_id: &str,
+    ) -> Result<bool> {
+        let Some(track_id) = self.track_id_by_content_id(content_id)? else {
+            return Ok(false);
+        };
+        let conn = self.lock();
+        let playlist_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM playlists WHERE sync_id = ?1",
+                [playlist_sync_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(playlist_id) = playlist_id else {
+            return Ok(false);
+        };
+        let next: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_tracks WHERE playlist_id = ?1",
+            [playlist_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position)
+             VALUES (?1, ?2, ?3)",
+            params![playlist_id, track_id, next],
+        )?;
+        Ok(true)
+    }
+
+    pub fn remove_content_id_from_synced_playlist(
+        &self,
+        playlist_sync_id: &str,
+        content_id: &str,
+    ) -> Result<()> {
+        let Some(track_id) = self.track_id_by_content_id(content_id)? else {
+            return Ok(());
+        };
+        let conn = self.lock();
+        let playlist_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM playlists WHERE sync_id = ?1",
+                [playlist_sync_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(playlist_id) = playlist_id else {
+            return Ok(());
+        };
+        conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+            params![playlist_id, track_id],
+        )?;
         Ok(())
     }
 
@@ -1222,6 +1409,28 @@ fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     if !track_columns.iter().any(|column| column == "content_id") {
         conn.execute("ALTER TABLE tracks ADD COLUMN content_id TEXT", [])?;
     }
+    let playlist_columns = table_columns(conn, "playlists")?;
+    if !playlist_columns.iter().any(|column| column == "sync_id") {
+        conn.execute("ALTER TABLE playlists ADD COLUMN sync_id TEXT", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_sync_id
+             ON playlists(sync_id)",
+            [],
+        )?;
+    }
+    let mut rows = conn.prepare("SELECT id, title FROM playlists WHERE sync_id IS NULL")?;
+    let missing = rows
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(rows);
+    for (id, title) in missing {
+        conn.execute(
+            "UPDATE playlists SET sync_id = ?2 WHERE id = ?1",
+            params![id, make_playlist_sync_id(id, &title)],
+        )?;
+    }
     Ok(())
 }
 
@@ -1230,6 +1439,15 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn make_playlist_sync_id(id: i64, title: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seed = format!("playlist:{id}:{title}:{now}:{}", std::process::id());
+    format!("pl_{}", &blake3::hash(seed.as_bytes()).to_hex()[..24])
 }
 
 #[cfg(test)]

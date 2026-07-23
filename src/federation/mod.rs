@@ -181,11 +181,13 @@ pub struct FedPlayable {
 struct Running {
     service: Arc<MusicDhtService>,
     network_name: String,
+    network_id: NetworkId,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub struct Federation {
     library: Arc<Library>,
+    devices: Arc<crate::devices::DeviceSync>,
     data_dir: PathBuf,
     cache_dir: PathBuf,
     media_dir: PathBuf,
@@ -284,7 +286,7 @@ async fn dht_record_payload_bytes(data_dir: PathBuf, now_ms: u64) -> Result<u64>
 }
 
 impl Federation {
-    pub fn new(library: Arc<Library>) -> Arc<Self> {
+    pub fn new(library: Arc<Library>, devices: Arc<crate::devices::DeviceSync>) -> Arc<Self> {
         let dirs = crate::config::project_dirs();
         let data_dir = dirs
             .as_ref()
@@ -307,6 +309,7 @@ impl Federation {
             });
         Arc::new(Self {
             library,
+            devices,
             data_dir,
             cache_dir,
             media_dir,
@@ -363,9 +366,18 @@ impl Federation {
 
     /// Starts the DHT node. Idempotent per network name.
     async fn start(self: &Arc<Self>, network_name: String) -> Result<()> {
+        self.start_with_network_id(NetworkId::from_name(&network_name), network_name)
+            .await
+    }
+
+    async fn start_with_network_id(
+        self: &Arc<Self>,
+        network_id: NetworkId,
+        network_name: String,
+    ) -> Result<()> {
         let mut guard = self.running.lock().await;
         if let Some(running) = guard.as_ref() {
-            if running.network_name == network_name {
+            if running.network_id == network_id {
                 return Ok(());
             }
             stop_running(guard.take()).await;
@@ -375,13 +387,15 @@ impl Federation {
 
         let config = MusicDhtConfig::builder()
             .data_dir(&self.data_dir)
-            .network_id(NetworkId::from_name(&network_name))
+            .network_id(network_id)
             // Peers of the network find each other knowing only its name.
             .rendezvous(RendezvousConfig::default())
             // Peers stream each other's audio over this protocol.
             .stream_protocol(AUDIO_ALPN)
             // ...and browse each other's per-artist catalogs over this one.
             .stream_protocol(CATALOG_ALPN)
+            // Personal-device sync (likes, playlists, trusted devices).
+            .stream_protocol(crate::devices::SYNC_ALPN)
             .build()
             .map_err(|err| anyhow::anyhow!("invalid federation config: {err}"))?;
         let (service, mut events) = MusicDhtService::start(config)
@@ -428,11 +442,32 @@ impl Federation {
             Arc::clone(&self.library),
             service.endpoint_id(),
         ));
+        let sync_acceptor = service
+            .stream_acceptor(crate::devices::SYNC_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take the device-sync acceptor: {err}"))?;
+        let device_sync_task = tokio::spawn(crate::devices::serve_peers(
+            sync_acceptor,
+            Arc::clone(&self.devices),
+            Arc::clone(&service),
+        ));
+        let device_sync = Arc::clone(&self.devices);
+        let device_service = Arc::clone(&service);
+        let device_tick_task = tokio::spawn(async move {
+            crate::devices::sync_loop(device_sync, device_service).await;
+        });
 
         *guard = Some(Running {
             service,
             network_name,
-            tasks: vec![event_task, sync_task, audio_task, catalog_task],
+            network_id,
+            tasks: vec![
+                event_task,
+                sync_task,
+                audio_task,
+                catalog_task,
+                device_sync_task,
+                device_tick_task,
+            ],
         });
         self.set_error(None);
         Ok(())
@@ -868,6 +903,38 @@ impl Federation {
             .await
             .map_err(|err| anyhow::anyhow!("cannot create a ticket: {err}"))?;
         Ok(ticket.to_string())
+    }
+
+    pub async fn device_invite(self: &Arc<Self>) -> Result<String> {
+        if self.running.lock().await.is_none() {
+            let status = self.devices.status();
+            let network_name = format!("furumi-device-sync:{}", status.group_id);
+            self.start_with_network_id(NetworkId::from_name(&network_name), "device-sync".into())
+                .await?;
+        }
+        let service = self.service().await?;
+        self.devices.create_invite(service).await
+    }
+
+    pub async fn device_connect(self: &Arc<Self>, invite: &str) -> Result<String> {
+        let network_id = crate::devices::invite_network_id(invite)?;
+        let needs_start = self
+            .running
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|running| running.network_id != network_id);
+        if needs_start {
+            self.start_with_network_id(network_id, "device-invite".to_string())
+                .await?;
+        }
+        let service = self.service().await?;
+        self.devices.connect_invite(service, invite).await
+    }
+
+    pub async fn device_sync_now(self: &Arc<Self>) -> Result<()> {
+        let service = self.service().await?;
+        self.devices.sync_once(service).await
     }
 
     pub async fn connect(&self, ticket: &str) -> Result<String> {

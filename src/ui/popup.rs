@@ -36,6 +36,15 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
         Some(Popup::FedInput { field, input }) => draw_fed_input(frame, field.title(), input),
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
+        Some(Popup::DevicePairing {
+            device_id,
+            name,
+            client_version,
+            ..
+        }) => draw_device_pairing(frame, device_id, name, client_version),
+        Some(Popup::ConfirmDeviceRevoke { device_id, name }) => {
+            draw_device_revoke(frame, device_id, name)
+        }
         None => {}
     }
 }
@@ -125,6 +134,58 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
         Paragraph::new(text.to_string()).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn draw_device_pairing(frame: &mut Frame, device_id: &str, name: &str, client_version: &str) {
+    let area = centered(frame.area(), 64, 8);
+    let block = Block::bordered()
+        .title(" Pair device ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Name     ", theme::dim()),
+            Span::raw(name.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Version  ", theme::dim()),
+            Span::raw(client_version.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Device   ", theme::dim()),
+            Span::raw(device_id.chars().take(24).collect::<String>()),
+        ]),
+        Line::default(),
+        Line::styled("enter/y accept · n/esc deny", theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
+    let area = centered(frame.area(), 64, 7);
+    let block = Block::bordered()
+        .title(" Revoke device ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Device   ", theme::dim()),
+            Span::raw(name.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("ID       ", theme::dim()),
+            Span::raw(device_id.chars().take(24).collect::<String>()),
+        ]),
+        Line::default(),
+        Line::styled("enter/y revoke · n/esc cancel", theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Metadata edit form: one bordered input per field, the focused field gets

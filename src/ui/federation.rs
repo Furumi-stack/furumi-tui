@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::theme;
-use crate::app::state::{AppState, FedRow};
+use crate::app::state::{AppState, FedRow, settings_rows};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::bordered()
@@ -16,7 +16,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows_height = (FedRow::ALL.len() + state.visualizer.scripts.len() + 6) as u16;
+    let rows_height = (settings_rows(state).len() + 5) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -64,6 +64,83 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             value,
         );
         cursor += 1;
+    }
+
+    y = y.saturating_add(1);
+    draw_section(frame, area, &mut y, "Connected Devices");
+    let devices = state.federation.devices.as_ref();
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "This device name",
+        devices
+            .map(|status| status.this_device_name.clone())
+            .unwrap_or_else(|| "loading…".to_string()),
+    );
+    cursor += 1;
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Generate device invite",
+        "↵".to_string(),
+    );
+    cursor += 1;
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Connect device by invite…",
+        "↵".to_string(),
+    );
+    cursor += 1;
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Sync devices now",
+        "↵".to_string(),
+    );
+    cursor += 1;
+    if let Some(status) = devices {
+        for device in &status.devices {
+            let label = if device.is_self {
+                format!("* {}", device.name)
+            } else if device.revoked {
+                format!("  {} (revoked)", device.name)
+            } else {
+                format!("  {}", device.name)
+            };
+            let version = if device.client_version.is_empty() {
+                "unknown".to_string()
+            } else {
+                format!("v{}", device.client_version)
+            };
+            let value = if device.is_self || device.revoked {
+                version
+            } else {
+                format!("{version} · revoke ↵")
+            };
+            draw_row(
+                frame,
+                area,
+                &mut y,
+                cursor,
+                state.settings_cursor,
+                &label,
+                value,
+            );
+            cursor += 1;
+        }
     }
 
     y = y.saturating_add(1);
@@ -270,6 +347,54 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             ));
             if let Some(error) = &status.last_error {
                 lines.push(status_line("Error", error.clone()));
+            }
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("Connected Devices", theme::header()));
+    match &state.federation.devices {
+        None => lines.push(Line::styled("loading…", theme::dim())),
+        Some(status) => {
+            lines.push(status_line("This device", status.this_device_id.clone()));
+            lines.push(status_line("Sync group", status.group_id.clone()));
+            lines.push(status_line(
+                "Active devices",
+                status.active_devices.to_string(),
+            ));
+            lines.push(status_line(
+                "Revoked devices",
+                status.revoked_devices.to_string(),
+            ));
+            lines.push(status_line(
+                "Pending requests",
+                status.pending_requests.to_string(),
+            ));
+            lines.push(status_line("Ops in log", status.ops_total.to_string()));
+            lines.push(status_line(
+                "Tombstones",
+                format!(
+                    "{} ({} compactable)",
+                    status.tombstone_ops, status.compactable_tombstones
+                ),
+            ));
+            lines.push(status_line("Outbox ops", status.outbox_ops.to_string()));
+            lines.push(status_line(
+                "Snapshot",
+                format!(
+                    "{} likes, {} playlists, {} items",
+                    status.snapshot_likes, status.snapshot_playlists, status.snapshot_items
+                ),
+            ));
+            lines.push(status_line(
+                "Unresolved items",
+                status.unresolved_playlist_items.to_string(),
+            ));
+            lines.push(status_line("Peer ack floor", status.peer_ack_floor.clone()));
+            if let Some(last_sync) = &status.last_sync {
+                lines.push(status_line("Last device sync", last_sync.clone()));
+            }
+            if let Some(last_error) = &status.last_error {
+                lines.push(status_line("Device error", last_error.clone()));
             }
         }
     }
