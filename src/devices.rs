@@ -222,6 +222,8 @@ enum WireMessage {
     PairResponse {
         accepted: bool,
         #[serde(default)]
+        pending: bool,
+        #[serde(default)]
         error: Option<String>,
         #[serde(default)]
         group_id: Option<String>,
@@ -387,56 +389,74 @@ impl DeviceSync {
             .ticket
             .parse()
             .map_err(|err| anyhow::anyhow!("malformed invite ticket: {err}"))?;
-        let peer = service.connect(ticket).await?;
-        let own_ticket = service.ticket().await?.to_string();
-        let profile = self.own_profile(&own_ticket)?;
-        let vector = self.vector()?;
-        let ops = self.ops_for_peer(&invite.device_id)?;
-        let snapshot = self.snapshot()?;
-        let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
-        write_msg(
-            &mut stream,
-            &WireMessage::PairRequest {
-                invite_id: invite.invite_id,
-                secret: invite.secret,
-                profile,
-                vector,
-                ops,
-                snapshot,
-            },
-        )
-        .await?;
-        finish_send(&mut stream).await?;
-        let response = read_msg(&mut stream).await?;
-        match response {
-            WireMessage::PairResponse {
-                accepted: true,
-                group_id: Some(group_id),
-                profile,
-                devices,
-                vector,
-                ops,
-                snapshot,
-                ..
-            } => {
-                self.set_group_id(&group_id)?;
-                if let Some(profile) = profile {
-                    self.apply_device_profile(&profile, false)?;
+        let deadline = now_ms() + PAIRING_WAIT_MS;
+        loop {
+            let peer = service.connect(ticket.clone()).await?;
+            let own_ticket = service.ticket().await?.to_string();
+            let profile = self.own_profile(&own_ticket)?;
+            let vector = self.vector()?;
+            let ops = self.ops_for_peer(&invite.device_id)?;
+            let snapshot = self.snapshot()?;
+            let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
+            write_msg(
+                &mut stream,
+                &WireMessage::PairRequest {
+                    invite_id: invite.invite_id.clone(),
+                    secret: invite.secret.clone(),
+                    profile,
+                    vector,
+                    ops,
+                    snapshot,
+                },
+            )
+            .await?;
+            finish_send(&mut stream).await?;
+            let response = read_msg(&mut stream)
+                .await
+                .context("pairing response was not received")?;
+            match response {
+                WireMessage::PairResponse {
+                    accepted: true,
+                    group_id: Some(group_id),
+                    profile,
+                    devices,
+                    vector,
+                    ops,
+                    snapshot,
+                    ..
+                } => {
+                    self.set_group_id(&group_id)?;
+                    if let Some(profile) = profile {
+                        self.apply_device_profile(&profile, false)?;
+                    }
+                    self.apply_device_profiles(&devices)?;
+                    self.apply_snapshot(snapshot)?;
+                    self.apply_ops(ops)?;
+                    self.note_peer_vector(&invite.device_id, &vector)?;
+                    self.set_last_sync(Some(format!(
+                        "paired with {}",
+                        short_id(&invite.device_id)
+                    )))?;
+                    self.gc_tombstones()?;
+                    return Ok(format!("connected device {}", short_id(&invite.device_id)));
                 }
-                self.apply_device_profiles(&devices)?;
-                self.apply_snapshot(snapshot)?;
-                self.apply_ops(ops)?;
-                self.note_peer_vector(&invite.device_id, &vector)?;
-                self.set_last_sync(Some(format!("paired with {}", short_id(&invite.device_id))))?;
-                self.gc_tombstones()?;
-                Ok(format!("connected device {}", short_id(&invite.device_id)))
+                WireMessage::PairResponse {
+                    accepted: false,
+                    pending: true,
+                    ..
+                } => {
+                    if now_ms() >= deadline {
+                        anyhow::bail!("pairing timed out");
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                WireMessage::PairResponse {
+                    accepted: false,
+                    error,
+                    ..
+                } => anyhow::bail!(error.unwrap_or_else(|| "pairing denied".to_string())),
+                _ => anyhow::bail!("unexpected pairing response"),
             }
-            WireMessage::PairResponse {
-                accepted: false,
-                error,
-                ..
-            } => anyhow::bail!(error.unwrap_or_else(|| "pairing denied".to_string())),
-            _ => anyhow::bail!("unexpected pairing response"),
         }
     }
 
@@ -601,7 +621,10 @@ impl DeviceSync {
         )
         .await?;
         finish_send(&mut stream).await?;
-        match read_msg(&mut stream).await? {
+        match read_msg(&mut stream)
+            .await
+            .context("device sync response was not received")?
+        {
             WireMessage::SyncResponse {
                 accepted: true,
                 devices,
@@ -1600,6 +1623,7 @@ async fn handle_pair_request(
             &mut stream,
             &WireMessage::PairResponse {
                 accepted: false,
+                pending: false,
                 error: Some("invalid or expired invite".to_string()),
                 group_id: None,
                 profile: None,
@@ -1614,11 +1638,11 @@ async fn handle_pair_request(
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
-    let request_id = format!("pair_{}", random_hex(8));
-    {
+    let request_id = pair_request_id(&invite_id, &profile.device_id);
+    let inserted = {
         let conn = lock(&sync.conn);
         conn.execute(
-            "INSERT INTO sync_pending_pairing
+            "INSERT OR IGNORE INTO sync_pending_pairing
                 (request_id, device_id, name, client_version, endpoint_id,
                  endpoint_ticket, invite_id, created_at_ms, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
@@ -1632,9 +1656,11 @@ async fn handle_pair_request(
                 invite_id,
                 now_ms(),
             ],
-        )?;
-    }
-    if let Some(tx) = lock(&sync.event_tx).as_ref() {
+        )?
+    };
+    if inserted > 0
+        && let Some(tx) = lock(&sync.event_tx).as_ref()
+    {
         let _ = tx.send(AppEvent::DevicePairingRequest(PendingPairing {
             request_id: request_id.clone(),
             device_id: profile.device_id.clone(),
@@ -1642,24 +1668,46 @@ async fn handle_pair_request(
             client_version: profile.client_version.clone(),
         }));
     }
-    let accepted = wait_pairing_answer(&sync, &request_id).await?;
-    if !accepted {
-        write_msg(
-            &mut stream,
-            &WireMessage::PairResponse {
-                accepted: false,
-                error: Some("pairing denied".to_string()),
-                group_id: None,
-                profile: None,
-                devices: Vec::new(),
-                vector: BTreeMap::new(),
-                ops: Vec::new(),
-                snapshot: SyncSnapshot::default(),
-            },
-        )
-        .await?;
-        finish_send(&mut stream).await?;
-        return Ok(());
+    match pairing_status(&sync, &request_id)?.as_deref() {
+        Some("pending") => {
+            write_msg(
+                &mut stream,
+                &WireMessage::PairResponse {
+                    accepted: false,
+                    pending: true,
+                    error: Some("pairing pending".to_string()),
+                    group_id: None,
+                    profile: None,
+                    devices: Vec::new(),
+                    vector: BTreeMap::new(),
+                    ops: Vec::new(),
+                    snapshot: SyncSnapshot::default(),
+                },
+            )
+            .await?;
+            finish_send(&mut stream).await?;
+            return Ok(());
+        }
+        Some("accepted") => {}
+        _ => {
+            write_msg(
+                &mut stream,
+                &WireMessage::PairResponse {
+                    accepted: false,
+                    pending: false,
+                    error: Some("pairing denied".to_string()),
+                    group_id: None,
+                    profile: None,
+                    devices: Vec::new(),
+                    vector: BTreeMap::new(),
+                    ops: Vec::new(),
+                    snapshot: SyncSnapshot::default(),
+                },
+            )
+            .await?;
+            finish_send(&mut stream).await?;
+            return Ok(());
+        }
     }
 
     let own_ticket = service.ticket().await?.to_string();
@@ -1685,6 +1733,7 @@ async fn handle_pair_request(
         &mut stream,
         &WireMessage::PairResponse {
             accepted: true,
+            pending: false,
             error: None,
             group_id: Some(identity.group_id),
             profile: Some(own_profile),
@@ -1780,25 +1829,20 @@ async fn handle_hello(
     Ok(())
 }
 
-async fn wait_pairing_answer(sync: &DeviceSync, request_id: &str) -> Result<bool> {
-    let deadline = now_ms() + PAIRING_WAIT_MS;
-    loop {
-        let status: Option<String> = {
-            let conn = lock(&sync.conn);
-            conn.query_row(
-                "SELECT status FROM sync_pending_pairing WHERE request_id = ?1",
-                [request_id],
-                |row| row.get(0),
-            )
-            .optional()?
-        };
-        match status.as_deref() {
-            Some("accepted") => return Ok(true),
-            Some("denied") => return Ok(false),
-            _ if now_ms() > deadline => return Ok(false),
-            _ => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    }
+fn pairing_status(sync: &DeviceSync, request_id: &str) -> Result<Option<String>> {
+    let conn = lock(&sync.conn);
+    Ok(conn
+        .query_row(
+            "SELECT status FROM sync_pending_pairing WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn pair_request_id(invite_id: &str, device_id: &str) -> String {
+    let digest = blake3::hash(format!("{invite_id}:{device_id}").as_bytes());
+    format!("pair_{}", &digest.to_hex()[..16])
 }
 
 fn valid_invite(sync: &DeviceSync, invite_id: &str, secret: &str) -> Result<bool> {

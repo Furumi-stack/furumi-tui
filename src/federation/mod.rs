@@ -261,6 +261,10 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn personal_sync_network_name(group_id: &str) -> String {
+    format!("furumi-device-sync:{group_id}")
+}
+
 async fn dht_record_payload_bytes(data_dir: PathBuf, now_ms: u64) -> Result<u64> {
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let path = data_dir.join("state.sqlite3");
@@ -346,7 +350,7 @@ impl Federation {
         if settings.enabled {
             self.start(settings.network_id.trim().to_string()).await?;
             self.spawn_sync_soon().await;
-        } else {
+        } else if !self.start_personal_sync_if_needed().await? {
             self.stop().await;
         }
         Ok(())
@@ -361,7 +365,21 @@ impl Federation {
             } else {
                 self.spawn_sync_soon().await;
             }
+        } else if let Err(err) = self.start_personal_sync_if_needed().await {
+            tracing::error!("device-sync autostart failed: {err:#}");
+            self.set_error(Some(format!("device sync autostart failed: {err}")));
         }
+    }
+
+    async fn start_personal_sync_if_needed(self: &Arc<Self>) -> Result<bool> {
+        let status = self.devices.status();
+        if status.active_devices <= 1 {
+            return Ok(false);
+        }
+        let network_name = personal_sync_network_name(&status.group_id);
+        self.start_with_network_id(NetworkId::from_name(&network_name), "device-sync".into())
+            .await?;
+        Ok(true)
     }
 
     /// Starts the DHT node. Idempotent per network name.
@@ -908,7 +926,7 @@ impl Federation {
     pub async fn device_invite(self: &Arc<Self>) -> Result<String> {
         if self.running.lock().await.is_none() {
             let status = self.devices.status();
-            let network_name = format!("furumi-device-sync:{}", status.group_id);
+            let network_name = personal_sync_network_name(&status.group_id);
             self.start_with_network_id(NetworkId::from_name(&network_name), "device-sync".into())
                 .await?;
         }
