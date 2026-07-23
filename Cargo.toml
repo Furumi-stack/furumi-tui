@@ -41,8 +41,3 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.186"
-
-# Build against the local frid checkout; drop (or keep, for local
-# development) once the frid changes are pushed and the lock is updated.
-[patch."https://gt.hexor.cy/ab/frid.git"]
-music-dht = { git = "https://gt.hexor.cy/ab/frid.git" }
