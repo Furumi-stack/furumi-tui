@@ -21,6 +21,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..
         }) => draw_edit(frame, title, fields, *focus, error.as_deref()),
         Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, label),
+        Some(Popup::LibraryFilters { cursor }) => draw_library_filters(frame, state, *cursor),
         Some(Popup::TrackInfo {
             tracks,
             cursor,
@@ -37,6 +38,49 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
         None => {}
     }
+}
+
+fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
+    let area = centered(frame.area(), 46, 6);
+    let block = Block::bordered()
+        .title(" Library filters ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [list_area, _, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let checked = if state.global.filters.hide_featured_only {
+        "[x]"
+    } else {
+        "[ ]"
+    };
+    let row = Rect {
+        height: 1,
+        ..list_area
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{checked} "), theme::accent()),
+            Span::raw("Hide featured only"),
+        ])),
+        row,
+    );
+    if cursor == 0 {
+        frame.buffer_mut().set_style(row, theme::tab_active());
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled("space/enter toggle · esc close", theme::dim()))
+            .alignment(Alignment::Center),
+        footer,
+    );
 }
 
 /// One-line text entry on the Federation tab (network id / peer ticket).

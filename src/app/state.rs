@@ -17,7 +17,7 @@ pub enum Loadable<T> {
     Failed(String),
 }
 
-/// Tile geometry for the Global artist grid (kept here so selection math in
+/// Tile geometry for the Library artist grid (kept here so selection math in
 /// update() and rendering in ui::global agree). Width × height in cells,
 /// including the tile border; the art area inside is 18×8 cells = 18×16 px.
 pub const TILE_WIDTH: u16 = 20;
@@ -52,7 +52,7 @@ pub enum ArtState {
     Failed,
 }
 
-/// A drill-down view pushed on top of the Global artist grid. Cursors live
+/// A drill-down view pushed on top of the Library artist grid. Cursors live
 /// in the stack entry so going Back restores the previous position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalView {
@@ -82,7 +82,7 @@ pub enum GlobalView {
     },
 }
 
-/// The Global tab: the whole server library of artists.
+/// The Library tab: the whole server library of artists.
 #[derive(Debug)]
 pub struct GlobalTab {
     pub artists: Vec<ArtistCard>,
@@ -93,6 +93,7 @@ pub struct GlobalTab {
     pub error: Option<String>,
     pub selected: usize,
     pub view: ViewMode,
+    pub filters: crate::config::settings::LibraryFilters,
     pub stack: Vec<GlobalView>,
     /// Page size, fixed at the first request — the offset is
     /// `(page-1) * limit`, so it must not change between pages.
@@ -113,6 +114,7 @@ impl Default for GlobalTab {
             error: None,
             selected: 0,
             view: ViewMode::default(),
+            filters: crate::config::settings::LibraryFilters::default(),
             stack: Vec::new(),
             page_limit: None,
             reloading: false,
@@ -503,6 +505,8 @@ pub enum Popup {
     },
     /// Delete confirmation; Enter/y deletes, Esc/n cancels.
     ConfirmDelete { target: DeleteTarget, label: String },
+    /// Library-home filters. Cursor is kept for the next filters added here.
+    LibraryFilters { cursor: usize },
     /// Track metadata viewer; left/right switch between selected tracks.
     TrackInfo {
         tracks: Vec<TrackItem>,
@@ -662,7 +666,7 @@ impl Tab {
 
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Global => "Global",
+            Tab::Global => "Library",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
             Tab::Federation => "Settings",

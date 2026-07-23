@@ -76,10 +76,18 @@ pub async fn run(
     let library = Arc::new(Library::open(&db_path)?);
     tracing::info!(path = %db_path.display(), "library opened");
 
+    let (settings, settings_warning) = crate::config::settings::load();
+    let status_message = match (startup_warning, settings_warning) {
+        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+        (Some(message), None) | (None, Some(message)) => Some(message),
+        (None, None) => None,
+    };
     let mut state = AppState {
-        status_message: startup_warning,
+        status_message,
         ..AppState::default()
     };
+    state.player.volume = settings.volume;
+    state.global.filters = settings.library;
     if let Err(err) = state.visualizer.load_library() {
         state.status_message = Some(format!("visualizations disabled: {err:#}"));
     }
@@ -191,13 +199,16 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         {
             global.loading = true;
             let page = global.next_page;
+            let hide_featured_only = global.filters.hide_featured_only;
             let limit = *global
                 .page_limit
                 .get_or_insert_with(|| (needed as i64).clamp(48, 200));
             let library = Arc::clone(&runtime.library);
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let result = library.artists(page, limit).map_err(err_string);
+                let result = library
+                    .artists(page, limit, hide_featured_only)
+                    .map_err(err_string);
                 let _ = tx.send(AppEvent::ArtistsLoaded(result));
             });
         }
@@ -389,7 +400,10 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 .player
                 .seek(std::time::Duration::from_secs_f64(target));
         }
-        Effect::SetVolume(volume) => runtime.player.set_volume(player::amplitude(volume)),
+        Effect::SetVolume(volume) => {
+            runtime.player.set_volume(player::amplitude(volume));
+            save_app_settings(state);
+        }
         Effect::SetOptions => {}
         Effect::EnqueueRelease { id, next } => {
             let library = Arc::clone(&runtime.library);
@@ -1104,16 +1118,40 @@ fn refresh_artists(state: &mut AppState, runtime: &Runtime) {
     let global = &mut state.global;
     let needed = artist_grid_capacity() + ARTISTS_PREFETCH_MARGIN;
     let limit = (global.artists.len().max(needed) as i64).clamp(48, 1000);
+    let hide_featured_only = global.filters.hide_featured_only;
     global.reloading = true;
     let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let event = match library.artists(1, limit) {
+        let event = match library.artists(1, limit, hide_featured_only) {
             Ok(page) => AppEvent::ArtistsReloaded { page, limit },
             Err(err) => AppEvent::ArtistsLoaded(Err(err_string(err))),
         };
         let _ = tx.send(event);
     });
+}
+
+fn save_app_settings(state: &AppState) {
+    let settings = crate::config::settings::AppSettings {
+        volume: state.player.volume,
+        library: state.global.filters,
+    };
+    if let Err(err) = crate::config::settings::save(&settings) {
+        tracing::warn!(%err, "saving app settings failed");
+    }
+}
+
+fn reset_artist_pagination(state: &mut AppState) {
+    let global = &mut state.global;
+    global.artists.clear();
+    global.total = 0;
+    global.has_more = true;
+    global.next_page = 1;
+    global.loading = false;
+    global.error = None;
+    global.selected = 0;
+    global.page_limit = None;
+    global.reloading = false;
 }
 
 /// Swap queue entries for their fresh library copies; tracks that were

@@ -40,6 +40,7 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConfirmDelete { target, label } => {
             handle_confirm_delete(state, runtime, target, label, key);
         }
+        Popup::LibraryFilters { cursor } => handle_library_filters(state, runtime, cursor, key),
         Popup::TrackInfo {
             tracks,
             cursor,
@@ -60,6 +61,23 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::FedText { title, text }),
         },
+    }
+}
+
+fn handle_library_filters(state: &mut AppState, runtime: &Runtime, cursor: usize, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {}
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+            state.popup = Some(Popup::LibraryFilters { cursor: 0 });
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            state.global.filters.hide_featured_only = !state.global.filters.hide_featured_only;
+            super::save_app_settings(state);
+            super::reset_artist_pagination(state);
+            super::refresh_artists(state, runtime);
+            state.popup = Some(Popup::LibraryFilters { cursor });
+        }
+        _ => state.popup = Some(Popup::LibraryFilters { cursor }),
     }
 }
 

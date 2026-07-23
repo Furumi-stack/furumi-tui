@@ -193,6 +193,16 @@ fn status_line(label: &str, value: String) -> Line<'static> {
     ])
 }
 
+fn bytes_label(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{bytes} B ({:.1} MiB)", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{bytes} B ({:.1} KiB)", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect::<String>() + "…"
 }
@@ -238,6 +248,13 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
                 status
                     .stored_dht_records
                     .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+            ));
+            lines.push(status_line(
+                "Stored DHT bytes",
+                status
+                    .stored_dht_bytes
+                    .map(bytes_label)
                     .unwrap_or_else(|| "unavailable".to_string()),
             ));
             lines.push(status_line(

@@ -47,6 +47,7 @@ pub enum Action {
     NewPlaylist,
     ToggleHelp,
     ToggleViewMode,
+    OpenLibraryFilters,
     OpenCommandLine,
     OpenSearch,
     EditSelected,
@@ -125,7 +126,9 @@ impl Action {
             | Action::GoToTab(_)
             | Action::GoToRelease
             | Action::ToggleViewMode => Category::Navigation,
-            Action::EditSelected | Action::DeleteSelected => Category::Library,
+            Action::EditSelected | Action::DeleteSelected | Action::OpenLibraryFilters => {
+                Category::Library
+            }
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
             Action::ToggleHelp | Action::Quit => Category::System,
         }
@@ -190,6 +193,7 @@ impl Action {
             Action::NewPlaylist => "Create a playlist".into(),
             Action::ToggleHelp => "Show / hide keybindings".into(),
             Action::ToggleViewMode => "Toggle tiles / table view".into(),
+            Action::OpenLibraryFilters => "Library filters…".into(),
             Action::OpenCommandLine => "Command line (:help for commands)".into(),
             Action::OpenSearch => "Search artists, releases, tracks".into(),
             Action::EditSelected => "Edit the selected item".into(),

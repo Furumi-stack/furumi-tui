@@ -218,6 +218,12 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
             None
         }
+        Action::OpenLibraryFilters => {
+            if state.active_tab == Tab::Global && state.global.stack.is_empty() {
+                state.popup = Some(super::state::Popup::LibraryFilters { cursor: 0 });
+            }
+            None
+        }
         Action::OpenCommandLine => {
             state.cmdline.active = true;
             state.cmdline.input.clear();
@@ -2569,6 +2575,21 @@ mod tests {
             update(&mut state, Action::VolumeDown);
         }
         assert_eq!(state.player.volume, 0);
+    }
+
+    #[test]
+    fn library_filters_popup_opens_only_on_root() {
+        let mut state = AppState::default();
+        update(&mut state, Action::OpenLibraryFilters);
+        assert!(matches!(
+            state.popup,
+            Some(crate::app::state::Popup::LibraryFilters { .. })
+        ));
+
+        state.popup = None;
+        state.global.stack.push(GlobalView::Search { cursor: 0 });
+        update(&mut state, Action::OpenLibraryFilters);
+        assert!(state.popup.is_none());
     }
 
     #[test]

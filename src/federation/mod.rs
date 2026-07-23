@@ -26,6 +26,7 @@ use music_dht::{
     EndpointId, ItemKind, ItemSpec, LibraryItem, MusicDhtConfig, MusicDhtService, NetworkId,
     PeerTicket, PublishStats, RendezvousConfig, SyncStats,
 };
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
 use crate::library::Library;
@@ -159,6 +160,7 @@ pub struct FedStatus {
     pub connected_peers: Vec<String>,
     pub known_contacts: usize,
     pub stored_dht_records: Option<usize>,
+    pub stored_dht_bytes: Option<u64>,
     pub published_items: usize,
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
@@ -248,6 +250,37 @@ fn now_label() -> String {
         secs / 60 % 60,
         secs % 60
     )
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn dht_record_payload_bytes(data_dir: PathBuf, now_ms: u64) -> Result<u64> {
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let path = data_dir.join("state.sqlite3");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length(payload)), 0)
+             FROM dht_records
+             WHERE expires_at_ms > ?1",
+            params![now_ms as i64],
+            |row| row.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    })
+    .await
+    .context("DHT size query task failed")?
 }
 
 impl Federation {
@@ -534,6 +567,10 @@ impl Federation {
                 .collect();
             status.known_contacts = service.known_peers().len();
             status.stored_dht_records = service.dht_record_count().await.ok();
+            status.stored_dht_bytes =
+                dht_record_payload_bytes(self.data_dir.clone(), unix_time_ms())
+                    .await
+                    .ok();
             status.published_items = service
                 .list_local_items()
                 .await

@@ -205,20 +205,42 @@ impl Library {
     // Reads (same shapes the API used to return)
     // -----------------------------------------------------------------
 
-    pub fn artists(&self, page: i64, limit: i64) -> Result<ArtistsPage> {
+    pub fn artists(&self, page: i64, limit: i64, hide_featured_only: bool) -> Result<ArtistsPage> {
         let conn = self.lock();
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))?;
+        let hide_featured_only = i64::from(hide_featured_only);
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM artists a
+             WHERE ?1 = 0
+                OR EXISTS (
+                    SELECT 1
+                    FROM release_artists ra
+                    WHERE ra.artist_id = a.id
+                )",
+            [hide_featured_only],
+            |row| row.get(0),
+        )?;
         let offset = (page.max(1) - 1) * limit;
         let mut statement = conn.prepare(
             "SELECT a.id, a.name, a.image_path,
-                (SELECT COUNT(*) FROM release_artists ra WHERE ra.artist_id = a.id),
-                (SELECT COUNT(*) FROM track_artists ta WHERE ta.artist_id = a.id)
+                (SELECT COUNT(DISTINCT ra.release_id)
+                 FROM release_artists ra
+                 WHERE ra.artist_id = a.id) AS release_count,
+                (SELECT COUNT(DISTINCT ta.track_id)
+                 FROM track_artists ta
+                 WHERE ta.artist_id = a.id) AS track_count
              FROM artists a
-             ORDER BY a.name COLLATE NOCASE
-             LIMIT ?1 OFFSET ?2",
+             WHERE ?1 = 0
+                OR EXISTS (
+                    SELECT 1
+                    FROM release_artists ra
+                    WHERE ra.artist_id = a.id
+                )
+             ORDER BY release_count DESC, track_count DESC, a.name COLLATE NOCASE
+             LIMIT ?2 OFFSET ?3",
         )?;
         let items = statement
-            .query_map(params![limit, offset], |row| {
+            .query_map(params![hide_featured_only, limit, offset], |row| {
                 Ok(ArtistCard {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -371,8 +393,12 @@ impl Library {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT a.id, a.name, a.image_path,
-                (SELECT COUNT(*) FROM release_artists ra WHERE ra.artist_id = a.id),
-                (SELECT COUNT(*) FROM track_artists ta WHERE ta.artist_id = a.id)
+                (SELECT COUNT(DISTINCT ra.release_id)
+                 FROM release_artists ra
+                 WHERE ra.artist_id = a.id),
+                (SELECT COUNT(DISTINCT ta.track_id)
+                 FROM track_artists ta
+                 WHERE ta.artist_id = a.id)
              FROM artists a WHERE instr(norm(a.name), ?1) > 0
              ORDER BY a.name COLLATE NOCASE LIMIT ?2",
         )?;
@@ -1222,12 +1248,22 @@ mod tests {
     }
 
     fn add_track(lib: &Library, title: &str, artist: &str, album: &str) -> i64 {
+        add_track_with_featured(lib, title, artist, &[], album)
+    }
+
+    fn add_track_with_featured(
+        lib: &Library,
+        title: &str,
+        artist: &str,
+        featured: &[&str],
+        album: &str,
+    ) -> i64 {
         let import = import::TrackImport {
             release_type: None,
             file_path: format!("/music/{artist}/{album}/{title}.mp3"),
             title: title.to_string(),
             artists: vec![artist.to_string()],
-            featured_artists: Vec::new(),
+            featured_artists: featured.iter().map(|name| (*name).to_string()).collect(),
             album_artists: vec![artist.to_string()],
             release_title: album.to_string(),
             year: Some(2020),
@@ -1245,10 +1281,39 @@ mod tests {
     }
 
     #[test]
+    fn artists_page_prioritizes_releases_then_tracks() {
+        let lib = test_library();
+        add_track(&lib, "Solo", "Zed", "Zed Album");
+        add_track_with_featured(&lib, "Guest One", "A Host", &["Guest"], "A Host Album");
+        add_track_with_featured(&lib, "Guest Two", "B Host", &["Guest"], "B Host Album");
+
+        let page = lib.artists(1, 10, false).unwrap();
+        let zed_pos = page
+            .items
+            .iter()
+            .position(|artist| artist.name == "Zed")
+            .unwrap();
+        let guest_pos = page
+            .items
+            .iter()
+            .position(|artist| artist.name == "Guest")
+            .unwrap();
+        let guest = &page.items[guest_pos];
+
+        assert_eq!(guest.release_count, 0);
+        assert_eq!(guest.track_count, 2);
+        assert!(zed_pos < guest_pos);
+
+        let filtered = lib.artists(1, 10, true).unwrap();
+        assert!(filtered.items.iter().all(|artist| artist.release_count > 0));
+        assert!(!filtered.items.iter().any(|artist| artist.name == "Guest"));
+    }
+
+    #[test]
     fn import_creates_artist_release_track() {
         let lib = test_library();
         let track_id = add_track(&lib, "Song", "Artist", "Album");
-        let page = lib.artists(1, 10).unwrap();
+        let page = lib.artists(1, 10, false).unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].name, "Artist");
         assert_eq!(page.items[0].track_count, 1);
@@ -1269,7 +1334,7 @@ mod tests {
         let first = add_track(&lib, "Song", "Artist", "Album");
         let second = add_track(&lib, "Song", "Artist", "Album");
         assert_eq!(first, second);
-        let page = lib.artists(1, 10).unwrap();
+        let page = lib.artists(1, 10, false).unwrap();
         assert_eq!(page.items[0].track_count, 1);
     }
 
@@ -1357,9 +1422,9 @@ mod tests {
     fn deleting_artist_cleans_up_own_content() {
         let lib = test_library();
         add_track(&lib, "Song", "Solo", "Solo Album");
-        let page = lib.artists(1, 10).unwrap();
+        let page = lib.artists(1, 10, false).unwrap();
         lib.delete_artist(page.items[0].id).unwrap();
-        assert_eq!(lib.artists(1, 10).unwrap().total, 0);
+        assert_eq!(lib.artists(1, 10, false).unwrap().total, 0);
         assert_eq!(lib.search("Song", 10).unwrap().len(), 0);
     }
 
@@ -1368,7 +1433,9 @@ mod tests {
         let lib = test_library();
         let track_id = add_track(&lib, "Only", "Artist", "Album");
         lib.delete_track(track_id).unwrap();
-        let detail = lib.artist(lib.artists(1, 10).unwrap().items[0].id).unwrap();
+        let detail = lib
+            .artist(lib.artists(1, 10, false).unwrap().items[0].id)
+            .unwrap();
         assert!(detail.releases.is_empty());
     }
 

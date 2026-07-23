@@ -1,5 +1,6 @@
 pub mod keymap;
 pub mod logging;
+pub mod settings;
 
 use directories::ProjectDirs;
 

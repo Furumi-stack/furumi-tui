@@ -36,10 +36,11 @@ fn error_style() -> Style {
 }
 
 fn bordered(frame: &mut Frame, area: Rect, title: String) -> Rect {
-    let block = Block::bordered()
-        .title(title)
-        .title_style(theme::header())
-        .border_style(theme::dim());
+    bordered_line(frame, area, Line::styled(title, theme::header()))
+}
+
+fn bordered_line(frame: &mut Frame, area: Rect, title: Line<'static>) -> Rect {
+    let block = Block::bordered().title(title).border_style(theme::dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
@@ -271,11 +272,16 @@ fn scroll_offset(items: &[PlanItem], cursor_item: Option<usize>, viewport: u16) 
 fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
     let global = &state.global;
     let title = if global.total > 0 {
-        format!(" Global — {} artists ", global.total)
+        format!(" Library — {} artists ", global.total)
     } else {
-        " Global ".to_string()
+        " Library ".to_string()
     };
-    let inner = bordered(frame, area, title);
+    let mut title_spans = vec![Span::styled(title, theme::tab_active())];
+    if global.filters.is_active() {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(" FILTERED ", theme::tab_active()));
+    }
+    let inner = bordered_line(frame, area, Line::from(title_spans));
 
     if global.artists.is_empty() {
         let message = if let Some(error) = &global.error {
@@ -373,7 +379,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         Some(Loadable::Ready(detail)) => detail.name.clone(),
         _ => "Artist".to_string(),
     };
-    let inner = bordered(frame, area, format!(" Global ▸ {name} "));
+    let inner = bordered(frame, area, format!(" Library ▸ {name} "));
 
     let detail = match loadable {
         Some(Loadable::Ready(detail)) => detail,
@@ -640,7 +646,7 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
         Some(Loadable::Ready(detail)) => detail.title.clone(),
         _ => "Release".to_string(),
     };
-    let inner = bordered(frame, area, format!(" Global ▸ {title} "));
+    let inner = bordered(frame, area, format!(" Library ▸ {title} "));
 
     let detail = match loadable {
         Some(Loadable::Ready(detail)) => detail,

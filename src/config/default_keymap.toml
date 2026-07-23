@@ -227,6 +227,11 @@ key_sequence = "v"
 command = "ToggleViewMode"
 
 [[keymaps]]
+key_sequence = "f"
+command = "OpenLibraryFilters"
+context = "library"
+
+[[keymaps]]
 key_sequence = ":"
 command = "OpenCommandLine"
 
