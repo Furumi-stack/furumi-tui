@@ -605,9 +605,9 @@ pub fn merge_catalogs(name: &str, catalogs: Vec<(String, CatalogArtist)>) -> Fed
             .then_with(|| a.track.title.cmp(&b.track.title))
     });
     releases.sort_by(|a, b| {
-        a.year
-            .unwrap_or(i32::MAX)
-            .cmp(&b.year.unwrap_or(i32::MAX))
+        b.year
+            .unwrap_or(i32::MIN)
+            .cmp(&a.year.unwrap_or(i32::MIN))
             .then_with(|| a.title.cmp(&b.title))
     });
 
@@ -753,5 +753,37 @@ mod tests {
         assert_eq!(card.appears_on[0].track.sources.len(), 2);
         assert_eq!(card.appears_on[0].track.artists, vec!["Host"]);
         assert_eq!(card.appears_on[0].track.featured_artists, vec!["Guest"]);
+    }
+
+    #[test]
+    fn merge_catalogs_sorts_releases_newest_first() {
+        let release = |title: &str, year: Option<i32>, item: &str| CatalogRelease {
+            title: title.into(),
+            release_type: "album".into(),
+            year,
+            tracks: vec![track("Song", 1, item)],
+        };
+        let card = merge_catalogs(
+            "Metallica",
+            vec![(
+                "peer-a".to_string(),
+                CatalogArtist {
+                    name: "Metallica".into(),
+                    releases: vec![
+                        release("Old Album", Some(1991), "a1"),
+                        release("New Album", Some(2024), "a2"),
+                        release("Undated Album", None, "a3"),
+                    ],
+                    appears_on: Vec::new(),
+                },
+            )],
+        );
+
+        let titles: Vec<&str> = card
+            .releases
+            .iter()
+            .map(|release| release.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["New Album", "Old Album", "Undated Album"]);
     }
 }

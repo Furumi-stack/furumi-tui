@@ -121,17 +121,23 @@ impl Default for GlobalTab {
 }
 
 /// Releases of an artist in display order: grouped by type (albums, singles,
-/// EPs, compilations, then anything else), keeping server order within a
-/// group. Returns (group label, indices into the original slice). Cursor
-/// positions use this flattened order, so update() and ui must both go
-/// through here.
+/// EPs, compilations, then anything else), newest first within each group.
+/// Returns (group label, indices into the original slice). Cursor positions
+/// use this flattened order, so update() and ui must both go through here.
 pub fn release_groups(releases: &[ReleaseCard]) -> Vec<(&'static str, Vec<usize>)> {
-    release_type_groups(releases, |release| &release.release_type)
+    release_type_groups(
+        releases,
+        |release| &release.release_type,
+        |release| release.year,
+        |release| &release.title,
+    )
 }
 
 fn release_type_groups<T>(
     items: &[T],
     release_type: impl Fn(&T) -> &str,
+    release_year: impl Fn(&T) -> Option<i32>,
+    release_title: impl Fn(&T) -> &str,
 ) -> Vec<(&'static str, Vec<usize>)> {
     const GROUPS: [(&str, &str); 4] = [
         ("album", "Albums"),
@@ -141,22 +147,38 @@ fn release_type_groups<T>(
     ];
     let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
     for (kind, label) in GROUPS {
-        let indices: Vec<usize> = items
+        let mut indices: Vec<usize> = items
             .iter()
             .enumerate()
             .filter(|(_, item)| release_type(item).eq_ignore_ascii_case(kind))
             .map(|(i, _)| i)
             .collect();
+        sort_release_indices(&mut indices, items, &release_year, &release_title);
         if !indices.is_empty() {
             groups.push((label, indices));
         }
     }
     let known: Vec<usize> = groups.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-    let other: Vec<usize> = (0..items.len()).filter(|i| !known.contains(i)).collect();
+    let mut other: Vec<usize> = (0..items.len()).filter(|i| !known.contains(i)).collect();
+    sort_release_indices(&mut other, items, &release_year, &release_title);
     if !other.is_empty() {
         groups.push(("Other", other));
     }
     groups
+}
+
+fn sort_release_indices<T>(
+    indices: &mut [usize],
+    items: &[T],
+    release_year: &impl Fn(&T) -> Option<i32>,
+    release_title: &impl Fn(&T) -> &str,
+) {
+    indices.sort_by(|&left, &right| {
+        release_year(&items[right])
+            .unwrap_or(i32::MIN)
+            .cmp(&release_year(&items[left]).unwrap_or(i32::MIN))
+            .then_with(|| release_title(&items[left]).cmp(release_title(&items[right])))
+    });
 }
 
 /// Flattened display order of releases (concatenated groups).
@@ -177,7 +199,12 @@ pub fn release_rows(releases: &[ReleaseCard], columns: usize) -> Vec<Vec<usize>>
 pub fn fed_release_groups(
     releases: &[crate::federation::FedRelease],
 ) -> Vec<(&'static str, Vec<usize>)> {
-    release_type_groups(releases, |release| &release.release_type)
+    release_type_groups(
+        releases,
+        |release| &release.release_type,
+        |release| release.year,
+        |release| &release.title,
+    )
 }
 
 /// Flattened display order of federated releases (concatenated groups).
@@ -210,6 +237,61 @@ fn grouped_release_rows(
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(id: i64, title: &str, release_type: &str, year: Option<i32>) -> ReleaseCard {
+        ReleaseCard {
+            id,
+            title: title.to_string(),
+            release_type: release_type.to_string(),
+            year,
+            cover_path: None,
+            track_count: 1,
+        }
+    }
+
+    fn fed_release(
+        title: &str,
+        release_type: &str,
+        year: Option<i32>,
+    ) -> crate::federation::FedRelease {
+        crate::federation::FedRelease {
+            title: title.to_string(),
+            release_type: release_type.to_string(),
+            year,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn release_display_order_is_newest_first_within_each_type() {
+        let releases = vec![
+            release(1, "Old Album", "album", Some(1991)),
+            release(2, "New Single", "single", Some(2024)),
+            release(3, "New Album", "album", Some(2020)),
+            release(4, "Undated Album", "album", None),
+            release(5, "Old Single", "single", Some(1999)),
+        ];
+
+        assert_eq!(release_display_order(&releases), vec![2, 0, 3, 1, 4]);
+    }
+
+    #[test]
+    fn fed_release_display_order_is_newest_first_within_each_type() {
+        let releases = vec![
+            fed_release("Old Album", "album", Some(1991)),
+            fed_release("New Single", "single", Some(2024)),
+            fed_release("New Album", "album", Some(2020)),
+            fed_release("Undated Album", "album", None),
+            fed_release("Old Single", "single", Some(1999)),
+        ];
+
+        assert_eq!(fed_release_display_order(&releases), vec![2, 0, 3, 1, 4]);
+    }
 }
 
 /// The virtual Likes playlist id (`kind == "likes"`).
