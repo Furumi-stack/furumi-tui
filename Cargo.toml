@@ -45,4 +45,4 @@ libc = "0.2.186"
 # Build against the local frid checkout; drop (or keep, for local
 # development) once the frid changes are pushed and the lock is updated.
 [patch."https://gt.hexor.cy/ab/frid.git"]
-music-dht = { path = "../frid/crates/music-dht" }
+music-dht = { git = "https://gt.hexor.cy/ab/frid.git" }
