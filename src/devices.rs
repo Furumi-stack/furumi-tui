@@ -152,6 +152,8 @@ pub enum SyncOpPayload {
         playlist_id: String,
         content_id: String,
         position: i64,
+        #[serde(default)]
+        fed: Option<SyncedFedTrack>,
     },
     PlaylistTrackRemoved {
         playlist_id: String,
@@ -217,6 +219,8 @@ struct SnapshotPlaylistItem {
     position: i64,
     hlc_ms: i64,
     op_id: String,
+    #[serde(default)]
+    fed: Option<SyncedFedTrack>,
 }
 
 enum PairAttempt {
@@ -722,17 +726,44 @@ impl DeviceSync {
     }
 
     pub fn record_playlist_tracks_added(&self, playlist_id: i64, track_ids: &[i64]) -> Result<()> {
-        let playlist_id = self.library.ensure_playlist_sync_id(playlist_id)?;
-        for (position, content_id) in self
+        let playlist_sync_id = self.library.ensure_playlist_sync_id(playlist_id)?;
+        for (content_id, position) in self
             .library
-            .track_content_ids(track_ids)?
-            .into_iter()
-            .enumerate()
+            .playlist_track_content_positions(playlist_id, track_ids)?
         {
             self.record_local_op(SyncOpPayload::PlaylistTrackAdded {
-                playlist_id: playlist_id.clone(),
+                playlist_id: playlist_sync_id.clone(),
                 content_id,
-                position: position as i64,
+                position,
+                fed: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn record_playlist_fed_tracks_added(
+        &self,
+        playlist_id: i64,
+        tracks: &[crate::federation::FedTrack],
+    ) -> Result<()> {
+        let playlist_sync_id = self.library.ensure_playlist_sync_id(playlist_id)?;
+        for (fallback_position, fed) in tracks.iter().enumerate() {
+            let Some(content_id) = fed
+                .content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+            else {
+                continue;
+            };
+            let position = self
+                .library
+                .playlist_content_position(playlist_id, &content_id)?
+                .unwrap_or(fallback_position as i64);
+            self.record_local_op(SyncOpPayload::PlaylistTrackAdded {
+                playlist_id: playlist_sync_id.clone(),
+                content_id,
+                position,
+                fed: SyncedFedTrack::from_fed(fed),
             })?;
         }
         Ok(())
@@ -1071,11 +1102,13 @@ impl DeviceSync {
                 playlist_id,
                 content_id,
                 position,
+                fed,
             } => self.apply_playlist_item_state(
                 playlist_id,
                 content_id,
                 true,
                 *position,
+                fed.as_ref(),
                 op.hlc_ms,
                 &op.op_id,
             )?,
@@ -1087,6 +1120,7 @@ impl DeviceSync {
                 content_id,
                 false,
                 0,
+                None,
                 op.hlc_ms,
                 &op.op_id,
             )?,
@@ -1335,6 +1369,7 @@ impl DeviceSync {
         content_id: &str,
         present: bool,
         position: i64,
+        fed: Option<&SyncedFedTrack>,
         hlc_ms: i64,
         op_id: &str,
     ) -> Result<bool> {
@@ -1377,14 +1412,23 @@ impl DeviceSync {
                 ],
             )?;
         }
+        let mut visible_changed = apply;
         if present {
-            self.library
+            visible_changed |= self
+                .library
                 .add_content_id_to_synced_playlist(playlist_id, content_id)?;
+            if let Some(fed) = fed {
+                visible_changed |= self.library.upsert_fed_playlist_track(
+                    playlist_id,
+                    &fed.to_fed_track(),
+                    position,
+                )?;
+            }
         } else {
             self.library
                 .remove_content_id_from_synced_playlist(playlist_id, content_id)?;
         }
-        Ok(true)
+        Ok(visible_changed)
     }
 
     fn apply_snapshot(&self, snapshot: SyncSnapshot) -> Result<()> {
@@ -1412,6 +1456,7 @@ impl DeviceSync {
                     &item.content_id,
                     true,
                     item.position,
+                    item.fed.as_ref(),
                     item.hlc_ms,
                     &item.op_id,
                 )?;
@@ -1617,16 +1662,34 @@ impl DeviceSync {
                  WHERE playlist_id = ?1 AND present = 1
                  ORDER BY position, content_id",
             )?;
-            let items = item_stmt
+            let item_rows = item_stmt
                 .query_map([&playlist_id], |row| {
-                    Ok(SnapshotPlaylistItem {
-                        content_id: row.get(0)?,
-                        position: row.get(1)?,
-                        hlc_ms: row.get(2)?,
-                        op_id: row.get(3)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut items = Vec::new();
+            for (content_id, position, hlc_ms, op_id) in item_rows {
+                let fed_track = match self
+                    .library
+                    .fed_playlist_track_by_content_id(&playlist_id, &content_id)?
+                {
+                    Some(fed) => Some(fed),
+                    None => self.library.fed_like_by_content_id(&content_id)?,
+                };
+                let fed = fed_track.as_ref().and_then(SyncedFedTrack::from_fed);
+                items.push(SnapshotPlaylistItem {
+                    content_id,
+                    position,
+                    hlc_ms,
+                    op_id,
+                    fed,
+                });
+            }
             playlists.push(SnapshotPlaylist {
                 playlist_id,
                 title,
@@ -1808,17 +1871,22 @@ impl DeviceSync {
 
     fn unresolved_playlist_item_count_with_conn(&self, conn: &Connection) -> Result<i64> {
         let mut stmt = conn.prepare(
-            "SELECT content_id
+            "SELECT playlist_id, content_id
              FROM sync_state_playlist_items
              WHERE present = 1",
         )?;
         let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         let mut unresolved = 0;
-        for content_id in ids {
-            if self.library.track_id_by_content_id(&content_id)?.is_none() {
+        for (playlist_id, content_id) in ids {
+            if !self
+                .library
+                .has_playlist_content_reference(&playlist_id, &content_id)?
+            {
                 unresolved += 1;
             }
         }
@@ -2857,5 +2925,55 @@ mod tests {
                 .unwrap()
         );
         assert!(sync.library.fed_like_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn synced_playlist_item_metadata_creates_pending_fed_track() {
+        let sync = test_sync();
+        let playlist = sync.library.create_playlist("Remote Mix").unwrap();
+        let playlist_sync_id = sync.library.ensure_playlist_sync_id(playlist.id).unwrap();
+        let content_id = format!("b3:{}", "b".repeat(64));
+        let fed = test_fed_track(&content_id);
+        let synced = SyncedFedTrack::from_fed(&fed).unwrap();
+
+        assert!(
+            sync.apply_playlist_item_state(
+                &playlist_sync_id,
+                &content_id,
+                true,
+                3,
+                Some(&synced),
+                10,
+                "dev_remote:2",
+            )
+            .unwrap()
+        );
+
+        let detail = sync.library.playlist(playlist.id).unwrap();
+        assert_eq!(detail.tracks.len(), 1);
+        assert!(detail.tracks[0].is_fed_pending());
+        assert_eq!(detail.tracks[0].title, fed.title);
+
+        let conn = lock(&sync.conn);
+        assert_eq!(
+            sync.unresolved_playlist_item_count_with_conn(&conn)
+                .unwrap(),
+            0
+        );
+        drop(conn);
+
+        assert!(
+            sync.apply_playlist_item_state(
+                &playlist_sync_id,
+                &content_id,
+                false,
+                0,
+                None,
+                11,
+                "dev_remote:3",
+            )
+            .unwrap()
+        );
+        assert_eq!(sync.library.playlist(playlist.id).unwrap().tracks.len(), 0);
     }
 }

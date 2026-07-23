@@ -1009,6 +1009,7 @@ pub(crate) fn fed_download_spawn(
     tokio::spawn(async move {
         let total = tracks.len();
         let mut imported_ids = Vec::new();
+        let mut imported_fed_tracks = Vec::new();
         let mut failed = 0usize;
         for (index, track) in tracks.iter().enumerate() {
             let _ = tx.send(AppEvent::StatusMessage(format!(
@@ -1017,7 +1018,10 @@ pub(crate) fn fed_download_spawn(
                 track.title
             )));
             match fed.download_to_library(track).await {
-                Ok(imported) => imported_ids.push(imported.id),
+                Ok(imported) => {
+                    imported_ids.push(imported.id);
+                    imported_fed_tracks.push(track.clone());
+                }
                 Err(err) => {
                     failed += 1;
                     tracing::warn!(title = %track.title, "federated download failed: {err:#}");
@@ -1041,7 +1045,7 @@ pub(crate) fn fed_download_spawn(
                     .map_err(|err| format!("{err:#}"));
                 if result.is_ok()
                     && let Err(err) =
-                        devices.record_playlist_tracks_added(playlist_id, &imported_ids)
+                        devices.record_playlist_fed_tracks_added(playlist_id, &imported_fed_tracks)
                 {
                     tracing::warn!(%err, playlist_id, "recording synced playlist add failed");
                 }
