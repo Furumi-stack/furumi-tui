@@ -12,7 +12,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::Runtime;
 use crate::app::event::AppEvent;
 use crate::app::state::{
-    AppState, DeleteTarget, EditField, EditTarget, FedInputField, Popup, addable_playlists,
+    AppState, DeleteTarget, EditField, EditTarget, FedInputField, Loadable, Popup,
+    addable_playlists,
 };
 use crate::library::models::{ReleaseEdit, TrackEdit, TrackItem};
 
@@ -536,7 +537,9 @@ fn handle_picker(
     cursor: usize,
     key: KeyEvent,
 ) {
+    let waiting = matches!(&state.playlists.list, None | Some(Loadable::Loading));
     let options = addable_playlists(state);
+    let new_index = options.len();
     match key.code {
         KeyCode::Esc => {}
         KeyCode::Up | KeyCode::Char('k') => {
@@ -548,18 +551,23 @@ fn handle_picker(
         KeyCode::Down | KeyCode::Char('j') => {
             state.popup = Some(Popup::AddToPlaylist {
                 target,
-                cursor: (cursor + 1).min(options.len()),
+                cursor: (cursor + 1).min(new_index),
             });
         }
         KeyCode::Enter => {
-            if cursor == 0 {
+            if waiting {
+                state.status_message = Some("loading playlists…".into());
+                state.popup = Some(Popup::AddToPlaylist { target, cursor });
+            } else if cursor < options.len() {
+                if let Some((id, title)) = options.get(cursor).cloned() {
+                    spawn_add_target(runtime, id, title, target);
+                }
+            } else {
                 state.popup = Some(Popup::NewPlaylist {
                     for_target: Some(target),
                     input: crate::app::input::LineEdit::default(),
                     busy: false,
                 });
-            } else if let Some((id, title)) = options.get(cursor - 1).cloned() {
-                spawn_add_target(runtime, id, title, target);
             }
         }
         _ => state.popup = Some(Popup::AddToPlaylist { target, cursor }),
@@ -586,7 +594,8 @@ fn handle_name_entry(
         KeyCode::Esc => {
             // Reached from the picker → step back to it; otherwise close.
             if let Some(target) = for_target {
-                state.popup = Some(Popup::AddToPlaylist { target, cursor: 0 });
+                let cursor = addable_playlists(state).len();
+                state.popup = Some(Popup::AddToPlaylist { target, cursor });
             }
         }
         KeyCode::Enter => {

@@ -441,8 +441,14 @@ fn file_size(value: Option<i64>) -> String {
 
 fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: usize) {
     let options = addable_playlists(state);
-    let loading = !matches!(&state.playlists.list, Some(Loadable::Ready(_)));
-    let rows = options.len() + 1;
+    let loading = matches!(&state.playlists.list, None | Some(Loadable::Loading));
+    let rows = if loading {
+        1
+    } else if options.is_empty() {
+        2
+    } else {
+        options.len() + 1
+    };
     let height = (rows as u16 + 4)
         .min(frame.area().height.saturating_sub(2))
         .max(6);
@@ -463,18 +469,30 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
     ])
     .areas(inner);
 
-    let mut lines: Vec<Line> = vec![Line::styled("+ New playlist…", theme::accent())];
+    let mut lines: Vec<Line> = Vec::new();
     if loading {
         lines.push(Line::styled("loading playlists…", theme::dim()));
+    } else if matches!(&state.playlists.list, Some(Loadable::Failed(_))) {
+        lines.push(Line::styled("playlist list unavailable", theme::dim()));
+        lines.push(Line::styled("+ New playlist…", theme::accent()));
     } else if options.is_empty() {
         lines.push(Line::styled("no playlists yet", theme::dim()));
+        lines.push(Line::styled("+ New playlist…", theme::accent()));
     } else {
         for (_, title) in &options {
             lines.push(Line::raw(title.clone()));
         }
+        lines.push(Line::styled("+ New playlist…", theme::accent()));
     }
+    let selected_line = if loading {
+        0
+    } else if options.is_empty() {
+        lines.len().saturating_sub(1)
+    } else {
+        cursor.min(options.len())
+    };
     let visible = usize::from(list_area.height.max(1));
-    let first = cursor
+    let first = selected_line
         .saturating_sub(visible / 2)
         .min(lines.len().saturating_sub(visible));
     for (index, line) in lines.into_iter().enumerate().skip(first).take(visible) {
@@ -485,17 +503,18 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
             height: 1,
         };
         frame.render_widget(Paragraph::new(line), row);
-        if index == cursor {
+        if index == selected_line {
             frame.buffer_mut().set_style(row, theme::tab_active());
         }
     }
 
+    let footer_text = if loading {
+        format!("♪ {track_title} · loading playlists · esc close")
+    } else {
+        format!("♪ {track_title} · enter add/create · esc close")
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            format!("♪ {track_title} · enter add · esc close"),
-            theme::dim(),
-        ))
-        .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(footer_text, theme::dim())).alignment(Alignment::Center),
         footer,
     );
 }

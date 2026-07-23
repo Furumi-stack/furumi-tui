@@ -34,6 +34,7 @@ pub enum Action {
     ToggleLike,
     ToggleTrackSelection,
     OpenTrackInfo,
+    OpenCurrentTrackInfo,
     QueueAddNext,
     QueueAddLast,
     /// Download the selected federated track(s) into the local library.
@@ -105,7 +106,8 @@ impl Action {
             | Action::NewPlaylist
             | Action::ToggleLike
             | Action::ToggleTrackSelection
-            | Action::OpenTrackInfo => Category::Queue,
+            | Action::OpenTrackInfo
+            | Action::OpenCurrentTrackInfo => Category::Queue,
             Action::MoveUp
             | Action::MoveDown
             | Action::MoveLeft
@@ -174,6 +176,7 @@ impl Action {
             Action::ToggleLike => "Like / unlike".into(),
             Action::ToggleTrackSelection => "Track line selection".into(),
             Action::OpenTrackInfo => "Track info".into(),
+            Action::OpenCurrentTrackInfo => "Current track info".into(),
             Action::QueueAddNext => "Queue: add next".into(),
             Action::QueueAddLast => "Queue: add to end".into(),
             Action::DownloadSelected => "Federation: download to library".into(),

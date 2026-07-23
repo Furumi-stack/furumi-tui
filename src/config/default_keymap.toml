@@ -87,11 +87,6 @@ key_sequence = "shift-p"
 command = "AddToPlaylist"
 
 [[keymaps]]
-key_sequence = "n"
-command = "NewPlaylist"
-context = "playlists"
-
-[[keymaps]]
 key_sequence = "j"
 command = "MoveDown"
 
@@ -210,6 +205,10 @@ command = "ToggleTrackSelection"
 [[keymaps]]
 key_sequence = "i"
 command = "OpenTrackInfo"
+
+[[keymaps]]
+key_sequence = "shift-i"
+command = "OpenCurrentTrackInfo"
 
 [[keymaps]]
 key_sequence = "e"

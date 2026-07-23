@@ -283,27 +283,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::OpenTrackInfo => {
             let tracks = selected_tracks(state);
-            if tracks.is_empty() {
-                state.status_message = Some("no track selected".into());
-                None
-            } else {
-                let fed_tracks = tracks
-                    .iter()
-                    .filter(|track| track_info_needs_fed_metadata(track))
-                    .filter_map(|track| track.fed.as_ref().map(|fed| (track.id, fed.clone())))
-                    .collect::<Vec<_>>();
-                state.popup = Some(super::state::Popup::TrackInfo {
-                    tracks,
-                    cursor: 0,
-                    scroll: 0,
-                });
-                if fed_tracks.is_empty() {
-                    None
-                } else {
-                    state.status_message = Some("federation: fetching track metadata…".to_string());
-                    Some(Effect::FedFetchTrackInfo { tracks: fed_tracks })
-                }
-            }
+            open_track_info(state, tracks, "no track selected")
+        }
+        Action::OpenCurrentTrackInfo => {
+            let tracks = state.player.current.clone().into_iter().collect();
+            open_track_info(state, tracks, "nothing playing")
         }
         Action::RemoveFromQueue => remove_selected_from_queue(state),
         Action::QueueAddNext => queue_add(state, true),
@@ -317,19 +301,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::AddToPlaylist => {
-            let fed = selected_fed_tracks(state);
-            let target = if !fed.is_empty() {
-                Some(super::state::PlaylistAddTarget::Fed(fed))
-            } else {
-                let local = selected_tracks(state);
-                if !local.is_empty() {
-                    Some(super::state::PlaylistAddTarget::Local(local))
-                } else {
-                    selected_track(state)
-                        .or_else(|| state.player.current.clone())
-                        .map(|track| super::state::PlaylistAddTarget::Local(vec![track]))
-                }
-            };
+            let target = selected_playlist_target(state, true);
             match target {
                 Some(target) => {
                     state.popup = Some(super::state::Popup::AddToPlaylist { target, cursor: 0 });
@@ -355,11 +327,13 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
         }
         Action::NewPlaylist => {
+            let for_target = selected_playlist_target(state, false);
             state.popup = Some(super::state::Popup::NewPlaylist {
-                for_target: None,
+                for_target,
                 input: crate::app::input::LineEdit::default(),
                 busy: false,
             });
+            state.track_selection.clear();
             None
         }
         Action::ClearQueue => {
@@ -397,6 +371,54 @@ fn track_info_needs_fed_metadata(track: &TrackItem) -> bool {
             || track.audio_bit_depth.is_none()
             || track.file_size_bytes.is_none()
             || track.file_path.is_empty())
+}
+
+fn open_track_info(
+    state: &mut AppState,
+    tracks: Vec<TrackItem>,
+    empty_message: &'static str,
+) -> Option<Effect> {
+    if tracks.is_empty() {
+        state.status_message = Some(empty_message.into());
+        return None;
+    }
+
+    let fed_tracks = tracks
+        .iter()
+        .filter(|track| track_info_needs_fed_metadata(track))
+        .filter_map(|track| track.fed.as_ref().map(|fed| (track.id, fed.clone())))
+        .collect::<Vec<_>>();
+    state.popup = Some(super::state::Popup::TrackInfo {
+        tracks,
+        cursor: 0,
+        scroll: 0,
+    });
+    if fed_tracks.is_empty() {
+        None
+    } else {
+        state.status_message = Some("federation: fetching track metadata…".to_string());
+        Some(Effect::FedFetchTrackInfo { tracks: fed_tracks })
+    }
+}
+
+fn selected_playlist_target(
+    state: &AppState,
+    include_current: bool,
+) -> Option<super::state::PlaylistAddTarget> {
+    let fed = selected_fed_tracks(state);
+    if !fed.is_empty() {
+        return Some(super::state::PlaylistAddTarget::Fed(fed));
+    }
+
+    let local = selected_tracks(state);
+    if !local.is_empty() {
+        return Some(super::state::PlaylistAddTarget::Local(local));
+    }
+
+    include_current
+        .then(|| state.player.current.clone())
+        .flatten()
+        .map(|track| super::state::PlaylistAddTarget::Local(vec![track]))
 }
 
 /// `e`: open the metadata edit form for whatever is under the cursor —
@@ -2746,6 +2768,91 @@ mod tests {
         );
         assert!(state.player.queue.is_empty());
         assert!(!state.player.playing);
+    }
+
+    #[test]
+    fn current_track_info_uses_now_playing_track() {
+        let mut state = AppState {
+            active_tab: Tab::Queue,
+            ..AppState::default()
+        };
+        state.player.queue = vec![test_track(1), test_track(2)];
+        state.queue_tab.cursor = 0;
+        state.player.current = Some(test_track(2));
+
+        assert_eq!(update(&mut state, Action::OpenCurrentTrackInfo), None);
+        match &state.popup {
+            Some(crate::app::state::Popup::TrackInfo { tracks, .. }) => {
+                assert_eq!(
+                    tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
+                    vec![2]
+                );
+            }
+            other => panic!("expected track info popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_to_playlist_from_release_carries_selected_track() {
+        use crate::app::state::{PlaylistAddTarget, Popup};
+        use crate::library::models::ReleaseDetail;
+
+        let mut state = AppState::default();
+        state
+            .global
+            .stack
+            .push(GlobalView::Release { id: 1, cursor: 1 });
+        state.release_views.insert(
+            1,
+            Loadable::Ready(ReleaseDetail {
+                id: 1,
+                title: "r".into(),
+                release_type: "album".into(),
+                year: None,
+                cover_path: None,
+                artists: vec![],
+                tracks: vec![test_track(1), test_track(2)],
+            }),
+        );
+
+        assert_eq!(update(&mut state, Action::AddToPlaylist), None);
+        match &state.popup {
+            Some(Popup::AddToPlaylist {
+                target: PlaylistAddTarget::Local(tracks),
+                ..
+            }) => {
+                assert_eq!(
+                    tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
+                    vec![2]
+                );
+            }
+            other => panic!("expected add-to-playlist popup with selected track, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_to_playlist_from_non_track_view_uses_current_track() {
+        use crate::app::state::{PlaylistAddTarget, Popup};
+
+        let mut state = AppState {
+            active_tab: Tab::Logs,
+            ..AppState::default()
+        };
+        state.player.current = Some(test_track(7));
+
+        assert_eq!(update(&mut state, Action::AddToPlaylist), None);
+        match &state.popup {
+            Some(Popup::AddToPlaylist {
+                target: PlaylistAddTarget::Local(tracks),
+                ..
+            }) => {
+                assert_eq!(
+                    tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
+                    vec![7]
+                );
+            }
+            other => panic!("expected add-to-playlist popup with current track, got {other:?}"),
+        }
     }
 
     #[test]

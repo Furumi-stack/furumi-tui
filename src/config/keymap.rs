@@ -417,6 +417,49 @@ mod tests {
     }
 
     #[test]
+    fn default_playlist_context_keeps_next_track_on_n() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        assert_eq!(
+            km.resolve(key!(n), KeyContext::Playlists),
+            KeyResolution::Action(Action::NextTrack)
+        );
+    }
+
+    #[test]
+    fn default_shift_n_is_unbound() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        let shift_n = KeyCombination::new(KeyCode::Char('N'), KeyModifiers::SHIFT);
+        assert_eq!(
+            km.resolve(shift_n, KeyContext::Library),
+            KeyResolution::Unmatched
+        );
+        assert_eq!(
+            km.resolve(shift_n, KeyContext::Playlists),
+            KeyResolution::Unmatched
+        );
+    }
+
+    #[test]
+    fn default_add_to_playlist_key_is_global() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        let shift_p = KeyCombination::new(KeyCode::Char('P'), KeyModifiers::SHIFT);
+        assert_eq!(
+            km.resolve(shift_p, KeyContext::Library),
+            KeyResolution::Action(Action::AddToPlaylist)
+        );
+    }
+
+    #[test]
+    fn default_current_track_info_key_resolves() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        let shift_i = KeyCombination::new(KeyCode::Char('I'), KeyModifiers::SHIFT);
+        assert_eq!(
+            km.resolve(shift_i, KeyContext::Library),
+            KeyResolution::Action(Action::OpenCurrentTrackInfo)
+        );
+    }
+
+    #[test]
     fn user_binding_overrides_default() {
         let mut bindings = parse_bindings(DEFAULT_KEYMAP).unwrap();
         let user = parse_bindings(

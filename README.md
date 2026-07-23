@@ -93,8 +93,9 @@ Common key bindings:
 | `x` | Like / unlike |
 | `a` | Add track next |
 | `Shift-A` | Add track to the end of the queue |
-| `Shift-P` | Add track to a playlist |
-| `Shift-D` | Open device picker |
+| `Shift-P` | Add selected/current track(s) to a playlist |
+| `i`, `Shift-I` | Track info / current track info |
+| `Shift-D` | Delete selected item |
 | `v` | Toggle tile/table view |
 | `/` | Search |
 | `:` | Open command line |

@@ -480,7 +480,7 @@ impl PlaylistAddTarget {
 /// Modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Popup {
-    /// Pick one of the playlists (row 0 = "create new"); the target is
+    /// Pick one of the playlists (last row = "create new"); the target is
     /// added on Enter (federated tracks are downloaded first).
     AddToPlaylist {
         target: PlaylistAddTarget,
