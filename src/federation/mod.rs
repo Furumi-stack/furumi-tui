@@ -261,10 +261,6 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn personal_sync_network_name(group_id: &str) -> String {
-    format!("furumi-device-sync:{group_id}")
-}
-
 async fn dht_record_payload_bytes(data_dir: PathBuf, now_ms: u64) -> Result<u64> {
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let path = data_dir.join("state.sqlite3");
@@ -350,7 +346,7 @@ impl Federation {
         if settings.enabled {
             self.start(settings.network_id.trim().to_string()).await?;
             self.spawn_sync_soon().await;
-        } else if !self.start_personal_sync_if_needed().await? {
+        } else {
             self.stop().await;
         }
         Ok(())
@@ -365,21 +361,7 @@ impl Federation {
             } else {
                 self.spawn_sync_soon().await;
             }
-        } else if let Err(err) = self.start_personal_sync_if_needed().await {
-            tracing::error!("device-sync autostart failed: {err:#}");
-            self.set_error(Some(format!("device sync autostart failed: {err}")));
         }
-    }
-
-    async fn start_personal_sync_if_needed(self: &Arc<Self>) -> Result<bool> {
-        let status = self.devices.status();
-        if status.active_devices <= 1 {
-            return Ok(false);
-        }
-        let network_name = personal_sync_network_name(&status.group_id);
-        self.start_with_network_id(NetworkId::from_name(&network_name), "device-sync".into())
-            .await?;
-        Ok(true)
     }
 
     /// Starts the DHT node. Idempotent per network name.
@@ -506,6 +488,24 @@ impl Federation {
             .await
             .as_ref()
             .map(|running| Arc::clone(&running.service))
+            .context("federation is not running")
+    }
+
+    fn ensure_connected_devices_enabled(&self) -> Result<()> {
+        let settings = self.settings();
+        anyhow::ensure!(
+            settings.enabled && !settings.network_id.trim().is_empty(),
+            "enable federation before using connected devices"
+        );
+        Ok(())
+    }
+
+    async fn running_service_and_network(&self) -> Result<(Arc<MusicDhtService>, NetworkId)> {
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .map(|running| (Arc::clone(&running.service), running.network_id))
             .context("federation is not running")
     }
 
@@ -924,33 +924,24 @@ impl Federation {
     }
 
     pub async fn device_invite(self: &Arc<Self>) -> Result<String> {
-        if self.running.lock().await.is_none() {
-            let status = self.devices.status();
-            let network_name = personal_sync_network_name(&status.group_id);
-            self.start_with_network_id(NetworkId::from_name(&network_name), "device-sync".into())
-                .await?;
-        }
+        self.ensure_connected_devices_enabled()?;
         let service = self.service().await?;
         self.devices.create_invite(service).await
     }
 
     pub async fn device_connect(self: &Arc<Self>, invite: &str) -> Result<String> {
+        self.ensure_connected_devices_enabled()?;
         let network_id = crate::devices::invite_network_id(invite)?;
-        let needs_start = self
-            .running
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|running| running.network_id != network_id);
-        if needs_start {
-            self.start_with_network_id(network_id, "device-invite".to_string())
-                .await?;
-        }
-        let service = self.service().await?;
+        let (service, running_network_id) = self.running_service_and_network().await?;
+        anyhow::ensure!(
+            running_network_id == network_id,
+            "device invite belongs to a different federation network"
+        );
         self.devices.connect_invite(service, invite).await
     }
 
     pub async fn device_sync_now(self: &Arc<Self>) -> Result<()> {
+        self.ensure_connected_devices_enabled()?;
         let service = self.service().await?;
         self.devices.sync_once(service).await
     }

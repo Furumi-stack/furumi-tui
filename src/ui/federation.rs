@@ -67,48 +67,70 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     y = y.saturating_add(1);
+    let connected_devices_enabled = state.connected_devices_enabled();
     draw_section(frame, area, &mut y, "Connected Devices");
+    let disabled_value = "enable federation first".to_string();
     let devices = state.federation.devices.as_ref();
-    draw_row(
+    draw_row_enabled(
         frame,
         area,
         &mut y,
         cursor,
         state.settings_cursor,
         "This device name",
-        devices
-            .map(|status| status.this_device_name.clone())
-            .unwrap_or_else(|| "loading…".to_string()),
+        if connected_devices_enabled {
+            devices
+                .map(|status| status.this_device_name.clone())
+                .unwrap_or_else(|| "loading…".to_string())
+        } else {
+            disabled_value.clone()
+        },
+        connected_devices_enabled,
     );
     cursor += 1;
-    draw_row(
+    draw_row_enabled(
         frame,
         area,
         &mut y,
         cursor,
         state.settings_cursor,
         "Generate device invite",
-        "↵".to_string(),
+        if connected_devices_enabled {
+            "↵".to_string()
+        } else {
+            disabled_value.clone()
+        },
+        connected_devices_enabled,
     );
     cursor += 1;
-    draw_row(
+    draw_row_enabled(
         frame,
         area,
         &mut y,
         cursor,
         state.settings_cursor,
         "Connect device by invite…",
-        "↵".to_string(),
+        if connected_devices_enabled {
+            "↵".to_string()
+        } else {
+            disabled_value.clone()
+        },
+        connected_devices_enabled,
     );
     cursor += 1;
-    draw_row(
+    draw_row_enabled(
         frame,
         area,
         &mut y,
         cursor,
         state.settings_cursor,
         "Sync devices now",
-        "↵".to_string(),
+        if connected_devices_enabled {
+            "↵".to_string()
+        } else {
+            disabled_value.clone()
+        },
+        connected_devices_enabled,
     );
     cursor += 1;
     if let Some(status) = devices {
@@ -125,12 +147,15 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 format!("v{}", device.client_version)
             };
-            let value = if device.is_self || device.revoked {
+            let can_revoke = connected_devices_enabled && !device.is_self && !device.revoked;
+            let value = if can_revoke {
+                format!("{version} · revoke ↵")
+            } else if connected_devices_enabled {
                 version
             } else {
-                format!("{version} · revoke ↵")
+                disabled_value.clone()
             };
-            draw_row(
+            draw_row_enabled(
                 frame,
                 area,
                 &mut y,
@@ -138,6 +163,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
                 state.settings_cursor,
                 &label,
                 value,
+                connected_devices_enabled,
             );
             cursor += 1;
         }
@@ -235,6 +261,19 @@ fn draw_row(
     label: &str,
     value: String,
 ) {
+    draw_row_enabled(frame, area, y, row_index, cursor, label, value, true);
+}
+
+fn draw_row_enabled(
+    frame: &mut Frame,
+    area: Rect,
+    y: &mut u16,
+    row_index: usize,
+    cursor: usize,
+    label: &str,
+    value: String,
+    enabled: bool,
+) {
     if *y >= area.y + area.height {
         return;
     }
@@ -248,10 +287,19 @@ fn draw_row(
     let marker = if selected { "▶ " } else { "  " };
     let label_width = 48usize;
     let line = Line::from(vec![
-        Span::styled(marker, theme::accent()),
+        Span::styled(
+            marker,
+            if enabled {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        ),
         Span::styled(
             format!("{label:<label_width$}"),
-            if selected {
+            if !enabled {
+                theme::dim()
+            } else if selected {
                 theme::accent()
             } else {
                 ratatui::style::Style::default()

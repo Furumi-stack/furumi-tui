@@ -71,7 +71,7 @@ pub(crate) fn track_row(
     let fed_liked = track
         .fed
         .as_ref()
-        .is_some_and(|fed| state.fed_likes.contains(&fed.item_id));
+        .is_some_and(|fed| state.fed_track_liked(fed));
     let heart = if state.likes.contains(&track.id) || fed_liked {
         Span::styled("♥ ", theme::accent())
     } else {

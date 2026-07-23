@@ -841,17 +841,17 @@ impl Library {
             .optional()?)
     }
 
-    pub fn set_like(&self, track_id: i64, liked: bool) -> Result<()> {
+    pub fn set_like(&self, track_id: i64, liked: bool) -> Result<bool> {
         let conn = self.lock();
-        if liked {
+        let changed = if liked {
             conn.execute(
                 "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
                 [track_id],
-            )?;
+            )?
         } else {
-            conn.execute("DELETE FROM likes WHERE track_id = ?1", [track_id])?;
-        }
-        Ok(())
+            conn.execute("DELETE FROM likes WHERE track_id = ?1", [track_id])?
+        };
+        Ok(changed > 0)
     }
 
     pub fn add_content_id_to_synced_playlist(
@@ -951,22 +951,50 @@ impl Library {
         Ok(rows)
     }
 
-    /// Item ids of every liked federated track (for the ♥ markers).
+    /// Item ids and content ids of every liked federated track (for the ♥ markers).
     pub fn fed_like_ids(&self) -> Result<Vec<String>> {
         let conn = self.lock();
-        let mut statement = conn.prepare("SELECT item_id FROM fed_likes")?;
+        let mut statement = conn.prepare("SELECT item_id, content_id FROM fed_likes")?;
         let rows = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(rows)
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut keys = Vec::new();
+        for (item_id, content_id) in rows {
+            keys.push(item_id);
+            if let Some(content_id) = content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+            {
+                keys.push(content_id);
+            }
+        }
+        Ok(keys)
     }
 
     /// Toggles a like on a federated track; returns the resulting state.
     pub fn toggle_fed_like(&self, fed: &crate::federation::FedTrack) -> Result<bool> {
         let conn = self.lock();
-        let removed = conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [&fed.item_id])?;
+        let content_id = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id);
+        let removed = match content_id.as_deref() {
+            Some(content_id) => conn.execute(
+                "DELETE FROM fed_likes WHERE item_id = ?1 OR content_id = ?2",
+                params![fed.item_id, content_id],
+            )?,
+            None => conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [&fed.item_id])?,
+        };
         if removed > 0 {
             return Ok(false);
+        }
+        if let Some(content_id) = content_id.as_deref() {
+            conn.execute(
+                "DELETE FROM fed_likes WHERE content_id = ?1 AND item_id != ?2",
+                params![content_id, fed.item_id],
+            )?;
         }
         conn.execute(
             "INSERT INTO fed_likes (item_id, owner, title, artist_names,
@@ -981,13 +1009,160 @@ impl Library {
                 fed.featured_artist_names.join("; "),
                 fed.year,
                 fed.duration_seconds.map(|d| d as f64),
-                fed.content_id,
+                content_id,
                 fed.release_title,
                 fed.track_number,
                 fed.disc_number,
             ],
         )?;
         Ok(true)
+    }
+
+    pub fn fed_like_by_content_id(
+        &self,
+        content_id: &str,
+    ) -> Result<Option<crate::federation::FedTrack>> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(None);
+        };
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT item_id, owner, title, artist_names, featured_artist_names,
+                    year, duration_seconds, content_id, release_title, track_number, disc_number
+             FROM fed_likes
+             WHERE content_id = ?1
+             ORDER BY liked_at DESC
+             LIMIT 1",
+        )?;
+        let track = statement
+            .query_row([content_id], |row| {
+                let artists: String = row.get(3)?;
+                Ok(crate::federation::FedTrack {
+                    item_id: row.get(0)?,
+                    owner: row.get(1)?,
+                    own: false,
+                    title: row.get(2)?,
+                    artist_names: artists
+                        .split("; ")
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    featured_artist_names: row
+                        .get::<_, String>(4)?
+                        .split("; ")
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    year: row.get(5)?,
+                    duration_seconds: row.get::<_, Option<f64>>(6)?.map(|d| d.round() as i64),
+                    content_id: row.get(7)?,
+                    release_title: row.get(8)?,
+                    track_number: row.get(9)?,
+                    disc_number: row.get(10)?,
+                })
+            })
+            .optional()?;
+        Ok(track)
+    }
+
+    pub fn upsert_synced_fed_like(&self, fed: &crate::federation::FedTrack) -> Result<bool> {
+        let Some(content_id) = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)
+        else {
+            return Ok(false);
+        };
+        let conn = self.lock();
+        let duplicate_rows = conn.execute(
+            "DELETE FROM fed_likes WHERE content_id = ?1 AND item_id != ?2",
+            params![content_id, fed.item_id],
+        )?;
+        let existing: Option<(
+            String,
+            String,
+            String,
+            String,
+            Option<i32>,
+            Option<i64>,
+            Option<String>,
+            Option<i32>,
+            Option<i32>,
+        )> = conn
+            .query_row(
+                "SELECT owner, title, artist_names, featured_artist_names,
+                        year, duration_seconds, release_title, track_number, disc_number
+                 FROM fed_likes
+                 WHERE item_id = ?1",
+                [&fed.item_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, Option<f64>>(5)?.map(|d| d.round() as i64),
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let incoming = (
+            fed.owner.clone(),
+            fed.title.clone(),
+            fed.artist_names.join("; "),
+            fed.featured_artist_names.join("; "),
+            fed.year,
+            fed.duration_seconds,
+            fed.release_title.clone(),
+            fed.track_number,
+            fed.disc_number,
+        );
+        if duplicate_rows == 0 && existing.as_ref() == Some(&incoming) {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO fed_likes (item_id, owner, title, artist_names,
+                featured_artist_names, year, duration_seconds, content_id,
+                release_title, track_number, disc_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(item_id) DO UPDATE SET
+                owner = excluded.owner,
+                title = excluded.title,
+                artist_names = excluded.artist_names,
+                featured_artist_names = excluded.featured_artist_names,
+                year = excluded.year,
+                duration_seconds = excluded.duration_seconds,
+                content_id = excluded.content_id,
+                release_title = excluded.release_title,
+                track_number = excluded.track_number,
+                disc_number = excluded.disc_number",
+            params![
+                fed.item_id,
+                fed.owner,
+                fed.title,
+                fed.artist_names.join("; "),
+                fed.featured_artist_names.join("; "),
+                fed.year,
+                fed.duration_seconds.map(|d| d as f64),
+                content_id,
+                fed.release_title,
+                fed.track_number,
+                fed.disc_number,
+            ],
+        )?;
+        Ok(true)
+    }
+
+    pub fn remove_fed_like_by_content_id(&self, content_id: &str) -> Result<bool> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(false);
+        };
+        let conn = self.lock();
+        Ok(conn.execute("DELETE FROM fed_likes WHERE content_id = ?1", [content_id])? > 0)
     }
 
     /// Moves a federated like onto a freshly imported local track. Returns

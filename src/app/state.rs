@@ -536,6 +536,8 @@ pub enum Popup {
         device_id: String,
         name: String,
         client_version: String,
+        requester_group_id: Option<String>,
+        requester_group_active_devices: usize,
     },
     /// Confirmation before revoking a trusted device.
     ConfirmDeviceRevoke { device_id: String, name: String },
@@ -819,8 +821,8 @@ pub struct AppState {
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
     /// Liked track ids, for the ♥ markers everywhere tracks are shown.
     pub likes: std::collections::HashSet<i64>,
-    /// Liked federated tracks (DHT item ids) — likes that reference peers'
-    /// tracks without downloading them.
+    /// Liked federated tracks (DHT item ids and content ids) — likes that
+    /// reference peers' tracks without downloading them.
     pub fed_likes: std::collections::HashSet<String>,
     pub likes_loaded: bool,
     pub logs: LogsTab,
@@ -847,4 +849,31 @@ pub struct AppState {
     /// Shared image cache keyed by `art::cache_key(url, w, h)`; reused by
     /// every view that shows artwork.
     pub art: HashMap<String, ArtState>,
+}
+
+impl AppState {
+    pub fn connected_devices_enabled(&self) -> bool {
+        self.federation.settings.enabled && !self.federation.settings.network_id.trim().is_empty()
+    }
+
+    pub fn fed_track_liked(&self, fed: &crate::federation::FedTrack) -> bool {
+        self.fed_likes.contains(&fed.item_id)
+            || fed
+                .content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+                .is_some_and(|content_id| self.fed_likes.contains(&content_id))
+    }
+
+    pub fn fed_card_track_liked(&self, track: &crate::federation::FedCardTrack) -> bool {
+        track
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)
+            .is_some_and(|content_id| self.fed_likes.contains(&content_id))
+            || track
+                .sources
+                .iter()
+                .any(|(_, item_id)| self.fed_likes.contains(item_id))
+    }
 }

@@ -37,6 +37,8 @@ pub struct PendingPairing {
     pub device_id: String,
     pub name: String,
     pub client_version: String,
+    pub requester_group_id: Option<String>,
+    pub requester_group_active_devices: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,6 +134,8 @@ pub enum SyncOpPayload {
     TrackLikeSet {
         content_id: String,
         liked: bool,
+        #[serde(default)]
+        fed: Option<SyncedFedTrack>,
     },
     PlaylistCreated {
         playlist_id: String,
@@ -193,6 +197,8 @@ struct SnapshotLike {
     content_id: String,
     hlc_ms: i64,
     op_id: String,
+    #[serde(default)]
+    fed: Option<SyncedFedTrack>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +225,67 @@ enum PairAttempt {
     Denied(String),
 }
 
+struct PairingStatus {
+    status: String,
+    use_requester_group: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedFedTrack {
+    item_id: String,
+    owner: String,
+    title: String,
+    #[serde(default)]
+    artist_names: Vec<String>,
+    #[serde(default)]
+    featured_artist_names: Vec<String>,
+    year: Option<i32>,
+    duration_seconds: Option<i64>,
+    content_id: String,
+    release_title: Option<String>,
+    track_number: Option<i32>,
+    disc_number: Option<i32>,
+}
+
+impl SyncedFedTrack {
+    fn from_fed(fed: &crate::federation::FedTrack) -> Option<Self> {
+        let content_id = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)?;
+        Some(Self {
+            item_id: fed.item_id.clone(),
+            owner: fed.owner.clone(),
+            title: fed.title.clone(),
+            artist_names: fed.artist_names.clone(),
+            featured_artist_names: fed.featured_artist_names.clone(),
+            year: fed.year,
+            duration_seconds: fed.duration_seconds,
+            content_id,
+            release_title: fed.release_title.clone(),
+            track_number: fed.track_number,
+            disc_number: fed.disc_number,
+        })
+    }
+
+    fn to_fed_track(&self) -> crate::federation::FedTrack {
+        crate::federation::FedTrack {
+            item_id: self.item_id.clone(),
+            owner: self.owner.clone(),
+            own: false,
+            title: self.title.clone(),
+            artist_names: self.artist_names.clone(),
+            featured_artist_names: self.featured_artist_names.clone(),
+            year: self.year,
+            duration_seconds: self.duration_seconds,
+            content_id: Some(self.content_id.clone()),
+            release_title: self.release_title.clone(),
+            track_number: self.track_number,
+            disc_number: self.disc_number,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireMessage {
@@ -226,6 +293,12 @@ enum WireMessage {
         invite_id: String,
         secret: String,
         profile: DeviceProfileWire,
+        #[serde(default)]
+        group_id: Option<String>,
+        #[serde(default)]
+        group_active_devices: usize,
+        #[serde(default)]
+        devices: Vec<DeviceProfileWire>,
         vector: BTreeMap<String, i64>,
         ops: Vec<SyncOpWire>,
         snapshot: SyncSnapshot,
@@ -433,7 +506,10 @@ impl DeviceSync {
     ) -> Result<PairAttempt> {
         let peer = service.connect(ticket).await?;
         let own_ticket = service.ticket().await?.to_string();
+        let identity = self.ensure_identity()?;
+        let group_active_devices = self.active_device_count()?;
         let profile = self.own_profile(&own_ticket)?;
+        let devices = self.device_profiles()?;
         let vector = self.vector()?;
         let ops = self.ops_for_peer(&invite.device_id)?;
         let snapshot = self.snapshot()?;
@@ -444,6 +520,9 @@ impl DeviceSync {
                 invite_id: invite.invite_id.clone(),
                 secret: invite.secret.clone(),
                 profile,
+                group_id: Some(identity.group_id),
+                group_active_devices,
+                devices,
                 vector,
                 ops,
                 snapshot,
@@ -499,27 +578,37 @@ impl DeviceSync {
         }
     }
 
-    pub fn answer_pairing(&self, request_id: &str, accept: bool) -> Result<()> {
-        let profile = {
+    pub fn answer_pairing(
+        &self,
+        request_id: &str,
+        accept: bool,
+        use_requester_group: bool,
+    ) -> Result<()> {
+        let pending = {
             let conn = lock(&self.conn);
             conn.query_row(
                 "SELECT device_id, name, client_version, endpoint_id,
-                        endpoint_ticket, created_at_ms
+                        endpoint_ticket, created_at_ms,
+                        requester_group_id, requester_group_devices_json
                  FROM sync_pending_pairing
                  WHERE request_id = ?1",
                 [request_id],
                 |row| {
-                    Ok(DeviceProfileWire {
-                        device_id: row.get(0)?,
-                        name: row.get(1)?,
-                        client_version: row.get(2)?,
-                        protocol_version: PROTOCOL_VERSION,
-                        endpoint_id: row.get(3)?,
-                        endpoint_ticket: row.get(4)?,
-                        revoked: false,
-                        revoke_cutoff_seq: None,
-                        updated_at_ms: row.get(5)?,
-                    })
+                    Ok((
+                        DeviceProfileWire {
+                            device_id: row.get(0)?,
+                            name: row.get(1)?,
+                            client_version: row.get(2)?,
+                            protocol_version: PROTOCOL_VERSION,
+                            endpoint_id: row.get(3)?,
+                            endpoint_ticket: row.get(4)?,
+                            revoked: false,
+                            revoke_cutoff_seq: None,
+                            updated_at_ms: row.get(5)?,
+                        },
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
                 },
             )
             .optional()?
@@ -528,17 +617,29 @@ impl DeviceSync {
             let conn = lock(&self.conn);
             conn.execute(
                 "UPDATE sync_pending_pairing
-                 SET status = ?2, answered_at_ms = ?3
+                 SET status = ?2, answered_at_ms = ?3, use_requester_group = ?4
                  WHERE request_id = ?1 AND status = 'pending'",
                 params![
                     request_id,
                     if accept { "accepted" } else { "denied" },
-                    now_ms()
+                    now_ms(),
+                    i64::from(use_requester_group),
                 ],
             )?
         };
         if accept && changed > 0 {
-            if let Some(profile) = profile {
+            if let Some((profile, requester_group_id, requester_group_devices_json)) = pending {
+                if use_requester_group {
+                    if let Some(group_id) = requester_group_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                    {
+                        self.set_group_id(group_id)?;
+                    }
+                    let requester_devices: Vec<DeviceProfileWire> =
+                        serde_json::from_str(&requester_group_devices_json)?;
+                    self.apply_device_profiles(&requester_devices)?;
+                }
                 self.apply_device_profile(&profile, true)?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: profile.device_id,
@@ -569,16 +670,28 @@ impl DeviceSync {
 
     pub fn record_track_like(&self, track_id: i64, liked: bool) -> Result<()> {
         if let Some(content_id) = self.library.track_content_id_by_id(track_id)? {
-            self.record_local_op(SyncOpPayload::TrackLikeSet { content_id, liked })?;
+            self.record_local_op(SyncOpPayload::TrackLikeSet {
+                content_id,
+                liked,
+                fed: None,
+            })?;
         }
         Ok(())
     }
 
-    pub fn record_fed_like(&self, content_id: Option<&str>, liked: bool) -> Result<()> {
-        let Some(content_id) = content_id.and_then(music_dht::normalize_content_id) else {
+    pub fn record_fed_like(&self, fed: &crate::federation::FedTrack, liked: bool) -> Result<()> {
+        let Some(content_id) = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)
+        else {
             return Ok(());
         };
-        self.record_local_op(SyncOpPayload::TrackLikeSet { content_id, liked })?;
+        self.record_local_op(SyncOpPayload::TrackLikeSet {
+            content_id,
+            liked,
+            fed: liked.then(|| SyncedFedTrack::from_fed(fed)).flatten(),
+        })?;
         Ok(())
     }
 
@@ -940,9 +1053,11 @@ impl DeviceSync {
 
     fn apply_op(&self, op: &SyncOpWire) -> Result<bool> {
         let changed = match &op.payload {
-            SyncOpPayload::TrackLikeSet { content_id, liked } => {
-                self.apply_like_state(content_id, *liked, op.hlc_ms, &op.op_id)?
-            }
+            SyncOpPayload::TrackLikeSet {
+                content_id,
+                liked,
+                fed,
+            } => self.apply_like_state(content_id, *liked, fed.as_ref(), op.hlc_ms, &op.op_id)?,
             SyncOpPayload::PlaylistCreated { playlist_id, title } => {
                 self.apply_playlist_state(playlist_id, title, false, op.hlc_ms, &op.op_id)?
             }
@@ -1108,26 +1223,34 @@ impl DeviceSync {
         &self,
         content_id: &str,
         liked: bool,
+        fed: Option<&SyncedFedTrack>,
         hlc_ms: i64,
         op_id: &str,
     ) -> Result<bool> {
-        let apply = {
-            let conn = lock(&self.conn);
-            let current: Option<(i64, String)> = conn
-                .query_row(
-                    "SELECT hlc_ms, op_id FROM sync_state_likes WHERE content_id = ?1",
-                    [content_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            current.as_ref().is_none_or(|(current_hlc, current_op)| {
-                (hlc_ms, op_id) > (*current_hlc, current_op.as_str())
-            })
-        };
-        if !apply {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
             return Ok(false);
-        }
-        {
+        };
+        let current = {
+            let conn = lock(&self.conn);
+            conn.query_row(
+                "SELECT liked, hlc_ms, op_id
+                     FROM sync_state_likes
+                     WHERE content_id = ?1",
+                [&content_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        };
+        let apply = current.as_ref().is_none_or(|(_, current_hlc, current_op)| {
+            (hlc_ms, op_id) > (*current_hlc, current_op.as_str())
+        });
+        if apply {
             let conn = lock(&self.conn);
             conn.execute(
                 "INSERT INTO sync_state_likes (content_id, liked, hlc_ms, op_id)
@@ -1139,10 +1262,25 @@ impl DeviceSync {
                 params![content_id, i64::from(liked), hlc_ms, op_id],
             )?;
         }
-        if let Some(track_id) = self.library.track_id_by_content_id(content_id)? {
-            self.library.set_like(track_id, liked)?;
+        let effective_liked = if apply {
+            liked
+        } else {
+            current.map(|(liked, _, _)| liked).unwrap_or(false)
+        };
+        let mut changed = apply;
+        if let Some(track_id) = self.library.track_id_by_content_id(&content_id)? {
+            changed |= self.library.set_like(track_id, effective_liked)?;
+            if effective_liked {
+                changed |= self.library.remove_fed_like_by_content_id(&content_id)?;
+            }
+        } else if effective_liked {
+            if let Some(fed) = fed {
+                changed |= self.library.upsert_synced_fed_like(&fed.to_fed_track())?;
+            }
+        } else if apply {
+            changed |= self.library.remove_fed_like_by_content_id(&content_id)?;
         }
-        Ok(true)
+        Ok(changed)
     }
 
     fn apply_playlist_state(
@@ -1252,7 +1390,13 @@ impl DeviceSync {
     fn apply_snapshot(&self, snapshot: SyncSnapshot) -> Result<()> {
         let mut changed = false;
         for like in snapshot.likes {
-            changed |= self.apply_like_state(&like.content_id, true, like.hlc_ms, &like.op_id)?;
+            changed |= self.apply_like_state(
+                &like.content_id,
+                true,
+                like.fed.as_ref(),
+                like.hlc_ms,
+                &like.op_id,
+            )?;
         }
         for playlist in snapshot.playlists {
             changed |= self.apply_playlist_state(
@@ -1415,23 +1559,40 @@ impl DeviceSync {
     }
 
     fn snapshot(&self) -> Result<SyncSnapshot> {
-        let conn = lock(&self.conn);
-        let mut likes_stmt = conn.prepare(
-            "SELECT content_id, hlc_ms, op_id
-             FROM sync_state_likes
-             WHERE liked = 1
-             ORDER BY content_id",
-        )?;
-        let likes = likes_stmt
-            .query_map([], |row| {
-                Ok(SnapshotLike {
-                    content_id: row.get(0)?,
-                    hlc_ms: row.get(1)?,
-                    op_id: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let like_rows = {
+            let conn = lock(&self.conn);
+            let mut likes_stmt = conn.prepare(
+                "SELECT content_id, hlc_ms, op_id
+                 FROM sync_state_likes
+                 WHERE liked = 1
+                 ORDER BY content_id",
+            )?;
+            likes_stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut likes = Vec::with_capacity(like_rows.len());
+        for (content_id, hlc_ms, op_id) in like_rows {
+            let fed = self
+                .library
+                .fed_like_by_content_id(&content_id)?
+                .as_ref()
+                .and_then(SyncedFedTrack::from_fed);
+            likes.push(SnapshotLike {
+                content_id,
+                hlc_ms,
+                op_id,
+                fed,
+            });
+        }
 
+        let conn = lock(&self.conn);
         let mut playlist_stmt = conn.prepare(
             "SELECT playlist_id, title, hlc_ms, op_id
              FROM sync_state_playlists
@@ -1521,6 +1682,16 @@ impl DeviceSync {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn active_device_count(&self) -> Result<usize> {
+        let conn = lock(&self.conn);
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM sync_devices
+             WHERE trusted_at_ms IS NOT NULL AND revoked_at_ms IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
     }
 
     fn status_inner(&self) -> Result<DeviceSyncStatus> {
@@ -1746,12 +1917,26 @@ async fn serve_one(
             invite_id,
             secret,
             profile,
+            group_id,
+            group_active_devices,
+            devices,
             vector,
             ops,
             snapshot,
         } => {
             handle_pair_request(
-                stream, sync, service, invite_id, secret, profile, vector, ops, snapshot,
+                stream,
+                sync,
+                service,
+                invite_id,
+                secret,
+                profile,
+                group_id,
+                group_active_devices,
+                devices,
+                vector,
+                ops,
+                snapshot,
             )
             .await
         }
@@ -1780,6 +1965,9 @@ async fn handle_pair_request(
     invite_id: String,
     secret: String,
     mut profile: DeviceProfileWire,
+    requester_group_id: Option<String>,
+    requester_group_active_devices: usize,
+    requester_group_devices: Vec<DeviceProfileWire>,
     vector: BTreeMap<String, i64>,
     ops: Vec<SyncOpWire>,
     snapshot: SyncSnapshot,
@@ -1810,13 +1998,24 @@ async fn handle_pair_request(
         finish_response(&mut stream).await?;
         return Ok(());
     }
+    let identity = sync.ensure_identity()?;
+    let requester_group_id = requester_group_id.filter(|id| !id.trim().is_empty());
+    let requester_group_active_devices = requester_group_active_devices.max(1);
+    let requester_group_conflict = requester_group_id
+        .as_deref()
+        .is_some_and(|group_id| group_id != identity.group_id)
+        && requester_group_active_devices > 1;
+    let requester_group_devices_json = serde_json::to_string(&requester_group_devices)?;
     let inserted = {
         let conn = lock(&sync.conn);
         conn.execute(
             "INSERT OR IGNORE INTO sync_pending_pairing
                 (request_id, device_id, name, client_version, endpoint_id,
-                 endpoint_ticket, invite_id, created_at_ms, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+                 endpoint_ticket, invite_id, created_at_ms, status,
+                 requester_group_id, requester_group_active_devices,
+                 requester_group_devices_json, use_requester_group)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending',
+                     ?9, ?10, ?11, 0)",
             params![
                 request_id,
                 profile.device_id,
@@ -1826,6 +2025,9 @@ async fn handle_pair_request(
                 profile.endpoint_ticket,
                 invite_id,
                 now_ms(),
+                requester_group_id.as_deref(),
+                requester_group_active_devices as i64,
+                requester_group_devices_json,
             ],
         )?
     };
@@ -1837,9 +2039,16 @@ async fn handle_pair_request(
             device_id: profile.device_id.clone(),
             name: profile.name.clone(),
             client_version: profile.client_version.clone(),
+            requester_group_id: requester_group_conflict
+                .then(|| requester_group_id.clone())
+                .flatten(),
+            requester_group_active_devices: requester_group_conflict
+                .then_some(requester_group_active_devices)
+                .unwrap_or(0),
         }));
     }
-    match pairing_status(&sync, &request_id)?.as_deref() {
+    let pairing = pairing_status(&sync, &request_id)?;
+    match pairing.as_ref().map(|status| status.status.as_str()) {
         Some("pending") => {
             write_msg(
                 &mut stream,
@@ -1881,9 +2090,21 @@ async fn handle_pair_request(
         }
     }
 
+    let use_requester_group = pairing
+        .as_ref()
+        .is_some_and(|status| status.use_requester_group);
     let own_ticket = service.ticket().await?.to_string();
     let own_profile = sync.own_profile(&own_ticket)?;
-    let identity = sync.ensure_identity()?;
+    let mut response_group_id = identity.group_id;
+    if use_requester_group
+        && let Some(group_id) = requester_group_id
+            .as_deref()
+            .filter(|group_id| !group_id.trim().is_empty())
+    {
+        sync.set_group_id(group_id)?;
+        response_group_id = group_id.to_string();
+        sync.apply_device_profiles(&requester_group_devices)?;
+    }
     sync.apply_device_profile(&profile, true)?;
     sync.apply_snapshot(snapshot)?;
     sync.apply_ops(ops)?;
@@ -1906,7 +2127,7 @@ async fn handle_pair_request(
             accepted: true,
             pending: false,
             error: None,
-            group_id: Some(identity.group_id),
+            group_id: Some(response_group_id),
             profile: Some(own_profile),
             devices,
             vector,
@@ -2000,13 +2221,20 @@ async fn handle_hello(
     Ok(())
 }
 
-fn pairing_status(sync: &DeviceSync, request_id: &str) -> Result<Option<String>> {
+fn pairing_status(sync: &DeviceSync, request_id: &str) -> Result<Option<PairingStatus>> {
     let conn = lock(&sync.conn);
     Ok(conn
         .query_row(
-            "SELECT status FROM sync_pending_pairing WHERE request_id = ?1",
+            "SELECT status, use_requester_group
+             FROM sync_pending_pairing
+             WHERE request_id = ?1",
             [request_id],
-            |row| row.get(0),
+            |row| {
+                Ok(PairingStatus {
+                    status: row.get(0)?,
+                    use_requester_group: row.get::<_, i64>(1)? != 0,
+                })
+            },
         )
         .optional()?)
 }
@@ -2099,16 +2327,20 @@ CREATE TABLE IF NOT EXISTS sync_invites (
     used_at_ms    INTEGER
 );
 CREATE TABLE IF NOT EXISTS sync_pending_pairing (
-    request_id      TEXT PRIMARY KEY,
-    device_id       TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    client_version  TEXT NOT NULL,
-    endpoint_id     TEXT NOT NULL,
-    endpoint_ticket TEXT NOT NULL,
-    invite_id       TEXT NOT NULL,
-    created_at_ms   INTEGER NOT NULL,
-    answered_at_ms  INTEGER,
-    status          TEXT NOT NULL
+    request_id                     TEXT PRIMARY KEY,
+    device_id                      TEXT NOT NULL,
+    name                           TEXT NOT NULL,
+    client_version                 TEXT NOT NULL,
+    endpoint_id                    TEXT NOT NULL,
+    endpoint_ticket                TEXT NOT NULL,
+    invite_id                      TEXT NOT NULL,
+    created_at_ms                  INTEGER NOT NULL,
+    answered_at_ms                 INTEGER,
+    status                         TEXT NOT NULL,
+    requester_group_id             TEXT,
+    requester_group_active_devices INTEGER NOT NULL DEFAULT 1,
+    requester_group_devices_json   TEXT NOT NULL DEFAULT '[]',
+    use_requester_group            INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sync_ops (
     op_id            TEXT PRIMARY KEY,
@@ -2161,7 +2393,54 @@ CREATE TABLE IF NOT EXISTS sync_state_playlist_items (
 );
 "#,
     )?;
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "requester_group_id",
+        "ALTER TABLE sync_pending_pairing ADD COLUMN requester_group_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "requester_group_active_devices",
+        "ALTER TABLE sync_pending_pairing
+         ADD COLUMN requester_group_active_devices INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "requester_group_devices_json",
+        "ALTER TABLE sync_pending_pairing
+         ADD COLUMN requester_group_devices_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "use_requester_group",
+        "ALTER TABLE sync_pending_pairing
+         ADD COLUMN use_requester_group INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute(ddl, [])?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -2469,6 +2748,23 @@ mod tests {
             != 0
     }
 
+    fn test_fed_track(content_id: &str) -> crate::federation::FedTrack {
+        crate::federation::FedTrack {
+            item_id: "fed_item_1".to_string(),
+            owner: "fed_owner_1".to_string(),
+            own: false,
+            title: "Remote Song".to_string(),
+            artist_names: vec!["Remote Artist".to_string()],
+            featured_artist_names: Vec::new(),
+            year: Some(2026),
+            duration_seconds: Some(123),
+            content_id: Some(content_id.to_string()),
+            release_title: Some("Remote Release".to_string()),
+            track_number: Some(1),
+            disc_number: Some(1),
+        }
+    }
+
     #[test]
     fn base64url_round_trip_without_padding() {
         for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
@@ -2483,14 +2779,16 @@ mod tests {
         assert!(
             SyncOpPayload::TrackLikeSet {
                 content_id: "b3:0".into(),
-                liked: false
+                liked: false,
+                fed: None,
             }
             .is_tombstone()
         );
         assert!(
             !SyncOpPayload::TrackLikeSet {
                 content_id: "b3:0".into(),
-                liked: true
+                liked: true,
+                fed: None,
             }
             .is_tombstone()
         );
@@ -2531,5 +2829,33 @@ mod tests {
         )
         .unwrap();
         assert!(!device_revoked(&sync, device_id));
+    }
+
+    #[test]
+    fn synced_fed_like_metadata_repairs_existing_like_state() {
+        let sync = test_sync();
+        let content_id = format!("b3:{}", "a".repeat(64));
+        let fed = test_fed_track(&content_id);
+        let synced = SyncedFedTrack::from_fed(&fed).unwrap();
+
+        assert!(
+            sync.apply_like_state(&content_id, true, None, 10, "dev_remote:1")
+                .unwrap()
+        );
+        assert!(sync.library.fed_like_ids().unwrap().is_empty());
+
+        assert!(
+            sync.apply_like_state(&content_id, true, Some(&synced), 10, "dev_remote:1")
+                .unwrap()
+        );
+        let keys = sync.library.fed_like_ids().unwrap();
+        assert!(keys.contains(&fed.item_id));
+        assert!(keys.contains(&content_id));
+
+        assert!(
+            sync.apply_like_state(&content_id, false, None, 11, "dev_remote:2")
+                .unwrap()
+        );
+        assert!(sync.library.fed_like_ids().unwrap().is_empty());
     }
 }

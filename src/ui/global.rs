@@ -847,7 +847,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             index += 1;
         }
         for fed in &state.search.fed_tracks {
-            let heart = if state.fed_likes.contains(&fed.item_id) {
+            let heart = if state.fed_track_liked(fed) {
                 Span::styled("♥ ", theme::accent())
             } else {
                 Span::raw("  ")
@@ -1090,10 +1090,7 @@ fn draw_fed_appearance_row(
     visual_selected: bool,
 ) {
     let track = &appearance.track;
-    let liked = track
-        .sources
-        .iter()
-        .any(|(_, item_id)| state.fed_likes.contains(item_id));
+    let liked = state.fed_card_track_liked(track);
     let heart = if liked {
         Span::styled("♥ ", theme::accent())
     } else {
@@ -1276,10 +1273,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
             duration
         };
         let in_selection = state.track_selection.contains(&scope, position);
-        let liked = track
-            .sources
-            .iter()
-            .any(|(_, item_id)| state.fed_likes.contains(item_id));
+        let liked = state.fed_card_track_liked(track);
         let heart = if liked {
             Span::styled("♥ ", theme::accent())
         } else {

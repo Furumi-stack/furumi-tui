@@ -56,10 +56,11 @@ pub enum AppEvent {
         track_id: i64,
         liked: bool,
     },
-    /// Liked federated item ids for the ♥ markers.
+    /// Liked federated item ids and content ids for the ♥ markers.
     FedLikesLoaded(Result<Vec<String>, String>),
     FedLikeToggled {
         item_id: String,
+        content_id: Option<String>,
         liked: bool,
     },
     /// A release fetched for queueing (a / shift-a on a release).

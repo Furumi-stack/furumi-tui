@@ -40,8 +40,17 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             device_id,
             name,
             client_version,
+            requester_group_id,
+            requester_group_active_devices,
             ..
-        }) => draw_device_pairing(frame, device_id, name, client_version),
+        }) => draw_device_pairing(
+            frame,
+            device_id,
+            name,
+            client_version,
+            requester_group_id.as_deref(),
+            *requester_group_active_devices,
+        ),
         Some(Popup::ConfirmDeviceRevoke { device_id, name }) => {
             draw_device_revoke(frame, device_id, name)
         }
@@ -136,8 +145,20 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
     );
 }
 
-fn draw_device_pairing(frame: &mut Frame, device_id: &str, name: &str, client_version: &str) {
-    let area = centered(frame.area(), 64, 8);
+fn draw_device_pairing(
+    frame: &mut Frame,
+    device_id: &str,
+    name: &str,
+    client_version: &str,
+    requester_group_id: Option<&str>,
+    requester_group_active_devices: usize,
+) {
+    let group_conflict = requester_group_id.is_some() && requester_group_active_devices > 1;
+    let area = centered(
+        frame.area(),
+        if group_conflict { 76 } else { 64 },
+        if group_conflict { 12 } else { 8 },
+    );
     let block = Block::bordered()
         .title(" Pair device ")
         .title_style(theme::header())
@@ -145,7 +166,7 @@ fn draw_device_pairing(frame: &mut Frame, device_id: &str, name: &str, client_ve
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Name     ", theme::dim()),
             Span::raw(name.to_string()),
@@ -158,9 +179,41 @@ fn draw_device_pairing(frame: &mut Frame, device_id: &str, name: &str, client_ve
             Span::styled("Device   ", theme::dim()),
             Span::raw(device_id.chars().take(24).collect::<String>()),
         ]),
-        Line::default(),
-        Line::styled("y accept · n/esc deny", theme::dim()),
     ];
+    if let Some(group_id) = requester_group_id.filter(|_| group_conflict) {
+        lines.extend([
+            Line::from(vec![
+                Span::styled("Group    ", theme::dim()),
+                Span::raw(format!(
+                    "{} · {requester_group_active_devices} active devices",
+                    group_id.chars().take(24).collect::<String>()
+                )),
+            ]),
+            Line::default(),
+            Line::styled(
+                "Recommended joins that group and keeps its peers syncing.",
+                theme::dim(),
+            ),
+            Line::styled(
+                "Cancel keeps this group; that device will switch groups and its peers may stop syncing.",
+                theme::dim(),
+            ),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("  Recommended  ", theme::tab_active()),
+                Span::raw("  "),
+                Span::styled("  Cancel  ", theme::danger_button()),
+            ])
+            .alignment(Alignment::Center),
+            Line::styled("y recommended · c cancel · n/esc deny", theme::dim())
+                .alignment(Alignment::Center),
+        ]);
+    } else {
+        lines.extend([
+            Line::default(),
+            Line::styled("y accept · n/esc deny", theme::dim()),
+        ]);
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

@@ -66,6 +66,8 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             device_id,
             name,
             client_version,
+            requester_group_id,
+            requester_group_active_devices,
         } => handle_device_pairing(
             state,
             runtime,
@@ -73,6 +75,8 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             device_id,
             name,
             client_version,
+            requester_group_id,
+            requester_group_active_devices,
             key,
         ),
         Popup::ConfirmDeviceRevoke { device_id, name } => {
@@ -165,11 +169,14 @@ fn handle_device_pairing(
     device_id: String,
     name: String,
     client_version: String,
+    requester_group_id: Option<String>,
+    requester_group_active_devices: usize,
     key: KeyEvent,
 ) {
+    let group_conflict = requester_group_id.is_some() && requester_group_active_devices > 1;
     match key.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-            if let Err(err) = runtime.devices.answer_pairing(&request_id, false) {
+            if let Err(err) = runtime.devices.answer_pairing(&request_id, false, false) {
                 state.status_message = Some(format!("pairing: {err:#}"));
             } else {
                 state.status_message = Some("device pairing denied".to_string());
@@ -177,10 +184,26 @@ fn handle_device_pairing(
             state.federation.devices = Some(runtime.devices.status());
         }
         KeyCode::Char('y') => {
-            if let Err(err) = runtime.devices.answer_pairing(&request_id, true) {
+            if let Err(err) = runtime
+                .devices
+                .answer_pairing(&request_id, true, group_conflict)
+            {
                 state.status_message = Some(format!("pairing: {err:#}"));
             } else {
-                state.status_message = Some(format!("device \"{name}\" accepted"));
+                state.status_message = Some(if group_conflict {
+                    format!("device \"{name}\" accepted; joining its sync group")
+                } else {
+                    format!("device \"{name}\" accepted")
+                });
+            }
+            state.federation.devices = Some(runtime.devices.status());
+        }
+        KeyCode::Char('c') if group_conflict => {
+            if let Err(err) = runtime.devices.answer_pairing(&request_id, true, false) {
+                state.status_message = Some(format!("pairing: {err:#}"));
+            } else {
+                state.status_message =
+                    Some(format!("device \"{name}\" accepted into this sync group"));
             }
             state.federation.devices = Some(runtime.devices.status());
         }
@@ -190,6 +213,8 @@ fn handle_device_pairing(
                 device_id,
                 name,
                 client_version,
+                requester_group_id,
+                requester_group_active_devices,
             });
         }
     }

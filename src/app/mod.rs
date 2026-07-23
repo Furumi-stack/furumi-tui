@@ -459,13 +459,12 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 for fed in fed_tracks {
                     match library.toggle_fed_like(&fed) {
                         Ok(liked) => {
-                            if let Err(err) =
-                                devices.record_fed_like(fed.content_id.as_deref(), liked)
-                            {
+                            if let Err(err) = devices.record_fed_like(&fed, liked) {
                                 tracing::warn!(%err, title = %fed.title, "recording synced federated like failed");
                             }
                             let _ = tx.send(AppEvent::FedLikeToggled {
                                 item_id: fed.item_id.clone(),
+                                content_id: fed.content_id.clone(),
                                 liked,
                             });
                         }
@@ -523,6 +522,15 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 let result = fed.ticket().await.map_err(|err| format!("{err:#}"));
                 let _ = tx.send(AppEvent::FedTicket(result));
             });
+        }
+        Effect::DeviceShowInvite
+        | Effect::DeviceConnectInvite(_)
+        | Effect::DeviceSyncNow
+        | Effect::DeviceSetName(_)
+        | Effect::DeviceRevoke(_)
+            if !state.connected_devices_enabled() =>
+        {
+            state.status_message = Some("enable federation before using connected devices".into());
         }
         Effect::DeviceShowInvite => {
             let fed = Arc::clone(&runtime.federation);
@@ -1393,6 +1401,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 device_id: request.device_id,
                 name: request.name,
                 client_version: request.client_version,
+                requester_group_id: request.requester_group_id,
+                requester_group_active_devices: request.requester_group_active_devices,
             });
             state.federation.devices = Some(runtime.devices.status());
         }
@@ -1703,11 +1713,25 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             Ok(ids) => state.fed_likes = ids.into_iter().collect(),
             Err(message) => tracing::warn!(%message, "federated likes load failed"),
         },
-        AppEvent::FedLikeToggled { item_id, liked } => {
+        AppEvent::FedLikeToggled {
+            item_id,
+            content_id,
+            liked,
+        } => {
             if liked {
                 state.fed_likes.insert(item_id);
+                if let Some(content_id) =
+                    content_id.and_then(|id| music_dht::normalize_content_id(&id))
+                {
+                    state.fed_likes.insert(content_id);
+                }
             } else {
                 state.fed_likes.remove(&item_id);
+                if let Some(content_id) =
+                    content_id.and_then(|id| music_dht::normalize_content_id(&id))
+                {
+                    state.fed_likes.remove(&content_id);
+                }
             }
             // The virtual Likes playlist is stale now; refetch on next open.
             state.playlist_views.remove(&state::LIKES_PLAYLIST_ID);

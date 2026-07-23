@@ -292,16 +292,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 None
             } else {
                 let should_like = track_ids.iter().any(|id| !state.likes.contains(id))
-                    || fed_tracks
-                        .iter()
-                        .any(|fed| !state.fed_likes.contains(&fed.item_id));
+                    || fed_tracks.iter().any(|fed| !state.fed_track_liked(fed));
                 let toggles: Vec<i64> = track_ids
                     .into_iter()
                     .filter(|id| state.likes.contains(id) != should_like)
                     .collect();
                 let fed_toggles: Vec<crate::federation::FedTrack> = fed_tracks
                     .into_iter()
-                    .filter(|fed| state.fed_likes.contains(&fed.item_id) != should_like)
+                    .filter(|fed| state.fed_track_liked(fed) != should_like)
                     .collect();
                 let total = toggles.len() + fed_toggles.len();
                 state.status_message = Some(if should_like {
@@ -2344,6 +2342,9 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             None
         }
         SettingsRow::DeviceName => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
             let name = state
                 .federation
                 .devices
@@ -2356,16 +2357,32 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             });
             None
         }
-        SettingsRow::DeviceInvite => Some(Effect::DeviceShowInvite),
+        SettingsRow::DeviceInvite => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
+            Some(Effect::DeviceShowInvite)
+        }
         SettingsRow::DeviceConnect => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::ConnectInvite,
                 input: crate::app::input::LineEdit::default(),
             });
             None
         }
-        SettingsRow::DeviceSyncNow => Some(Effect::DeviceSyncNow),
+        SettingsRow::DeviceSyncNow => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
+            Some(Effect::DeviceSyncNow)
+        }
         SettingsRow::Device(index) => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
             let Some(device) = state
                 .federation
                 .devices
@@ -2430,6 +2447,15 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
                 None
             }
         },
+    }
+}
+
+fn require_connected_devices_enabled(state: &mut AppState) -> bool {
+    if state.connected_devices_enabled() {
+        true
+    } else {
+        state.status_message = Some("enable federation before using connected devices".to_string());
+        false
     }
 }
 
