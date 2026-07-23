@@ -406,6 +406,7 @@ impl DeviceSync {
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         let response = read_msg(&mut stream).await?;
         match response {
             WireMessage::PairResponse {
@@ -599,6 +600,7 @@ impl DeviceSync {
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         match read_msg(&mut stream).await? {
             WireMessage::SyncResponse {
                 accepted: true,
@@ -1608,6 +1610,7 @@ async fn handle_pair_request(
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
@@ -1655,6 +1658,7 @@ async fn handle_pair_request(
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         return Ok(());
     }
 
@@ -1691,6 +1695,7 @@ async fn handle_pair_request(
         },
     )
     .await?;
+    finish_send(&mut stream).await?;
     Ok(())
 }
 
@@ -1720,6 +1725,7 @@ async fn handle_hello(
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         return Ok(());
     }
     if !is_active_trusted(&sync, &profile.device_id)? {
@@ -1735,6 +1741,7 @@ async fn handle_hello(
             },
         )
         .await?;
+        finish_send(&mut stream).await?;
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
@@ -1768,6 +1775,7 @@ async fn handle_hello(
         },
     )
     .await?;
+    finish_send(&mut stream).await?;
     sync.gc_tombstones()?;
     Ok(())
 }
@@ -2045,6 +2053,11 @@ async fn write_msg(stream: &mut ByteStream, message: &WireMessage) -> Result<()>
     let mut payload = serde_json::to_vec(message)?;
     payload.push(b'\n');
     stream.send.write_all(&payload).await?;
+    Ok(())
+}
+
+async fn finish_send(stream: &mut ByteStream) -> Result<()> {
+    stream.send.finish()?;
     Ok(())
 }
 
