@@ -159,13 +159,13 @@ fn draw_device_pairing(frame: &mut Frame, device_id: &str, name: &str, client_ve
             Span::raw(device_id.chars().take(24).collect::<String>()),
         ]),
         Line::default(),
-        Line::styled("enter/y accept · n/esc deny", theme::dim()),
+        Line::styled("y accept · n/esc deny", theme::dim()),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
-    let area = centered(frame.area(), 64, 7);
+    let area = centered(frame.area(), 64, 8);
     let block = Block::bordered()
         .title(" Revoke device ")
         .title_style(theme::header())
@@ -173,6 +173,14 @@ fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    let [details, _, buttons, hint, _] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
     let lines = vec![
         Line::from(vec![
             Span::styled("Device   ", theme::dim()),
@@ -182,10 +190,22 @@ fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
             Span::styled("ID       ", theme::dim()),
             Span::raw(device_id.chars().take(24).collect::<String>()),
         ]),
-        Line::default(),
-        Line::styled("enter/y revoke · n/esc cancel", theme::dim()),
     ];
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), details);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Yes  ", theme::danger_button()),
+            Span::raw("  "),
+            Span::styled("  Cancel  ", theme::tab_active()),
+        ]))
+        .alignment(Alignment::Center),
+        buttons,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("y revoke · enter/esc cancel", theme::dim()))
+            .alignment(Alignment::Center),
+        hint,
+    );
 }
 
 /// Metadata edit form: one bordered input per field, the focused field gets

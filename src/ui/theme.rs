@@ -18,6 +18,13 @@ pub fn tab_active() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+pub fn danger_button() -> Style {
+    Style::new()
+        .fg(Color::White)
+        .bg(Color::Rgb(96, 0, 24))
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn selection() -> Style {
     Style::new().fg(Color::White).bg(Color::Rgb(24, 68, 72))
 }

@@ -159,6 +159,9 @@ pub enum SyncOpPayload {
         endpoint_ticket: String,
         endpoint_id: String,
     },
+    DeviceTrusted {
+        target_device_id: String,
+    },
     DeviceRevoked {
         target_device_id: String,
         target_max_seq_seen: i64,
@@ -464,11 +467,14 @@ impl DeviceSync {
             } => {
                 self.set_group_id(&group_id)?;
                 if let Some(profile) = profile {
-                    self.apply_device_profile(&profile, false)?;
+                    self.apply_device_profile(&profile, true)?;
                 }
                 self.apply_device_profiles(&devices)?;
                 self.apply_snapshot(snapshot)?;
                 self.apply_ops(ops)?;
+                self.record_local_op(SyncOpPayload::DeviceTrusted {
+                    target_device_id: invite.device_id.clone(),
+                })?;
                 self.note_peer_vector(&invite.device_id, &vector)?;
                 self.set_last_sync(Some(format!("paired with {}", short_id(&invite.device_id))))?;
                 self.gc_tombstones()?;
@@ -494,17 +500,51 @@ impl DeviceSync {
     }
 
     pub fn answer_pairing(&self, request_id: &str, accept: bool) -> Result<()> {
-        let conn = lock(&self.conn);
-        conn.execute(
-            "UPDATE sync_pending_pairing
-             SET status = ?2, answered_at_ms = ?3
-             WHERE request_id = ?1 AND status = 'pending'",
-            params![
-                request_id,
-                if accept { "accepted" } else { "denied" },
-                now_ms()
-            ],
-        )?;
+        let profile = {
+            let conn = lock(&self.conn);
+            conn.query_row(
+                "SELECT device_id, name, client_version, endpoint_id,
+                        endpoint_ticket, created_at_ms
+                 FROM sync_pending_pairing
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| {
+                    Ok(DeviceProfileWire {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        client_version: row.get(2)?,
+                        protocol_version: PROTOCOL_VERSION,
+                        endpoint_id: row.get(3)?,
+                        endpoint_ticket: row.get(4)?,
+                        revoked: false,
+                        revoke_cutoff_seq: None,
+                        updated_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?
+        };
+        let changed = {
+            let conn = lock(&self.conn);
+            conn.execute(
+                "UPDATE sync_pending_pairing
+                 SET status = ?2, answered_at_ms = ?3
+                 WHERE request_id = ?1 AND status = 'pending'",
+                params![
+                    request_id,
+                    if accept { "accepted" } else { "denied" },
+                    now_ms()
+                ],
+            )?
+        };
+        if accept && changed > 0 {
+            if let Some(profile) = profile {
+                self.apply_device_profile(&profile, true)?;
+                self.record_local_op(SyncOpPayload::DeviceTrusted {
+                    target_device_id: profile.device_id,
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -519,15 +559,6 @@ impl DeviceSync {
                 |row| row.get::<_, i64>(0),
             )?
         };
-        {
-            let conn = lock(&self.conn);
-            conn.execute(
-                "UPDATE sync_devices
-                 SET revoked_at_ms = ?2, revoked_by = ?3, revoke_cutoff_seq = ?4
-                 WHERE device_id = ?1",
-                params![device_id, now_ms(), own, cutoff],
-            )?;
-        }
         self.record_local_op(SyncOpPayload::DeviceRevoked {
             target_device_id: device_id.to_string(),
             target_max_seq_seen: cutoff,
@@ -964,28 +995,113 @@ impl DeviceSync {
                 self.apply_device_profile(&profile, false)?;
                 false
             }
+            SyncOpPayload::DeviceTrusted { target_device_id } => {
+                self.apply_device_trusted(target_device_id, op.hlc_ms)?
+            }
             SyncOpPayload::DeviceRevoked {
                 target_device_id,
                 target_max_seq_seen,
-            } => {
-                let conn = lock(&self.conn);
-                conn.execute(
-                    "UPDATE sync_devices
-                     SET revoked_at_ms = COALESCE(revoked_at_ms, ?2),
-                         revoked_by = ?3,
-                         revoke_cutoff_seq = COALESCE(revoke_cutoff_seq, ?4)
-                     WHERE device_id = ?1",
-                    params![
-                        target_device_id,
-                        op.hlc_ms,
-                        op.origin_device_id,
-                        target_max_seq_seen,
-                    ],
-                )?;
-                true
-            }
+            } => self.apply_device_revoked(
+                target_device_id,
+                op.hlc_ms,
+                &op.origin_device_id,
+                *target_max_seq_seen,
+            )?,
         };
         Ok(changed)
+    }
+
+    fn apply_device_trusted(&self, target_device_id: &str, hlc_ms: i64) -> Result<bool> {
+        let was_revoked = {
+            let conn = lock(&self.conn);
+            conn.query_row(
+                "SELECT revoked_at_ms IS NOT NULL
+                 FROM sync_devices
+                 WHERE device_id = ?1",
+                [target_device_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+                != 0
+        };
+        let conn = lock(&self.conn);
+        conn.execute(
+            "INSERT INTO sync_devices (device_id, trusted_at_ms, last_seen_ms)
+             VALUES (?1, ?2, ?2)
+             ON CONFLICT(device_id) DO UPDATE SET
+                trusted_at_ms = MAX(COALESCE(sync_devices.trusted_at_ms, 0), excluded.trusted_at_ms),
+                last_seen_ms = MAX(COALESCE(sync_devices.last_seen_ms, 0), excluded.last_seen_ms),
+                revoked_at_ms = CASE
+                    WHEN sync_devices.revoked_at_ms IS NOT NULL
+                     AND sync_devices.revoked_at_ms <= excluded.trusted_at_ms
+                    THEN NULL
+                    ELSE sync_devices.revoked_at_ms
+                END,
+                revoked_by = CASE
+                    WHEN sync_devices.revoked_at_ms IS NOT NULL
+                     AND sync_devices.revoked_at_ms <= excluded.trusted_at_ms
+                    THEN NULL
+                    ELSE sync_devices.revoked_by
+                END,
+                revoke_cutoff_seq = CASE
+                    WHEN sync_devices.revoked_at_ms IS NOT NULL
+                     AND sync_devices.revoked_at_ms <= excluded.trusted_at_ms
+                    THEN NULL
+                    ELSE sync_devices.revoke_cutoff_seq
+                END",
+            params![target_device_id, hlc_ms],
+        )?;
+        Ok(was_revoked)
+    }
+
+    fn apply_device_revoked(
+        &self,
+        target_device_id: &str,
+        hlc_ms: i64,
+        revoked_by: &str,
+        target_max_seq_seen: i64,
+    ) -> Result<bool> {
+        let was_active = {
+            let conn = lock(&self.conn);
+            conn.query_row(
+                "SELECT trusted_at_ms IS NOT NULL AND revoked_at_ms IS NULL
+                 FROM sync_devices
+                 WHERE device_id = ?1",
+                [target_device_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+                != 0
+        };
+        let conn = lock(&self.conn);
+        conn.execute(
+            "INSERT INTO sync_devices
+                (device_id, revoked_at_ms, revoked_by, revoke_cutoff_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET
+                revoked_at_ms = CASE
+                    WHEN COALESCE(sync_devices.trusted_at_ms, 0) <= excluded.revoked_at_ms
+                     AND COALESCE(sync_devices.revoked_at_ms, 0) <= excluded.revoked_at_ms
+                    THEN excluded.revoked_at_ms
+                    ELSE sync_devices.revoked_at_ms
+                END,
+                revoked_by = CASE
+                    WHEN COALESCE(sync_devices.trusted_at_ms, 0) <= excluded.revoked_at_ms
+                     AND COALESCE(sync_devices.revoked_at_ms, 0) <= excluded.revoked_at_ms
+                    THEN excluded.revoked_by
+                    ELSE sync_devices.revoked_by
+                END,
+                revoke_cutoff_seq = CASE
+                    WHEN COALESCE(sync_devices.trusted_at_ms, 0) <= excluded.revoked_at_ms
+                     AND COALESCE(sync_devices.revoked_at_ms, 0) <= excluded.revoked_at_ms
+                    THEN excluded.revoke_cutoff_seq
+                    ELSE sync_devices.revoke_cutoff_seq
+                END",
+            params![target_device_id, hlc_ms, revoked_by, target_max_seq_seen,],
+        )?;
+        Ok(was_active)
     }
 
     fn apply_like_state(
@@ -1175,39 +1291,61 @@ impl DeviceSync {
         if profile.device_id == own {
             return Ok(());
         }
-        let conn = lock(&self.conn);
-        conn.execute(
-            "INSERT INTO sync_devices
-                (device_id, name, client_version, protocol_version, endpoint_id,
-                 endpoint_ticket, trusted_at_ms, last_seen_ms, revoked_at_ms,
-                 revoke_cutoff_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(device_id) DO UPDATE SET
-                name = excluded.name,
-                client_version = excluded.client_version,
-                protocol_version = excluded.protocol_version,
-                endpoint_id = excluded.endpoint_id,
-                endpoint_ticket = CASE
-                    WHEN excluded.endpoint_ticket != '' THEN excluded.endpoint_ticket
-                    ELSE sync_devices.endpoint_ticket
-                END,
-                trusted_at_ms = COALESCE(sync_devices.trusted_at_ms, excluded.trusted_at_ms),
-                last_seen_ms = COALESCE(excluded.last_seen_ms, sync_devices.last_seen_ms),
-                revoked_at_ms = COALESCE(sync_devices.revoked_at_ms, excluded.revoked_at_ms),
-                revoke_cutoff_seq = COALESCE(sync_devices.revoke_cutoff_seq, excluded.revoke_cutoff_seq)",
-            params![
-                profile.device_id,
-                profile.name,
-                profile.client_version,
-                profile.protocol_version,
-                profile.endpoint_id,
-                profile.endpoint_ticket,
-                if trusted { now_ms() } else { profile.updated_at_ms },
-                profile.updated_at_ms,
-                if profile.revoked { Some(profile.updated_at_ms) } else { None },
-                profile.revoke_cutoff_seq,
-            ],
-        )?;
+        let trusted_at_ms = if trusted {
+            now_ms()
+        } else {
+            profile.updated_at_ms
+        };
+        {
+            let conn = lock(&self.conn);
+            conn.execute(
+                "INSERT INTO sync_devices
+                    (device_id, name, client_version, protocol_version, endpoint_id,
+                     endpoint_ticket, trusted_at_ms, last_seen_ms, revoked_at_ms,
+                     revoke_cutoff_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    name = excluded.name,
+                    client_version = excluded.client_version,
+                    protocol_version = excluded.protocol_version,
+                    endpoint_id = excluded.endpoint_id,
+                    endpoint_ticket = CASE
+                        WHEN excluded.endpoint_ticket != '' THEN excluded.endpoint_ticket
+                        ELSE sync_devices.endpoint_ticket
+                    END,
+                    trusted_at_ms = MAX(COALESCE(sync_devices.trusted_at_ms, 0), excluded.trusted_at_ms),
+                    last_seen_ms = COALESCE(excluded.last_seen_ms, sync_devices.last_seen_ms),
+                    revoked_at_ms = CASE
+                        WHEN excluded.revoked_at_ms IS NOT NULL
+                         AND COALESCE(sync_devices.trusted_at_ms, 0) <= excluded.revoked_at_ms
+                         AND COALESCE(sync_devices.revoked_at_ms, 0) <= excluded.revoked_at_ms
+                        THEN excluded.revoked_at_ms
+                        ELSE sync_devices.revoked_at_ms
+                    END,
+                    revoke_cutoff_seq = CASE
+                        WHEN excluded.revoked_at_ms IS NOT NULL
+                         AND COALESCE(sync_devices.trusted_at_ms, 0) <= excluded.revoked_at_ms
+                         AND COALESCE(sync_devices.revoked_at_ms, 0) <= excluded.revoked_at_ms
+                        THEN excluded.revoke_cutoff_seq
+                        ELSE sync_devices.revoke_cutoff_seq
+                    END",
+                params![
+                    profile.device_id,
+                    profile.name,
+                    profile.client_version,
+                    profile.protocol_version,
+                    profile.endpoint_id,
+                    profile.endpoint_ticket,
+                    trusted_at_ms,
+                    profile.updated_at_ms,
+                    if profile.revoked { Some(profile.updated_at_ms) } else { None },
+                    profile.revoke_cutoff_seq,
+                ],
+            )?;
+        }
+        if trusted {
+            let _ = self.apply_device_trusted(&profile.device_id, trusted_at_ms)?;
+        }
         Ok(())
     }
 
@@ -2057,6 +2195,7 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
         SyncOpPayload::PlaylistTrackAdded { .. } => "playlist_track_added",
         SyncOpPayload::PlaylistTrackRemoved { .. } => "playlist_track_removed",
         SyncOpPayload::DeviceProfileSet { .. } => "device_profile_set",
+        SyncOpPayload::DeviceTrusted { .. } => "device_trusted",
         SyncOpPayload::DeviceRevoked { .. } => "device_revoked",
     }
 }
@@ -2298,6 +2437,38 @@ fn base64url_decode(value: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn test_sync() -> DeviceSync {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let library_path = std::env::temp_dir().join(format!(
+            "furumi-devices-test-{}-{}.sqlite3",
+            std::process::id(),
+            now_ms()
+        ));
+        let sync = DeviceSync {
+            conn: Arc::new(std::sync::Mutex::new(conn)),
+            library: Arc::new(Library::open(&library_path).unwrap()),
+            event_tx: Arc::new(std::sync::Mutex::new(None)),
+        };
+        sync.ensure_identity().unwrap();
+        sync
+    }
+
+    fn device_revoked(sync: &DeviceSync, device_id: &str) -> bool {
+        let conn = lock(&sync.conn);
+        conn.query_row(
+            "SELECT revoked_at_ms IS NOT NULL
+             FROM sync_devices
+             WHERE device_id = ?1",
+            [device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(0)
+            != 0
+    }
+
     #[test]
     fn base64url_round_trip_without_padding() {
         for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
@@ -2323,5 +2494,42 @@ mod tests {
             }
             .is_tombstone()
         );
+    }
+
+    #[test]
+    fn newer_device_trust_reactivates_revoked_device() {
+        let sync = test_sync();
+        let device_id = "dev_readd";
+
+        sync.apply_device_trusted(device_id, 10).unwrap();
+        assert!(!device_revoked(&sync, device_id));
+
+        sync.apply_device_revoked(device_id, 20, "dev_owner", 0)
+            .unwrap();
+        assert!(device_revoked(&sync, device_id));
+
+        sync.apply_device_trusted(device_id, 30).unwrap();
+        assert!(!device_revoked(&sync, device_id));
+
+        sync.apply_device_revoked(device_id, 25, "dev_owner", 0)
+            .unwrap();
+        assert!(!device_revoked(&sync, device_id));
+
+        sync.apply_device_profile(
+            &DeviceProfileWire {
+                device_id: device_id.to_string(),
+                name: "readded".to_string(),
+                client_version: CLIENT_VERSION.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                endpoint_id: String::new(),
+                endpoint_ticket: String::new(),
+                revoked: true,
+                revoke_cutoff_seq: Some(0),
+                updated_at_ms: 20,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(!device_revoked(&sync, device_id));
     }
 }

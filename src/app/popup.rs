@@ -176,7 +176,7 @@ fn handle_device_pairing(
             }
             state.federation.devices = Some(runtime.devices.status());
         }
-        KeyCode::Enter | KeyCode::Char('y') => {
+        KeyCode::Char('y') => {
             if let Err(err) = runtime.devices.answer_pairing(&request_id, true) {
                 state.status_message = Some(format!("pairing: {err:#}"));
             } else {
@@ -203,8 +203,8 @@ fn handle_device_revoke(
     key: KeyEvent,
 ) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
-        KeyCode::Enter | KeyCode::Char('y') => {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('q') => {}
+        KeyCode::Char('y') => {
             super::perform_effect(
                 state,
                 runtime,
