@@ -939,6 +939,9 @@ pub(crate) fn device_connect(runtime: &Runtime, invite: String) {
     let devices = Arc::clone(&runtime.devices);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
+        let _ = tx.send(AppEvent::StatusMessage(
+            "waiting for device confirmation...".to_string(),
+        ));
         let result = fed
             .device_connect(&invite)
             .await

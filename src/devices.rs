@@ -24,7 +24,9 @@ pub const SYNC_ALPN: &[u8] = b"furumi/sync/1";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: u16 = 1;
 const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
-const PAIRING_WAIT_MS: i64 = 120 * 1000;
+const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
+const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const MAX_OPS_PER_BATCH: usize = 1000;
@@ -208,6 +210,12 @@ struct SnapshotPlaylistItem {
     op_id: String,
 }
 
+enum PairAttempt {
+    Accepted(String),
+    Pending,
+    Denied(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireMessage {
@@ -389,74 +397,99 @@ impl DeviceSync {
             .ticket
             .parse()
             .map_err(|err| anyhow::anyhow!("malformed invite ticket: {err}"))?;
-        let deadline = now_ms() + PAIRING_WAIT_MS;
+        let deadline = (now_ms() + PAIRING_WAIT_MS).min(invite.expires_at_ms);
+        let mut last_error: Option<String>;
         loop {
-            let peer = service.connect(ticket.clone()).await?;
-            let own_ticket = service.ticket().await?.to_string();
-            let profile = self.own_profile(&own_ticket)?;
-            let vector = self.vector()?;
-            let ops = self.ops_for_peer(&invite.device_id)?;
-            let snapshot = self.snapshot()?;
-            let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
-            write_msg(
-                &mut stream,
-                &WireMessage::PairRequest {
-                    invite_id: invite.invite_id.clone(),
-                    secret: invite.secret.clone(),
-                    profile,
-                    vector,
-                    ops,
-                    snapshot,
-                },
-            )
-            .await?;
-            finish_send(&mut stream).await?;
-            let response = read_msg(&mut stream)
+            match self
+                .try_connect_invite(Arc::clone(&service), &invite, ticket.clone())
                 .await
-                .context("pairing response was not received")?;
-            match response {
-                WireMessage::PairResponse {
-                    accepted: true,
-                    group_id: Some(group_id),
-                    profile,
-                    devices,
-                    vector,
-                    ops,
-                    snapshot,
-                    ..
-                } => {
-                    self.set_group_id(&group_id)?;
-                    if let Some(profile) = profile {
-                        self.apply_device_profile(&profile, false)?;
-                    }
-                    self.apply_device_profiles(&devices)?;
-                    self.apply_snapshot(snapshot)?;
-                    self.apply_ops(ops)?;
-                    self.note_peer_vector(&invite.device_id, &vector)?;
-                    self.set_last_sync(Some(format!(
-                        "paired with {}",
-                        short_id(&invite.device_id)
-                    )))?;
-                    self.gc_tombstones()?;
-                    return Ok(format!("connected device {}", short_id(&invite.device_id)));
+            {
+                Ok(PairAttempt::Accepted(message)) => return Ok(message),
+                Ok(PairAttempt::Pending) => last_error = None,
+                Ok(PairAttempt::Denied(message)) => anyhow::bail!(message),
+                Err(err) => {
+                    tracing::debug!("pairing poll failed: {err:#}");
+                    last_error = Some(format!("{err:#}"));
                 }
-                WireMessage::PairResponse {
-                    accepted: false,
-                    pending: true,
-                    ..
-                } => {
-                    if now_ms() >= deadline {
-                        anyhow::bail!("pairing timed out");
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                WireMessage::PairResponse {
-                    accepted: false,
-                    error,
-                    ..
-                } => anyhow::bail!(error.unwrap_or_else(|| "pairing denied".to_string())),
-                _ => anyhow::bail!("unexpected pairing response"),
             }
+            if now_ms() >= deadline {
+                if let Some(error) = last_error {
+                    anyhow::bail!("pairing timed out; last error: {error}");
+                }
+                anyhow::bail!("pairing timed out");
+            }
+            tokio::time::sleep(PAIRING_RETRY_DELAY).await;
+        }
+    }
+
+    async fn try_connect_invite(
+        &self,
+        service: Arc<MusicDhtService>,
+        invite: &InviteWire,
+        ticket: PeerTicket,
+    ) -> Result<PairAttempt> {
+        let peer = service.connect(ticket).await?;
+        let own_ticket = service.ticket().await?.to_string();
+        let profile = self.own_profile(&own_ticket)?;
+        let vector = self.vector()?;
+        let ops = self.ops_for_peer(&invite.device_id)?;
+        let snapshot = self.snapshot()?;
+        let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
+        write_msg(
+            &mut stream,
+            &WireMessage::PairRequest {
+                invite_id: invite.invite_id.clone(),
+                secret: invite.secret.clone(),
+                profile,
+                vector,
+                ops,
+                snapshot,
+            },
+        )
+        .await?;
+        finish_send(&mut stream).await?;
+        match read_msg(&mut stream)
+            .await
+            .context("pairing response was not received")?
+        {
+            WireMessage::PairResponse {
+                accepted: true,
+                group_id: Some(group_id),
+                profile,
+                devices,
+                vector,
+                ops,
+                snapshot,
+                ..
+            } => {
+                self.set_group_id(&group_id)?;
+                if let Some(profile) = profile {
+                    self.apply_device_profile(&profile, false)?;
+                }
+                self.apply_device_profiles(&devices)?;
+                self.apply_snapshot(snapshot)?;
+                self.apply_ops(ops)?;
+                self.note_peer_vector(&invite.device_id, &vector)?;
+                self.set_last_sync(Some(format!("paired with {}", short_id(&invite.device_id))))?;
+                self.gc_tombstones()?;
+                Ok(PairAttempt::Accepted(format!(
+                    "connected device {}",
+                    short_id(&invite.device_id)
+                )))
+            }
+            WireMessage::PairResponse {
+                accepted: false,
+                pending: true,
+                ..
+            } => Ok(PairAttempt::Pending),
+            WireMessage::PairResponse {
+                accepted: false,
+                error,
+                ..
+            } => Ok(PairAttempt::Denied(
+                error.unwrap_or_else(|| "pairing denied".to_string()),
+            )),
+            _ => anyhow::bail!("unexpected pairing response"),
         }
     }
 
@@ -1613,7 +1646,9 @@ async fn handle_pair_request(
     ops: Vec<SyncOpWire>,
     snapshot: SyncSnapshot,
 ) -> Result<()> {
-    if !valid_invite(&sync, &invite_id, &secret)? {
+    profile.endpoint_id = stream.peer_id.to_string();
+    let request_id = pair_request_id(&invite_id, &profile.device_id);
+    if !valid_pair_request(&sync, &invite_id, &secret, &request_id)? {
         tracing::warn!(
             peer = %stream.peer_id,
             invite_id,
@@ -1634,11 +1669,9 @@ async fn handle_pair_request(
             },
         )
         .await?;
-        finish_send(&mut stream).await?;
+        finish_response(&mut stream).await?;
         return Ok(());
     }
-    profile.endpoint_id = stream.peer_id.to_string();
-    let request_id = pair_request_id(&invite_id, &profile.device_id);
     let inserted = {
         let conn = lock(&sync.conn);
         conn.execute(
@@ -1685,7 +1718,7 @@ async fn handle_pair_request(
                 },
             )
             .await?;
-            finish_send(&mut stream).await?;
+            finish_response(&mut stream).await?;
             return Ok(());
         }
         Some("accepted") => {}
@@ -1705,7 +1738,7 @@ async fn handle_pair_request(
                 },
             )
             .await?;
-            finish_send(&mut stream).await?;
+            finish_response(&mut stream).await?;
             return Ok(());
         }
     }
@@ -1744,7 +1777,7 @@ async fn handle_pair_request(
         },
     )
     .await?;
-    finish_send(&mut stream).await?;
+    finish_response(&mut stream).await?;
     Ok(())
 }
 
@@ -1774,7 +1807,7 @@ async fn handle_hello(
             },
         )
         .await?;
-        finish_send(&mut stream).await?;
+        finish_response(&mut stream).await?;
         return Ok(());
     }
     if !is_active_trusted(&sync, &profile.device_id)? {
@@ -1790,7 +1823,7 @@ async fn handle_hello(
             },
         )
         .await?;
-        finish_send(&mut stream).await?;
+        finish_response(&mut stream).await?;
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
@@ -1824,7 +1857,7 @@ async fn handle_hello(
         },
     )
     .await?;
-    finish_send(&mut stream).await?;
+    finish_response(&mut stream).await?;
     sync.gc_tombstones()?;
     Ok(())
 }
@@ -1845,7 +1878,12 @@ fn pair_request_id(invite_id: &str, device_id: &str) -> String {
     format!("pair_{}", &digest.to_hex()[..16])
 }
 
-fn valid_invite(sync: &DeviceSync, invite_id: &str, secret: &str) -> Result<bool> {
+fn valid_pair_request(
+    sync: &DeviceSync,
+    invite_id: &str,
+    secret: &str,
+    request_id: &str,
+) -> Result<bool> {
     let conn = lock(&sync.conn);
     let expected: Option<(String, i64, Option<i64>)> = conn
         .query_row(
@@ -1859,7 +1897,21 @@ fn valid_invite(sync: &DeviceSync, invite_id: &str, secret: &str) -> Result<bool
     let Some((secret_hash, expires_at_ms, used_at_ms)) = expected else {
         return Ok(false);
     };
-    Ok(used_at_ms.is_none() && expires_at_ms >= now_ms() && secret_hash == hash_secret(secret))
+    if expires_at_ms < now_ms() || secret_hash != hash_secret(secret) {
+        return Ok(false);
+    }
+    if used_at_ms.is_none() {
+        return Ok(true);
+    }
+    let accepted: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sync_pending_pairing
+             WHERE request_id = ?1 AND status = 'accepted'",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(accepted.is_some())
 }
 
 fn is_active_trusted(sync: &DeviceSync, device_id: &str) -> Result<bool> {
@@ -2102,6 +2154,12 @@ async fn write_msg(stream: &mut ByteStream, message: &WireMessage) -> Result<()>
 
 async fn finish_send(stream: &mut ByteStream) -> Result<()> {
     stream.send.finish()?;
+    Ok(())
+}
+
+async fn finish_response(stream: &mut ByteStream) -> Result<()> {
+    stream.send.finish()?;
+    let _ = tokio::time::timeout(RESPONSE_DRAIN_TIMEOUT, stream.send.stopped()).await;
     Ok(())
 }
 
