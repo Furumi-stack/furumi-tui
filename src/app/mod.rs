@@ -7,7 +7,9 @@ mod popup;
 pub mod state;
 pub mod update;
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use state::AppState;
 use update::{Effect, update};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+const VISUALIZER_TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Handles shared by background tasks; AppState stays pure UI data.
 pub struct Runtime {
@@ -40,6 +43,8 @@ pub struct Runtime {
     pub fed_resolving: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// Caps concurrent artwork loads so they never starve the disk.
     pub art_semaphore: Arc<tokio::sync::Semaphore>,
+    /// The terminal screen was externally disturbed and needs a full repaint.
+    pub force_redraw: bool,
     /// Monotonic sequence for live search; stale responses are dropped.
     pub search_seq: Arc<std::sync::atomic::AtomicU64>,
     pub player: player::Controller,
@@ -75,6 +80,9 @@ pub async fn run(
         status_message: startup_warning,
         ..AppState::default()
     };
+    if let Err(err) = state.visualizer.load_library() {
+        state.status_message = Some(format!("visualizations disabled: {err:#}"));
+    }
 
     let federation = crate::federation::Federation::new(Arc::clone(&library));
     state.federation.settings = federation.settings();
@@ -86,6 +94,7 @@ pub async fn run(
         fed_status_at: None,
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
         art_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        force_redraw: false,
         search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         player: player::spawn(move |event| {
             let _ = player_events.send(AppEvent::Player(event));
@@ -108,8 +117,14 @@ pub async fn run(
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut visual_tick = tokio::time::interval(VISUALIZER_TICK_INTERVAL);
+    visual_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if runtime.force_redraw {
+            terminal.clear()?;
+            runtime.force_redraw = false;
+        }
         terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
 
         tokio::select! {
@@ -121,12 +136,12 @@ pub async fn run(
             Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
             _ = tick.tick() => {
                 expire_quit_confirmation(&mut state);
-                if state.player.current.is_some() && !runtime.player_start_pending {
-                    state.player.position_secs = runtime.player.shared.position().as_secs_f64();
-                    state.player.paused = runtime.player.shared.paused();
-                }
+                sync_player_shared(&mut state, &runtime);
                 maybe_prefetch_next(&mut state, &runtime);
                 push_media_update(&state, &mut runtime, false);
+            }
+            _ = visual_tick.tick(), if state.visualizer.active => {
+                sync_player_shared(&mut state, &runtime);
             }
         }
 
@@ -136,6 +151,14 @@ pub async fn run(
         }
         maintenance(&mut state, &mut runtime);
     }
+}
+
+fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
+    if state.player.current.is_some() && !runtime.player_start_pending {
+        state.player.position_secs = runtime.player.shared.position().as_secs_f64();
+        state.player.paused = runtime.player.shared.paused();
+    }
+    state.player.audio_analysis = runtime.player.shared.audio_analysis();
 }
 
 const ARTISTS_PREFETCH_MARGIN: usize = 24;
@@ -522,6 +545,27 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 });
             }
         }
+        Effect::OpenVisualizerEditor { path } => match open_visualizer_editor(&path) {
+            Ok(()) => {
+                runtime.force_redraw = true;
+                match state.visualizer.load_library() {
+                    Ok(()) => {
+                        clamp_settings_cursor(state);
+                        state.status_message =
+                            Some(format!("visualization script saved: {}", path.display()));
+                    }
+                    Err(err) => {
+                        state.status_message = Some(format!("visualizations: {err:#}"));
+                    }
+                }
+            }
+            Err(err) => {
+                runtime.force_redraw = true;
+                state.status_message = Some(format!("editor failed: {err:#}"));
+                let _ = state.visualizer.load_library();
+                clamp_settings_cursor(state);
+            }
+        },
         Effect::RemoveQueueIndices {
             restart_paused,
             stop,
@@ -540,6 +584,52 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             }
         }
     }
+}
+
+fn clamp_settings_cursor(state: &mut AppState) {
+    let last = state::settings_rows(state).len().saturating_sub(1);
+    state.settings_cursor = state.settings_cursor.min(last);
+}
+
+fn open_visualizer_editor(path: &Path) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste
+    );
+
+    let status = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", &format!("{editor} {}", path.display())])
+            .status()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} {}", shell_quote(path)))
+            .status()
+    };
+
+    let _ = crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    );
+    let _ = crossterm::terminal::enable_raw_mode();
+
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => anyhow::bail!("editor exited with {status}"),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Start playing `queue[queue_pos]`: open the local file in a background
@@ -578,6 +668,7 @@ fn start_current_audio(
     state.player.playing = true;
     state.player.paused = paused;
     state.player.position_secs = position_secs.max(0.0);
+    state.player.audio_analysis = player::AudioAnalysisSnapshot::default();
     state.player.track_started_at = same_track_started_at.or_else(|| Some(now_epoch_seconds()));
     state.player.prefetched_pos = None;
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));

@@ -17,6 +17,11 @@ use crate::app::state::{AppState, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
+    if state.visualizer.active {
+        crate::visualizer::draw(frame, state);
+        return;
+    }
+
     let [tabs_area, main_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),

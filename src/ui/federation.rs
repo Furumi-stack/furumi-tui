@@ -1,4 +1,4 @@
-//! The Federation tab: settings rows on top, a live status block below.
+//! The Settings tab: federation settings, visualization scripts and status.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,23 +10,32 @@ use crate::app::state::{AppState, FedRow};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::bordered()
-        .title(" Federation ")
+        .title(" Settings ")
         .title_style(theme::header())
         .border_style(theme::dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows_height = FedRow::ALL.len() as u16;
+    let rows_height = (FedRow::ALL.len() + state.visualizer.scripts.len() + 6) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
-        Constraint::Length(rows_height),
+        Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(inner);
 
+    draw_settings_rows(frame, rows_area, state);
+    draw_status(frame, status_area, state);
+}
+
+fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     let settings = &state.federation.settings;
     let on_off = |on: bool| if on { "on" } else { "off" };
-    for (index, row) in FedRow::ALL.iter().enumerate() {
+    let mut y = area.y;
+    let mut cursor = 0usize;
+
+    draw_section(frame, area, &mut y, "Federation");
+    for row in FedRow::ALL {
         let (label, value) = match row {
             FedRow::Toggle => ("Federation", on_off(settings.enabled).to_string()),
             FedRow::NetworkId => (
@@ -45,34 +54,136 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
             FedRow::ShowTicket => ("Show my connection ticket", "↵".to_string()),
             FedRow::Connect => ("Connect to a peer by ticket…", "↵".to_string()),
         };
-        let selected = index == state.federation.cursor;
-        let rect = Rect {
-            x: rows_area.x,
-            y: rows_area.y + index as u16,
-            width: rows_area.width,
-            height: 1,
-        };
-        if rect.y >= rows_area.y + rows_area.height {
-            break;
-        }
-        let marker = if selected { "▶ " } else { "  " };
-        let label_width = 48usize;
-        let line = Line::from(vec![
-            Span::styled(marker, theme::accent()),
-            Span::styled(
-                format!("{label:<label_width$}"),
-                if selected {
-                    theme::accent()
-                } else {
-                    ratatui::style::Style::default()
-                },
-            ),
-            Span::styled(value, theme::dim()),
-        ]);
-        frame.render_widget(Paragraph::new(line), rect);
+        draw_row(
+            frame,
+            area,
+            &mut y,
+            cursor,
+            state.settings_cursor,
+            label,
+            value,
+        );
+        cursor += 1;
     }
 
-    draw_status(frame, status_area, state);
+    y = y.saturating_add(1);
+    draw_section(frame, area, &mut y, "Visualizations");
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Show clock",
+        if state.visualizer.config.show_clock {
+            "[x]".to_string()
+        } else {
+            "[ ]".to_string()
+        },
+    );
+    cursor += 1;
+
+    for (index, script) in state.visualizer.scripts.iter().enumerate() {
+        let selected_script = state
+            .visualizer
+            .selected_script_index()
+            .is_some_and(|selected| selected == index);
+        let label = if selected_script {
+            format!("* {}", script.name)
+        } else {
+            format!("  {}", script.name)
+        };
+        let value = script
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        draw_row(
+            frame,
+            area,
+            &mut y,
+            cursor,
+            state.settings_cursor,
+            &label,
+            value,
+        );
+        cursor += 1;
+    }
+
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "+ New visualization script",
+        "↵".to_string(),
+    );
+    cursor += 1;
+
+    if state.visualizer.selected_script().is_some() {
+        draw_row(
+            frame,
+            area,
+            &mut y,
+            cursor,
+            state.settings_cursor,
+            "Edit selected visualization",
+            "↵".to_string(),
+        );
+    }
+}
+
+fn draw_section(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str) {
+    if *y >= area.y + area.height {
+        return;
+    }
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(Line::styled(title, theme::header())), rect);
+    *y = (*y).saturating_add(1);
+}
+
+fn draw_row(
+    frame: &mut Frame,
+    area: Rect,
+    y: &mut u16,
+    row_index: usize,
+    cursor: usize,
+    label: &str,
+    value: String,
+) {
+    if *y >= area.y + area.height {
+        return;
+    }
+    let selected = row_index == cursor;
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: 1,
+    };
+    let marker = if selected { "▶ " } else { "  " };
+    let label_width = 48usize;
+    let line = Line::from(vec![
+        Span::styled(marker, theme::accent()),
+        Span::styled(
+            format!("{label:<label_width$}"),
+            if selected {
+                theme::accent()
+            } else {
+                ratatui::style::Style::default()
+            },
+        ),
+        Span::styled(value, theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(line), rect);
+    *y = (*y).saturating_add(1);
 }
 
 fn status_line(label: &str, value: String) -> Line<'static> {

@@ -7,6 +7,7 @@ mod media;
 mod player;
 mod share;
 mod ui;
+mod visualizer;
 
 use std::io;
 

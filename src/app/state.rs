@@ -543,7 +543,7 @@ impl FedInputField {
     }
 }
 
-/// Rows of the Federation tab, in display order.
+/// Rows of the federation block inside Settings, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FedRow {
     Toggle,
@@ -565,10 +565,40 @@ impl FedRow {
     ];
 }
 
-/// The Federation tab: settings mirror + the latest status snapshot.
+/// Rows of the Settings tab, in display order. Federation rows are fixed;
+/// visualization script rows are derived from the scripts currently found in
+/// the config directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    Federation(FedRow),
+    VisualizationClock,
+    VisualizationScript(usize),
+    VisualizationNew,
+    VisualizationEdit,
+}
+
+pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
+    let mut rows = Vec::new();
+    rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
+    rows.push(SettingsRow::VisualizationClock);
+    rows.extend(
+        state
+            .visualizer
+            .scripts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| SettingsRow::VisualizationScript(index)),
+    );
+    rows.push(SettingsRow::VisualizationNew);
+    if !state.visualizer.scripts.is_empty() {
+        rows.push(SettingsRow::VisualizationEdit);
+    }
+    rows
+}
+
+/// Federation settings mirror + the latest status snapshot for Settings.
 #[derive(Debug, Default)]
 pub struct FederationTab {
-    pub cursor: usize,
     pub settings: crate::federation::FedSettings,
     pub status: Option<crate::federation::FedStatus>,
 }
@@ -635,7 +665,7 @@ impl Tab {
             Tab::Global => "Global",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
-            Tab::Federation => "Federation",
+            Tab::Federation => "Settings",
             Tab::Logs => "Logs",
         }
     }
@@ -704,6 +734,7 @@ pub struct PlayerBar {
     pub playing: bool,
     pub paused: bool,
     pub position_secs: f64,
+    pub audio_analysis: crate::player::AudioAnalysisSnapshot,
     /// Epoch seconds when the current track started (for history reports).
     pub track_started_at: Option<i64>,
     /// Queue index already enqueued in the audio thread for gapless play.
@@ -725,6 +756,7 @@ impl Default for PlayerBar {
             playing: false,
             paused: false,
             position_secs: 0.0,
+            audio_analysis: crate::player::AudioAnalysisSnapshot::default(),
             track_started_at: None,
             prefetched_pos: None,
             original_order: None,
@@ -747,7 +779,9 @@ pub struct AppState {
     pub help_visible: bool,
     pub pending_keys: Option<String>,
     pub status_message: Option<String>,
+    pub settings_cursor: usize,
     pub player: PlayerBar,
+    pub visualizer: crate::visualizer::VisualizerState,
     pub global: GlobalTab,
     pub artist_views: HashMap<i64, Loadable<ArtistDetail>>,
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,

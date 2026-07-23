@@ -6,7 +6,7 @@ use crate::library::models::TrackItem;
 use super::state::{
     AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, TILE_HEIGHT, TILE_WIDTH, Tab,
     TrackSelectionScope, ViewMode, fed_release_display_order, fed_release_rows,
-    release_display_order, release_rows,
+    release_display_order, release_rows, settings_rows,
 };
 
 pub const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
@@ -43,7 +43,7 @@ pub enum Effect {
         restart_paused: Option<bool>,
         stop: bool,
     },
-    /// Persist the Federation-tab settings and start/stop the node.
+    /// Persist the federation settings and start/stop the node.
     FedApplySettings,
     /// Force an immediate library publish into the DHT.
     FedSyncNow,
@@ -58,6 +58,10 @@ pub enum Effect {
     /// Fetch richer metadata for federated tracks without downloading audio.
     FedFetchTrackInfo {
         tracks: Vec<(i64, crate::federation::FedTrack)>,
+    },
+    /// Temporarily leaves the TUI and opens a visualization script in $EDITOR.
+    OpenVisualizerEditor {
+        path: std::path::PathBuf,
     },
 }
 
@@ -154,6 +158,20 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             state.player.repeat = state.player.repeat.next();
             Some(Effect::SetOptions)
         }
+        Action::ToggleVisualizer => {
+            if state.visualizer.active {
+                state.visualizer.close();
+            } else if state.player.current.is_some() {
+                state.visualizer.open();
+                state.help_visible = false;
+                state.popup = None;
+                state.cmdline.active = false;
+                state.pending_keys = None;
+            } else {
+                state.status_message = Some("nothing playing — start a track first".into());
+            }
+            None
+        }
         Action::MoveUp => {
             move_selection(state, 0, -1);
             None
@@ -219,6 +237,10 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::Select => select_current(state),
+        Action::Back if state.visualizer.active => {
+            state.visualizer.close();
+            None
+        }
         Action::Back if state.track_selection.is_active() => {
             state.track_selection.clear();
             state.status_message = Some("selection cleared".into());
@@ -1460,9 +1482,8 @@ fn page_step(state: &AppState) -> isize {
 fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
     if state.active_tab == Tab::Federation {
         if dy != 0 {
-            let last = super::state::FedRow::ALL.len() as isize - 1;
-            state.federation.cursor =
-                (state.federation.cursor as isize + dy).clamp(0, last) as usize;
+            let last = settings_rows(state).len() as isize - 1;
+            state.settings_cursor = (state.settings_cursor as isize + dy).clamp(0, last) as usize;
         }
         return;
     }
@@ -1719,7 +1740,7 @@ fn current_view_len(state: &AppState) -> usize {
         return state.player.queue.len();
     }
     if state.active_tab == Tab::Federation {
-        return super::state::FedRow::ALL.len();
+        return settings_rows(state).len();
     }
     match state.global.stack.last() {
         None => state.global.artists.len(),
@@ -1766,8 +1787,8 @@ fn jump_selection(state: &mut AppState, first: bool) {
         return;
     }
     if state.active_tab == Tab::Federation {
-        let last = super::state::FedRow::ALL.len() - 1;
-        state.federation.cursor = if first { 0 } else { last };
+        let last = settings_rows(state).len().saturating_sub(1);
+        state.settings_cursor = if first { 0 } else { last };
         return;
     }
     if state.active_tab == Tab::Logs {
@@ -2267,12 +2288,12 @@ fn fed_card_featured_artist_names(track: &crate::federation::FedCardTrack) -> Ve
     names
 }
 
-/// Enter on the Federation tab: toggle switches, open text inputs, run
+/// Enter on Settings: toggle switches, open text inputs, run
 /// one-shot operations. The heavy lifting happens in perform_effect().
 fn federation_select(state: &mut AppState) -> Option<Effect> {
-    use super::state::{FedInputField, FedRow, Popup};
-    match FedRow::ALL.get(state.federation.cursor)? {
-        FedRow::Toggle => {
+    use super::state::{FedInputField, FedRow, Popup, SettingsRow};
+    match settings_rows(state).get(state.settings_cursor).copied()? {
+        SettingsRow::Federation(FedRow::Toggle) => {
             let settings = &mut state.federation.settings;
             if !settings.enabled && settings.network_id.trim().is_empty() {
                 state.popup = Some(Popup::FedInput {
@@ -2284,7 +2305,7 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             settings.enabled = !settings.enabled;
             Some(Effect::FedApplySettings)
         }
-        FedRow::NetworkId => {
+        SettingsRow::Federation(FedRow::NetworkId) => {
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::NetworkId,
                 input: crate::app::input::LineEdit::new(
@@ -2293,19 +2314,64 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             });
             None
         }
-        FedRow::SaveOnListen => {
+        SettingsRow::Federation(FedRow::SaveOnListen) => {
             state.federation.settings.save_on_listen = !state.federation.settings.save_on_listen;
             Some(Effect::FedApplySettings)
         }
-        FedRow::SyncNow => Some(Effect::FedSyncNow),
-        FedRow::ShowTicket => Some(Effect::FedShowTicket),
-        FedRow::Connect => {
+        SettingsRow::Federation(FedRow::SyncNow) => Some(Effect::FedSyncNow),
+        SettingsRow::Federation(FedRow::ShowTicket) => Some(Effect::FedShowTicket),
+        SettingsRow::Federation(FedRow::Connect) => {
             state.popup = Some(Popup::FedInput {
                 field: FedInputField::ConnectTicket,
                 input: crate::app::input::LineEdit::default(),
             });
             None
         }
+        SettingsRow::VisualizationClock => {
+            match state.visualizer.toggle_clock() {
+                Ok(()) => {
+                    state.status_message = Some(format!(
+                        "visualization clock {}",
+                        if state.visualizer.config.show_clock {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ));
+                }
+                Err(err) => state.status_message = Some(format!("visualization settings: {err:#}")),
+            }
+            None
+        }
+        SettingsRow::VisualizationScript(index) => {
+            match state.visualizer.select_script(index) {
+                Ok(()) => {
+                    let name = state
+                        .visualizer
+                        .scripts
+                        .get(index)
+                        .map(|script| script.name.clone())
+                        .unwrap_or_else(|| "visualization".to_string());
+                    state.status_message = Some(format!("visualization: {name}"));
+                }
+                Err(err) => state.status_message = Some(format!("visualization settings: {err:#}")),
+            }
+            None
+        }
+        SettingsRow::VisualizationNew => match state.visualizer.create_script() {
+            Ok(path) => Some(Effect::OpenVisualizerEditor { path }),
+            Err(err) => {
+                state.status_message = Some(format!("visualization script: {err:#}"));
+                None
+            }
+        },
+        SettingsRow::VisualizationEdit => match state.visualizer.selected_script_path() {
+            Some(path) => Some(Effect::OpenVisualizerEditor { path }),
+            None => {
+                state.status_message = Some("no visualization script selected".into());
+                None
+            }
+        },
     }
 }
 
@@ -2397,7 +2463,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.fed_artist_view = None;
         }
         Tab::Playlists => state.playlists.opened = None,
-        Tab::Federation => state.federation.cursor = 0,
+        Tab::Federation => state.settings_cursor = 0,
         Tab::Logs => {
             state.logs.follow = true;
             state.logs.selected_seq = None;
@@ -2790,6 +2856,35 @@ mod tests {
             }
             other => panic!("expected track info popup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn visualizer_requires_current_track() {
+        let mut state = AppState::default();
+
+        assert_eq!(update(&mut state, Action::ToggleVisualizer), None);
+
+        assert!(!state.visualizer.active);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("nothing playing — start a track first")
+        );
+    }
+
+    #[test]
+    fn visualizer_toggles_and_back_closes_it() {
+        let mut state = AppState::default();
+        state.player.current = Some(test_track(7));
+        state.help_visible = true;
+
+        assert_eq!(update(&mut state, Action::ToggleVisualizer), None);
+        assert!(state.visualizer.active);
+        assert!(state.visualizer.started_at.is_some());
+        assert!(!state.help_visible);
+
+        assert_eq!(update(&mut state, Action::Back), None);
+        assert!(!state.visualizer.active);
+        assert!(state.visualizer.started_at.is_none());
     }
 
     #[test]

@@ -90,6 +90,7 @@ Common key bindings:
 | `+`, `-` | Volume up / down |
 | `s` | Toggle shuffle |
 | `r` | Cycle repeat mode |
+| `Shift-L` | Toggle fullscreen visualizer |
 | `x` | Like / unlike |
 | `a` | Add track next |
 | `Shift-A` | Add track to the end of the queue |

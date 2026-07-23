@@ -20,6 +20,7 @@ pub enum KeyContext {
     Search,
     Playlists,
     Queue,
+    #[serde(rename = "settings", alias = "federation")]
     Federation,
     Logs,
 }
@@ -32,7 +33,7 @@ impl KeyContext {
             KeyContext::Search => "search",
             KeyContext::Playlists => "playlists",
             KeyContext::Queue => "queue",
-            KeyContext::Federation => "federation",
+            KeyContext::Federation => "settings",
             KeyContext::Logs => "logs",
         }
     }
@@ -457,6 +458,36 @@ mod tests {
             km.resolve(shift_i, KeyContext::Library),
             KeyResolution::Action(Action::OpenCurrentTrackInfo)
         );
+    }
+
+    #[test]
+    fn default_visualizer_key_resolves() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        let shift_l = KeyCombination::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(
+            km.resolve(shift_l, KeyContext::Library),
+            KeyResolution::Action(Action::ToggleVisualizer)
+        );
+    }
+
+    #[test]
+    fn settings_context_keeps_federation_alias() {
+        let settings = parse_bindings(
+            r#"
+            [[keymaps]]
+            key_sequence = "z"
+            command = "ToggleHelp"
+            context = "settings"
+
+            [[keymaps]]
+            key_sequence = "x"
+            command = "ToggleHelp"
+            context = "federation"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(settings[0].context, KeyContext::Federation);
+        assert_eq!(settings[1].context, KeyContext::Federation);
     }
 
     #[test]

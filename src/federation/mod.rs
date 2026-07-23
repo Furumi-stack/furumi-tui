@@ -265,6 +265,13 @@ impl Federation {
             .as_ref()
             .map(|d| d.data_dir().join("federation-media"))
             .unwrap_or_else(|| PathBuf::from("federation-media"));
+        let initial_error = [&data_dir, &cache_dir, &media_dir]
+            .into_iter()
+            .find_map(|dir| {
+                std::fs::create_dir_all(dir)
+                    .err()
+                    .map(|err| format!("cannot create {}: {err}", dir.display()))
+            });
         Arc::new(Self {
             library,
             data_dir,
@@ -274,7 +281,7 @@ impl Federation {
             settings: std::sync::Mutex::new(load_settings()),
             running: tokio::sync::Mutex::new(None),
             last_sync: std::sync::Mutex::new(None),
-            last_error: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(initial_error),
         })
     }
 
@@ -330,6 +337,8 @@ impl Federation {
             }
             stop_running(guard.take()).await;
         }
+        std::fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
 
         let config = MusicDhtConfig::builder()
             .data_dir(&self.data_dir)

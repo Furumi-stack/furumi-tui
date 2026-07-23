@@ -197,7 +197,7 @@ mod tests {
         .expect("valid link");
         assert_eq!(link.label.as_deref(), Some("Артист"));
         let link = parse_frid_link(
-            "frid://b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            "frid://b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
         .expect("valid link");
         assert_eq!(link.label, None);

@@ -195,6 +195,10 @@ key_sequence = "r"
 command = "CycleRepeat"
 
 [[keymaps]]
+key_sequence = "shift-l"
+command = "ToggleVisualizer"
+
+[[keymaps]]
 key_sequence = "x"
 command = "ToggleLike"
 

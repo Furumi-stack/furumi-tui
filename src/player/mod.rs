@@ -4,12 +4,16 @@
 //! through the callback given to `spawn` — this module knows nothing about
 //! the UI or app state.
 
+mod analyzer;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, Player, stream::MixerDeviceSink};
+
+pub use analyzer::AudioAnalysisSnapshot;
 
 /// Local audio files are read straight from disk.
 pub type TrackReader = std::io::BufReader<std::fs::File>;
@@ -58,6 +62,7 @@ enum Command {
 pub struct Shared {
     position_ms: AtomicU64,
     paused: AtomicBool,
+    analysis: Arc<analyzer::AnalyzerShared>,
 }
 
 impl Shared {
@@ -67,6 +72,10 @@ impl Shared {
 
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn audio_analysis(&self) -> AudioAnalysisSnapshot {
+        self.analysis.snapshot()
     }
 }
 
@@ -140,7 +149,7 @@ fn run(rx: Receiver<Command>, shared: Arc<Shared>, on_event: impl Fn(PlayerEvent
             Ok(command) => {
                 // Commands change the source queue legitimately; resync the
                 // length so the next tick doesn't read it as a track ending.
-                handle(command, &mut output, &mut track_loaded, &on_event);
+                handle(command, &shared, &mut output, &mut track_loaded, &on_event);
                 last_len = output.as_ref().map_or(0, |out| out.player.len());
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -170,6 +179,7 @@ fn run(rx: Receiver<Command>, shared: Arc<Shared>, on_event: impl Fn(PlayerEvent
 
 fn handle(
     command: Command,
+    shared: &Arc<Shared>,
     output: &mut Option<Output>,
     track_loaded: &mut bool,
     on_event: &impl Fn(PlayerEvent),
@@ -208,9 +218,13 @@ fn handle(
             }
             match builder.build() {
                 Ok(decoder) => {
+                    shared.analysis.clear();
                     out.player.stop();
                     out.player.set_volume(volume);
-                    out.player.append(decoder);
+                    out.player.append(analyzer::AnalyzedSource::new(
+                        decoder,
+                        Arc::clone(&shared.analysis),
+                    ));
                     out.player.play();
                     *track_loaded = true;
                     on_event(PlayerEvent::Started);
@@ -232,7 +246,10 @@ fn handle(
                 builder = builder.with_byte_len(len);
             }
             match builder.build() {
-                Ok(decoder) => out.player.append(decoder),
+                Ok(decoder) => out.player.append(analyzer::AnalyzedSource::new(
+                    decoder,
+                    Arc::clone(&shared.analysis),
+                )),
                 Err(err) => {
                     on_event(PlayerEvent::Failed(format!(
                         "cannot decode next track: {err}"
@@ -254,6 +271,7 @@ fn handle(
             if let Some(out) = output.take() {
                 out.player.stop();
             }
+            shared.analysis.clear();
             *track_loaded = false;
         }
         Command::Seek(position) => {
@@ -262,6 +280,7 @@ fn handle(
             {
                 tracing::warn!(%err, "seek failed");
             }
+            shared.analysis.clear();
         }
         Command::SetVolume(volume) => {
             if let Some(out) = output {

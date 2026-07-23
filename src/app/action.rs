@@ -31,6 +31,7 @@ pub enum Action {
     VolumeDown,
     ToggleShuffle,
     CycleRepeat,
+    ToggleVisualizer,
     ToggleLike,
     ToggleTrackSelection,
     OpenTrackInfo,
@@ -96,7 +97,8 @@ impl Action {
             | Action::VolumeUp
             | Action::VolumeDown
             | Action::ToggleShuffle
-            | Action::CycleRepeat => Category::Playback,
+            | Action::CycleRepeat
+            | Action::ToggleVisualizer => Category::Playback,
             Action::QueueAddNext
             | Action::QueueAddLast
             | Action::DownloadSelected
@@ -173,6 +175,7 @@ impl Action {
             Action::VolumeDown => "Volume down".into(),
             Action::ToggleShuffle => "Toggle shuffle".into(),
             Action::CycleRepeat => "Cycle repeat mode".into(),
+            Action::ToggleVisualizer => "Toggle fullscreen visualizer".into(),
             Action::ToggleLike => "Like / unlike".into(),
             Action::ToggleTrackSelection => "Track line selection".into(),
             Action::OpenTrackInfo => "Track info".into(),
