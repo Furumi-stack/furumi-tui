@@ -544,6 +544,8 @@ pub enum Popup {
     ConfirmDeviceRevoke { device_id: String, name: String },
     /// Connected playback devices and their current role/status.
     ConnectedDevices { cursor: usize },
+    /// Full federation, transport and device status details.
+    FederationStatusDetails { scroll: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +595,7 @@ impl FedRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     Federation(FedRow),
+    StatusDetails,
     DeviceName,
     DeviceInvite,
     DeviceConnect,
@@ -751,6 +754,7 @@ pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     if !state.visualizer.scripts.is_empty() {
         rows.push(SettingsRow::VisualizationEdit);
     }
+    rows.push(SettingsRow::StatusDetails);
     rows
 }
 

@@ -2452,6 +2452,10 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             });
             None
         }
+        SettingsRow::StatusDetails => {
+            state.popup = Some(Popup::FederationStatusDetails { scroll: 0 });
+            None
+        }
         SettingsRow::DeviceName => {
             if !require_connected_devices_enabled(state) {
                 return None;
@@ -2851,8 +2855,9 @@ mod tests {
             cover_path: None,
             track_count: 1,
         };
-        // columns = 3 in tests (no tty → 80 wide): albums rows [0,1,2],[3],
-        // compilations row [4,5].
+        let columns = grid_columns();
+        // The terminal size can be visible to tests. Build enough albums to
+        // force a short second album row for whichever width this run has.
         let detail = ArtistDetail {
             id: 1,
             name: "a".into(),
@@ -2861,45 +2866,50 @@ mod tests {
             total_play_count: 0,
             top_tracks: vec![],
             featured_tracks: vec![],
-            releases: vec![
-                release(10, "album"),
-                release(11, "album"),
-                release(12, "album"),
-                release(13, "album"),
-                release(14, "compilation"),
-                release(15, "compilation"),
-            ],
+            releases: (0..=columns)
+                .map(|index| release(10 + index as i64, "album"))
+                .chain((0..2).map(|index| release(100 + index, "compilation")))
+                .collect(),
         };
         let mut state = AppState::default();
         state.artist_views.insert(1, Loadable::Ready(detail));
-        state
-            .global
-            .stack
-            .push(GlobalView::Artist { id: 1, cursor: 4 });
+        state.global.stack.push(GlobalView::Artist {
+            id: 1,
+            cursor: columns + 1,
+        });
 
         // Up from the first compilation lands on the album row directly
-        // above (position 3), not three flat items back.
+        // above, not one flat grid-width jump back.
         update(&mut state, Action::MoveUp);
         assert_eq!(
             state.global.stack.last(),
-            Some(&GlobalView::Artist { id: 1, cursor: 3 })
+            Some(&GlobalView::Artist {
+                id: 1,
+                cursor: columns
+            })
         );
         // And back down returns to the compilation row, same column.
         update(&mut state, Action::MoveDown);
         assert_eq!(
             state.global.stack.last(),
-            Some(&GlobalView::Artist { id: 1, cursor: 4 })
+            Some(&GlobalView::Artist {
+                id: 1,
+                cursor: columns + 1
+            })
         );
         // Up from the second compilation clamps to the single tile above.
         state.global.stack.pop();
-        state
-            .global
-            .stack
-            .push(GlobalView::Artist { id: 1, cursor: 5 });
+        state.global.stack.push(GlobalView::Artist {
+            id: 1,
+            cursor: columns + 2,
+        });
         update(&mut state, Action::MoveUp);
         assert_eq!(
             state.global.stack.last(),
-            Some(&GlobalView::Artist { id: 1, cursor: 3 })
+            Some(&GlobalView::Artist {
+                id: 1,
+                cursor: columns
+            })
         );
     }
 

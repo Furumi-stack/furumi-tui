@@ -39,6 +39,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
         Some(Popup::FedInput { field, input }) => draw_fed_input(frame, field.title(), input),
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
+        Some(Popup::FederationStatusDetails { scroll }) => {
+            draw_federation_status_details(frame, state, *scroll)
+        }
         Some(Popup::DevicePairing {
             device_id,
             name,
@@ -60,6 +63,37 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ConnectedDevices { cursor }) => draw_connected_devices(frame, state, *cursor),
         None => {}
     }
+}
+
+fn draw_federation_status_details(frame: &mut Frame, state: &AppState, scroll: usize) {
+    let width = frame.area().width.saturating_sub(6).clamp(52, 104);
+    let height = frame.area().height.saturating_sub(4).clamp(10, 32);
+    let area = centered(frame.area(), width, height);
+    let block = Block::bordered()
+        .title(" Full status details ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let lines = super::federation::status_detail_lines(state);
+    let max_scroll = lines.len().saturating_sub(usize::from(body.height));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(max_scroll) as u16, 0)),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "j/k scroll - pgup/pgdn page - esc close",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        footer,
+    );
 }
 
 fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {

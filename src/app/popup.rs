@@ -136,6 +136,9 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::FedText { title, text }),
         },
+        Popup::FederationStatusDetails { scroll } => {
+            handle_federation_status_details(state, scroll, key);
+        }
         Popup::DevicePairing {
             request_id,
             device_id,
@@ -161,6 +164,20 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             handle_connected_devices(state, runtime, cursor, key);
         }
     }
+}
+
+fn handle_federation_status_details(state: &mut AppState, scroll: usize, key: KeyEvent) {
+    let next_scroll = match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return,
+        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => scroll + 1,
+        KeyCode::PageUp => scroll.saturating_sub(8),
+        KeyCode::PageDown => scroll + 8,
+        _ => scroll,
+    };
+    state.popup = Some(Popup::FederationStatusDetails {
+        scroll: next_scroll,
+    });
 }
 
 fn handle_connected_devices(

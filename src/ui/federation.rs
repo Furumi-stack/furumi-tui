@@ -32,7 +32,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let rows_height =
-        (settings_rows(state).len() + 5 + device_presence_sections(state).len()) as u16;
+        (settings_rows(state).len() + 6 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -285,7 +285,19 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             "Edit selected visualization",
             "↵".to_string(),
         );
+        cursor += 1;
     }
+
+    y = y.saturating_add(1);
+    draw_row(
+        frame,
+        area,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Full status details",
+        "enter".to_string(),
+    );
 }
 
 fn draw_section(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str) {
@@ -481,7 +493,7 @@ fn push_transport_status(lines: &mut Vec<Line<'static>>, status: &crate::federat
             "Last peer",
             format!(
                 "{} · paths d/r/c/open {}/{}/{}/{}",
-                short_id(&sample.peer_id),
+                sample.peer_id,
                 sample.direct_paths,
                 sample.relay_paths,
                 sample.custom_paths,
@@ -501,7 +513,7 @@ fn push_transport_status(lines: &mut Vec<Line<'static>>, status: &crate::federat
             ),
         ));
     }
-    for sample in transport.last.iter().take(3) {
+    for sample in &transport.last {
         lines.push(Line::from(vec![
             Span::styled(format!("{:<14}", sample.at), theme::dim()),
             Span::raw(format!(
@@ -518,6 +530,267 @@ fn push_transport_status(lines: &mut Vec<Line<'static>>, status: &crate::federat
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    if area.height < 18 || area.width < 36 {
+        frame.render_widget(
+            Paragraph::new(compact_status_lines(state))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
+    let [node_area, _, transport_area, _, devices_area, _] = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+
+    draw_summary_card(frame, node_area, " Status ", node_summary_lines(state));
+    draw_summary_card(
+        frame,
+        transport_area,
+        " Iroh Transport ",
+        transport_summary_lines(state),
+    );
+    draw_summary_card(
+        frame,
+        devices_area,
+        " Connected Devices ",
+        device_summary_lines(state),
+    );
+}
+
+fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::styled("Status", theme::header()));
+    lines.extend(node_summary_lines(state).into_iter().take(2));
+    lines.push(Line::default());
+    lines.push(Line::styled("Iroh Transport", theme::header()));
+    lines.extend(transport_summary_lines(state).into_iter().take(2));
+    lines.push(Line::default());
+    lines.push(Line::styled("Connected Devices", theme::header()));
+    lines.extend(device_summary_lines(state).into_iter().take(2));
+    lines
+}
+
+fn draw_summary_card(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'static>>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(title)
+        .title_style(theme::header())
+        .border_style(theme::dim());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn summary_line(label: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<10}"), theme::dim()),
+        Span::raw(value),
+    ])
+}
+
+fn node_summary_lines(state: &AppState) -> Vec<Line<'static>> {
+    match &state.federation.status {
+        None => vec![
+            summary_line("Node", "loading".to_string()),
+            summary_line("Network", "unknown".to_string()),
+            summary_line("Peers", "waiting for status".to_string()),
+        ],
+        Some(status) if !status.running => {
+            let network = if state.federation.settings.network_id.trim().is_empty() {
+                "network id not set".to_string()
+            } else {
+                state.federation.settings.network_id.clone()
+            };
+            vec![
+                summary_line("Node", "stopped".to_string()),
+                summary_line("Network", network),
+                summary_line(
+                    "Problem",
+                    status
+                        .last_error
+                        .as_deref()
+                        .map(first_line)
+                        .unwrap_or_else(|| "disabled".to_string()),
+                ),
+            ]
+        }
+        Some(status) => vec![
+            summary_line("Node", format!("running on {}", status.network)),
+            summary_line(
+                "Peers",
+                format!(
+                    "{} connected / {} contacts",
+                    status.connected_peers.len(),
+                    status.known_contacts
+                ),
+            ),
+            summary_line(
+                "Library",
+                format!(
+                    "{} published / {} DHT records",
+                    status.published_items,
+                    status
+                        .stored_dht_records
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+            ),
+        ],
+    }
+}
+
+fn transport_summary_lines(state: &AppState) -> Vec<Line<'static>> {
+    let Some(status) = &state.federation.status else {
+        return vec![
+            summary_line("Traffic", "loading".to_string()),
+            summary_line("Streams", "loading".to_string()),
+            summary_line("Path", "loading".to_string()),
+        ];
+    };
+    let transport = &status.transport;
+    if transport.total_samples == 0 {
+        return vec![
+            summary_line("Traffic", "no samples yet".to_string()),
+            summary_line("Streams", format!("{} active", transport.active_streams)),
+            summary_line("Path", "waiting for a stream".to_string()),
+        ];
+    }
+    let runtime_total = transport
+        .runtime_tx_bytes
+        .saturating_add(transport.runtime_rx_bytes);
+    let last_path = transport
+        .last
+        .first()
+        .map(|sample| {
+            format!(
+                "{} / {} / {}",
+                sample.protocol,
+                sample.selected_path,
+                rtt_label(sample.selected_rtt_ms)
+            )
+        })
+        .unwrap_or_else(|| "no recent stream".to_string());
+    vec![
+        summary_line(
+            "Traffic",
+            format!(
+                "{} (tx {} / rx {})",
+                short_bytes_label(runtime_total),
+                short_bytes_label(transport.runtime_tx_bytes),
+                short_bytes_label(transport.runtime_rx_bytes)
+            ),
+        ),
+        summary_line(
+            "Streams",
+            format!(
+                "{} active / {} samples",
+                transport.active_streams, transport.total_samples
+            ),
+        ),
+        summary_line(
+            "Paths",
+            format!(
+                "direct {} / relay {} / custom {}",
+                transport.direct_samples, transport.relay_samples, transport.custom_samples
+            ),
+        ),
+        summary_line("Last", last_path),
+    ]
+}
+
+fn device_summary_lines(state: &AppState) -> Vec<Line<'static>> {
+    if !state.connected_devices_enabled() {
+        return vec![
+            summary_line("Sync", "disabled".to_string()),
+            summary_line("This", state.device_playback.self_device_name.clone()),
+            summary_line("Devices", "enable federation first".to_string()),
+        ];
+    }
+    let Some(status) = &state.federation.devices else {
+        return vec![
+            summary_line("Sync", "loading".to_string()),
+            summary_line("This", state.device_playback.self_device_name.clone()),
+            summary_line("Devices", "waiting for device status".to_string()),
+        ];
+    };
+    let (online, offline, revoked) = device_presence_counts(state);
+    let this_name = if status.this_device_name.trim().is_empty() {
+        short_id(&status.this_device_id)
+    } else {
+        format!(
+            "{} / {}",
+            status.this_device_name,
+            short_id(&status.this_device_id)
+        )
+    };
+    vec![
+        summary_line("This", this_name),
+        summary_line(
+            "Devices",
+            format!(
+                "{} active / {} online / {} pending",
+                status.active_devices, online, status.pending_requests
+            ),
+        ),
+        summary_line(
+            "Sync",
+            format!(
+                "{} outbox / last {}",
+                status.outbox_ops,
+                status
+                    .last_sync
+                    .clone()
+                    .unwrap_or_else(|| "not yet".to_string())
+            ),
+        ),
+        summary_line(
+            "Other",
+            format!("{} offline / {} revoked", offline, revoked),
+        ),
+    ]
+}
+
+fn device_presence_counts(state: &AppState) -> (usize, usize, usize) {
+    let Some(status) = &state.federation.devices else {
+        return (0, 0, 0);
+    };
+    let now = crate::app::state::unix_time_ms();
+    let mut online = 0usize;
+    let mut offline = 0usize;
+    let mut revoked = 0usize;
+    for device in &status.devices {
+        match crate::app::state::device_presence_section(state, device, now) {
+            DevicePresenceSection::Online => online += 1,
+            DevicePresenceSection::Offline => offline += 1,
+            DevicePresenceSection::Revoked => revoked += 1,
+        }
+    }
+    (online, offline, revoked)
+}
+
+fn first_line(value: &str) -> String {
+    value.lines().next().unwrap_or(value).to_string()
+}
+
+pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![Line::styled("Status", theme::header())];
     match &state.federation.status {
         None => lines.push(Line::styled("loading…", theme::dim())),
@@ -540,21 +813,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.push(status_line("Node", format!("running · {}", status.network)));
             lines.push(status_line(
                 "Endpoint",
-                format!(
-                    "{} · dht {}",
-                    short_id(&status.endpoint_id),
-                    short_id(&status.dht_node_id)
-                ),
+                format!("{} · dht {}", status.endpoint_id, status.dht_node_id),
             ));
             let peers = if status.connected_peers.is_empty() {
                 format!("none · contacts {}", status.known_contacts)
             } else {
-                let names: Vec<String> = status
-                    .connected_peers
-                    .iter()
-                    .take(3)
-                    .map(|p| short_id(p))
-                    .collect();
+                let names: Vec<String> = status.connected_peers.iter().map(String::clone).collect();
                 let more = status.connected_peers.len().saturating_sub(names.len());
                 let more = if more > 0 {
                     format!(" +{more}")
@@ -605,13 +869,9 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         Some(status) => {
             lines.push(status_line(
                 "This device",
-                format!(
-                    "{} · {}",
-                    status.this_device_name,
-                    short_id(&status.this_device_id)
-                ),
+                format!("{} · {}", status.this_device_name, status.this_device_id),
             ));
-            lines.push(status_line("Sync group", short_id(&status.group_id)));
+            lines.push(status_line("Sync group", status.group_id.clone()));
             lines.push(status_line(
                 "Devices",
                 format!(
@@ -647,7 +907,70 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             if let Some(last_error) = &status.last_error {
                 lines.push(status_line("Device error", last_error.clone()));
             }
+            lines.push(Line::default());
+            lines.push(Line::styled("Device List", theme::header()));
+            if status.devices.is_empty() {
+                lines.push(status_line("Devices", "none recorded".to_string()));
+            } else {
+                let ordered = crate::app::state::device_status_order(state);
+                let now = crate::app::state::unix_time_ms();
+                for index in &ordered {
+                    if let Some(device) = status.devices.get(*index) {
+                        push_device_detail(&mut lines, state, device, now);
+                    }
+                }
+                for (index, device) in status.devices.iter().enumerate() {
+                    if !ordered.contains(&index) {
+                        push_device_detail(&mut lines, state, device, now);
+                    }
+                }
+            }
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    lines
+}
+
+fn push_device_detail(
+    lines: &mut Vec<Line<'static>>,
+    state: &AppState,
+    device: &crate::devices::DeviceStatusRow,
+    now_ms: i64,
+) {
+    let mut name = crate::app::state::device_display_name(device);
+    if device.is_self {
+        name.push_str(" (this device)");
+    }
+    if device.revoked {
+        name.push_str(" (revoked)");
+    }
+    let presence = match crate::app::state::device_presence_section(state, device, now_ms) {
+        DevicePresenceSection::Online => "online",
+        DevicePresenceSection::Offline => "offline",
+        DevicePresenceSection::Revoked => "revoked",
+    };
+    lines.push(status_line("Device", name));
+    lines.push(status_line("Device ID", device.device_id.clone()));
+    lines.push(status_line(
+        "Endpoint ID",
+        if device.endpoint_id.trim().is_empty() {
+            "unavailable".to_string()
+        } else {
+            device.endpoint_id.clone()
+        },
+    ));
+    lines.push(status_line(
+        "Version",
+        if device.client_version.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            device.client_version.clone()
+        },
+    ));
+    lines.push(status_line(
+        "Presence",
+        match device.last_seen_ms {
+            Some(seen) => format!("{presence} · last seen {seen} ms"),
+            None => format!("{presence} · last seen unavailable"),
+        },
+    ));
 }
