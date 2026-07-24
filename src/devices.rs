@@ -255,6 +255,8 @@ pub struct PlaybackSnapshot {
 pub enum PlaybackCommand {
     SetState {
         state: PlaybackStateWire,
+        #[serde(default)]
+        seek: bool,
     },
     ActiveChanged {
         active_device_id: String,
@@ -3527,6 +3529,7 @@ mod tests {
                 shuffle: false,
                 repeat: PlaybackRepeat::Off,
             },
+            seek: false,
         };
 
         sync.apply_playback_command("dev_other", &command, "op_other")

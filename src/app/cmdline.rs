@@ -135,6 +135,30 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     }
 }
 
+/// Refresh only the local-library half of an already open search.
+///
+/// Library/device sync notifications can arrive while federated search
+/// results are visible. Reusing `schedule_search` here would clear the
+/// federation rows and bump the shared sequence, causing valid network
+/// responses to be dropped or flicker away.
+pub(super) fn refresh_local_search(state: &mut AppState, runtime: &Runtime) {
+    let query = state.search.query.clone();
+    if query.is_empty() {
+        return;
+    }
+    let seq = runtime.search_seq.load(Ordering::SeqCst);
+    let library = Arc::clone(&runtime.library);
+    state.search.loading = true;
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || library.search(&query, SEARCH_LIMIT))
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+        let _ = tx.send(AppEvent::SearchLoaded { seq, result });
+    });
+}
+
 /// Enter: close the line. Live commands already took effect (their view
 /// stays open); one-shot commands execute here.
 fn commit(state: &mut AppState, runtime: &mut Runtime) {

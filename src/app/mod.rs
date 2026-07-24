@@ -561,13 +561,10 @@ fn record_active_handoff(
         active_device_name: state.device_playback.self_device_name.clone(),
         state: playback_state_from_ui(state),
     };
-    if let Err(err) = runtime.devices.record_playback_command(&target, command) {
-        tracing::warn!(%err, target, "recording active handoff command failed");
-        state.status_message = Some(format!("device handoff failed: {err:#}"));
-    }
+    record_playback_command_async(runtime, target, command, "device handoff");
 }
 
-fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
+fn record_control_playback_state(state: &mut AppState, runtime: &Runtime, seek: bool) {
     if !state.device_playback.is_control() {
         return;
     }
@@ -577,31 +574,77 @@ fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
     };
     let command = crate::devices::PlaybackCommand::SetState {
         state: playback_state_from_ui(state),
+        seek,
     };
-    if let Err(err) = runtime.devices.record_playback_command(&target, command) {
-        tracing::warn!(%err, target, "recording playback command failed");
-        state.status_message = Some(format!("device command failed: {err:#}"));
-    } else {
-        request_urgent_device_sync(runtime);
-    }
+    record_playback_command_async(runtime, target, command, "device command");
+}
+
+fn record_playback_command_async(
+    runtime: &Runtime,
+    target: String,
+    command: crate::devices::PlaybackCommand,
+    label: &'static str,
+) {
+    let devices = Arc::clone(&runtime.devices);
+    let sync_devices = Arc::clone(&runtime.devices);
+    let federation = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    let sync_tx = runtime.event_tx.clone();
+    let running = Arc::clone(&runtime.device_sync_running);
+    let requested = Arc::clone(&runtime.device_sync_requested);
+    tokio::spawn(async move {
+        let target_for_write = target.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            devices.record_playback_command(&target_for_write, command)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                request_urgent_device_sync_parts(
+                    federation,
+                    sync_devices,
+                    sync_tx,
+                    running,
+                    requested,
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%err, target, "recording playback command failed");
+                let _ = tx.send(AppEvent::StatusMessage(format!("{label} failed: {err:#}")));
+            }
+            Err(err) => {
+                tracing::warn!(%err, target, "recording playback command task failed");
+                let _ = tx.send(AppEvent::StatusMessage(format!("{label} failed: {err}")));
+            }
+        }
+    });
 }
 
 fn request_urgent_device_sync(runtime: &Runtime) {
+    request_urgent_device_sync_parts(
+        Arc::clone(&runtime.federation),
+        Arc::clone(&runtime.devices),
+        runtime.event_tx.clone(),
+        Arc::clone(&runtime.device_sync_running),
+        Arc::clone(&runtime.device_sync_requested),
+    );
+}
+
+fn request_urgent_device_sync_parts(
+    federation: Arc<crate::federation::Federation>,
+    devices: Arc<crate::devices::DeviceSync>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    requested: Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::Ordering;
 
-    runtime.device_sync_requested.store(true, Ordering::SeqCst);
-    if runtime
-        .device_sync_running
+    requested.store(true, Ordering::SeqCst);
+    if running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        spawn_urgent_device_sync(
-            Arc::clone(&runtime.federation),
-            Arc::clone(&runtime.devices),
-            runtime.event_tx.clone(),
-            Arc::clone(&runtime.device_sync_running),
-            Arc::clone(&runtime.device_sync_requested),
-        );
+        spawn_urgent_device_sync(federation, devices, tx, running, requested);
     }
 }
 
@@ -1171,12 +1214,14 @@ fn is_controlled_playback_effect(effect: &Effect) -> bool {
 }
 
 fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
+    let mut seek = false;
     match effect {
         Effect::PlayCurrent => {
             state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
             state.player.playing = state.player.current.is_some();
             state.player.paused = false;
             state.player.position_secs = 0.0;
+            seek = true;
         }
         Effect::TogglePause => {}
         Effect::StopPlayback => {
@@ -1187,6 +1232,7 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
         }
         Effect::SeekBy(delta) => {
             state.player.position_secs = (state.player.position_secs + delta as f64).max(0.0);
+            seek = true;
         }
         Effect::SetVolume(volume) => {
             state.player.volume = volume.min(100);
@@ -1195,7 +1241,7 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
         Effect::SetOptions | Effect::RemoveQueueIndices { .. } | Effect::PlaybackQueueChanged => {}
         _ => {}
     }
-    record_control_playback_state(state, runtime);
+    record_control_playback_state(state, runtime, seek);
 }
 
 fn clamp_settings_cursor(state: &mut AppState) {
@@ -1856,7 +1902,8 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
         });
     }
 
-    // A live search view shows stale rows now; run the query again.
+    // A live search view shows stale local rows now; refresh only the local
+    // half so device-sync/library events do not wipe federated results.
     if state
         .global
         .stack
@@ -1864,7 +1911,7 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
         .any(|view| matches!(view, state::GlobalView::Search { .. }))
         && !state.search.query.is_empty()
     {
-        cmdline::schedule_search(state, runtime);
+        cmdline::refresh_local_search(state, runtime);
     }
 }
 
@@ -2037,7 +2084,7 @@ fn handle_playback_command(
     command: crate::devices::PlaybackCommand,
 ) {
     match command {
-        crate::devices::PlaybackCommand::SetState { state: wire } => {
+        crate::devices::PlaybackCommand::SetState { state: wire, seek } => {
             let old_current_key = state.player.current.as_ref().map(track_playback_key);
             let old_playing = state.player.playing;
             let old_paused = state.player.paused;
@@ -2063,9 +2110,11 @@ fn handle_playback_command(
                 );
                 push_media_metadata(state, runtime);
             } else {
-                runtime.player.seek(std::time::Duration::from_secs_f64(
-                    state.player.position_secs,
-                ));
+                if seek {
+                    runtime.player.seek(std::time::Duration::from_secs_f64(
+                        state.player.position_secs,
+                    ));
+                }
                 if state.player.paused && !old_paused {
                     runtime.player.pause();
                 } else if !state.player.paused && old_paused {
@@ -2604,7 +2653,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::EnqueueTracks { tracks, next } => {
             let count = tracks.len();
             update::enqueue_tracks(state, tracks, next);
-            record_control_playback_state(state, runtime);
+            record_control_playback_state(state, runtime, false);
             state.status_message = Some(if next {
                 format!("{count} tracks queued next")
             } else {
@@ -2689,7 +2738,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     state.player.paused = false;
                     state.player.current = None;
                     if state.device_playback.is_control() {
-                        record_control_playback_state(state, runtime);
+                        record_control_playback_state(state, runtime, false);
                     } else {
                         runtime.player.stop();
                         push_media_update(state, runtime, true);
