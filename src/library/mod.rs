@@ -867,6 +867,43 @@ impl Library {
         Ok(())
     }
 
+    pub fn remove_content_ids_from_playlist(
+        &self,
+        playlist_id: i64,
+        content_ids: &[String],
+    ) -> Result<()> {
+        let conn = self.lock();
+        let playlist_sync_id: Option<String> = conn
+            .query_row(
+                "SELECT sync_id FROM playlists WHERE id = ?1",
+                [playlist_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        for content_id in content_ids {
+            let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+                continue;
+            };
+            conn.execute(
+                "DELETE FROM playlist_tracks
+                 WHERE playlist_id = ?1
+                   AND track_id IN (
+                    SELECT id FROM tracks WHERE content_id = ?2
+                   )",
+                params![playlist_id, content_id],
+            )?;
+            if let Some(sync_id) = playlist_sync_id.as_deref() {
+                conn.execute(
+                    "DELETE FROM fed_playlist_tracks
+                     WHERE playlist_sync_id = ?1 AND content_id = ?2",
+                    params![sync_id, content_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn track_content_id_by_id(&self, track_id: i64) -> Result<Option<String>> {
         let conn = self.lock();
         let content_id: Option<String> = conn
@@ -879,26 +916,6 @@ impl Library {
             .flatten()
             .and_then(|value| music_dht::normalize_content_id(&value));
         Ok(content_id)
-    }
-
-    pub fn track_content_ids(&self, track_ids: &[i64]) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut out = Vec::new();
-        for &track_id in track_ids {
-            let content_id: Option<String> = conn
-                .query_row(
-                    "SELECT content_id FROM tracks WHERE id = ?1",
-                    [track_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten()
-                .and_then(|value| music_dht::normalize_content_id(&value));
-            if let Some(content_id) = content_id {
-                out.push(content_id);
-            }
-        }
-        Ok(out)
     }
 
     pub fn playlist_track_content_positions(
@@ -2115,9 +2132,14 @@ mod tests {
             .unwrap();
         assert_eq!(card.track_count, 1);
 
-        lib.remove_content_id_from_synced_playlist(&sync_id, &content_id)
+        lib.remove_content_ids_from_playlist(playlist.id, std::slice::from_ref(&content_id))
             .unwrap();
         assert_eq!(lib.playlist(playlist.id).unwrap().tracks.len(), 0);
+        assert!(
+            lib.fed_playlist_track_by_content_id(&sync_id, &content_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

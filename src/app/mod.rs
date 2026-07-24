@@ -481,15 +481,20 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         Effect::RemoveFromPlaylist {
             playlist_id,
             track_ids,
+            content_ids,
         } => {
             let library = Arc::clone(&runtime.library);
             let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let event = match library.remove_tracks_from_playlist(playlist_id, &track_ids) {
+                let event = match library
+                    .remove_tracks_from_playlist(playlist_id, &track_ids)
+                    .and_then(|()| {
+                        library.remove_content_ids_from_playlist(playlist_id, &content_ids)
+                    }) {
                     Ok(()) => {
                         if let Err(err) =
-                            devices.record_playlist_tracks_removed(playlist_id, &track_ids)
+                            devices.record_playlist_content_removed(playlist_id, &content_ids)
                         {
                             tracing::warn!(%err, playlist_id, "recording synced playlist removal failed");
                         }

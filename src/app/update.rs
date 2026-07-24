@@ -37,6 +37,7 @@ pub enum Effect {
     RemoveFromPlaylist {
         playlist_id: i64,
         track_ids: Vec<i64>,
+        content_ids: Vec<String>,
     },
     RemoveQueueIndices {
         indices: Vec<usize>,
@@ -607,6 +608,15 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
                     return None;
                 }
                 let track_ids: Vec<i64> = tracks.iter().map(|track| track.id).collect();
+                let content_ids: Vec<String> = tracks
+                    .iter()
+                    .filter_map(|track| {
+                        track
+                            .content_id
+                            .as_deref()
+                            .and_then(music_dht::normalize_content_id)
+                    })
+                    .collect();
                 state.track_selection.clear();
                 if opened.id == super::state::LIKES_PLAYLIST_ID {
                     let liked: Vec<i64> = track_ids
@@ -626,6 +636,7 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
                 return Some(Effect::RemoveFromPlaylist {
                     playlist_id: opened.id,
                     track_ids,
+                    content_ids,
                 });
             }
         }

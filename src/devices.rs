@@ -5,7 +5,7 @@
 //! materialized tables, so offline clients can merge likes, playlists and
 //! membership changes deterministically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -191,7 +191,13 @@ struct SyncSnapshot {
     #[serde(default)]
     likes: Vec<SnapshotLike>,
     #[serde(default)]
+    unlikes: Vec<SnapshotLikeTombstone>,
+    #[serde(default)]
     playlists: Vec<SnapshotPlaylist>,
+    #[serde(default)]
+    deleted_playlists: Vec<SnapshotPlaylistTombstone>,
+    #[serde(default)]
+    removed_playlist_items: Vec<SnapshotPlaylistItemTombstone>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +207,13 @@ struct SnapshotLike {
     op_id: String,
     #[serde(default)]
     fed: Option<SyncedFedTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotLikeTombstone {
+    content_id: String,
+    hlc_ms: i64,
+    op_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +227,13 @@ struct SnapshotPlaylist {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotPlaylistTombstone {
+    playlist_id: String,
+    hlc_ms: i64,
+    op_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotPlaylistItem {
     content_id: String,
     position: i64,
@@ -221,6 +241,14 @@ struct SnapshotPlaylistItem {
     op_id: String,
     #[serde(default)]
     fed: Option<SyncedFedTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotPlaylistItemTombstone {
+    playlist_id: String,
+    content_id: String,
+    hlc_ms: i64,
+    op_id: String,
 }
 
 enum PairAttempt {
@@ -769,15 +797,22 @@ impl DeviceSync {
         Ok(())
     }
 
-    pub fn record_playlist_tracks_removed(
+    pub fn record_playlist_content_removed(
         &self,
         playlist_id: i64,
-        track_ids: &[i64],
+        content_ids: &[String],
     ) -> Result<()> {
         let Some(playlist_id) = self.library.playlist_sync_id(playlist_id)? else {
             return Ok(());
         };
-        for content_id in self.library.track_content_ids(track_ids)? {
+        let mut seen = BTreeSet::new();
+        for content_id in content_ids {
+            let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+                continue;
+            };
+            if !seen.insert(content_id.clone()) {
+                continue;
+            }
             self.record_local_op(SyncOpPayload::PlaylistTrackRemoved {
                 playlist_id: playlist_id.clone(),
                 content_id,
@@ -1442,6 +1477,10 @@ impl DeviceSync {
                 &like.op_id,
             )?;
         }
+        for like in snapshot.unlikes {
+            changed |=
+                self.apply_like_state(&like.content_id, false, None, like.hlc_ms, &like.op_id)?;
+        }
         for playlist in snapshot.playlists {
             changed |= self.apply_playlist_state(
                 &playlist.playlist_id,
@@ -1461,6 +1500,26 @@ impl DeviceSync {
                     &item.op_id,
                 )?;
             }
+        }
+        for playlist in snapshot.deleted_playlists {
+            changed |= self.apply_playlist_state(
+                &playlist.playlist_id,
+                "",
+                true,
+                playlist.hlc_ms,
+                &playlist.op_id,
+            )?;
+        }
+        for item in snapshot.removed_playlist_items {
+            changed |= self.apply_playlist_item_state(
+                &item.playlist_id,
+                &item.content_id,
+                false,
+                0,
+                None,
+                item.hlc_ms,
+                &item.op_id,
+            )?;
         }
         if changed {
             self.notify_library_changed();
@@ -1636,6 +1695,23 @@ impl DeviceSync {
                 fed,
             });
         }
+        let unlikes = {
+            let conn = lock(&self.conn);
+            let mut stmt = conn.prepare(
+                "SELECT content_id, hlc_ms, op_id
+                 FROM sync_state_likes
+                 WHERE liked = 0
+                 ORDER BY content_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok(SnapshotLikeTombstone {
+                    content_id: row.get(0)?,
+                    hlc_ms: row.get(1)?,
+                    op_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
 
         let conn = lock(&self.conn);
         let mut playlist_stmt = conn.prepare(
@@ -1698,7 +1774,46 @@ impl DeviceSync {
                 items,
             });
         }
-        Ok(SyncSnapshot { likes, playlists })
+        let deleted_playlists = {
+            let mut stmt = conn.prepare(
+                "SELECT playlist_id, hlc_ms, op_id
+                 FROM sync_state_playlists
+                 WHERE deleted = 1
+                 ORDER BY playlist_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok(SnapshotPlaylistTombstone {
+                    playlist_id: row.get(0)?,
+                    hlc_ms: row.get(1)?,
+                    op_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let removed_playlist_items = {
+            let mut stmt = conn.prepare(
+                "SELECT playlist_id, content_id, hlc_ms, op_id
+                 FROM sync_state_playlist_items
+                 WHERE present = 0
+                 ORDER BY playlist_id, content_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok(SnapshotPlaylistItemTombstone {
+                    playlist_id: row.get(0)?,
+                    content_id: row.get(1)?,
+                    hlc_ms: row.get(2)?,
+                    op_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(SyncSnapshot {
+            likes,
+            unlikes,
+            playlists,
+            deleted_playlists,
+            removed_playlist_items,
+        })
     }
 
     fn device_profiles(&self) -> Result<Vec<DeviceProfileWire>> {
@@ -2548,6 +2663,7 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
 }
 
 fn compactable_tombstone_ids(conn: &Connection) -> Result<Vec<(String, String, i64)>> {
+    let own_device_id = get_meta(conn, "device_id")?.unwrap_or_default();
     let active_devices = conn
         .prepare(
             "SELECT device_id FROM sync_devices
@@ -2582,25 +2698,31 @@ fn compactable_tombstone_ids(conn: &Connection) -> Result<Vec<(String, String, i
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
     for (op_id, origin, seq) in rows {
+        let local_vector: i64 = conn
+            .query_row(
+                "SELECT max_seq FROM sync_vectors
+                 WHERE device_id = ?1",
+                [&origin],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
         let mut all_acked = true;
         for device in &active_devices {
-            let ack: Option<i64> = conn
-                .query_row(
+            let seen = if device == &own_device_id {
+                local_vector
+            } else if device == &origin {
+                seq
+            } else {
+                conn.query_row(
                     "SELECT max_seq FROM sync_peer_acks
                      WHERE peer_device_id = ?1 AND origin_device_id = ?2",
                     params![device, origin],
                     |row| row.get(0),
                 )
-                .optional()?;
-            let local_vector: Option<i64> = conn
-                .query_row(
-                    "SELECT max_seq FROM sync_vectors
-                     WHERE device_id = ?1",
-                    [&origin],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let seen = ack.or(local_vector).unwrap_or(0);
+                .optional()?
+                .unwrap_or(0)
+            };
             if seen < seq {
                 all_acked = false;
                 break;
@@ -2897,6 +3019,97 @@ mod tests {
         )
         .unwrap();
         assert!(!device_revoked(&sync, device_id));
+    }
+
+    #[test]
+    fn tombstone_gc_waits_for_every_active_remote_ack() {
+        let sync = test_sync();
+        let origin = sync.ensure_identity().unwrap().device_id;
+        sync.apply_device_trusted("dev_a", 1).unwrap();
+        sync.apply_device_trusted("dev_b", 1).unwrap();
+
+        sync.record_local_op(SyncOpPayload::PlaylistDeleted {
+            playlist_id: "pl_deleted".to_string(),
+        })
+        .unwrap();
+        {
+            let conn = lock(&sync.conn);
+            let tombstones: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_ops WHERE tombstone = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tombstones, 1);
+        }
+
+        let ack = BTreeMap::from([(origin, 1)]);
+        sync.note_peer_vector("dev_a", &ack).unwrap();
+        sync.gc_tombstones().unwrap();
+        {
+            let conn = lock(&sync.conn);
+            let tombstones: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_ops WHERE tombstone = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tombstones, 1);
+        }
+
+        sync.note_peer_vector("dev_b", &ack).unwrap();
+        sync.gc_tombstones().unwrap();
+        let conn = lock(&sync.conn);
+        let tombstones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_ops WHERE tombstone = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 0);
+    }
+
+    #[test]
+    fn snapshot_carries_deleted_playlists_to_repair_stale_peers() {
+        let source = test_sync();
+        let source_playlist = source.library.create_playlist("Gone").unwrap();
+        let playlist_sync_id = source
+            .library
+            .ensure_playlist_sync_id(source_playlist.id)
+            .unwrap();
+        source
+            .apply_playlist_state(&playlist_sync_id, "Gone", false, 10, "dev_remote:1")
+            .unwrap();
+        source
+            .apply_playlist_state(&playlist_sync_id, "", true, 20, "dev_remote:2")
+            .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        assert!(
+            snapshot
+                .deleted_playlists
+                .iter()
+                .any(|playlist| playlist.playlist_id == playlist_sync_id)
+        );
+
+        let peer = test_sync();
+        let peer_playlist = peer
+            .library
+            .upsert_synced_playlist(&playlist_sync_id, "Gone")
+            .unwrap();
+        assert!(peer.library.playlist(peer_playlist).is_ok());
+
+        peer.apply_snapshot(snapshot).unwrap();
+        assert!(
+            !peer
+                .library
+                .playlists()
+                .unwrap()
+                .iter()
+                .any(|playlist| playlist.title == "Gone")
+        );
     }
 
     #[test]
