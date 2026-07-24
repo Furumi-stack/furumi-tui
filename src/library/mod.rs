@@ -647,27 +647,59 @@ impl Library {
     pub fn playlist(&self, id: i64) -> Result<PlaylistDetail> {
         let conn = self.lock();
         if id == LIKES_PLAYLIST_ID {
-            let mut tracks = query_tracks(
+            let local_tracks = query_tracks(
                 &conn,
                 &format!(
                     "SELECT {TRACK_COLUMNS} FROM tracks t
                      JOIN releases r ON r.id = t.release_id
-                     JOIN likes k ON k.track_id = t.id
-                     ORDER BY k.liked_at DESC"
+                     JOIN likes k ON k.track_id = t.id"
                 ),
                 params![],
             )?;
-            drop(conn);
-            // Liked federated tracks follow the local ones as queueable
-            // placeholders (downloaded on playback like everywhere else).
-            for fed in self.fed_likes()? {
-                tracks.push(crate::federation::pending_track(&fed));
+            let mut liked_at_by_track = HashMap::new();
+            let mut liked_stmt = conn.prepare("SELECT track_id, liked_at FROM likes")?;
+            let liked_rows = liked_stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in liked_rows {
+                let (track_id, liked_at) = row?;
+                liked_at_by_track.insert(track_id, liked_at);
             }
+            drop(liked_stmt);
+
+            let mut entries: Vec<(String, String, TrackItem)> = local_tracks
+                .into_iter()
+                .map(|track| {
+                    let liked_at = liked_at_by_track
+                        .get(&track.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (liked_at, track.title.clone(), track)
+                })
+                .collect();
+
+            let mut fed_stmt = conn.prepare(
+                "SELECT liked_at, item_id, owner, title, artist_names, featured_artist_names,
+                        year, duration_seconds, content_id, release_title, track_number, disc_number
+                 FROM fed_likes",
+            )?;
+            let fed_rows = fed_stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, fed_track_from_offset_row(row, 1)?))
+            })?;
+            for row in fed_rows {
+                let (liked_at, fed) = row?;
+                entries.push((
+                    liked_at,
+                    fed.title.clone(),
+                    crate::federation::pending_track(&fed),
+                ));
+            }
+            entries.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
             return Ok(PlaylistDetail {
                 id,
                 title: "Liked tracks".to_string(),
                 description: None,
-                tracks,
+                tracks: entries.into_iter().map(|(_, _, track)| track).collect(),
             });
         }
         let (title, description, sync_id): (String, Option<String>, Option<String>) = conn
@@ -1152,45 +1184,6 @@ impl Library {
             params![playlist_sync_id, content_id],
         )?;
         Ok(())
-    }
-
-    /// Liked federated tracks, newest first, as playable references.
-    pub fn fed_likes(&self) -> Result<Vec<crate::federation::FedTrack>> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT item_id, owner, title, artist_names, featured_artist_names,
-                    year, duration_seconds, content_id, release_title, track_number, disc_number
-             FROM fed_likes ORDER BY liked_at DESC",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                let artists: String = row.get(3)?;
-                Ok(crate::federation::FedTrack {
-                    item_id: row.get(0)?,
-                    owner: row.get(1)?,
-                    own: false,
-                    title: row.get(2)?,
-                    artist_names: artists
-                        .split("; ")
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    featured_artist_names: row
-                        .get::<_, String>(4)?
-                        .split("; ")
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    year: row.get(5)?,
-                    duration_seconds: row.get::<_, Option<f64>>(6)?.map(|d| d.round() as i64),
-                    content_id: row.get(7)?,
-                    release_title: row.get(8)?,
-                    track_number: row.get(9)?,
-                    disc_number: row.get(10)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     /// Item ids and content ids of every liked federated track (for the ♥ markers).
@@ -2086,6 +2079,78 @@ mod tests {
         lib.delete_playlist(playlist.id).unwrap();
         // Only the virtual Likes playlist remains.
         assert_eq!(lib.playlists().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn likes_playlist_orders_local_and_federated_by_liked_at() {
+        let lib = test_library();
+        let old_id = add_track(&lib, "Old Local", "Artist", "Album");
+        let new_id = add_track(&lib, "New Local", "Artist", "Album");
+        let content_id = format!("b3:{}", "c".repeat(64));
+        let fed = crate::federation::FedTrack {
+            item_id: "fed_item_order".to_string(),
+            owner: "fed_owner_order".to_string(),
+            own: false,
+            title: "Middle Fed".to_string(),
+            artist_names: vec!["Remote Artist".to_string()],
+            featured_artist_names: Vec::new(),
+            year: Some(2026),
+            duration_seconds: Some(123),
+            content_id: Some(content_id),
+            release_title: Some("Remote Release".to_string()),
+            track_number: Some(1),
+            disc_number: Some(1),
+        };
+
+        assert!(lib.toggle_like(old_id).unwrap());
+        assert!(lib.toggle_like(new_id).unwrap());
+        assert!(lib.toggle_fed_like(&fed).unwrap());
+        {
+            let conn = lib.lock();
+            conn.execute(
+                "UPDATE likes SET liked_at = ?2 WHERE track_id = ?1",
+                params![old_id, "2026-01-01 00:00:00"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE likes SET liked_at = ?2 WHERE track_id = ?1",
+                params![new_id, "2026-01-02 00:00:00"],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE fed_likes SET liked_at = ?2 WHERE item_id = ?1",
+                params![fed.item_id, "2026-01-03 00:00:00"],
+            )
+            .unwrap();
+        }
+
+        let titles: Vec<String> = lib
+            .playlist(LIKES_PLAYLIST_ID)
+            .unwrap()
+            .tracks
+            .into_iter()
+            .map(|track| track.title)
+            .collect();
+        assert_eq!(titles, vec!["Middle Fed", "New Local", "Old Local"]);
+
+        assert!(!lib.toggle_like(old_id).unwrap());
+        assert!(lib.toggle_like(old_id).unwrap());
+        {
+            let conn = lib.lock();
+            conn.execute(
+                "UPDATE likes SET liked_at = ?2 WHERE track_id = ?1",
+                params![old_id, "2026-01-04 00:00:00"],
+            )
+            .unwrap();
+        }
+        let titles: Vec<String> = lib
+            .playlist(LIKES_PLAYLIST_ID)
+            .unwrap()
+            .tracks
+            .into_iter()
+            .map(|track| track.title)
+            .collect();
+        assert_eq!(titles, vec!["Old Local", "Middle Fed", "New Local"]);
     }
 
     #[test]
