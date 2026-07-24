@@ -31,6 +31,7 @@ use update::{Effect, update};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const VISUALIZER_TICK_INTERVAL: Duration = Duration::from_millis(50);
+const ACTIVE_IDLE_LEASE_MS: i64 = 5 * 60 * 1000;
 
 /// Handles shared by background tasks; AppState stays pure UI data.
 pub struct Runtime {
@@ -228,6 +229,9 @@ fn playback_state_from_ui(state: &AppState) -> crate::devices::PlaybackStateWire
         queue_pos: state.player.queue_pos,
         playing: state.player.playing,
         paused: state.player.paused,
+        idle_since_ms: (!state.player.playing || state.player.paused)
+            .then_some(state.device_playback.local_idle_since_ms)
+            .flatten(),
         position_secs: state.player.position_secs,
         volume: state.player.volume,
         shuffle: state.player.shuffle,
@@ -262,6 +266,11 @@ fn apply_playback_state_to_ui(
         .min(state.player.queue.len().saturating_sub(1));
     state.player.playing = wire.playing && !state.player.queue.is_empty();
     state.player.paused = wire.paused;
+    state.device_playback.local_idle_since_ms = if state.player.playing && !state.player.paused {
+        None
+    } else {
+        wire.idle_since_ms.or_else(|| Some(unix_time_ms()))
+    };
     state.player.position_secs = wire.position_secs.max(0.0);
     state.player.volume = wire.volume.min(100);
     state.player.shuffle = wire.shuffle;
@@ -287,6 +296,7 @@ fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
     let Ok((device_id, device_name)) = runtime.devices.identity_summary() else {
         return;
     };
+    update_local_idle_since(state);
     state.device_playback.self_device_id = device_id.clone();
     state.device_playback.self_device_name = device_name.clone();
     if state.device_playback.role == state::DevicePlaybackRole::Active {
@@ -301,6 +311,32 @@ fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
         state: playback_state_from_ui(state),
     };
     runtime.devices.publish_playback(snapshot);
+}
+
+fn update_local_idle_since(state: &mut AppState) {
+    if !state.player.playing || state.player.paused {
+        if state.device_playback.local_idle_since_ms.is_none() {
+            state.device_playback.local_idle_since_ms = Some(unix_time_ms());
+        }
+    } else {
+        state.device_playback.local_idle_since_ms = None;
+    }
+}
+
+fn active_snapshot_idle_since(snapshot: &crate::devices::PlaybackSnapshot) -> Option<i64> {
+    if snapshot.state.playing && !snapshot.state.paused {
+        None
+    } else {
+        snapshot
+            .state
+            .idle_since_ms
+            .or(Some(snapshot.updated_at_ms))
+    }
+}
+
+fn active_idle_lease_expired(snapshot: &crate::devices::PlaybackSnapshot, now: i64) -> bool {
+    active_snapshot_idle_since(snapshot)
+        .is_some_and(|idle_since| now.saturating_sub(idle_since) >= ACTIVE_IDLE_LEASE_MS)
 }
 
 fn extrapolate_control_position(state: &mut AppState) {
@@ -361,6 +397,7 @@ pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, 
     state.device_playback.active_device_id = Some(device_id);
     state.device_playback.active_device_name = Some(device_name);
     state.device_playback.last_remote_snapshot = None;
+    state.device_playback.local_idle_since_ms = None;
     if was_control && start_audio && state.player.playing {
         start_current_audio(
             state,
@@ -376,6 +413,7 @@ fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
     if !state.device_playback.is_control() {
         return;
     }
+    update_local_idle_since(state);
     let Some(target) = state.device_playback.active_device_id.clone() else {
         return;
     };
@@ -1715,7 +1753,10 @@ fn handle_device_playback_snapshot(
     if !snapshot.active {
         return;
     }
-    if snapshot.state.playing {
+    let lease_expired = active_idle_lease_expired(&snapshot, now);
+    let already_controls_this_device = state.device_playback.is_control()
+        && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str());
+    if !lease_expired || already_controls_this_device {
         let was_active = state.device_playback.role == state::DevicePlaybackRole::Active;
         let was_paused = state.player.playing && state.player.paused;
         become_control_device(state, runtime, snapshot.clone());
@@ -1725,12 +1766,17 @@ fn handle_device_playback_snapshot(
                 text: format!("Playback is now controlled by {}.", snapshot.device_name),
             });
         }
-    } else if state.device_playback.is_control()
-        && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str())
-    {
-        become_active_device(state, runtime, false);
-        state.status_message = Some("active playback moved to this device".into());
+        return;
     }
+
+    if state.device_playback.is_control() {
+        return;
+    }
+    become_active_device(state, runtime, false);
+    state.status_message = Some(format!(
+        "active playback moved here; {} was idle for 5m",
+        snapshot.device_name
+    ));
 }
 
 fn handle_playback_command(
@@ -1887,6 +1933,13 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&placeholder_id);
+            if state.device_playback.is_control() {
+                tracing::debug!(
+                    placeholder_id,
+                    "ignored local federated track resolution while controlling remote playback"
+                );
+                return;
+            }
             match result {
                 Ok(playable) => {
                     if playable.imported {
@@ -2095,6 +2148,13 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             };
             state.art.insert(key, entry);
         }
+        AppEvent::Player(event) if state.device_playback.is_control() => {
+            runtime.player_start_pending = false;
+            tracing::debug!(
+                ?event,
+                "ignored local player event while controlling remote playback"
+            );
+        }
         AppEvent::Player(player::PlayerEvent::Started) => {
             runtime.player_start_pending = false;
         }
@@ -2138,6 +2198,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.status_message = Some(message);
         }
         AppEvent::PrefetchFailed { pos } => {
+            if state.device_playback.is_control() {
+                return;
+            }
             if state.player.prefetched_pos == Some(pos) {
                 state.player.prefetched_pos = None;
             }
@@ -2278,6 +2341,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.status_message = Some(format!("importing {done}/{total}: {current}"));
         }
         AppEvent::QueueTracksRefreshed { tracks } => {
+            if state.device_playback.is_control() {
+                return;
+            }
             apply_queue_refresh(state, runtime, tracks);
         }
         AppEvent::Media(command) => {

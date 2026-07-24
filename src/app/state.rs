@@ -950,6 +950,7 @@ pub struct DevicePlaybackState {
     pub active_device_id: Option<String>,
     pub active_device_name: Option<String>,
     pub online_devices: usize,
+    pub local_idle_since_ms: Option<i64>,
     pub remote: BTreeMap<String, crate::devices::PlaybackSnapshot>,
     pub last_remote_snapshot: Option<crate::devices::PlaybackSnapshot>,
 }

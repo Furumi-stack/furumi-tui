@@ -196,6 +196,8 @@ pub struct PlaybackStateWire {
     pub queue_pos: usize,
     pub playing: bool,
     pub paused: bool,
+    #[serde(default)]
+    pub idle_since_ms: Option<i64>,
     pub position_secs: f64,
     #[serde(default)]
     pub volume: u8,
@@ -3436,6 +3438,7 @@ mod tests {
                 queue_pos: 0,
                 playing: false,
                 paused: false,
+                idle_since_ms: None,
                 position_secs: 0.0,
                 volume: 42,
                 shuffle: false,

@@ -2,6 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme;
 use crate::app::state::{
@@ -77,7 +78,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         display_lines.push(DisplayLine::Row(index));
     }
     let height =
-        (display_lines.len() as u16 + 5).clamp(7, frame.area().height.saturating_sub(2).max(7));
+        (display_lines.len() as u16 + 6).clamp(8, frame.area().height.saturating_sub(2).max(8));
     let area = centered(frame.area(), 76, height);
     let block = Block::bordered()
         .title(" Connected devices ")
@@ -90,7 +91,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     let [summary_area, list_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(inner);
     let active = state.device_playback.active_label();
@@ -132,31 +133,64 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
             continue;
         };
         let row = &rows[*index];
-        let role = if row.revoked {
-            "revoked"
-        } else if row.active {
-            "active"
+        let role = if row.active {
+            "◆"
         } else if row.is_self
             && state.device_playback.role == crate::app::state::DevicePlaybackRole::Control
         {
-            "control"
+            "◇"
         } else {
-            "device"
+            "·"
         };
         let play = if row.playing && row.paused {
-            "paused"
+            "II"
         } else if row.playing {
-            "playing"
+            "▶"
         } else {
-            "stopped"
+            "■"
         };
-        let online = if row.online { "online" } else { "offline" };
+        let online = if row.online { "●" } else { "○" };
         let marker = if row.is_self { "*" } else { " " };
+        let status = format!("{online} {role} {play} Q{}", row.queue_len);
+        let marker_width = UnicodeWidthStr::width(format!("{marker} ").as_str());
+        let status_width = UnicodeWidthStr::width(status.as_str());
+        let total_width = usize::from(area.width);
+        let name_width = total_width.saturating_sub(marker_width + status_width + 1);
+        let name = clip_cells(&row.name, name_width);
+        let used_width = marker_width + UnicodeWidthStr::width(name.as_str()) + status_width;
+        let gap = " ".repeat(total_width.saturating_sub(used_width));
         let line = Line::from(vec![
             Span::styled(format!("{marker} "), theme::accent()),
-            Span::raw(row.name.clone()),
-            Span::styled(format!("  {role} · {online} · {play}"), theme::dim()),
-            Span::styled(format!(" · {} queued", row.queue_len), theme::dim()),
+            Span::raw(name),
+            Span::raw(gap),
+            Span::styled(
+                online,
+                if row.online {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                role,
+                if row.active {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                play,
+                if row.playing {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(format!("Q{}", row.queue_len), theme::dim()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         if *index == selected {
@@ -164,14 +198,49 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         }
     }
 
+    let [legend_area, controls_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(hint_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "● on  ○ off   ◆ active  ◇ control   ▶ play  II pause  ■ stop   Q queue",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        legend_area,
+    );
     frame.render_widget(
         Paragraph::new(Line::styled(
             "enter: control selected / move active here · esc close",
             theme::dim(),
         ))
         .alignment(Alignment::Center),
-        hint_area,
+        controls_area,
     );
+}
+
+fn clip_cells(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 1usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
