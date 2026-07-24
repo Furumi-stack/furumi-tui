@@ -251,7 +251,9 @@ fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
     } else {
         runtime.player.shared.audio_analysis()
     };
-    publish_playback_snapshot(state, runtime);
+    if state.device_playback.role == state::DevicePlaybackRole::Active {
+        publish_playback_snapshot(state, runtime);
+    }
 }
 
 fn unix_time_ms() -> i64 {
@@ -310,6 +312,27 @@ fn playback_track_to_ui(
     wire.to_track_item()
 }
 
+fn track_playback_key(track: &crate::library::models::TrackItem) -> String {
+    if let Some(content_id) = track
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id)
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .and_then(|fed| fed.content_id.as_deref())
+                .and_then(music_dht::normalize_content_id)
+        })
+    {
+        return format!("content:{content_id}");
+    }
+    if let Some(fed) = &track.fed {
+        return format!("fed:{}:{}", fed.owner, fed.item_id);
+    }
+    format!("local:{}", track.id)
+}
+
 fn apply_playback_state_to_ui(
     state: &mut AppState,
     wire: &crate::devices::PlaybackStateWire,
@@ -352,20 +375,31 @@ fn apply_playback_state_to_ui(
 }
 
 fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
+    if state.device_playback.role != state::DevicePlaybackRole::Active {
+        return;
+    }
+    publish_playback_snapshot_with_active(state, runtime, true);
+}
+
+fn publish_inactive_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
+    publish_playback_snapshot_with_active(state, runtime, false);
+}
+
+fn publish_playback_snapshot_with_active(state: &mut AppState, runtime: &Runtime, active: bool) {
     let Ok((device_id, device_name)) = runtime.devices.identity_summary() else {
         return;
     };
     update_local_idle_since(state);
     state.device_playback.self_device_id = device_id.clone();
     state.device_playback.self_device_name = device_name.clone();
-    if state.device_playback.role == state::DevicePlaybackRole::Active {
+    if active {
         state.device_playback.active_device_id = Some(device_id.clone());
         state.device_playback.active_device_name = Some(device_name.clone());
     }
     let snapshot = crate::devices::PlaybackSnapshot {
         device_id,
         device_name,
-        active: state.device_playback.role == state::DevicePlaybackRole::Active,
+        active,
         updated_at_ms: unix_time_ms(),
         state: playback_state_from_ui(state),
     };
@@ -445,6 +479,7 @@ pub(crate) fn become_control_device(
 ) {
     if state.device_playback.role == state::DevicePlaybackRole::Active {
         runtime.player.stop();
+        publish_inactive_playback_snapshot(state, runtime);
     }
     state.device_playback.role = state::DevicePlaybackRole::Control;
     state.device_playback.active_device_id = Some(snapshot.device_id.clone());
@@ -1978,7 +2013,7 @@ fn handle_playback_command(
 ) {
     match command {
         crate::devices::PlaybackCommand::SetState { state: wire } => {
-            let old_current_id = state.player.current.as_ref().map(|track| track.id);
+            let old_current_key = state.player.current.as_ref().map(track_playback_key);
             let old_playing = state.player.playing;
             let old_paused = state.player.paused;
             become_active_device(state, runtime, false);
@@ -1993,8 +2028,8 @@ fn handle_playback_command(
                 publish_playback_snapshot(state, runtime);
                 return;
             }
-            let current_id = state.player.current.as_ref().map(|track| track.id);
-            if !old_playing || old_current_id != current_id {
+            let current_key = state.player.current.as_ref().map(track_playback_key);
+            if !old_playing || old_current_key != current_key {
                 start_current_audio(
                     state,
                     runtime,

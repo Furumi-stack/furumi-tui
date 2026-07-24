@@ -123,6 +123,37 @@ pub struct PlaybackTrack {
 }
 
 impl PlaybackTrack {
+    fn portable_placeholder_id(&self) -> i64 {
+        let key = self
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)
+            .map(|content_id| format!("content:{content_id}"))
+            .or_else(|| {
+                self.fed
+                    .as_ref()
+                    .map(|fed| fed.content_id.as_str())
+                    .and_then(music_dht::normalize_content_id)
+                    .map(|content_id| format!("content:{content_id}"))
+            })
+            .or_else(|| {
+                self.fed
+                    .as_ref()
+                    .map(|fed| format!("fed:{}:{}", fed.owner, fed.item_id))
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "remote:{}:{}:{}:{}",
+                    self.id, self.title, self.release_title, self.duration_seconds
+                )
+            });
+        let hash = blake3::hash(key.as_bytes());
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash.as_bytes()[..8]);
+        let positive = (i64::from_be_bytes(bytes) & i64::MAX).max(1);
+        -positive
+    }
+
     pub fn from_track(track: &TrackItem) -> Self {
         Self {
             id: track.id,
@@ -169,7 +200,7 @@ impl PlaybackTrack {
                 .collect()
         };
         TrackItem {
-            id: self.id,
+            id: self.portable_placeholder_id(),
             title: self.title.clone(),
             track_number: self.track_number,
             disc_number: self.disc_number,
@@ -3453,6 +3484,8 @@ mod tests {
         let mut legacy_wire = wire.clone();
         legacy_wire.file_path = "/Users/me/Music/song.mp3".to_string();
         let restored = legacy_wire.to_track_item();
+        assert!(restored.id < 0);
+        assert_ne!(restored.id, source.id);
         assert!(restored.file_path.is_empty());
         assert_eq!(restored.content_id, source.content_id);
     }

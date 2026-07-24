@@ -126,7 +126,42 @@ fn capture_stderr() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn capture_stderr() {
+    use std::io::BufRead as _;
+    use std::os::windows::io::FromRawHandle as _;
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    unsafe {
+        let mut read = core::ptr::null_mut();
+        let mut write = core::ptr::null_mut();
+        if CreatePipe(&mut read, &mut write, core::ptr::null(), 0) == 0 {
+            return;
+        }
+        if SetStdHandle(STD_ERROR_HANDLE, write) == 0 {
+            CloseHandle(read);
+            CloseHandle(write);
+            return;
+        }
+        let reader = std::fs::File::from_raw_handle(read);
+        std::thread::Builder::new()
+            .name("stderr".to_string())
+            .spawn(move || {
+                for line in std::io::BufReader::new(reader).lines() {
+                    let Ok(line) = line else { break };
+                    if !line.trim().is_empty() {
+                        tracing::warn!(target: "stderr", "{line}");
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn capture_stderr() {}
 
 /// Kitty keyboard protocol, where supported, disambiguates Esc from alt-keys
