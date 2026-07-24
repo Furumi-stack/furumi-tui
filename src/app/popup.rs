@@ -792,14 +792,26 @@ pub(crate) fn spawn_add_target(
             let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
             let ids: Vec<i64> = tracks.iter().map(|t| t.id).filter(|id| *id >= 0).collect();
+            let fed_tracks: Vec<crate::federation::FedTrack> = tracks
+                .iter()
+                .filter(|track| track.is_fed_pending())
+                .filter_map(|track| track.fed.clone())
+                .collect();
             tokio::task::spawn_blocking(move || {
                 let result = library
                     .add_tracks_to_playlist(playlist_id, &ids)
+                    .and_then(|()| library.add_fed_tracks_to_playlist(playlist_id, &fed_tracks))
                     .map_err(|err| format!("{err:#}"));
                 if result.is_ok()
                     && let Err(err) = devices.record_playlist_tracks_added(playlist_id, &ids)
                 {
                     tracing::warn!(%err, playlist_id, "recording synced playlist add failed");
+                }
+                if result.is_ok()
+                    && let Err(err) =
+                        devices.record_playlist_fed_tracks_added(playlist_id, &fed_tracks)
+                {
+                    tracing::warn!(%err, playlist_id, "recording synced federated playlist add failed");
                 }
                 let _ = tx.send(AppEvent::PlaylistTracksAdded {
                     playlist_id,

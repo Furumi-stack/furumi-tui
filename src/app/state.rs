@@ -457,8 +457,9 @@ impl EditField {
     }
 }
 
-/// What an add-to-playlist flow adds: local library tracks directly, or
-/// federated tracks that are downloaded into the library first.
+/// What an add-to-playlist flow adds: local library tracks directly (including
+/// already-materialized federation placeholders), or federated search/card
+/// tracks that are downloaded into the library first.
 #[derive(Debug, Clone)]
 pub enum PlaylistAddTarget {
     Local(Vec<TrackItem>),

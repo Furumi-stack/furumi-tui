@@ -898,6 +898,114 @@ impl Library {
         Ok(())
     }
 
+    pub fn add_fed_tracks_to_playlist(
+        &self,
+        playlist_id: i64,
+        tracks: &[crate::federation::FedTrack],
+    ) -> Result<()> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let playlist_sync_id: Option<String> = tx
+            .query_row(
+                "SELECT sync_id FROM playlists WHERE id = ?1",
+                [playlist_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let playlist_sync_id = match playlist_sync_id {
+            Some(sync_id) => sync_id,
+            None => {
+                let title: String = tx.query_row(
+                    "SELECT title FROM playlists WHERE id = ?1",
+                    [playlist_id],
+                    |row| row.get(0),
+                )?;
+                let sync_id = make_playlist_sync_id(playlist_id, &title);
+                tx.execute(
+                    "UPDATE playlists SET sync_id = ?2 WHERE id = ?1",
+                    params![playlist_id, sync_id],
+                )?;
+                sync_id
+            }
+        };
+        let local_max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = ?1",
+            [playlist_id],
+            |row| row.get(0),
+        )?;
+        let fed_max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position), -1) FROM fed_playlist_tracks WHERE playlist_sync_id = ?1",
+            [&playlist_sync_id],
+            |row| row.get(0),
+        )?;
+        let mut next = local_max.max(fed_max) + 1;
+        for fed in tracks {
+            let Some(content_id) = fed
+                .content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+            else {
+                continue;
+            };
+            let existing_position: Option<i64> = tx
+                .query_row(
+                    "SELECT position FROM fed_playlist_tracks
+                     WHERE playlist_sync_id = ?1 AND content_id = ?2",
+                    params![playlist_sync_id, content_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let position = match existing_position {
+                Some(position) => position,
+                None => {
+                    let position = next;
+                    next += 1;
+                    position
+                }
+            };
+            tx.execute(
+                "INSERT INTO fed_playlist_tracks
+                    (playlist_sync_id, item_id, owner, title, artist_names,
+                     featured_artist_names, year, duration_seconds, content_id,
+                     release_title, track_number, disc_number, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(playlist_sync_id, content_id) DO UPDATE SET
+                    item_id = excluded.item_id,
+                    owner = excluded.owner,
+                    title = excluded.title,
+                    artist_names = excluded.artist_names,
+                    featured_artist_names = excluded.featured_artist_names,
+                    year = excluded.year,
+                    duration_seconds = excluded.duration_seconds,
+                    release_title = excluded.release_title,
+                    track_number = excluded.track_number,
+                    disc_number = excluded.disc_number,
+                    position = excluded.position",
+                params![
+                    playlist_sync_id,
+                    fed.item_id,
+                    fed.owner,
+                    fed.title,
+                    fed.artist_names.join("; "),
+                    fed.featured_artist_names.join("; "),
+                    fed.year,
+                    fed.duration_seconds.map(|d| d as f64),
+                    content_id,
+                    fed.release_title,
+                    fed.track_number,
+                    fed.disc_number,
+                    position,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_tracks_from_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<()> {
         let conn = self.lock();
         for &track_id in track_ids {
@@ -1000,7 +1108,7 @@ impl Library {
             return Ok(None);
         };
         let conn = self.lock();
-        Ok(conn
+        let local_position = conn
             .query_row(
                 "SELECT pt.position
                  FROM playlist_tracks pt
@@ -1008,6 +1116,30 @@ impl Library {
                  WHERE pt.playlist_id = ?1 AND t.content_id = ?2
                  LIMIT 1",
                 params![playlist_id, content_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if local_position.is_some() {
+            return Ok(local_position);
+        }
+        let sync_id: Option<String> = conn
+            .query_row(
+                "SELECT sync_id FROM playlists WHERE id = ?1",
+                [playlist_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(sync_id) = sync_id else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT position
+                 FROM fed_playlist_tracks
+                 WHERE playlist_sync_id = ?1 AND content_id = ?2
+                 LIMIT 1",
+                params![sync_id, content_id],
                 |row| row.get(0),
             )
             .optional()?)
@@ -2260,6 +2392,47 @@ mod tests {
             lib.fed_playlist_track_by_content_id(&sync_id, &content_id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn add_federated_pending_track_to_playlist_records_position() {
+        let lib = test_library();
+        let local_id = add_track(&lib, "Local Song", "Artist", "Album");
+        let playlist = lib.create_playlist("Remote Mix").unwrap();
+        let content_id = format!("b3:{}", "b".repeat(64));
+        let fed = crate::federation::FedTrack {
+            item_id: "fed_item_2".to_string(),
+            owner: "fed_owner_2".to_string(),
+            own: false,
+            title: "Remote Song".to_string(),
+            artist_names: vec!["Remote Artist".to_string()],
+            featured_artist_names: Vec::new(),
+            year: Some(2026),
+            duration_seconds: Some(123),
+            content_id: Some(content_id.clone()),
+            release_title: Some("Remote Release".to_string()),
+            track_number: Some(2),
+            disc_number: Some(1),
+        };
+
+        lib.add_tracks_to_playlist(playlist.id, &[local_id])
+            .unwrap();
+        lib.add_fed_tracks_to_playlist(playlist.id, std::slice::from_ref(&fed))
+            .unwrap();
+
+        let position = lib
+            .playlist_content_position(playlist.id, &content_id)
+            .unwrap();
+        assert_eq!(position, Some(1));
+        let detail = lib.playlist(playlist.id).unwrap();
+        assert_eq!(
+            detail
+                .tracks
+                .into_iter()
+                .map(|track| track.title)
+                .collect::<Vec<_>>(),
+            vec!["Local Song", "Remote Song"]
         );
     }
 

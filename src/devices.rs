@@ -1447,25 +1447,30 @@ impl DeviceSync {
         hlc_ms: i64,
         op_id: &str,
     ) -> Result<bool> {
-        let apply = {
+        let current = {
             let conn = lock(&self.conn);
-            let current: Option<(i64, String)> = conn
-                .query_row(
-                    "SELECT hlc_ms, op_id
-                     FROM sync_state_playlist_items
-                     WHERE playlist_id = ?1 AND content_id = ?2",
-                    params![playlist_id, content_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            current.as_ref().is_none_or(|(current_hlc, current_op)| {
-                (hlc_ms, op_id) > (*current_hlc, current_op.as_str())
-            })
+            conn.query_row(
+                "SELECT present, position, hlc_ms, op_id
+	                     FROM sync_state_playlist_items
+	                     WHERE playlist_id = ?1 AND content_id = ?2",
+                params![playlist_id, content_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
         };
-        if !apply {
-            return Ok(false);
-        }
-        {
+        let apply = current
+            .as_ref()
+            .is_none_or(|(_, _, current_hlc, current_op)| {
+                (hlc_ms, op_id) > (*current_hlc, current_op.as_str())
+            });
+        if apply {
             let conn = lock(&self.conn);
             conn.execute(
                 "INSERT INTO sync_state_playlist_items
@@ -1486,8 +1491,16 @@ impl DeviceSync {
                 ],
             )?;
         }
+        let (effective_present, effective_position) = if apply {
+            (present, position)
+        } else {
+            current
+                .as_ref()
+                .map(|(present, position, _, _)| (*present, *position))
+                .unwrap_or((present, position))
+        };
         let mut visible_changed = apply;
-        if present {
+        if effective_present {
             visible_changed |= self
                 .library
                 .add_content_id_to_synced_playlist(playlist_id, content_id)?;
@@ -1495,10 +1508,16 @@ impl DeviceSync {
                 visible_changed |= self.library.upsert_fed_playlist_track(
                     playlist_id,
                     &fed.to_fed_track(),
-                    position,
+                    effective_position,
+                )?;
+            } else if let Some(fed) = self.library.fed_like_by_content_id(content_id)? {
+                visible_changed |= self.library.upsert_fed_playlist_track(
+                    playlist_id,
+                    &fed,
+                    effective_position,
                 )?;
             }
-        } else {
+        } else if apply {
             self.library
                 .remove_content_id_from_synced_playlist(playlist_id, content_id)?;
         }
@@ -3257,5 +3276,46 @@ mod tests {
             .unwrap()
         );
         assert_eq!(sync.library.playlist(playlist.id).unwrap().tracks.len(), 0);
+    }
+
+    #[test]
+    fn stale_synced_playlist_item_metadata_repairs_pending_fed_track() {
+        let sync = test_sync();
+        let playlist = sync.library.create_playlist("Remote Mix").unwrap();
+        let playlist_sync_id = sync.library.ensure_playlist_sync_id(playlist.id).unwrap();
+        let content_id = format!("b3:{}", "e".repeat(64));
+        let fed = test_fed_track(&content_id);
+        let synced = SyncedFedTrack::from_fed(&fed).unwrap();
+
+        assert!(
+            sync.apply_playlist_item_state(
+                &playlist_sync_id,
+                &content_id,
+                true,
+                7,
+                None,
+                10,
+                "dev_remote:2",
+            )
+            .unwrap()
+        );
+        assert_eq!(sync.library.playlist(playlist.id).unwrap().tracks.len(), 0);
+
+        assert!(
+            sync.apply_playlist_item_state(
+                &playlist_sync_id,
+                &content_id,
+                true,
+                7,
+                Some(&synced),
+                10,
+                "dev_remote:2",
+            )
+            .unwrap()
+        );
+        let detail = sync.library.playlist(playlist.id).unwrap();
+        assert_eq!(detail.tracks.len(), 1);
+        assert!(detail.tracks[0].is_fed_pending());
+        assert_eq!(detail.tracks[0].title, fed.title);
     }
 }
