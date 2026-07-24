@@ -523,6 +523,8 @@ pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut
         request_urgent_device_sync(runtime);
         return;
     }
+    extrapolate_control_position(state);
+    let previous_active_id = state.device_playback.active_device_id.clone();
     let should_start = state.player.current.is_some() || !state.player.queue.is_empty();
     if state.player.current.is_none() && !state.player.queue.is_empty() {
         state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
@@ -539,7 +541,30 @@ pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut
         push_media_update(state, runtime, true);
     }
     publish_playback_snapshot(state, runtime);
+    record_active_handoff(state, runtime, previous_active_id);
     request_urgent_device_sync(runtime);
+}
+
+fn record_active_handoff(
+    state: &mut AppState,
+    runtime: &Runtime,
+    previous_active_id: Option<String>,
+) {
+    let Some(target) = previous_active_id else {
+        return;
+    };
+    if target == state.device_playback.self_device_id {
+        return;
+    }
+    let command = crate::devices::PlaybackCommand::ActiveChanged {
+        active_device_id: state.device_playback.self_device_id.clone(),
+        active_device_name: state.device_playback.self_device_name.clone(),
+        state: playback_state_from_ui(state),
+    };
+    if let Err(err) = runtime.devices.record_playback_command(&target, command) {
+        tracing::warn!(%err, target, "recording active handoff command failed");
+        state.status_message = Some(format!("device handoff failed: {err:#}"));
+    }
 }
 
 fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
@@ -2050,6 +2075,30 @@ fn handle_playback_command(
             push_media_update(state, runtime, true);
             publish_playback_snapshot(state, runtime);
         }
+        crate::devices::PlaybackCommand::ActiveChanged {
+            active_device_id,
+            active_device_name,
+            state: wire,
+        } => {
+            if active_device_id == state.device_playback.self_device_id {
+                return;
+            }
+            let was_active = state.device_playback.role == state::DevicePlaybackRole::Active;
+            let snapshot = crate::devices::PlaybackSnapshot {
+                device_id: active_device_id,
+                device_name: active_device_name,
+                active: true,
+                updated_at_ms: unix_time_ms(),
+                state: wire,
+            };
+            become_control_device(state, runtime, snapshot);
+            runtime.player_start_pending = false;
+            push_media_metadata(state, runtime);
+            push_media_update(state, runtime, true);
+            if was_active {
+                state.status_message = Some("active playback moved to another device".into());
+            }
+        }
     }
 }
 
@@ -2167,6 +2216,42 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 );
                 return;
             }
+            let placeholder_key = state
+                .player
+                .queue
+                .iter()
+                .find(|track| track.id == placeholder_id)
+                .or_else(|| {
+                    state
+                        .player
+                        .current
+                        .as_ref()
+                        .filter(|track| track.id == placeholder_id)
+                })
+                .map(track_playback_key);
+            let queue_pos_waiting =
+                state
+                    .player
+                    .queue
+                    .get(state.player.queue_pos)
+                    .is_some_and(|track| {
+                        track.id == placeholder_id
+                            || placeholder_key
+                                .as_deref()
+                                .is_some_and(|key| track_playback_key(track) == key)
+                    });
+            let current_waiting = state.player.current.as_ref().is_some_and(|current| {
+                current.id == placeholder_id
+                    || placeholder_key
+                        .as_deref()
+                        .is_some_and(|key| track_playback_key(current) == key)
+            });
+            let waiting = queue_pos_waiting || current_waiting;
+            let resume_position_secs = if waiting {
+                state.player.position_secs
+            } else {
+                0.0
+            };
             match result {
                 Ok(playable) => {
                     if playable.imported {
@@ -2180,33 +2265,43 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         });
                     }
                     let resolved = playable.track.clone();
+                    let resolved_key = track_playback_key(&resolved);
                     // Swap the placeholder for the real track everywhere it
                     // sits in the queue.
                     for slot in &mut state.player.queue {
-                        if slot.id == placeholder_id {
+                        if slot.id == placeholder_id
+                            || placeholder_key
+                                .as_deref()
+                                .is_some_and(|key| track_playback_key(slot) == key)
+                        {
                             *slot = resolved.clone();
                         }
                     }
-                    let waiting = state
-                        .player
-                        .current
-                        .as_ref()
-                        .is_some_and(|current| current.id == placeholder_id);
                     if waiting {
                         // Playback was parked on this track; start it now.
                         let paused = state.player.paused;
-                        start_current_audio(state, runtime, 0.0, paused);
+                        if state
+                            .player
+                            .queue
+                            .get(state.player.queue_pos)
+                            .is_none_or(|track| track_playback_key(track) != resolved_key)
+                            && let Some(pos) = state
+                                .player
+                                .queue
+                                .iter()
+                                .position(|track| track_playback_key(track) == resolved_key)
+                        {
+                            state.player.queue_pos = pos;
+                        }
+                        state.player.current =
+                            state.player.queue.get(state.player.queue_pos).cloned();
+                        start_current_audio(state, runtime, resume_position_secs, paused);
                         push_media_metadata(state, runtime);
                         push_media_update(state, runtime, true);
                     }
                 }
                 Err(message) => {
                     state.status_message = Some(format!("federation: {message}"));
-                    let waiting = state
-                        .player
-                        .current
-                        .as_ref()
-                        .is_some_and(|current| current.id == placeholder_id);
                     if waiting {
                         // Skip the failed track instead of stalling the queue.
                         if state.player.queue_pos + 1 < state.player.queue.len() {

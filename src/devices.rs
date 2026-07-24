@@ -253,7 +253,14 @@ pub struct PlaybackSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlaybackCommand {
-    SetState { state: PlaybackStateWire },
+    SetState {
+        state: PlaybackStateWire,
+    },
+    ActiveChanged {
+        active_device_id: String,
+        active_device_name: String,
+        state: PlaybackStateWire,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
