@@ -601,6 +601,24 @@ impl Library {
         Ok(tracks)
     }
 
+    pub fn track_by_content_id(&self, content_id: &str) -> Result<Option<TrackItem>> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(None);
+        };
+        let conn = self.lock();
+        let mut tracks = query_tracks(
+            &conn,
+            &format!(
+                "SELECT {TRACK_COLUMNS} FROM tracks t
+                 JOIN releases r ON r.id = t.release_id
+                 WHERE t.content_id = ?1
+                 LIMIT 1"
+            ),
+            params![content_id],
+        )?;
+        Ok(tracks.pop())
+    }
+
     // -----------------------------------------------------------------
     // Playlists & likes
     // -----------------------------------------------------------------

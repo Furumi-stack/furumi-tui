@@ -12,10 +12,88 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::Runtime;
 use crate::app::event::AppEvent;
 use crate::app::state::{
-    AppState, DeleteTarget, EditField, EditTarget, FedInputField, Loadable, Popup,
-    addable_playlists,
+    self, AppState, DeleteTarget, DevicePresenceSection, EditField, EditTarget, FedInputField,
+    Loadable, Popup, addable_playlists,
 };
 use crate::library::models::{ReleaseEdit, TrackEdit, TrackItem};
+
+#[derive(Clone)]
+pub(crate) struct ConnectedDevicePopupRow {
+    pub device_id: String,
+    pub name: String,
+    pub is_self: bool,
+    pub online: bool,
+    pub revoked: bool,
+    pub section: DevicePresenceSection,
+    pub active: bool,
+    pub playing: bool,
+    pub paused: bool,
+    pub queue_len: usize,
+}
+
+pub(crate) fn connected_device_rows(state: &AppState) -> Vec<ConnectedDevicePopupRow> {
+    let mut rows = Vec::new();
+    if let Some(status) = &state.federation.devices {
+        let now = state::unix_time_ms();
+        for index in state::device_status_order(state) {
+            let Some(device) = status.devices.get(index) else {
+                continue;
+            };
+            let snapshot = state.device_playback.remote.get(&device.device_id);
+            let is_self =
+                device.is_self || device.device_id == state.device_playback.self_device_id;
+            let section = state::device_presence_section(state, device, now);
+            let online = section == DevicePresenceSection::Online;
+            rows.push(ConnectedDevicePopupRow {
+                device_id: device.device_id.clone(),
+                name: state::device_display_name(device),
+                is_self,
+                online,
+                revoked: device.revoked,
+                section,
+                active: state::device_status_active(state, &device.device_id),
+                playing: if is_self {
+                    state.player.playing
+                } else {
+                    snapshot.is_some_and(|snapshot| snapshot.state.playing)
+                },
+                paused: if is_self {
+                    state.player.paused
+                } else {
+                    snapshot.is_some_and(|snapshot| snapshot.state.paused)
+                },
+                queue_len: if is_self {
+                    state.player.queue.len()
+                } else {
+                    snapshot
+                        .map(|snapshot| snapshot.state.queue.len())
+                        .unwrap_or(0)
+                },
+            });
+        }
+    }
+    if rows
+        .iter()
+        .all(|row| row.device_id != state.device_playback.self_device_id)
+    {
+        rows.insert(
+            0,
+            ConnectedDevicePopupRow {
+                device_id: state.device_playback.self_device_id.clone(),
+                name: state.device_playback.self_device_name.clone(),
+                is_self: true,
+                online: true,
+                revoked: false,
+                section: DevicePresenceSection::Online,
+                active: state.device_playback.role == crate::app::state::DevicePlaybackRole::Active,
+                playing: state.player.playing,
+                paused: state.player.paused,
+                queue_len: state.player.queue.len(),
+            },
+        );
+    }
+    rows
+}
 
 pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     let Some(popup) = state.popup.take() else {
@@ -82,6 +160,49 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConfirmDeviceRevoke { device_id, name } => {
             handle_device_revoke(state, runtime, device_id, name, key);
         }
+        Popup::ConnectedDevices { cursor } => {
+            handle_connected_devices(state, runtime, cursor, key);
+        }
+    }
+}
+
+fn handle_connected_devices(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    cursor: usize,
+    key: KeyEvent,
+) {
+    let rows = connected_device_rows(state);
+    let last = rows.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {}
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.popup = Some(Popup::ConnectedDevices {
+                cursor: cursor.saturating_sub(1),
+            });
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.popup = Some(Popup::ConnectedDevices {
+                cursor: (cursor + 1).min(last),
+            });
+        }
+        KeyCode::Enter => {
+            if let Some(row) = rows.get(cursor.min(last)) {
+                if row.revoked {
+                    state.status_message = Some("revoked device cannot be controlled".into());
+                } else if row.is_self {
+                    super::become_active_device(state, runtime, true);
+                    state.status_message = Some("active playback moved to this device".into());
+                } else if let Some(snapshot) =
+                    state.device_playback.remote.get(&row.device_id).cloned()
+                {
+                    super::become_control_device(state, runtime, snapshot);
+                } else {
+                    state.status_message = Some("device has no playback snapshot yet".into());
+                }
+            }
+        }
+        _ => state.popup = Some(Popup::ConnectedDevices { cursor }),
     }
 }
 

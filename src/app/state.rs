@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::app::input::LineEdit;
@@ -542,6 +542,8 @@ pub enum Popup {
     },
     /// Confirmation before revoking a trusted device.
     ConfirmDeviceRevoke { device_id: String, name: String },
+    /// Connected playback devices and their current role/status.
+    ConnectedDevices { cursor: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,6 +604,128 @@ pub enum SettingsRow {
     VisualizationEdit,
 }
 
+pub const DEVICE_ONLINE_TTL_MS: i64 = 45_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevicePresenceSection {
+    Online,
+    Offline,
+    Revoked,
+}
+
+impl DevicePresenceSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            DevicePresenceSection::Online => "Online devices",
+            DevicePresenceSection::Offline => "Offline devices",
+            DevicePresenceSection::Revoked => "Revoked devices",
+        }
+    }
+
+    fn sort_rank(self) -> u8 {
+        match self {
+            DevicePresenceSection::Online => 0,
+            DevicePresenceSection::Offline => 1,
+            DevicePresenceSection::Revoked => 2,
+        }
+    }
+}
+
+pub fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn device_display_name(device: &crate::devices::DeviceStatusRow) -> String {
+    if device.name.trim().is_empty() {
+        device.device_id.chars().take(10).collect()
+    } else {
+        device.name.clone()
+    }
+}
+
+pub fn device_status_active(state: &AppState, device_id: &str) -> bool {
+    state
+        .device_playback
+        .active_device_id
+        .as_deref()
+        .is_some_and(|active| active == device_id)
+        || state
+            .device_playback
+            .remote
+            .get(device_id)
+            .is_some_and(|snapshot| snapshot.active)
+}
+
+pub fn device_status_online(
+    state: &AppState,
+    device: &crate::devices::DeviceStatusRow,
+    now_ms: i64,
+) -> bool {
+    device.is_self
+        || device.device_id == state.device_playback.self_device_id
+        || device
+            .last_seen_ms
+            .is_some_and(|seen| now_ms.saturating_sub(seen) <= DEVICE_ONLINE_TTL_MS)
+        || state
+            .device_playback
+            .remote
+            .get(&device.device_id)
+            .is_some_and(|snapshot| {
+                now_ms.saturating_sub(snapshot.updated_at_ms) <= DEVICE_ONLINE_TTL_MS
+            })
+}
+
+pub fn device_presence_section(
+    state: &AppState,
+    device: &crate::devices::DeviceStatusRow,
+    now_ms: i64,
+) -> DevicePresenceSection {
+    if device.revoked {
+        DevicePresenceSection::Revoked
+    } else if device_status_online(state, device, now_ms) {
+        DevicePresenceSection::Online
+    } else {
+        DevicePresenceSection::Offline
+    }
+}
+
+pub fn device_status_order(state: &AppState) -> Vec<usize> {
+    let Some(status) = &state.federation.devices else {
+        return Vec::new();
+    };
+    let now = unix_time_ms();
+    let mut indices: Vec<usize> = status
+        .devices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| (!device.revoked).then_some(index))
+        .collect();
+    indices.sort_by(|left, right| {
+        let left_device = &status.devices[*left];
+        let right_device = &status.devices[*right];
+        let left_section = device_presence_section(state, left_device, now).sort_rank();
+        let right_section = device_presence_section(state, right_device, now).sort_rank();
+        (
+            left_section,
+            !device_status_active(state, &left_device.device_id),
+            !left_device.is_self,
+            device_display_name(left_device).to_ascii_lowercase(),
+            left_device.device_id.as_str(),
+        )
+            .cmp(&(
+                right_section,
+                !device_status_active(state, &right_device.device_id),
+                !right_device.is_self,
+                device_display_name(right_device).to_ascii_lowercase(),
+                right_device.device_id.as_str(),
+            ))
+    });
+    indices
+}
+
 pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = Vec::new();
     rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
@@ -609,9 +733,11 @@ pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     rows.push(SettingsRow::DeviceInvite);
     rows.push(SettingsRow::DeviceConnect);
     rows.push(SettingsRow::DeviceSyncNow);
-    if let Some(status) = &state.federation.devices {
-        rows.extend((0..status.devices.len()).map(SettingsRow::Device));
-    }
+    rows.extend(
+        device_status_order(state)
+            .into_iter()
+            .map(SettingsRow::Device),
+    );
     rows.push(SettingsRow::VisualizationClock);
     rows.extend(
         state
@@ -800,6 +926,47 @@ impl Default for PlayerBar {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevicePlaybackRole {
+    #[default]
+    Active,
+    Control,
+}
+
+impl DevicePlaybackRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            DevicePlaybackRole::Active => "active",
+            DevicePlaybackRole::Control => "control",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DevicePlaybackState {
+    pub role: DevicePlaybackRole,
+    pub self_device_id: String,
+    pub self_device_name: String,
+    pub active_device_id: Option<String>,
+    pub active_device_name: Option<String>,
+    pub online_devices: usize,
+    pub remote: BTreeMap<String, crate::devices::PlaybackSnapshot>,
+    pub last_remote_snapshot: Option<crate::devices::PlaybackSnapshot>,
+}
+
+impl DevicePlaybackState {
+    pub fn is_control(&self) -> bool {
+        self.role == DevicePlaybackRole::Control
+    }
+
+    pub fn active_label(&self) -> String {
+        self.active_device_name
+            .clone()
+            .or_else(|| self.active_device_id.clone())
+            .unwrap_or_else(|| "this device".to_string())
+    }
+}
+
 /// Single source of truth for the UI. Mutated only by `update()` and the
 /// event handlers in the main loop; views render from `&AppState`.
 #[derive(Debug, Default)]
@@ -814,6 +981,7 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub settings_cursor: usize,
     pub player: PlayerBar,
+    pub device_playback: DevicePlaybackState,
     pub visualizer: crate::visualizer::VisualizerState,
     pub global: GlobalTab,
     pub artist_views: HashMap<i64, Loadable<ArtistDetail>>,

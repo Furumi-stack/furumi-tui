@@ -142,7 +142,7 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     let player = &state.player;
     let block = Block::bordered()
         .title(format!(
-            " Queue — {} tracks · enter: play · d: remove · shift-v: select · shift-c: clear ",
+            " Queue — {} tracks · enter: play · d: remove · shift-v: select · :clear ",
             player.queue.len()
         ))
         .title_style(theme::header())
@@ -212,7 +212,8 @@ fn format_secs(secs: f64) -> String {
 
 /// Playback time, progress bar, queue position, volume and mode flags.
 /// Wider consoles get a longer bar and full flags; narrow ones drop pieces.
-fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<'static> {
+fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
+    let player = &state.player;
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(track) = &player.current
         && player.playing
@@ -268,6 +269,17 @@ fn player_right_line(player: &crate::app::state::PlayerBar, width: u16) -> Line<
     } else {
         spans.push(Span::styled(format!("  {}%", player.volume), theme::dim()));
     }
+    if width >= 70 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(
+                "{} · online {}",
+                state.device_playback.role.label(),
+                state.device_playback.online_devices.max(1)
+            ),
+            theme::dim(),
+        ));
+    }
     // Keep a gap between the flags and the username block to the right.
     spans.push(Span::raw("  "));
     Line::from(spans)
@@ -281,7 +293,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     // Layout: track title left, time/progress/flags on the right. The
     // right block is built first and gets a fixed width; the title
     // truncates into whatever is left.
-    let center = player_right_line(player, area.width);
+    let center = player_right_line(state, area.width);
     let center_width = (center.width() as u16).min(area.width);
     let [title_area, right_area] =
         Layout::horizontal([Constraint::Min(8), Constraint::Length(center_width)])

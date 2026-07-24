@@ -3,7 +3,7 @@ mod cmdline;
 pub mod command;
 pub mod event;
 pub mod input;
-mod popup;
+pub(crate) mod popup;
 pub mod state;
 pub mod update;
 
@@ -98,6 +98,12 @@ pub async fn run(
     let federation = crate::federation::Federation::new(Arc::clone(&library), Arc::clone(&devices));
     state.federation.settings = federation.settings();
     state.federation.devices = Some(devices.status());
+    if let Ok((device_id, device_name)) = devices.identity_summary() {
+        state.device_playback.self_device_id = device_id.clone();
+        state.device_playback.self_device_name = device_name.clone();
+        state.device_playback.active_device_id = Some(device_id);
+        state.device_playback.active_device_name = Some(device_name);
+    }
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
         event_tx,
@@ -169,11 +175,212 @@ pub async fn run(
 }
 
 fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
-    if state.player.current.is_some() && !runtime.player_start_pending {
+    if state.device_playback.is_control() {
+        extrapolate_control_position(state);
+    } else if state.player.current.is_some() && !runtime.player_start_pending {
         state.player.position_secs = runtime.player.shared.position().as_secs_f64();
         state.player.paused = runtime.player.shared.paused();
     }
-    state.player.audio_analysis = runtime.player.shared.audio_analysis();
+    state.player.audio_analysis = if state.device_playback.is_control() {
+        player::AudioAnalysisSnapshot::default()
+    } else {
+        runtime.player.shared.audio_analysis()
+    };
+    publish_playback_snapshot(state, runtime);
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn playback_repeat_to_wire(mode: state::RepeatMode) -> crate::devices::PlaybackRepeat {
+    match mode {
+        state::RepeatMode::Off => crate::devices::PlaybackRepeat::Off,
+        state::RepeatMode::One => crate::devices::PlaybackRepeat::One,
+        state::RepeatMode::All => crate::devices::PlaybackRepeat::All,
+    }
+}
+
+fn playback_repeat_from_wire(mode: crate::devices::PlaybackRepeat) -> state::RepeatMode {
+    match mode {
+        crate::devices::PlaybackRepeat::Off => state::RepeatMode::Off,
+        crate::devices::PlaybackRepeat::One => state::RepeatMode::One,
+        crate::devices::PlaybackRepeat::All => state::RepeatMode::All,
+    }
+}
+
+fn playback_state_from_ui(state: &AppState) -> crate::devices::PlaybackStateWire {
+    crate::devices::PlaybackStateWire {
+        queue: state
+            .player
+            .queue
+            .iter()
+            .map(crate::devices::PlaybackTrack::from_track)
+            .collect(),
+        queue_pos: state.player.queue_pos,
+        playing: state.player.playing,
+        paused: state.player.paused,
+        position_secs: state.player.position_secs,
+        volume: state.player.volume,
+        shuffle: state.player.shuffle,
+        repeat: playback_repeat_to_wire(state.player.repeat),
+    }
+}
+
+fn playback_track_to_ui(
+    wire: &crate::devices::PlaybackTrack,
+    library: Option<&Library>,
+) -> crate::library::models::TrackItem {
+    if let (Some(library), Some(content_id)) = (library, wire.content_id.as_deref())
+        && let Ok(Some(track)) = library.track_by_content_id(content_id)
+    {
+        return track;
+    }
+    wire.to_track_item()
+}
+
+fn apply_playback_state_to_ui(
+    state: &mut AppState,
+    wire: &crate::devices::PlaybackStateWire,
+    library: Option<&Library>,
+) {
+    state.player.queue = wire
+        .queue
+        .iter()
+        .map(|track| playback_track_to_ui(track, library))
+        .collect();
+    state.player.queue_pos = wire
+        .queue_pos
+        .min(state.player.queue.len().saturating_sub(1));
+    state.player.playing = wire.playing && !state.player.queue.is_empty();
+    state.player.paused = wire.paused;
+    state.player.position_secs = wire.position_secs.max(0.0);
+    state.player.volume = wire.volume.min(100);
+    state.player.shuffle = wire.shuffle;
+    state.player.repeat = playback_repeat_from_wire(wire.repeat);
+    state.player.prefetched_pos = None;
+    state.player.original_order = None;
+    state.player.current = state
+        .player
+        .playing
+        .then(|| state.player.queue.get(state.player.queue_pos).cloned())
+        .flatten();
+    if !state.player.playing {
+        state.player.current = None;
+        state.player.paused = false;
+    }
+    state.queue_tab.cursor = state
+        .queue_tab
+        .cursor
+        .min(state.player.queue.len().saturating_sub(1));
+}
+
+fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
+    let Ok((device_id, device_name)) = runtime.devices.identity_summary() else {
+        return;
+    };
+    state.device_playback.self_device_id = device_id.clone();
+    state.device_playback.self_device_name = device_name.clone();
+    if state.device_playback.role == state::DevicePlaybackRole::Active {
+        state.device_playback.active_device_id = Some(device_id.clone());
+        state.device_playback.active_device_name = Some(device_name.clone());
+    }
+    let snapshot = crate::devices::PlaybackSnapshot {
+        device_id,
+        device_name,
+        active: state.device_playback.role == state::DevicePlaybackRole::Active,
+        updated_at_ms: unix_time_ms(),
+        state: playback_state_from_ui(state),
+    };
+    runtime.devices.publish_playback(snapshot);
+}
+
+fn extrapolate_control_position(state: &mut AppState) {
+    let Some(snapshot) = state.device_playback.last_remote_snapshot.as_ref() else {
+        return;
+    };
+    if !snapshot.state.playing {
+        return;
+    }
+    let elapsed = if snapshot.state.paused {
+        0.0
+    } else {
+        (unix_time_ms().saturating_sub(snapshot.updated_at_ms) as f64 / 1000.0).max(0.0)
+    };
+    let duration = state
+        .player
+        .current
+        .as_ref()
+        .map(|track| track.duration_seconds)
+        .unwrap_or(0.0);
+    let position = snapshot.state.position_secs + elapsed;
+    state.player.position_secs = if duration > 0.0 {
+        position.min(duration)
+    } else {
+        position
+    };
+}
+
+pub(crate) fn become_control_device(
+    state: &mut AppState,
+    runtime: &Runtime,
+    snapshot: crate::devices::PlaybackSnapshot,
+) {
+    if state.device_playback.role == state::DevicePlaybackRole::Active {
+        runtime.player.stop();
+    }
+    state.device_playback.role = state::DevicePlaybackRole::Control;
+    state.device_playback.active_device_id = Some(snapshot.device_id.clone());
+    state.device_playback.active_device_name = Some(snapshot.device_name.clone());
+    state.device_playback.last_remote_snapshot = Some(snapshot.clone());
+    state
+        .device_playback
+        .remote
+        .insert(snapshot.device_id.clone(), snapshot.clone());
+    apply_playback_state_to_ui(state, &snapshot.state, Some(runtime.library.as_ref()));
+    extrapolate_control_position(state);
+    state.status_message = Some(format!("controlling {}", snapshot.device_name));
+}
+
+pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, start_audio: bool) {
+    let was_control = state.device_playback.role == state::DevicePlaybackRole::Control;
+    state.device_playback.role = state::DevicePlaybackRole::Active;
+    let Ok((device_id, device_name)) = runtime.devices.identity_summary() else {
+        return;
+    };
+    state.device_playback.self_device_id = device_id.clone();
+    state.device_playback.self_device_name = device_name.clone();
+    state.device_playback.active_device_id = Some(device_id);
+    state.device_playback.active_device_name = Some(device_name);
+    state.device_playback.last_remote_snapshot = None;
+    if was_control && start_audio && state.player.playing {
+        start_current_audio(
+            state,
+            runtime,
+            state.player.position_secs,
+            state.player.paused,
+        );
+    }
+    publish_playback_snapshot(state, runtime);
+}
+
+fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
+    if !state.device_playback.is_control() {
+        return;
+    }
+    let Some(target) = state.device_playback.active_device_id.clone() else {
+        return;
+    };
+    let command = crate::devices::PlaybackCommand::SetState {
+        state: playback_state_from_ui(state),
+    };
+    if let Err(err) = runtime.devices.record_playback_command(&target, command) {
+        tracing::warn!(%err, target, "recording playback command failed");
+        state.status_message = Some(format!("device command failed: {err:#}"));
+    }
 }
 
 const ARTISTS_PREFETCH_MARGIN: usize = 24;
@@ -381,6 +588,10 @@ fn spawn_art_fetch(runtime: &Runtime, key: String, path: String, width: u16, hei
 
 /// Execute a side effect requested by update().
 fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
+    if state.device_playback.is_control() && is_controlled_playback_effect(&effect) {
+        perform_control_playback_effect(state, runtime, effect);
+        return;
+    }
     match effect {
         Effect::PlayCurrent => {
             play_current(state, runtime);
@@ -412,6 +623,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             save_app_settings(state);
         }
         Effect::SetOptions => {}
+        Effect::PlaybackQueueChanged => {}
         Effect::EnqueueRelease { id, next } => {
             let library = Arc::clone(&runtime.library);
             let tx = runtime.event_tx.clone();
@@ -686,6 +898,48 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             }
         }
     }
+}
+
+fn is_controlled_playback_effect(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::PlayCurrent
+            | Effect::TogglePause
+            | Effect::StopPlayback
+            | Effect::SeekBy(_)
+            | Effect::SetVolume(_)
+            | Effect::SetOptions
+            | Effect::RemoveQueueIndices { .. }
+            | Effect::PlaybackQueueChanged
+    )
+}
+
+fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
+    match effect {
+        Effect::PlayCurrent => {
+            state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
+            state.player.playing = state.player.current.is_some();
+            state.player.paused = false;
+            state.player.position_secs = 0.0;
+        }
+        Effect::TogglePause => {}
+        Effect::StopPlayback => {
+            state.player.playing = false;
+            state.player.current = None;
+            state.player.paused = false;
+            state.player.position_secs = 0.0;
+        }
+        Effect::SeekBy(delta) => {
+            state.player.position_secs = (state.player.position_secs + delta as f64).max(0.0);
+        }
+        Effect::SetVolume(volume) => {
+            state.player.volume = volume.min(100);
+            save_app_settings(state);
+        }
+        Effect::SetOptions | Effect::RemoveQueueIndices { .. } | Effect::PlaybackQueueChanged => {}
+        _ => {}
+    }
+    record_control_playback_state(state, runtime);
 }
 
 fn clamp_settings_cursor(state: &mut AppState) {
@@ -1375,6 +1629,97 @@ fn apply_queue_refresh(
     }
 }
 
+fn handle_device_playback_snapshot(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    snapshot: crate::devices::PlaybackSnapshot,
+) {
+    if snapshot.device_id == state.device_playback.self_device_id {
+        return;
+    }
+    state
+        .device_playback
+        .remote
+        .insert(snapshot.device_id.clone(), snapshot.clone());
+    let now = unix_time_ms();
+    state.device_playback.online_devices = state
+        .device_playback
+        .remote
+        .values()
+        .filter(|snapshot| {
+            now.saturating_sub(snapshot.updated_at_ms) <= state::DEVICE_ONLINE_TTL_MS
+        })
+        .count()
+        + 1;
+
+    if !snapshot.active {
+        return;
+    }
+    if snapshot.state.playing {
+        let was_active = state.device_playback.role == state::DevicePlaybackRole::Active;
+        let was_paused = state.player.playing && state.player.paused;
+        become_control_device(state, runtime, snapshot.clone());
+        if was_active && was_paused {
+            state.popup = Some(state::Popup::FedText {
+                title: "Active device moved".to_string(),
+                text: format!("Playback is now controlled by {}.", snapshot.device_name),
+            });
+        }
+    } else if state.device_playback.is_control()
+        && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str())
+    {
+        become_active_device(state, runtime, false);
+        state.status_message = Some("active playback moved to this device".into());
+    }
+}
+
+fn handle_playback_command(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    command: crate::devices::PlaybackCommand,
+) {
+    match command {
+        crate::devices::PlaybackCommand::SetState { state: wire } => {
+            let old_current_id = state.player.current.as_ref().map(|track| track.id);
+            let old_playing = state.player.playing;
+            let old_paused = state.player.paused;
+            become_active_device(state, runtime, false);
+            apply_playback_state_to_ui(state, &wire, Some(runtime.library.as_ref()));
+            runtime
+                .player
+                .set_volume(player::amplitude(state.player.volume));
+            if !state.player.playing {
+                runtime.player_start_pending = false;
+                runtime.player.stop();
+                push_media_update(state, runtime, true);
+                publish_playback_snapshot(state, runtime);
+                return;
+            }
+            let current_id = state.player.current.as_ref().map(|track| track.id);
+            if !old_playing || old_current_id != current_id {
+                start_current_audio(
+                    state,
+                    runtime,
+                    state.player.position_secs,
+                    state.player.paused,
+                );
+                push_media_metadata(state, runtime);
+            } else {
+                runtime.player.seek(std::time::Duration::from_secs_f64(
+                    state.player.position_secs,
+                ));
+                if state.player.paused && !old_paused {
+                    runtime.player.pause();
+                } else if !state.player.paused && old_paused {
+                    runtime.player.resume();
+                }
+            }
+            push_media_update(state, runtime, true);
+            publish_playback_snapshot(state, runtime);
+        }
+    }
+}
+
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
     match event {
         AppEvent::StatusMessage(message) => state.status_message = Some(message),
@@ -1383,6 +1728,45 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::DeviceSyncStatus(status) => {
             state.federation.devices = Some(status);
+            let now = unix_time_ms();
+            state.device_playback.online_devices = state
+                .federation
+                .devices
+                .as_ref()
+                .map(|status| {
+                    status
+                        .devices
+                        .iter()
+                        .filter(|device| {
+                            state::device_presence_section(state, device, now)
+                                == state::DevicePresenceSection::Online
+                        })
+                        .count()
+                })
+                .unwrap_or(1)
+                .max(1);
+            let active_revoked = state.device_playback.is_control()
+                && state
+                    .device_playback
+                    .active_device_id
+                    .as_ref()
+                    .is_some_and(|active| {
+                        state
+                            .federation
+                            .devices
+                            .as_ref()
+                            .and_then(|status| {
+                                status
+                                    .devices
+                                    .iter()
+                                    .find(|device| device.device_id == *active)
+                            })
+                            .is_some_and(|device| device.revoked)
+                    });
+            if active_revoked {
+                become_active_device(state, runtime, false);
+                state.status_message = Some("active playback moved to this device".into());
+            }
             clamp_settings_cursor(state);
         }
         AppEvent::DeviceInvite(result) => match result {
@@ -1414,6 +1798,12 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 requester_group_active_devices: request.requester_group_active_devices,
             });
             state.federation.devices = Some(runtime.devices.status());
+        }
+        AppEvent::DevicePlayback(snapshot) => {
+            handle_device_playback_snapshot(state, runtime, snapshot);
+        }
+        AppEvent::PlaybackCommand(command) => {
+            handle_playback_command(state, runtime, command);
         }
         AppEvent::FedSearchLoaded { seq, result } => {
             if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {
@@ -1769,6 +2159,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::EnqueueTracks { tracks, next } => {
             let count = tracks.len();
             update::enqueue_tracks(state, tracks, next);
+            record_control_playback_state(state, runtime);
             state.status_message = Some(if next {
                 format!("{count} tracks queued next")
             } else {
@@ -1849,8 +2240,12 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     state.player.playing = false;
                     state.player.paused = false;
                     state.player.current = None;
-                    runtime.player.stop();
-                    push_media_update(state, runtime, true);
+                    if state.device_playback.is_control() {
+                        record_control_playback_state(state, runtime);
+                    } else {
+                        runtime.player.stop();
+                        push_media_update(state, runtime, true);
+                    }
                     return;
                 }
             };

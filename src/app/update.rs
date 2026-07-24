@@ -44,6 +44,8 @@ pub enum Effect {
         restart_paused: Option<bool>,
         stop: bool,
     },
+    /// Queue/options changed without a direct audio engine action.
+    PlaybackQueueChanged,
     /// Persist the federation settings and start/stop the node.
     FedApplySettings,
     /// Force an immediate library publish into the DHT.
@@ -100,6 +102,10 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::ToggleHelp => {
             state.help_visible = !state.help_visible;
+            None
+        }
+        Action::OpenConnectedDevices => {
+            state.popup = Some(super::state::Popup::ConnectedDevices { cursor: 0 });
             None
         }
         Action::NextTab => {
@@ -642,7 +648,7 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
         }
     }
     if state.active_tab != Tab::Global {
-        return None;
+        return Some(Effect::PlaybackQueueChanged);
     }
     if state.global.stack.is_empty() {
         let artist = state.global.artists.get(state.global.selected).cloned()?;

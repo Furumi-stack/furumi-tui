@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use super::theme;
-use crate::app::state::{AppState, EditField, Loadable, Popup, addable_playlists};
+use crate::app::state::{
+    AppState, DevicePresenceSection, EditField, Loadable, Popup, addable_playlists,
+};
 use crate::library::models::{ArtistRef, TrackItem};
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
@@ -54,8 +56,122 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ConfirmDeviceRevoke { device_id, name }) => {
             draw_device_revoke(frame, device_id, name)
         }
+        Some(Popup::ConnectedDevices { cursor }) => draw_connected_devices(frame, state, *cursor),
         None => {}
     }
+}
+
+fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
+    let rows = crate::app::popup::connected_device_rows(state);
+    enum DisplayLine {
+        Section(DevicePresenceSection),
+        Row(usize),
+    }
+    let mut display_lines = Vec::new();
+    let mut last_section = None;
+    for (index, row) in rows.iter().enumerate() {
+        if last_section != Some(row.section) {
+            display_lines.push(DisplayLine::Section(row.section));
+            last_section = Some(row.section);
+        }
+        display_lines.push(DisplayLine::Row(index));
+    }
+    let height =
+        (display_lines.len() as u16 + 5).clamp(7, frame.area().height.saturating_sub(2).max(7));
+    let area = centered(frame.area(), 76, height);
+    let block = Block::bordered()
+        .title(" Connected devices ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [summary_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let active = state.device_playback.active_label();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Role ", theme::dim()),
+            Span::styled(state.device_playback.role.label(), theme::accent()),
+            Span::raw("  "),
+            Span::styled("Active ", theme::dim()),
+            Span::raw(active),
+        ])),
+        summary_area,
+    );
+
+    let visible = usize::from(list_area.height.max(1));
+    let selected = cursor.min(rows.len().saturating_sub(1));
+    let selected_line = display_lines
+        .iter()
+        .position(|line| matches!(line, DisplayLine::Row(index) if *index == selected))
+        .unwrap_or(0);
+    let first = selected_line
+        .saturating_sub(visible / 2)
+        .min(display_lines.len().saturating_sub(visible));
+    for (line_index, line) in display_lines.iter().enumerate().skip(first).take(visible) {
+        let area = Rect {
+            x: list_area.x,
+            y: list_area.y + (line_index - first) as u16,
+            width: list_area.width,
+            height: 1,
+        };
+        let DisplayLine::Row(index) = line else {
+            let DisplayLine::Section(section) = line else {
+                continue;
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(section.title(), theme::header())),
+                area,
+            );
+            continue;
+        };
+        let row = &rows[*index];
+        let role = if row.revoked {
+            "revoked"
+        } else if row.active {
+            "active"
+        } else if row.is_self
+            && state.device_playback.role == crate::app::state::DevicePlaybackRole::Control
+        {
+            "control"
+        } else {
+            "device"
+        };
+        let play = if row.playing && row.paused {
+            "paused"
+        } else if row.playing {
+            "playing"
+        } else {
+            "stopped"
+        };
+        let online = if row.online { "online" } else { "offline" };
+        let marker = if row.is_self { "*" } else { " " };
+        let line = Line::from(vec![
+            Span::styled(format!("{marker} "), theme::accent()),
+            Span::raw(row.name.clone()),
+            Span::styled(format!("  {role} · {online} · {play}"), theme::dim()),
+            Span::styled(format!(" · {} queued", row.queue_len), theme::dim()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        if *index == selected {
+            frame.buffer_mut().set_style(area, theme::tab_active());
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "enter: control selected / move active here · esc close",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        hint_area,
+    );
 }
 
 fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {

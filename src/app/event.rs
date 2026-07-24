@@ -137,4 +137,8 @@ pub enum AppEvent {
     DeviceConnectResult(Result<String, String>),
     /// Incoming pairing request that passed the invite-secret check.
     DevicePairingRequest(crate::devices::PendingPairing),
+    /// Trusted device playback state, delivered by personal-device sync.
+    DevicePlayback(crate::devices::PlaybackSnapshot),
+    /// Playback command addressed to this device.
+    PlaybackCommand(crate::devices::PlaybackCommand),
 }

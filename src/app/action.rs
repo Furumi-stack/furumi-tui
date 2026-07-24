@@ -42,6 +42,7 @@ pub enum Action {
     DownloadSelected,
     RemoveFromQueue,
     ClearQueue,
+    OpenConnectedDevices,
     GoToRelease,
     AddToPlaylist,
     NewPlaylist,
@@ -99,7 +100,8 @@ impl Action {
             | Action::VolumeDown
             | Action::ToggleShuffle
             | Action::CycleRepeat
-            | Action::ToggleVisualizer => Category::Playback,
+            | Action::ToggleVisualizer
+            | Action::OpenConnectedDevices => Category::Playback,
             Action::QueueAddNext
             | Action::QueueAddLast
             | Action::DownloadSelected
@@ -147,6 +149,7 @@ impl Action {
             Action::ToggleShuffle => Some(":shuffle"),
             Action::CycleRepeat => Some(":repeat [off|one|all]"),
             Action::ClearQueue => Some(":clear"),
+            Action::OpenConnectedDevices => None,
             Action::ToggleHelp => Some(":help"),
             Action::OpenSearch => Some("/text"),
             _ => None,
@@ -188,6 +191,7 @@ impl Action {
             Action::DownloadSelected => "Federation: download to library".into(),
             Action::RemoveFromQueue => "Queue: remove selected".into(),
             Action::ClearQueue => "Queue: clear".into(),
+            Action::OpenConnectedDevices => "Connected devices…".into(),
             Action::GoToRelease => "Open the track's release".into(),
             Action::AddToPlaylist => "Add track to a playlist…".into(),
             Action::NewPlaylist => "Create a playlist".into(),

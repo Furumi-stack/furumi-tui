@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::app::event::AppEvent;
 use crate::library::Library;
+use crate::library::models::{ArtistRef, TrackItem};
 
 pub const SYNC_ALPN: &[u8] = b"furumi/sync/1";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -27,7 +28,7 @@ const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
 const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const MAX_OPS_PER_BATCH: usize = 1000;
 
@@ -79,6 +80,148 @@ pub struct DeviceSync {
     conn: Arc<std::sync::Mutex<Connection>>,
     library: Arc<Library>,
     event_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    playback: Arc<std::sync::Mutex<PlaybackShared>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackRepeat {
+    #[default]
+    Off,
+    One,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackTrack {
+    pub id: i64,
+    pub title: String,
+    pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
+    pub duration_seconds: f64,
+    #[serde(default)]
+    pub artist_names: Vec<String>,
+    #[serde(default)]
+    pub featured_artist_names: Vec<String>,
+    pub release_id: i64,
+    pub release_title: String,
+    pub release_year: Option<i32>,
+    #[serde(default)]
+    pub file_path: String,
+    pub content_id: Option<String>,
+    pub audio_format: Option<String>,
+    pub audio_bitrate: Option<i32>,
+    pub audio_sample_rate: Option<i32>,
+    pub audio_bit_depth: Option<i32>,
+    pub file_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub play_count: i64,
+    #[serde(default)]
+    pub fed: Option<SyncedFedTrack>,
+}
+
+impl PlaybackTrack {
+    pub fn from_track(track: &TrackItem) -> Self {
+        Self {
+            id: track.id,
+            title: track.title.clone(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_seconds: track.duration_seconds,
+            artist_names: track
+                .artists
+                .iter()
+                .map(|artist| artist.name.clone())
+                .collect(),
+            featured_artist_names: track
+                .featured_artists
+                .iter()
+                .map(|artist| artist.name.clone())
+                .collect(),
+            release_id: track.release_id,
+            release_title: track.release_title.clone(),
+            release_year: track.release_year,
+            file_path: track.file_path.clone(),
+            content_id: track.content_id.clone(),
+            audio_format: track.audio_format.clone(),
+            audio_bitrate: track.audio_bitrate,
+            audio_sample_rate: track.audio_sample_rate,
+            audio_bit_depth: track.audio_bit_depth,
+            file_size_bytes: track.file_size_bytes,
+            play_count: track.play_count,
+            fed: track.fed.as_ref().and_then(SyncedFedTrack::from_fed),
+        }
+    }
+
+    pub fn to_track_item(&self) -> TrackItem {
+        let refs = |names: &[String]| -> Vec<ArtistRef> {
+            names
+                .iter()
+                .map(|name| ArtistRef {
+                    id: -1,
+                    name: name.clone(),
+                })
+                .collect()
+        };
+        TrackItem {
+            id: self.id,
+            title: self.title.clone(),
+            track_number: self.track_number,
+            disc_number: self.disc_number,
+            duration_seconds: self.duration_seconds,
+            artists: refs(&self.artist_names),
+            featured_artists: refs(&self.featured_artist_names),
+            release_id: self.release_id,
+            release_title: self.release_title.clone(),
+            release_year: self.release_year,
+            file_path: self.file_path.clone(),
+            content_id: self.content_id.clone(),
+            cover_path: None,
+            audio_format: self.audio_format.clone(),
+            audio_bitrate: self.audio_bitrate,
+            audio_sample_rate: self.audio_sample_rate,
+            audio_bit_depth: self.audio_bit_depth,
+            file_size_bytes: self.file_size_bytes,
+            play_count: self.play_count,
+            fed: self.fed.as_ref().map(SyncedFedTrack::to_fed_track),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackStateWire {
+    #[serde(default)]
+    pub queue: Vec<PlaybackTrack>,
+    #[serde(default)]
+    pub queue_pos: usize,
+    pub playing: bool,
+    pub paused: bool,
+    pub position_secs: f64,
+    #[serde(default)]
+    pub volume: u8,
+    pub shuffle: bool,
+    pub repeat: PlaybackRepeat,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackSnapshot {
+    pub device_id: String,
+    pub device_name: String,
+    pub active: bool,
+    pub updated_at_ms: i64,
+    pub state: PlaybackStateWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybackCommand {
+    SetState { state: PlaybackStateWire },
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlaybackShared {
+    local: Option<PlaybackSnapshot>,
+    remote: BTreeMap<String, PlaybackSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +314,10 @@ pub enum SyncOpPayload {
     DeviceRevoked {
         target_device_id: String,
         target_max_seq_seen: i64,
+    },
+    PlaybackCommand {
+        target_device_id: String,
+        command: PlaybackCommand,
     },
 }
 
@@ -334,6 +481,8 @@ enum WireMessage {
         vector: BTreeMap<String, i64>,
         ops: Vec<SyncOpWire>,
         snapshot: SyncSnapshot,
+        #[serde(default)]
+        playback: Option<PlaybackSnapshot>,
     },
     PairResponse {
         accepted: bool,
@@ -353,6 +502,8 @@ enum WireMessage {
         ops: Vec<SyncOpWire>,
         #[serde(default)]
         snapshot: SyncSnapshot,
+        #[serde(default)]
+        playback: Option<PlaybackSnapshot>,
     },
     Hello {
         group_id: String,
@@ -361,6 +512,8 @@ enum WireMessage {
         vector: BTreeMap<String, i64>,
         ops: Vec<SyncOpWire>,
         snapshot: SyncSnapshot,
+        #[serde(default)]
+        playback: Option<PlaybackSnapshot>,
     },
     SyncResponse {
         accepted: bool,
@@ -374,6 +527,8 @@ enum WireMessage {
         ops: Vec<SyncOpWire>,
         #[serde(default)]
         snapshot: SyncSnapshot,
+        #[serde(default)]
+        playback: Option<PlaybackSnapshot>,
     },
 }
 
@@ -419,6 +574,7 @@ impl DeviceSync {
             conn: Arc::new(std::sync::Mutex::new(conn)),
             library,
             event_tx: Arc::new(std::sync::Mutex::new(None)),
+            playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
         });
         sync.ensure_identity()?;
         sync.repair_like_order_from_sync_state()?;
@@ -427,6 +583,32 @@ impl DeviceSync {
 
     pub fn set_event_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
         *lock(&self.event_tx) = Some(tx);
+    }
+
+    pub fn identity_summary(&self) -> Result<(String, String)> {
+        let identity = self.ensure_identity()?;
+        Ok((identity.device_id, identity.name))
+    }
+
+    pub fn publish_playback(&self, mut snapshot: PlaybackSnapshot) {
+        if snapshot.updated_at_ms <= 0 {
+            snapshot.updated_at_ms = now_ms();
+        }
+        lock(&self.playback).local = Some(snapshot);
+    }
+
+    pub fn record_playback_command(
+        &self,
+        target_device_id: &str,
+        command: PlaybackCommand,
+    ) -> Result<()> {
+        if target_device_id.trim().is_empty() {
+            return Ok(());
+        }
+        self.record_local_op(SyncOpPayload::PlaybackCommand {
+            target_device_id: target_device_id.to_string(),
+            command,
+        })
     }
 
     pub fn set_device_name(&self, name: &str, endpoint_ticket: Option<&str>) -> Result<()> {
@@ -546,6 +728,7 @@ impl DeviceSync {
         let vector = self.vector()?;
         let ops = self.ops_for_peer(&invite.device_id)?;
         let snapshot = self.snapshot()?;
+        let playback = self.local_playback_snapshot();
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         write_msg(
             &mut stream,
@@ -559,6 +742,7 @@ impl DeviceSync {
                 vector,
                 ops,
                 snapshot,
+                playback,
             },
         )
         .await?;
@@ -575,11 +759,15 @@ impl DeviceSync {
                 vector,
                 ops,
                 snapshot,
+                playback,
                 ..
             } => {
                 self.set_group_id(&group_id)?;
                 if let Some(profile) = profile {
                     self.apply_device_profile(&profile, true)?;
+                    if let Some(playback) = playback {
+                        self.apply_playback_snapshot(playback)?;
+                    }
                 }
                 self.apply_device_profiles(&devices)?;
                 self.apply_snapshot(snapshot)?;
@@ -851,6 +1039,7 @@ impl DeviceSync {
         let vector = self.vector()?;
         let ops = self.ops_for_peer(&device.device_id)?;
         let snapshot = self.snapshot()?;
+        let playback = self.local_playback_snapshot();
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         write_msg(
             &mut stream,
@@ -861,6 +1050,7 @@ impl DeviceSync {
                 vector,
                 ops,
                 snapshot,
+                playback,
             },
         )
         .await?;
@@ -875,9 +1065,13 @@ impl DeviceSync {
                 vector,
                 ops,
                 snapshot,
+                playback,
                 ..
             } => {
                 self.apply_device_profiles(&devices)?;
+                if let Some(playback) = playback {
+                    self.apply_playback_snapshot(playback)?;
+                }
                 self.apply_snapshot(snapshot)?;
                 self.apply_ops(ops)?;
                 self.note_peer_vector(&device.device_id, &vector)?;
@@ -1192,8 +1386,42 @@ impl DeviceSync {
                 &op.origin_device_id,
                 *target_max_seq_seen,
             )?,
+            SyncOpPayload::PlaybackCommand {
+                target_device_id,
+                command,
+            } => {
+                self.apply_playback_command(target_device_id, command, &op.op_id)?;
+                false
+            }
         };
         Ok(changed)
+    }
+
+    fn apply_playback_command(
+        &self,
+        target_device_id: &str,
+        command: &PlaybackCommand,
+        op_id: &str,
+    ) -> Result<()> {
+        let identity = self.ensure_identity()?;
+        if target_device_id != identity.device_id {
+            return Ok(());
+        }
+        let inserted = {
+            let conn = lock(&self.conn);
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_playback_applied (op_id, applied_at_ms)
+                 VALUES (?1, ?2)",
+                params![op_id, now_ms()],
+            )?
+        };
+        if inserted == 0 {
+            return Ok(());
+        }
+        if let Some(tx) = lock(&self.event_tx).as_ref() {
+            let _ = tx.send(AppEvent::PlaybackCommand(command.clone()));
+        }
+        Ok(())
     }
 
     fn apply_device_trusted(&self, target_device_id: &str, hlc_ms: i64) -> Result<bool> {
@@ -1451,8 +1679,8 @@ impl DeviceSync {
             let conn = lock(&self.conn);
             conn.query_row(
                 "SELECT present, position, hlc_ms, op_id
-	                     FROM sync_state_playlist_items
-	                     WHERE playlist_id = ?1 AND content_id = ?2",
+                 FROM sync_state_playlist_items
+                 WHERE playlist_id = ?1 AND content_id = ?2",
                 params![playlist_id, content_id],
                 |row| {
                     Ok((
@@ -2082,6 +2310,34 @@ impl DeviceSync {
         }
     }
 
+    fn local_playback_snapshot(&self) -> Option<PlaybackSnapshot> {
+        lock(&self.playback).local.clone()
+    }
+
+    fn apply_playback_snapshot(&self, snapshot: PlaybackSnapshot) -> Result<()> {
+        let identity = self.ensure_identity()?;
+        if snapshot.device_id == identity.device_id {
+            return Ok(());
+        }
+        let should_send = {
+            let mut playback = lock(&self.playback);
+            let changed = playback
+                .remote
+                .get(&snapshot.device_id)
+                .is_none_or(|current| snapshot.updated_at_ms > current.updated_at_ms);
+            if changed {
+                playback
+                    .remote
+                    .insert(snapshot.device_id.clone(), snapshot.clone());
+            }
+            changed
+        };
+        if should_send && let Some(tx) = lock(&self.event_tx).as_ref() {
+            let _ = tx.send(AppEvent::DevicePlayback(snapshot));
+        }
+        Ok(())
+    }
+
     fn notify_library_changed(&self) {
         if let Some(tx) = lock(&self.event_tx).as_ref() {
             let _ = tx.send(AppEvent::LibraryChanged { message: None });
@@ -2093,6 +2349,7 @@ impl DeviceSync {
         let conn = lock(&self.conn);
         let compactable = compactable_tombstone_ids(&conn)?;
         for (op_id, origin, seq) in compactable {
+            let revoked_target = tombstone_revoke_target(&conn, &op_id)?;
             conn.execute(
                 "INSERT INTO sync_compacted (origin_device_id, max_seq)
                  VALUES (?1, ?2)
@@ -2101,6 +2358,9 @@ impl DeviceSync {
                 params![origin, seq],
             )?;
             conn.execute("DELETE FROM sync_ops WHERE op_id = ?1", [op_id])?;
+            if let Some(device_id) = revoked_target {
+                delete_revoked_device_if_fully_compacted(&conn, &device_id)?;
+            }
         }
         conn.execute(
             "DELETE FROM sync_state_likes
@@ -2145,6 +2405,9 @@ pub async fn sync_loop(sync: Arc<DeviceSync>, service: Arc<MusicDhtService>) {
         if let Err(err) = sync.sync_once(Arc::clone(&service)).await {
             tracing::debug!("personal sync tick failed: {err:#}");
         }
+        if let Some(tx) = lock(&sync.event_tx).as_ref() {
+            let _ = tx.send(AppEvent::DeviceSyncStatus(sync.status()));
+        }
     }
 }
 
@@ -2164,6 +2427,7 @@ async fn serve_one(
             vector,
             ops,
             snapshot,
+            playback,
         } => {
             handle_pair_request(
                 stream,
@@ -2178,6 +2442,7 @@ async fn serve_one(
                 vector,
                 ops,
                 snapshot,
+                playback,
             )
             .await
         }
@@ -2188,9 +2453,10 @@ async fn serve_one(
             vector,
             ops,
             snapshot,
+            playback,
         } => {
             handle_hello(
-                stream, sync, service, group_id, profile, devices, vector, ops, snapshot,
+                stream, sync, service, group_id, profile, devices, vector, ops, snapshot, playback,
             )
             .await
         }
@@ -2212,6 +2478,7 @@ async fn handle_pair_request(
     vector: BTreeMap<String, i64>,
     ops: Vec<SyncOpWire>,
     snapshot: SyncSnapshot,
+    playback: Option<PlaybackSnapshot>,
 ) -> Result<()> {
     profile.endpoint_id = stream.peer_id.to_string();
     let request_id = pair_request_id(&invite_id, &profile.device_id);
@@ -2233,6 +2500,7 @@ async fn handle_pair_request(
                 vector: BTreeMap::new(),
                 ops: Vec::new(),
                 snapshot: SyncSnapshot::default(),
+                playback: None,
             },
         )
         .await?;
@@ -2303,6 +2571,7 @@ async fn handle_pair_request(
                     vector: BTreeMap::new(),
                     ops: Vec::new(),
                     snapshot: SyncSnapshot::default(),
+                    playback: None,
                 },
             )
             .await?;
@@ -2323,6 +2592,7 @@ async fn handle_pair_request(
                     vector: BTreeMap::new(),
                     ops: Vec::new(),
                     snapshot: SyncSnapshot::default(),
+                    playback: None,
                 },
             )
             .await?;
@@ -2347,6 +2617,9 @@ async fn handle_pair_request(
         sync.apply_device_profiles(&requester_group_devices)?;
     }
     sync.apply_device_profile(&profile, true)?;
+    if let Some(playback) = playback {
+        sync.apply_playback_snapshot(playback)?;
+    }
     sync.apply_snapshot(snapshot)?;
     sync.apply_ops(ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
@@ -2362,6 +2635,7 @@ async fn handle_pair_request(
     let vector = sync.vector()?;
     let ops = sync.ops_for_peer(&profile.device_id)?;
     let snapshot = sync.snapshot()?;
+    let playback = sync.local_playback_snapshot();
     write_msg(
         &mut stream,
         &WireMessage::PairResponse {
@@ -2374,6 +2648,7 @@ async fn handle_pair_request(
             vector,
             ops,
             snapshot,
+            playback,
         },
     )
     .await?;
@@ -2392,6 +2667,7 @@ async fn handle_hello(
     vector: BTreeMap<String, i64>,
     ops: Vec<SyncOpWire>,
     snapshot: SyncSnapshot,
+    playback: Option<PlaybackSnapshot>,
 ) -> Result<()> {
     let identity = sync.ensure_identity()?;
     if group_id != identity.group_id {
@@ -2404,6 +2680,7 @@ async fn handle_hello(
                 vector: BTreeMap::new(),
                 ops: Vec::new(),
                 snapshot: SyncSnapshot::default(),
+                playback: None,
             },
         )
         .await?;
@@ -2420,6 +2697,7 @@ async fn handle_hello(
                 vector: BTreeMap::new(),
                 ops: Vec::new(),
                 snapshot: SyncSnapshot::default(),
+                playback: None,
             },
         )
         .await?;
@@ -2429,6 +2707,9 @@ async fn handle_hello(
     profile.endpoint_id = stream.peer_id.to_string();
     sync.apply_device_profile(&profile, false)?;
     sync.apply_device_profiles(&devices)?;
+    if let Some(playback) = playback {
+        sync.apply_playback_snapshot(playback)?;
+    }
     sync.apply_snapshot(snapshot)?;
     sync.apply_ops(ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
@@ -2441,6 +2722,7 @@ async fn handle_hello(
     let vector = sync.vector()?;
     let ops = sync.ops_for_peer(&profile.device_id)?;
     let snapshot = sync.snapshot()?;
+    let playback = sync.local_playback_snapshot();
     write_msg(
         &mut stream,
         &WireMessage::SyncResponse {
@@ -2454,6 +2736,7 @@ async fn handle_hello(
             vector,
             ops,
             snapshot,
+            playback,
         },
     )
     .await?;
@@ -2632,7 +2915,11 @@ CREATE TABLE IF NOT EXISTS sync_state_playlist_items (
     op_id       TEXT NOT NULL,
     PRIMARY KEY (playlist_id, content_id)
 );
-"#,
+CREATE TABLE IF NOT EXISTS sync_playback_applied (
+    op_id         TEXT PRIMARY KEY,
+    applied_at_ms INTEGER NOT NULL
+);
+    "#,
     )?;
     ensure_column(
         conn,
@@ -2717,6 +3004,7 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
         SyncOpPayload::DeviceProfileSet { .. } => "device_profile_set",
         SyncOpPayload::DeviceTrusted { .. } => "device_trusted",
         SyncOpPayload::DeviceRevoked { .. } => "device_revoked",
+        SyncOpPayload::PlaybackCommand { .. } => "playback_command",
     }
 }
 
@@ -2791,6 +3079,71 @@ fn compactable_tombstone_ids(conn: &Connection) -> Result<Vec<(String, String, i
         }
     }
     Ok(out)
+}
+
+fn tombstone_revoke_target(conn: &Connection, op_id: &str) -> Result<Option<String>> {
+    let payload_json: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM sync_ops WHERE op_id = ?1 AND kind = 'device_revoked'",
+            [op_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload_json) = payload_json else {
+        return Ok(None);
+    };
+    let payload: SyncOpPayload = serde_json::from_str(&payload_json)?;
+    Ok(match payload {
+        SyncOpPayload::DeviceRevoked {
+            target_device_id, ..
+        } => Some(target_device_id),
+        _ => None,
+    })
+}
+
+fn has_revoke_op_for_target(conn: &Connection, device_id: &str) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT payload_json FROM sync_ops WHERE kind = 'device_revoked'")?;
+    let payloads = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for payload_json in payloads {
+        let Ok(SyncOpPayload::DeviceRevoked {
+            target_device_id, ..
+        }) = serde_json::from_str::<SyncOpPayload>(&payload_json)
+        else {
+            continue;
+        };
+        if target_device_id == device_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn delete_revoked_device_if_fully_compacted(conn: &Connection, device_id: &str) -> Result<()> {
+    let own_device_id = get_meta(conn, "device_id")?.unwrap_or_default();
+    if device_id == own_device_id {
+        return Ok(());
+    }
+    let origin_ops: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_ops WHERE origin_device_id = ?1",
+        [device_id],
+        |row| row.get(0),
+    )?;
+    if origin_ops > 0 || has_revoke_op_for_target(conn, device_id)? {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM sync_devices
+         WHERE device_id = ?1 AND revoked_at_ms IS NOT NULL",
+        [device_id],
+    )?;
+    conn.execute(
+        "DELETE FROM sync_peer_acks WHERE peer_device_id = ?1",
+        [device_id],
+    )?;
+    Ok(())
 }
 
 fn peer_ack_floor_label(conn: &Connection) -> Result<String> {
@@ -2964,18 +3317,23 @@ fn base64url_decode(value: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    static NEXT_TEST_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
     fn test_sync() -> DeviceSync {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
+        let unique = NEXT_TEST_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let library_path = std::env::temp_dir().join(format!(
-            "furumi-devices-test-{}-{}.sqlite3",
+            "furumi-devices-test-{}-{}-{}.sqlite3",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            unique
         ));
         let sync = DeviceSync {
             conn: Arc::new(std::sync::Mutex::new(conn)),
             library: Arc::new(Library::open(&library_path).unwrap()),
             event_tx: Arc::new(std::sync::Mutex::new(None)),
+            playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
         };
         sync.ensure_identity().unwrap();
         sync
@@ -2994,6 +3352,18 @@ mod tests {
         .unwrap()
         .unwrap_or(0)
             != 0
+    }
+
+    fn device_known(sync: &DeviceSync, device_id: &str) -> bool {
+        let conn = lock(&sync.conn);
+        conn.query_row(
+            "SELECT 1 FROM sync_devices WHERE device_id = ?1",
+            [device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
     }
 
     fn test_fed_track(content_id: &str) -> crate::federation::FedTrack {
@@ -3040,6 +3410,53 @@ mod tests {
             }
             .is_tombstone()
         );
+    }
+
+    #[test]
+    fn compacted_device_revoke_removes_device_row() {
+        let sync = test_sync();
+        let device_id = "dev_old";
+
+        sync.apply_device_trusted(device_id, 10).unwrap();
+        assert!(device_known(&sync, device_id));
+
+        sync.revoke_device(device_id).unwrap();
+        assert!(!device_known(&sync, device_id));
+    }
+
+    #[test]
+    fn playback_command_is_targeted_and_deduplicated() {
+        let sync = test_sync();
+        let identity = sync.ensure_identity().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sync.set_event_tx(tx);
+        let command = PlaybackCommand::SetState {
+            state: PlaybackStateWire {
+                queue: Vec::new(),
+                queue_pos: 0,
+                playing: false,
+                paused: false,
+                position_secs: 0.0,
+                volume: 42,
+                shuffle: false,
+                repeat: PlaybackRepeat::Off,
+            },
+        };
+
+        sync.apply_playback_command("dev_other", &command, "op_other")
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        sync.apply_playback_command(&identity.device_id, &command, "op_1")
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::app::event::AppEvent::PlaybackCommand(_)
+        ));
+
+        sync.apply_playback_command(&identity.device_id, &command, "op_1")
+            .unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

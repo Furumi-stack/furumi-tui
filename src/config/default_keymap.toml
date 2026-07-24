@@ -65,8 +65,7 @@ command = "QueueAddLast"
 
 [[keymaps]]
 key_sequence = "shift-c"
-command = "ClearQueue"
-context = "queue"
+command = "OpenConnectedDevices"
 
 [[keymaps]]
 key_sequence = "d"

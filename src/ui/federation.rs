@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::theme;
-use crate::app::state::{AppState, FedRow, settings_rows};
+use crate::app::state::{AppState, DevicePresenceSection, FedRow, settings_rows};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::bordered()
@@ -16,7 +16,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows_height = (settings_rows(state).len() + 5) as u16;
+    let rows_height =
+        (settings_rows(state).len() + 5 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -26,6 +27,24 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
 
     draw_settings_rows(frame, rows_area, state);
     draw_status(frame, status_area, state);
+}
+
+fn device_presence_sections(state: &AppState) -> Vec<DevicePresenceSection> {
+    let Some(status) = &state.federation.devices else {
+        return Vec::new();
+    };
+    let now = crate::app::state::unix_time_ms();
+    let mut sections = Vec::new();
+    for index in crate::app::state::device_status_order(state) {
+        let Some(device) = status.devices.get(index) else {
+            continue;
+        };
+        let section = crate::app::state::device_presence_section(state, device, now);
+        if sections.last().copied() != Some(section) {
+            sections.push(section);
+        }
+    }
+    sections
 }
 
 fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -134,13 +153,24 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     cursor += 1;
     if let Some(status) = devices {
-        for device in &status.devices {
+        let now = crate::app::state::unix_time_ms();
+        let mut current_section = None;
+        for index in crate::app::state::device_status_order(state) {
+            let Some(device) = status.devices.get(index) else {
+                continue;
+            };
+            let section = crate::app::state::device_presence_section(state, device, now);
+            if current_section != Some(section) {
+                draw_subsection(frame, area, &mut y, section.title());
+                current_section = Some(section);
+            }
+            let name = crate::app::state::device_display_name(device);
             let label = if device.is_self {
-                format!("* {}", device.name)
+                format!("* {name}")
             } else if device.revoked {
-                format!("  {} (revoked)", device.name)
+                format!("  {name} (revoked)")
             } else {
-                format!("  {}", device.name)
+                format!("  {name}")
             };
             let version = if device.client_version.is_empty() {
                 "unknown".to_string()
@@ -148,10 +178,15 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
                 format!("v{}", device.client_version)
             };
             let can_revoke = connected_devices_enabled && !device.is_self && !device.revoked;
+            let presence = match section {
+                DevicePresenceSection::Online => "online",
+                DevicePresenceSection::Offline => "offline",
+                DevicePresenceSection::Revoked => "revoked",
+            };
             let value = if can_revoke {
-                format!("{version} · revoke ↵")
+                format!("{version} · {presence} · revoke ↵")
             } else if connected_devices_enabled {
-                version
+                format!("{version} · {presence}")
             } else {
                 disabled_value.clone()
             };
@@ -249,6 +284,26 @@ fn draw_section(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str)
         height: 1,
     };
     frame.render_widget(Paragraph::new(Line::styled(title, theme::header())), rect);
+    *y = (*y).saturating_add(1);
+}
+
+fn draw_subsection(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str) {
+    if *y >= area.y + area.height {
+        return;
+    }
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(title, theme::dim()),
+        ])),
+        rect,
+    );
     *y = (*y).saturating_add(1);
 }
 
