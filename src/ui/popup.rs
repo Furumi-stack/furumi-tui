@@ -197,7 +197,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "enter: activate this device / control selected · esc close",
+            "enter: activate selected device / control active selected · esc close",
             theme::dim(),
         ))
         .alignment(Alignment::Center),

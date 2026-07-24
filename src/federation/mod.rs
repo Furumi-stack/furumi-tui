@@ -15,6 +15,7 @@
 mod audio;
 pub mod catalog;
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,8 +24,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use music_dht::{
-    EndpointId, ItemKind, ItemSpec, LibraryItem, MusicDhtConfig, MusicDhtService, NetworkId,
-    PeerTicket, PublishStats, RendezvousConfig, SyncStats,
+    ByteStream, ByteStreamConnectionStats, EndpointId, ItemKind, ItemSpec, LibraryItem,
+    MusicDhtConfig, MusicDhtService, NetworkId, PeerTicket, PublishStats, RendezvousConfig,
+    SyncStats,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -32,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::library::Library;
 use crate::library::models::{ArtistRef, TrackItem};
 
-pub use audio::{AUDIO_ALPN, TrackMetadata};
+pub use audio::{AUDIO_ALPN, DownloadProgress, StreamingStart, TrackMetadata};
 pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRelease};
 
 /// How often the published library is re-synchronized with the local index.
@@ -43,11 +45,229 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const CONTENT_LOOKUP_ATTEMPTS: usize = 3;
 /// Pause between share-link content lookup attempts.
 const CONTENT_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+const TRANSPORT_SAMPLE_LIMIT: usize = 16;
 
 /// Ephemeral (not-in-library) tracks get negative ids so the rest of the
 /// app can tell them apart from library rows (history, likes and release
 /// navigation skip them).
 static NEXT_EPHEMERAL_ID: AtomicI64 = AtomicI64::new(-1);
+
+#[derive(Debug, Clone, Default)]
+pub struct TransportSample {
+    pub at: String,
+    pub protocol: &'static str,
+    pub direction: &'static str,
+    pub phase: &'static str,
+    pub peer_id: String,
+    pub selected_path: String,
+    pub open_paths: usize,
+    pub direct_paths: usize,
+    pub relay_paths: usize,
+    pub custom_paths: usize,
+    pub selected_rtt_ms: Option<u64>,
+    pub selected_tx_bytes: u64,
+    pub selected_rx_bytes: u64,
+    pub total_tx_bytes: u64,
+    pub total_rx_bytes: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TransportTrafficCursor {
+    tx_bytes: u64,
+    rx_bytes: u64,
+    lost_packets: u64,
+    lost_bytes: u64,
+}
+
+impl TransportSample {
+    fn from_stats(
+        protocol: &'static str,
+        direction: &'static str,
+        phase: &'static str,
+        stats: ByteStreamConnectionStats,
+    ) -> Self {
+        Self {
+            at: now_label(),
+            protocol,
+            direction,
+            phase,
+            peer_id: stats.peer_id.to_string(),
+            selected_path: stats.selected_path.as_str().to_string(),
+            open_paths: stats.open_paths,
+            direct_paths: stats.direct_paths,
+            relay_paths: stats.relay_paths,
+            custom_paths: stats.custom_paths,
+            selected_rtt_ms: stats
+                .selected_rtt
+                .map(|duration| duration.as_millis() as u64),
+            selected_tx_bytes: stats.selected_tx_bytes,
+            selected_rx_bytes: stats.selected_rx_bytes,
+            total_tx_bytes: stats.total_tx_bytes,
+            total_rx_bytes: stats.total_rx_bytes,
+            lost_packets: stats.lost_packets,
+            lost_bytes: stats.lost_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransportStatsSnapshot {
+    pub total_samples: u64,
+    pub direct_samples: u64,
+    pub relay_samples: u64,
+    pub custom_samples: u64,
+    pub unknown_samples: u64,
+    pub audio_samples: u64,
+    pub catalog_samples: u64,
+    pub sync_samples: u64,
+    pub runtime_tx_bytes: u64,
+    pub runtime_rx_bytes: u64,
+    pub runtime_lost_packets: u64,
+    pub runtime_lost_bytes: u64,
+    pub active_streams: usize,
+    pub last: Vec<TransportSample>,
+}
+
+#[derive(Debug, Default)]
+struct TransportStatsState {
+    total_samples: u64,
+    direct_samples: u64,
+    relay_samples: u64,
+    custom_samples: u64,
+    unknown_samples: u64,
+    audio_samples: u64,
+    catalog_samples: u64,
+    sync_samples: u64,
+    runtime_tx_bytes: u64,
+    runtime_rx_bytes: u64,
+    runtime_lost_packets: u64,
+    runtime_lost_bytes: u64,
+    traffic_cursors: HashMap<u64, TransportTrafficCursor>,
+    last: VecDeque<TransportSample>,
+}
+
+#[derive(Debug, Default)]
+pub struct TransportStats {
+    inner: std::sync::Mutex<TransportStatsState>,
+}
+
+impl TransportStats {
+    fn reset(&self) {
+        *lock(&self.inner) = TransportStatsState::default();
+    }
+
+    pub fn record(
+        &self,
+        stream_key: u64,
+        protocol: &'static str,
+        direction: &'static str,
+        phase: &'static str,
+        stats: ByteStreamConnectionStats,
+    ) {
+        let sample = TransportSample::from_stats(protocol, direction, phase, stats);
+        let mut state = lock(&self.inner);
+        state.total_samples += 1;
+        let previous = if transport_phase_is_open(phase) {
+            TransportTrafficCursor::default()
+        } else {
+            state
+                .traffic_cursors
+                .get(&stream_key)
+                .copied()
+                .unwrap_or_default()
+        };
+        state.runtime_tx_bytes = state
+            .runtime_tx_bytes
+            .saturating_add(sample.total_tx_bytes.saturating_sub(previous.tx_bytes));
+        state.runtime_rx_bytes = state
+            .runtime_rx_bytes
+            .saturating_add(sample.total_rx_bytes.saturating_sub(previous.rx_bytes));
+        state.runtime_lost_packets = state
+            .runtime_lost_packets
+            .saturating_add(sample.lost_packets.saturating_sub(previous.lost_packets));
+        state.runtime_lost_bytes = state
+            .runtime_lost_bytes
+            .saturating_add(sample.lost_bytes.saturating_sub(previous.lost_bytes));
+        state.traffic_cursors.insert(
+            stream_key,
+            TransportTrafficCursor {
+                tx_bytes: sample.total_tx_bytes,
+                rx_bytes: sample.total_rx_bytes,
+                lost_packets: sample.lost_packets,
+                lost_bytes: sample.lost_bytes,
+            },
+        );
+        if transport_phase_is_terminal(phase) {
+            state.traffic_cursors.remove(&stream_key);
+        }
+        match sample.selected_path.as_str() {
+            "direct" => state.direct_samples += 1,
+            "relay" => state.relay_samples += 1,
+            "custom" => state.custom_samples += 1,
+            _ => state.unknown_samples += 1,
+        }
+        match protocol {
+            "audio" => state.audio_samples += 1,
+            "catalog" => state.catalog_samples += 1,
+            "device-sync" => state.sync_samples += 1,
+            _ => {}
+        }
+        state.last.push_front(sample);
+        while state.last.len() > TRANSPORT_SAMPLE_LIMIT {
+            state.last.pop_back();
+        }
+    }
+
+    fn snapshot(&self) -> TransportStatsSnapshot {
+        let state = lock(&self.inner);
+        TransportStatsSnapshot {
+            total_samples: state.total_samples,
+            direct_samples: state.direct_samples,
+            relay_samples: state.relay_samples,
+            custom_samples: state.custom_samples,
+            unknown_samples: state.unknown_samples,
+            audio_samples: state.audio_samples,
+            catalog_samples: state.catalog_samples,
+            sync_samples: state.sync_samples,
+            runtime_tx_bytes: state.runtime_tx_bytes,
+            runtime_rx_bytes: state.runtime_rx_bytes,
+            runtime_lost_packets: state.runtime_lost_packets,
+            runtime_lost_bytes: state.runtime_lost_bytes,
+            active_streams: state.traffic_cursors.len(),
+            last: state.last.iter().cloned().collect(),
+        }
+    }
+}
+
+fn transport_phase_is_terminal(phase: &str) -> bool {
+    phase == "done" || phase.ends_with("-done")
+}
+
+fn transport_phase_is_open(phase: &str) -> bool {
+    phase == "open" || phase.ends_with("-open")
+}
+
+pub(crate) fn stream_transport_key(stream: &ByteStream) -> u64 {
+    stream as *const ByteStream as usize as u64
+}
+
+pub fn record_stream_transport(
+    stats: &Arc<TransportStats>,
+    protocol: &'static str,
+    direction: &'static str,
+    phase: &'static str,
+    stream: &ByteStream,
+) {
+    stats.record(
+        stream_transport_key(stream),
+        protocol,
+        direction,
+        phase,
+        stream.connection_stats(),
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Settings (persisted in <config dir>/federation.toml)
@@ -164,6 +384,7 @@ pub struct FedStatus {
     pub published_items: usize,
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
+    pub transport: TransportStatsSnapshot,
 }
 
 /// Outcome of preparing a federated track for playback.
@@ -196,6 +417,7 @@ pub struct Federation {
     running: tokio::sync::Mutex<Option<Running>>,
     last_sync: std::sync::Mutex<Option<String>>,
     last_error: std::sync::Mutex<Option<String>>,
+    transport_stats: Arc<TransportStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +540,7 @@ impl Federation {
             running: tokio::sync::Mutex::new(None),
             last_sync: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(initial_error),
+            transport_stats: Arc::new(TransportStats::default()),
         })
     }
 
@@ -384,6 +607,7 @@ impl Federation {
         }
         std::fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("creating {}", self.data_dir.display()))?;
+        self.transport_stats.reset();
 
         let config = MusicDhtConfig::builder()
             .data_dir(&self.data_dir)
@@ -432,6 +656,7 @@ impl Federation {
             audio_acceptor,
             Arc::clone(&self.library),
             service.endpoint_id(),
+            Arc::clone(&self.transport_stats),
         ));
         // Serve per-artist catalog requests (the federated artist card).
         let catalog_acceptor = service
@@ -441,6 +666,7 @@ impl Federation {
             catalog_acceptor,
             Arc::clone(&self.library),
             service.endpoint_id(),
+            Arc::clone(&self.transport_stats),
         ));
         let sync_acceptor = service
             .stream_acceptor(crate::devices::SYNC_ALPN)
@@ -449,11 +675,13 @@ impl Federation {
             sync_acceptor,
             Arc::clone(&self.devices),
             Arc::clone(&service),
+            Arc::clone(&self.transport_stats),
         ));
         let device_sync = Arc::clone(&self.devices);
         let device_service = Arc::clone(&service);
+        let device_transport = Arc::clone(&self.transport_stats);
         let device_tick_task = tokio::spawn(async move {
-            crate::devices::sync_loop(device_sync, device_service).await;
+            crate::devices::sync_loop(device_sync, device_service, device_transport).await;
         });
 
         *guard = Some(Running {
@@ -630,6 +858,7 @@ impl Federation {
                 .map(|items| items.len())
                 .unwrap_or(0);
         }
+        status.transport = self.transport_stats.snapshot();
         status
     }
 
@@ -733,33 +962,36 @@ impl Federation {
 
     /// Resolves a share-link content id to one playable federated track.
     ///
-    /// Resolution order: the in-session metadata cache, the DHT content key
-    /// (retried — the DHT is eventually consistent, so a single lookup can
-    /// transiently come up short), then a name search by the link label:
-    /// records under the name keys carry content ids too, and failing an
-    /// exact match, a track whose artists and title all match the label is
-    /// the same song from another owner.
+    /// Resolution order: the in-session metadata cache, the DHT content key,
+    /// then an early name search by the link label while content lookup keeps
+    /// retrying. The DHT is eventually consistent, so a single lookup can
+    /// transiently come up short. Records under the name keys carry content
+    /// ids too, and failing an exact match, a track whose artists and title
+    /// all match the label is the same song from another owner.
     pub async fn track_by_content_id(
         &self,
         content_id: &str,
         label: Option<&str>,
     ) -> Result<FedTrack> {
+        let content_id =
+            music_dht::normalize_content_id(content_id).context("invalid content id")?;
         let service = self.service().await?;
         let own = service.endpoint_id();
 
         for cached in self.cached_metadata_snapshot() {
-            if cached.fed.content_id.as_deref() == Some(content_id) {
+            if cached.fed.content_id.as_deref() == Some(content_id.as_str()) {
                 return Ok(cached.to_fed_track());
             }
         }
 
         let mut queried_nodes = 0usize;
+        let mut tried_label_fallback = false;
         for attempt in 0..CONTENT_LOOKUP_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(CONTENT_LOOKUP_RETRY_DELAY).await;
             }
             let outcome = service
-                .search_content_id(content_id)
+                .search_content_id(&content_id)
                 .await
                 .map_err(|err| anyhow::anyhow!("federated content lookup failed: {err}"))?;
             queried_nodes = queried_nodes.max(outcome.queried_nodes);
@@ -771,41 +1003,13 @@ impl Federation {
             {
                 return Ok(fed_track_from_item(item, own));
             }
-        }
-
-        if let Some(label) = label {
-            let normalized = music_dht::normalize_name(label);
-            if !normalized.is_empty() {
-                let outcome = service
-                    .search_network(label)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
-                queried_nodes = queried_nodes.max(outcome.queried_nodes);
-                let candidates: Vec<music_dht::LibraryItem> = outcome
-                    .local_results
-                    .into_iter()
-                    .chain(outcome.network_results)
-                    .filter(|item| item.kind == ItemKind::Track)
-                    .collect();
-                if let Some(item) = candidates
-                    .iter()
-                    .find(|item| item.content_id.as_deref() == Some(content_id))
+            if !tried_label_fallback {
+                tried_label_fallback = true;
+                if let Some(item) = self
+                    .track_by_content_label(&service, own, &content_id, label, &mut queried_nodes)
+                    .await?
                 {
-                    return Ok(fed_track_from_item(item.clone(), own));
-                }
-                // "feat" is an artifact of the label format ("A feat. B-Title"),
-                // not a token of any track record.
-                let tokens: Vec<String> = music_dht::tokenize(&normalized)
-                    .into_iter()
-                    .filter(|token| token != "feat")
-                    .collect();
-                if !tokens.is_empty()
-                    && let Some(item) = candidates.into_iter().find(|item| {
-                        let item_tokens = item.search_tokens();
-                        tokens.iter().all(|token| item_tokens.contains(token))
-                    })
-                {
-                    return Ok(fed_track_from_item(item, own));
+                    return Ok(item);
                 }
             }
         }
@@ -814,6 +1018,89 @@ impl Federation {
             anyhow::bail!("no federation peers reachable yet — check the Federation tab and retry");
         }
         anyhow::bail!("no peers currently publish this shared track")
+    }
+
+    async fn track_by_content_label(
+        &self,
+        service: &MusicDhtService,
+        own: EndpointId,
+        content_id: &str,
+        label: Option<&str>,
+        queried_nodes: &mut usize,
+    ) -> Result<Option<FedTrack>> {
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        let normalized = music_dht::normalize_name(label);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let outcome = service
+            .search_network(label)
+            .await
+            .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
+        *queried_nodes = (*queried_nodes).max(outcome.queried_nodes);
+        let candidates: Vec<music_dht::LibraryItem> = outcome
+            .local_results
+            .into_iter()
+            .chain(outcome.network_results)
+            .filter(|item| item.kind == ItemKind::Track)
+            .collect();
+        if let Some(item) = candidates
+            .iter()
+            .find(|item| item.content_id.as_deref() == Some(content_id))
+        {
+            return Ok(Some(fed_track_from_item(item.clone(), own)));
+        }
+        // "feat" is an artifact of the label format ("A feat. B-Title"),
+        // not a token of any track record.
+        let tokens: Vec<String> = music_dht::tokenize(&normalized)
+            .into_iter()
+            .filter(|token| token != "feat")
+            .collect();
+        if !tokens.is_empty()
+            && let Some(item) = candidates.into_iter().find(|item| {
+                let item_tokens = item.search_tokens();
+                tokens.iter().all(|token| item_tokens.contains(token))
+            })
+        {
+            return Ok(Some(fed_track_from_item(item, own)));
+        }
+        Ok(None)
+    }
+
+    async fn source_by_content_id_for_playback(
+        &self,
+        fed: &FedTrack,
+        reason: String,
+    ) -> Result<FedTrack> {
+        let content_id = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id)
+            .with_context(|| format!("{reason}; no content id fallback is available"))?;
+        let label = format!("{} {}", fed.artist_names.join(" "), fed.title);
+        let resolved = self.track_by_content_id(&content_id, Some(&label)).await?;
+        if resolved.owner == fed.owner && resolved.item_id == fed.item_id {
+            anyhow::bail!("{reason}");
+        }
+        Ok(resolved)
+    }
+
+    async fn local_track_by_content_id_for_playback(
+        self: &Arc<Self>,
+        content_id: &str,
+    ) -> Result<Option<TrackItem>> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(None);
+        };
+        let library = Arc::clone(&self.library);
+        tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
+            Ok(library
+                .track_by_content_id(&content_id)?
+                .filter(|track| Path::new(&track.file_path).is_file()))
+        })
+        .await?
     }
 
     /// Assembles the federated artist card: finds the peers holding the
@@ -878,11 +1165,12 @@ impl Federation {
         let mut requests = Vec::new();
         for owner in owners {
             let service = Arc::clone(&service);
+            let transport_stats = Arc::clone(&self.transport_stats);
             let name = name.to_string();
             requests.push(tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
-                    catalog::fetch_catalog(&service, owner, &name),
+                    catalog::fetch_catalog(&service, owner, &name, &transport_stats),
                 )
                 .await;
                 match result {
@@ -937,13 +1225,17 @@ impl Federation {
             running_network_id == network_id,
             "device invite belongs to a different federation network"
         );
-        self.devices.connect_invite(service, invite).await
+        self.devices
+            .connect_invite(service, invite, Arc::clone(&self.transport_stats))
+            .await
     }
 
     pub async fn device_sync_now(self: &Arc<Self>) -> Result<()> {
         self.ensure_connected_devices_enabled()?;
         let service = self.service().await?;
-        self.devices.sync_once(service).await
+        self.devices
+            .sync_once(service, Arc::clone(&self.transport_stats))
+            .await
     }
 
     pub async fn connect(&self, ticket: &str) -> Result<String> {
@@ -998,7 +1290,7 @@ impl Federation {
             };
             let fetched = tokio::time::timeout(
                 Duration::from_secs(5),
-                catalog::fetch_image(&service, owner, artist, release),
+                catalog::fetch_image(&service, owner, artist, release, &self.transport_stats),
             )
             .await;
             match fetched {
@@ -1019,17 +1311,49 @@ impl Federation {
     /// Downloads a federated track straight into the local library
     /// (regardless of the save-on-listen setting) and returns the imported
     /// track. Own/already-local tracks resolve without downloading.
-    pub async fn download_to_library(self: &Arc<Self>, fed: &FedTrack) -> Result<TrackItem> {
-        let playable = self.fetch_playable(fed, true).await?;
+    pub async fn download_to_library_with_progress<F>(
+        self: &Arc<Self>,
+        fed: &FedTrack,
+        progress: F,
+    ) -> Result<TrackItem>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let playable = self
+            .fetch_playable_with_progress(fed, true, true, progress, None)
+            .await?;
         Ok(playable.track)
     }
 
     /// Prepares a federated track for playback: local tracks resolve
     /// straight to the library; remote tracks are downloaded — into the
     /// library when save-on-listen is enabled, into the cache otherwise.
-    pub async fn prepare_playback(self: &Arc<Self>, fed: &FedTrack) -> Result<FedPlayable> {
+    pub async fn prepare_playback_with_progress<F>(
+        self: &Arc<Self>,
+        fed: &FedTrack,
+        progress: F,
+    ) -> Result<FedPlayable>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
         let save = self.settings().save_on_listen;
-        self.fetch_playable(fed, save).await
+        self.fetch_playable_with_progress(fed, save, false, progress, None)
+            .await
+    }
+
+    pub async fn prepare_playback_streaming_with_progress<F, S>(
+        self: &Arc<Self>,
+        fed: &FedTrack,
+        progress: F,
+        mut stream_start: S,
+    ) -> Result<FedPlayable>
+    where
+        F: FnMut(DownloadProgress) + Send,
+        S: FnMut(StreamingStart) + Send,
+    {
+        let save = self.settings().save_on_listen;
+        self.fetch_playable_with_progress(fed, save, false, progress, Some(&mut stream_start))
+            .await
     }
 
     /// Fetches rich metadata for a federated track without downloading the
@@ -1071,132 +1395,259 @@ impl Federation {
         Ok(enriched)
     }
 
-    async fn fetch_playable(self: &Arc<Self>, fed: &FedTrack, save: bool) -> Result<FedPlayable> {
-        let service = self.service().await?;
-        let item_id =
-            audio::hex_decode_item_id(&fed.item_id).context("malformed item id in the result")?;
+    async fn fetch_playable_with_progress<F>(
+        self: &Arc<Self>,
+        fed: &FedTrack,
+        save: bool,
+        want_images: bool,
+        mut progress: F,
+        mut stream_start: Option<&mut (dyn FnMut(StreamingStart) + Send)>,
+    ) -> Result<FedPlayable>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
+        let mut fed = fed.clone();
+        let mut tried_content_lookup = false;
 
-        if fed.own {
-            let library = Arc::clone(&self.library);
-            let own_id = service.endpoint_id();
-            let track = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
-                let Some(track_id) = audio::resolve_local_track_id(&library, own_id, item_id)?
-                else {
-                    return Ok(None);
-                };
-                Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
-            })
-            .await??
-            .context("this track is no longer in the local library")?;
+        loop {
+            if let Some(content_id) = fed
+                .content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+                && let Some(track) = self
+                    .local_track_by_content_id_for_playback(&content_id)
+                    .await?
+            {
+                return Ok(FedPlayable {
+                    track,
+                    imported: false,
+                });
+            }
+
+            let service = self.service().await?;
+            let item_id = match audio::hex_decode_item_id(&fed.item_id) {
+                Some(item_id) => item_id,
+                None if !tried_content_lookup => {
+                    fed = self
+                        .source_by_content_id_for_playback(
+                            &fed,
+                            "malformed item id in the result".to_string(),
+                        )
+                        .await?;
+                    tried_content_lookup = true;
+                    continue;
+                }
+                None => anyhow::bail!("malformed item id in the result"),
+            };
+
+            if fed.own {
+                let library = Arc::clone(&self.library);
+                let own_id = service.endpoint_id();
+                let track = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
+                    let Some(track_id) = audio::resolve_local_track_id(&library, own_id, item_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
+                })
+                .await??;
+                if let Some(track) = track.filter(|track| Path::new(&track.file_path).is_file()) {
+                    return Ok(FedPlayable {
+                        track,
+                        imported: false,
+                    });
+                }
+                if !tried_content_lookup {
+                    fed = self
+                        .source_by_content_id_for_playback(
+                            &fed,
+                            "this track is no longer in the local library".to_string(),
+                        )
+                        .await?;
+                    tried_content_lookup = true;
+                    continue;
+                }
+                anyhow::bail!("this track is no longer in the local library");
+            }
+
+            let owner = match EndpointId::from_str(&fed.owner) {
+                Ok(owner) => owner,
+                Err(_) if !tried_content_lookup => {
+                    fed = self
+                        .source_by_content_id_for_playback(
+                            &fed,
+                            format!("malformed owner id '{}'", fed.owner),
+                        )
+                        .await?;
+                    tried_content_lookup = true;
+                    continue;
+                }
+                Err(_) => anyhow::bail!("malformed owner id '{}'", fed.owner),
+            };
+            let dir = if save {
+                &self.media_dir
+            } else {
+                &self.cache_dir
+            };
+            tokio::fs::create_dir_all(dir).await?;
+
+            let downloaded = match self
+                .download_track_with_fallback(
+                    &service,
+                    owner,
+                    &fed,
+                    dir,
+                    want_images,
+                    &mut progress,
+                    stream_start
+                        .as_mut()
+                        .map(|callback| &mut **callback as &mut (dyn FnMut(StreamingStart) + Send)),
+                )
+                .await
+            {
+                Ok(downloaded) => downloaded,
+                Err(err) if !tried_content_lookup && fed.content_id.is_some() => {
+                    tracing::warn!(
+                        owner = %fed.owner,
+                        item_id = %fed.item_id,
+                        "federated source failed; resolving by content id: {err:#}"
+                    );
+                    fed = self
+                        .source_by_content_id_for_playback(
+                            &fed,
+                            "federated source failed".to_string(),
+                        )
+                        .await?;
+                    tried_content_lookup = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            tracing::info!(
+                path = %downloaded.path.display(),
+                mime = %downloaded.mime_type,
+                cover = downloaded.cover.is_some(),
+                "federated track downloaded"
+            );
+
+            if save {
+                let library = Arc::clone(&self.library);
+                let import_path = downloaded.path.clone();
+                let import_metadata = downloaded.metadata.clone();
+                let import_cover = downloaded.cover.clone();
+                let artist_image = downloaded.artist_image.clone();
+                let fed_item_id = fed.item_id.clone();
+                let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
+                    let mut import = crate::library::import::read_file(&import_path)?;
+                    // The owner's database is more authoritative than whatever
+                    // tags the file happens to carry (often none at all).
+                    if let Some(meta) = &import_metadata {
+                        apply_remote_metadata(&mut import, meta);
+                    }
+                    // Same for the cover: the peer's library cover wins over an
+                    // embedded picture; embedded art stays as the fallback.
+                    if import_cover.is_some() {
+                        import.cover = import_cover;
+                    }
+                    let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
+                    // A like that referenced the federated track moves onto the
+                    // freshly imported local row.
+                    if let Err(err) = library.transfer_fed_like(&fed_item_id, track_id) {
+                        tracing::warn!(%err, "federated like transfer failed");
+                    }
+                    // The owner's artist image fills the gap for a freshly
+                    // created (or still image-less) main artist.
+                    if let (Some((bytes, extension)), Some(artist_name)) =
+                        (&artist_image, import.artists.first())
+                        && let Err(err) = save_artist_image(&library, artist_name, bytes, extension)
+                    {
+                        tracing::warn!(%err, "saving the artist image failed");
+                    }
+                    Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
+                })
+                .await?;
+                match imported {
+                    Ok(Some(track)) => {
+                        return Ok(FedPlayable {
+                            track,
+                            imported: true,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "importing the downloaded track failed: {err:#}; playing from the file"
+                        );
+                    }
+                }
+            }
+
+            // Ephemeral playback: put the cover next to the cached audio so
+            // the views can show it.
+            let cover_path = match &downloaded.cover {
+                Some((bytes, extension)) => {
+                    let path = downloaded.path.with_extension(format!("cover.{extension}"));
+                    match tokio::fs::write(&path, bytes).await {
+                        Ok(()) => Some(path.to_string_lossy().into_owned()),
+                        Err(err) => {
+                            tracing::warn!(%err, "saving the cover failed");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let mut track = ephemeral_track(&fed, downloaded.metadata.as_ref(), &downloaded.path);
+            track.cover_path = cover_path;
             return Ok(FedPlayable {
                 track,
                 imported: false,
             });
         }
-
-        let owner = EndpointId::from_str(&fed.owner)
-            .map_err(|_| anyhow::anyhow!("malformed owner id '{}'", fed.owner))?;
-        let dir = if save {
-            &self.media_dir
-        } else {
-            &self.cache_dir
-        };
-        tokio::fs::create_dir_all(dir).await?;
-
-        let downloaded = self
-            .download_track_with_fallback(&service, owner, fed, dir)
-            .await?;
-        tracing::info!(
-            path = %downloaded.path.display(),
-            mime = %downloaded.mime_type,
-            cover = downloaded.cover.is_some(),
-            "federated track downloaded"
-        );
-
-        if save {
-            let library = Arc::clone(&self.library);
-            let import_path = downloaded.path.clone();
-            let import_metadata = downloaded.metadata.clone();
-            let import_cover = downloaded.cover.clone();
-            let artist_image = downloaded.artist_image.clone();
-            let fed_item_id = fed.item_id.clone();
-            let imported = tokio::task::spawn_blocking(move || -> Result<Option<TrackItem>> {
-                let mut import = crate::library::import::read_file(&import_path)?;
-                // The owner's database is more authoritative than whatever
-                // tags the file happens to carry (often none at all).
-                if let Some(meta) = &import_metadata {
-                    apply_remote_metadata(&mut import, meta);
-                }
-                // Same for the cover: the peer's library cover wins over an
-                // embedded picture; embedded art stays as the fallback.
-                if import_cover.is_some() {
-                    import.cover = import_cover;
-                }
-                let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
-                // A like that referenced the federated track moves onto the
-                // freshly imported local row.
-                if let Err(err) = library.transfer_fed_like(&fed_item_id, track_id) {
-                    tracing::warn!(%err, "federated like transfer failed");
-                }
-                // The owner's artist image fills the gap for a freshly
-                // created (or still image-less) main artist.
-                if let (Some((bytes, extension)), Some(artist_name)) =
-                    (&artist_image, import.artists.first())
-                    && let Err(err) = save_artist_image(&library, artist_name, bytes, extension)
-                {
-                    tracing::warn!(%err, "saving the artist image failed");
-                }
-                Ok(library.tracks_by_ids(&[track_id])?.into_iter().next())
-            })
-            .await?;
-            match imported {
-                Ok(Some(track)) => {
-                    return Ok(FedPlayable {
-                        track,
-                        imported: true,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        "importing the downloaded track failed: {err:#}; playing from the file"
-                    );
-                }
-            }
-        }
-
-        // Ephemeral playback: put the cover next to the cached audio so the
-        // views can show it.
-        let cover_path = match &downloaded.cover {
-            Some((bytes, extension)) => {
-                let path = downloaded.path.with_extension(format!("cover.{extension}"));
-                match tokio::fs::write(&path, bytes).await {
-                    Ok(()) => Some(path.to_string_lossy().into_owned()),
-                    Err(err) => {
-                        tracing::warn!(%err, "saving the cover failed");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let mut track = ephemeral_track(fed, downloaded.metadata.as_ref(), &downloaded.path);
-        track.cover_path = cover_path;
-        Ok(FedPlayable {
-            track,
-            imported: false,
-        })
     }
 
-    async fn download_track_with_fallback(
+    async fn download_track_with_fallback<F>(
         &self,
         service: &MusicDhtService,
         owner: EndpointId,
         fed: &FedTrack,
         dir: &Path,
-    ) -> Result<audio::Downloaded> {
+        want_images: bool,
+        progress: &mut F,
+        mut stream_start: Option<&mut (dyn FnMut(StreamingStart) + Send)>,
+    ) -> Result<audio::Downloaded>
+    where
+        F: FnMut(DownloadProgress) + Send,
+    {
         let stem = download_stem(fed);
-        match audio::download_track(service, owner, &fed.item_id, dir, &stem).await {
+        let primary = {
+            let primary_stream_start = stream_start
+                .as_mut()
+                .map(|callback| &mut **callback as &mut (dyn FnMut(StreamingStart) + Send));
+            audio::download_track_with_streaming(
+                service,
+                owner,
+                &fed.item_id,
+                dir,
+                &stem,
+                want_images,
+                |event| {
+                    if let Some(stats) = event.transport {
+                        self.transport_stats.record(
+                            event.stream_key,
+                            "audio",
+                            "outbound",
+                            event.transport_phase,
+                            stats,
+                        );
+                    }
+                    progress(event);
+                },
+                primary_stream_start,
+            )
+            .await
+        };
+        match primary {
             Ok(downloaded) => return Ok(downloaded),
             Err(primary_err) => {
                 let Some(content_id) = fed.content_id.as_deref() else {
@@ -1224,15 +1675,34 @@ impl Federation {
                         continue;
                     }
                     let candidate_owner = item.owner;
-                    match audio::download_track(
-                        service,
-                        candidate_owner,
-                        &candidate_item_id,
-                        dir,
-                        &stem,
-                    )
-                    .await
-                    {
+                    let fallback = {
+                        let fallback_stream_start = stream_start.as_mut().map(|callback| {
+                            &mut **callback as &mut (dyn FnMut(StreamingStart) + Send)
+                        });
+                        audio::download_track_with_streaming(
+                            service,
+                            candidate_owner,
+                            &candidate_item_id,
+                            dir,
+                            &stem,
+                            want_images,
+                            |event| {
+                                if let Some(stats) = event.transport {
+                                    self.transport_stats.record(
+                                        event.stream_key,
+                                        "audio",
+                                        "outbound",
+                                        event.transport_phase,
+                                        stats,
+                                    );
+                                }
+                                progress(event);
+                            },
+                            fallback_stream_start,
+                        )
+                        .await
+                    };
+                    match fallback {
                         Ok(downloaded) => {
                             tracing::info!(
                                 owner = %candidate_owner,

@@ -16,6 +16,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if inner.width >= 132 {
+        let desired_settings_width = ((inner.width as usize * 44) / 100).clamp(68, 92) as u16;
+        let settings_width = desired_settings_width.min(inner.width.saturating_sub(56));
+        let [rows_area, _, status_area] = Layout::horizontal([
+            Constraint::Length(settings_width),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+
+        draw_settings_rows(frame, rows_area, state);
+        draw_status(frame, status_area, state);
+        return;
+    }
+
     let rows_height =
         (settings_rows(state).len() + 5 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
@@ -340,7 +355,7 @@ fn draw_row_enabled(
         height: 1,
     };
     let marker = if selected { "▶ " } else { "  " };
-    let label_width = 48usize;
+    let label_width = settings_label_width(area.width);
     let line = Line::from(vec![
         Span::styled(
             marker,
@@ -366,25 +381,140 @@ fn draw_row_enabled(
     *y = (*y).saturating_add(1);
 }
 
+fn settings_label_width(width: u16) -> usize {
+    let width = width as usize;
+    if width >= 88 {
+        48
+    } else {
+        width.saturating_sub(28).clamp(24, 48)
+    }
+}
+
 fn status_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<22}"), theme::dim()),
+        Span::styled(format!("{label:<18}"), theme::dim()),
         Span::raw(value),
     ])
 }
 
-fn bytes_label(bytes: u64) -> String {
+fn short_bytes_label(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
-        format!("{bytes} B ({:.1} MiB)", bytes as f64 / 1024.0 / 1024.0)
+        format!("{:.1} MiB", bytes as f64 / 1024.0 / 1024.0)
     } else if bytes >= 1024 {
-        format!("{bytes} B ({:.1} KiB)", bytes as f64 / 1024.0)
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
     }
 }
 
+fn rtt_label(ms: Option<u64>) -> String {
+    ms.map(|ms| format!("{ms} ms"))
+        .unwrap_or_else(|| "rtt n/a".to_string())
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect::<String>() + "…"
+}
+
+fn push_transport_status(lines: &mut Vec<Line<'static>>, status: &crate::federation::FedStatus) {
+    lines.push(Line::default());
+    lines.push(Line::styled("Iroh Transport", theme::header()));
+    let transport = &status.transport;
+    if transport.total_samples == 0 {
+        lines.push(status_line("Streams", "no samples yet".to_string()));
+        return;
+    }
+    let runtime_total = transport
+        .runtime_tx_bytes
+        .saturating_add(transport.runtime_rx_bytes);
+    lines.push(status_line(
+        "Runtime traffic",
+        format!(
+            "{} · tx {} · rx {} · active {}",
+            short_bytes_label(runtime_total),
+            short_bytes_label(transport.runtime_tx_bytes),
+            short_bytes_label(transport.runtime_rx_bytes),
+            transport.active_streams
+        ),
+    ));
+    if transport.runtime_lost_packets > 0 || transport.runtime_lost_bytes > 0 {
+        lines.push(status_line(
+            "Runtime loss",
+            format!(
+                "{} pkts · {}",
+                transport.runtime_lost_packets,
+                short_bytes_label(transport.runtime_lost_bytes)
+            ),
+        ));
+    }
+    lines.push(status_line(
+        "Samples",
+        format!(
+            "{} total · direct {} · relay {} · custom {} · unknown {}",
+            transport.total_samples,
+            transport.direct_samples,
+            transport.relay_samples,
+            transport.custom_samples,
+            transport.unknown_samples
+        ),
+    ));
+    lines.push(status_line(
+        "Protocols",
+        format!(
+            "audio {} · catalog {} · sync {}",
+            transport.audio_samples, transport.catalog_samples, transport.sync_samples
+        ),
+    ));
+    if let Some(sample) = transport.last.first() {
+        lines.push(status_line(
+            "Last stream",
+            format!(
+                "{} {} {} · {} · {}",
+                sample.protocol,
+                sample.direction,
+                sample.phase,
+                sample.selected_path,
+                rtt_label(sample.selected_rtt_ms)
+            ),
+        ));
+        lines.push(status_line(
+            "Last peer",
+            format!(
+                "{} · paths d/r/c/open {}/{}/{}/{}",
+                short_id(&sample.peer_id),
+                sample.direct_paths,
+                sample.relay_paths,
+                sample.custom_paths,
+                sample.open_paths
+            ),
+        ));
+        lines.push(status_line(
+            "Last bytes",
+            format!(
+                "sel {}/{} · total {}/{} · lost {} / {}",
+                short_bytes_label(sample.selected_tx_bytes),
+                short_bytes_label(sample.selected_rx_bytes),
+                short_bytes_label(sample.total_tx_bytes),
+                short_bytes_label(sample.total_rx_bytes),
+                sample.lost_packets,
+                short_bytes_label(sample.lost_bytes)
+            ),
+        ));
+    }
+    for sample in transport.last.iter().take(3) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", sample.at), theme::dim()),
+            Span::raw(format!(
+                "{} {} {} · {} · tx {} rx {}",
+                sample.protocol,
+                sample.direction,
+                sample.phase,
+                sample.selected_path,
+                short_bytes_label(sample.total_tx_bytes),
+                short_bytes_label(sample.total_rx_bytes)
+            )),
+        ]));
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -407,39 +537,53 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             ));
         }
         Some(status) => {
-            lines.push(status_line("Node", "running".to_string()));
-            lines.push(status_line("Network", status.network.clone()));
-            lines.push(status_line("Endpoint ID", status.endpoint_id.clone()));
-            lines.push(status_line("DHT node ID", status.dht_node_id.clone()));
+            lines.push(status_line("Node", format!("running · {}", status.network)));
+            lines.push(status_line(
+                "Endpoint",
+                format!(
+                    "{} · dht {}",
+                    short_id(&status.endpoint_id),
+                    short_id(&status.dht_node_id)
+                ),
+            ));
             let peers = if status.connected_peers.is_empty() {
-                "none yet".to_string()
+                format!("none · contacts {}", status.known_contacts)
             } else {
-                let names: Vec<String> =
-                    status.connected_peers.iter().map(|p| short_id(p)).collect();
-                format!("{} — {}", status.connected_peers.len(), names.join(", "))
+                let names: Vec<String> = status
+                    .connected_peers
+                    .iter()
+                    .take(3)
+                    .map(|p| short_id(p))
+                    .collect();
+                let more = status.connected_peers.len().saturating_sub(names.len());
+                let more = if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} connected{} · contacts {} · {}",
+                    status.connected_peers.len(),
+                    more,
+                    status.known_contacts,
+                    names.join(", ")
+                )
             };
-            lines.push(status_line("Connected peers", peers));
+            lines.push(status_line("Peers", peers));
             lines.push(status_line(
-                "Known contacts",
-                status.known_contacts.to_string(),
-            ));
-            lines.push(status_line(
-                "Stored DHT records",
-                status
-                    .stored_dht_records
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "unavailable".to_string()),
-            ));
-            lines.push(status_line(
-                "Stored DHT bytes",
-                status
-                    .stored_dht_bytes
-                    .map(bytes_label)
-                    .unwrap_or_else(|| "unavailable".to_string()),
-            ));
-            lines.push(status_line(
-                "Published items",
-                status.published_items.to_string(),
+                "DHT",
+                format!(
+                    "{} records · {} · {} published",
+                    status
+                        .stored_dht_records
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    status
+                        .stored_dht_bytes
+                        .map(short_bytes_label)
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    status.published_items
+                ),
             ));
             lines.push(status_line(
                 "Last sync",
@@ -451,6 +595,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             if let Some(error) = &status.last_error {
                 lines.push(status_line("Error", error.clone()));
             }
+            push_transport_status(&mut lines, status);
         }
     }
     lines.push(Line::default());
@@ -458,29 +603,32 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     match &state.federation.devices {
         None => lines.push(Line::styled("loading…", theme::dim())),
         Some(status) => {
-            lines.push(status_line("This device", status.this_device_id.clone()));
-            lines.push(status_line("Sync group", status.group_id.clone()));
             lines.push(status_line(
-                "Active devices",
-                status.active_devices.to_string(),
-            ));
-            lines.push(status_line(
-                "Revoked devices",
-                status.revoked_devices.to_string(),
-            ));
-            lines.push(status_line(
-                "Pending requests",
-                status.pending_requests.to_string(),
-            ));
-            lines.push(status_line("Ops in log", status.ops_total.to_string()));
-            lines.push(status_line(
-                "Tombstones",
+                "This device",
                 format!(
-                    "{} ({} compactable)",
-                    status.tombstone_ops, status.compactable_tombstones
+                    "{} · {}",
+                    status.this_device_name,
+                    short_id(&status.this_device_id)
                 ),
             ));
-            lines.push(status_line("Outbox ops", status.outbox_ops.to_string()));
+            lines.push(status_line("Sync group", short_id(&status.group_id)));
+            lines.push(status_line(
+                "Devices",
+                format!(
+                    "{} active · {} revoked · {} pending",
+                    status.active_devices, status.revoked_devices, status.pending_requests
+                ),
+            ));
+            lines.push(status_line(
+                "Sync log",
+                format!(
+                    "{} ops · {} outbox · {} tombstones ({} gc)",
+                    status.ops_total,
+                    status.outbox_ops,
+                    status.tombstone_ops,
+                    status.compactable_tombstones
+                ),
+            ));
             lines.push(status_line(
                 "Snapshot",
                 format!(

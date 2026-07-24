@@ -1263,6 +1263,56 @@ impl Library {
             .optional()?)
     }
 
+    pub fn liked_content_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT t.content_id
+             FROM likes k
+             JOIN tracks t ON t.id = k.track_id
+             WHERE t.content_id IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|content_id| music_dht::normalize_content_id(&content_id))
+            .collect())
+    }
+
+    /// Returns the new liked state for this content id.
+    pub fn toggle_like_by_content_id(&self, content_id: &str) -> Result<bool> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            anyhow::bail!("invalid content id");
+        };
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let removed_local = tx.execute(
+            "DELETE FROM likes
+             WHERE track_id IN (
+                SELECT id FROM tracks WHERE content_id = ?1
+             )",
+            [&content_id],
+        )?;
+        let removed_fed =
+            tx.execute("DELETE FROM fed_likes WHERE content_id = ?1", [&content_id])?;
+        if removed_local + removed_fed > 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let track_id: i64 = tx
+            .query_row(
+                "SELECT id FROM tracks WHERE content_id = ?1 ORDER BY id LIMIT 1",
+                [&content_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("no local track with content id {content_id}"))?;
+        tx.execute("INSERT INTO likes (track_id) VALUES (?1)", [track_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn set_synced_like(&self, track_id: i64, liked: bool, liked_hlc_ms: i64) -> Result<bool> {
         let conn = self.lock();
         let changed = if liked {
@@ -1460,28 +1510,40 @@ impl Library {
 
     /// Toggles a like on a federated track; returns the resulting state.
     pub fn toggle_fed_like(&self, fed: &crate::federation::FedTrack) -> Result<bool> {
-        let conn = self.lock();
         let content_id = fed
             .content_id
             .as_deref()
             .and_then(music_dht::normalize_content_id);
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let removed = match content_id.as_deref() {
-            Some(content_id) => conn.execute(
-                "DELETE FROM fed_likes WHERE item_id = ?1 OR content_id = ?2",
-                params![fed.item_id, content_id],
-            )?,
-            None => conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [&fed.item_id])?,
+            Some(content_id) => {
+                let removed_fed = tx.execute(
+                    "DELETE FROM fed_likes WHERE item_id = ?1 OR content_id = ?2",
+                    params![fed.item_id, content_id],
+                )?;
+                let removed_local = tx.execute(
+                    "DELETE FROM likes
+                     WHERE track_id IN (
+                        SELECT id FROM tracks WHERE content_id = ?1
+                     )",
+                    [content_id],
+                )?;
+                removed_fed + removed_local
+            }
+            None => tx.execute("DELETE FROM fed_likes WHERE item_id = ?1", [&fed.item_id])?,
         };
         if removed > 0 {
+            tx.commit()?;
             return Ok(false);
         }
         if let Some(content_id) = content_id.as_deref() {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM fed_likes WHERE content_id = ?1 AND item_id != ?2",
                 params![content_id, fed.item_id],
             )?;
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO fed_likes (item_id, owner, title, artist_names,
                 featured_artist_names, year, duration_seconds, content_id,
                 release_title, track_number, disc_number)
@@ -1500,6 +1562,7 @@ impl Library {
                 fed.disc_number,
             ],
         )?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -1694,26 +1757,6 @@ impl Library {
                 [track_id],
             )?;
         }
-        Ok(true)
-    }
-
-    pub fn likes(&self) -> Result<Vec<i64>> {
-        let conn = self.lock();
-        let mut statement = conn.prepare("SELECT track_id FROM likes")?;
-        let ids = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?;
-        Ok(ids)
-    }
-
-    /// Returns the new liked state.
-    pub fn toggle_like(&self, track_id: i64) -> Result<bool> {
-        let conn = self.lock();
-        let removed = conn.execute("DELETE FROM likes WHERE track_id = ?1", [track_id])?;
-        if removed > 0 {
-            return Ok(false);
-        }
-        conn.execute("INSERT INTO likes (track_id) VALUES (?1)", [track_id])?;
         Ok(true)
     }
 
@@ -2255,7 +2298,15 @@ mod tests {
             file_size_bytes: Some(1),
             cover: None,
         };
-        import::upsert_track(lib, &import).unwrap().0
+        let id = import::upsert_track(lib, &import).unwrap().0;
+        let content_id = format!("b3:{}", blake3::hash(import.file_path.as_bytes()).to_hex());
+        lib.lock()
+            .execute(
+                "UPDATE tracks SET content_id = ?2 WHERE id = ?1",
+                params![id, content_id],
+            )
+            .unwrap();
+        id
     }
 
     #[test]
@@ -2414,10 +2465,11 @@ mod tests {
             .unwrap();
         assert_eq!(lib.playlist(playlist.id).unwrap().tracks.len(), 1);
 
-        assert!(lib.toggle_like(track_id).unwrap());
-        assert_eq!(lib.likes().unwrap(), vec![track_id]);
+        let content_id = lib.track_content_id_by_id(track_id).unwrap().unwrap();
+        assert!(lib.toggle_like_by_content_id(&content_id).unwrap());
+        assert_eq!(lib.liked_content_ids().unwrap(), vec![content_id.clone()]);
         assert_eq!(lib.playlist(LIKES_PLAYLIST_ID).unwrap().tracks.len(), 1);
-        assert!(!lib.toggle_like(track_id).unwrap());
+        assert!(!lib.toggle_like_by_content_id(&content_id).unwrap());
 
         lib.remove_tracks_from_playlist(playlist.id, &[track_id])
             .unwrap();
@@ -2432,6 +2484,8 @@ mod tests {
         let lib = test_library();
         let old_id = add_track(&lib, "Old Local", "Artist", "Album");
         let new_id = add_track(&lib, "New Local", "Artist", "Album");
+        let old_content_id = lib.track_content_id_by_id(old_id).unwrap().unwrap();
+        let new_content_id = lib.track_content_id_by_id(new_id).unwrap().unwrap();
         let content_id = format!("b3:{}", "c".repeat(64));
         let fed = crate::federation::FedTrack {
             item_id: "fed_item_order".to_string(),
@@ -2448,8 +2502,8 @@ mod tests {
             disc_number: Some(1),
         };
 
-        assert!(lib.toggle_like(old_id).unwrap());
-        assert!(lib.toggle_like(new_id).unwrap());
+        assert!(lib.toggle_like_by_content_id(&old_content_id).unwrap());
+        assert!(lib.toggle_like_by_content_id(&new_content_id).unwrap());
         assert!(lib.toggle_fed_like(&fed).unwrap());
         {
             let conn = lib.lock();
@@ -2479,8 +2533,8 @@ mod tests {
             .collect();
         assert_eq!(titles, vec!["Middle Fed", "New Local", "Old Local"]);
 
-        assert!(!lib.toggle_like(old_id).unwrap());
-        assert!(lib.toggle_like(old_id).unwrap());
+        assert!(!lib.toggle_like_by_content_id(&old_content_id).unwrap());
+        assert!(lib.toggle_like_by_content_id(&old_content_id).unwrap());
         {
             let conn = lib.lock();
             conn.execute(

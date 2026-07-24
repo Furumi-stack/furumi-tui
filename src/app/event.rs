@@ -50,10 +50,10 @@ pub enum AppEvent {
         id: i64,
         result: Result<PlaylistDetail, String>,
     },
-    /// Liked track ids for the ♥ markers.
-    LikesLoaded(Result<Vec<i64>, String>),
+    /// Liked local content ids for the ♥ markers.
+    LikesLoaded(Result<Vec<String>, String>),
     LikeToggled {
-        track_id: i64,
+        content_id: String,
         liked: bool,
     },
     /// Liked federated item ids and content ids for the ♥ markers.
@@ -118,6 +118,7 @@ pub enum AppEvent {
     /// queue swaps the placeholder for the resolved track.
     FedTrackResolved {
         placeholder_id: i64,
+        resolve_key: String,
         result: Result<Box<crate::federation::FedPlayable>, String>,
     },
     /// Rich metadata for a federated track-info preview arrived without

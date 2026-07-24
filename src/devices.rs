@@ -728,6 +728,7 @@ impl DeviceSync {
         &self,
         service: Arc<MusicDhtService>,
         invite_link: &str,
+        transport_stats: Arc<crate::federation::TransportStats>,
     ) -> Result<String> {
         let invite = parse_invite(invite_link)?;
         anyhow::ensure!(invite.expires_at_ms >= now_ms(), "invite expired");
@@ -739,7 +740,12 @@ impl DeviceSync {
         let mut last_error: Option<String>;
         loop {
             match self
-                .try_connect_invite(Arc::clone(&service), &invite, ticket.clone())
+                .try_connect_invite(
+                    Arc::clone(&service),
+                    &invite,
+                    ticket.clone(),
+                    Arc::clone(&transport_stats),
+                )
                 .await
             {
                 Ok(PairAttempt::Accepted(message)) => return Ok(message),
@@ -765,6 +771,7 @@ impl DeviceSync {
         service: Arc<MusicDhtService>,
         invite: &InviteWire,
         ticket: PeerTicket,
+        transport_stats: Arc<crate::federation::TransportStats>,
     ) -> Result<PairAttempt> {
         let peer = service.connect(ticket).await?;
         let own_ticket = service.ticket().await?.to_string();
@@ -777,6 +784,13 @@ impl DeviceSync {
         let snapshot = self.snapshot()?;
         let playback = self.local_playback_snapshot();
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
+        crate::federation::record_stream_transport(
+            &transport_stats,
+            "device-sync",
+            "outbound",
+            "pair-open",
+            &stream,
+        );
         write_msg(
             &mut stream,
             &WireMessage::PairRequest {
@@ -794,10 +808,17 @@ impl DeviceSync {
         )
         .await?;
         finish_send(&mut stream).await?;
-        match read_msg(&mut stream)
+        let response = read_msg(&mut stream)
             .await
-            .context("pairing response was not received")?
-        {
+            .context("pairing response was not received")?;
+        crate::federation::record_stream_transport(
+            &transport_stats,
+            "device-sync",
+            "outbound",
+            "pair-done",
+            &stream,
+        );
+        match response {
             WireMessage::PairResponse {
                 accepted: true,
                 group_id: Some(group_id),
@@ -936,14 +957,15 @@ impl DeviceSync {
         Ok(())
     }
 
-    pub fn record_track_like(&self, track_id: i64, liked: bool) -> Result<()> {
-        if let Some(content_id) = self.library.track_content_id_by_id(track_id)? {
-            self.record_local_op(SyncOpPayload::TrackLikeSet {
-                content_id,
-                liked,
-                fed: None,
-            })?;
-        }
+    pub fn record_content_like(&self, content_id: &str, liked: bool) -> Result<()> {
+        let Some(content_id) = music_dht::normalize_content_id(content_id) else {
+            return Ok(());
+        };
+        self.record_local_op(SyncOpPayload::TrackLikeSet {
+            content_id,
+            liked,
+            fed: None,
+        })?;
         Ok(())
     }
 
@@ -1057,13 +1079,20 @@ impl DeviceSync {
         Ok(())
     }
 
-    pub async fn sync_once(&self, service: Arc<MusicDhtService>) -> Result<()> {
+    pub async fn sync_once(
+        &self,
+        service: Arc<MusicDhtService>,
+        transport_stats: Arc<crate::federation::TransportStats>,
+    ) -> Result<()> {
         let devices = self.active_remote_devices()?;
         for device in devices {
             if device.endpoint_ticket.trim().is_empty() {
                 continue;
             }
-            if let Err(err) = self.sync_device(Arc::clone(&service), &device).await {
+            if let Err(err) = self
+                .sync_device(Arc::clone(&service), &device, Arc::clone(&transport_stats))
+                .await
+            {
                 tracing::debug!(device = %device.device_id, "device sync failed: {err:#}");
                 self.set_last_error(Some(format!("{}: {err:#}", short_id(&device.device_id))))?;
             }
@@ -1076,6 +1105,7 @@ impl DeviceSync {
         &self,
         service: Arc<MusicDhtService>,
         device: &StoredDevice,
+        transport_stats: Arc<crate::federation::TransportStats>,
     ) -> Result<()> {
         let ticket: PeerTicket = device.endpoint_ticket.parse()?;
         let peer = service.connect(ticket).await?;
@@ -1088,6 +1118,13 @@ impl DeviceSync {
         let snapshot = self.snapshot()?;
         let playback = self.local_playback_snapshot();
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
+        crate::federation::record_stream_transport(
+            &transport_stats,
+            "device-sync",
+            "outbound",
+            "sync-open",
+            &stream,
+        );
         write_msg(
             &mut stream,
             &WireMessage::Hello {
@@ -1102,10 +1139,17 @@ impl DeviceSync {
         )
         .await?;
         finish_send(&mut stream).await?;
-        match read_msg(&mut stream)
+        let response = read_msg(&mut stream)
             .await
-            .context("device sync response was not received")?
-        {
+            .context("device sync response was not received")?;
+        crate::federation::record_stream_transport(
+            &transport_stats,
+            "device-sync",
+            "outbound",
+            "sync-done",
+            &stream,
+        );
+        match response {
             WireMessage::SyncResponse {
                 accepted: true,
                 devices,
@@ -2432,24 +2476,33 @@ pub async fn serve_peers(
     mut acceptor: StreamAcceptor,
     sync: Arc<DeviceSync>,
     service: Arc<MusicDhtService>,
+    transport_stats: Arc<crate::federation::TransportStats>,
 ) {
     while let Some(stream) = acceptor.accept().await {
         let sync = Arc::clone(&sync);
         let service = Arc::clone(&service);
+        let transport_stats = Arc::clone(&transport_stats);
         tokio::spawn(async move {
             let peer = stream.peer_id;
-            if let Err(err) = serve_one(stream, sync, service).await {
+            if let Err(err) = serve_one(stream, sync, service, transport_stats).await {
                 tracing::warn!(peer = %peer, "personal sync stream failed: {err:#}");
             }
         });
     }
 }
 
-pub async fn sync_loop(sync: Arc<DeviceSync>, service: Arc<MusicDhtService>) {
+pub async fn sync_loop(
+    sync: Arc<DeviceSync>,
+    service: Arc<MusicDhtService>,
+    transport_stats: Arc<crate::federation::TransportStats>,
+) {
     let mut interval = tokio::time::interval(SYNC_INTERVAL);
     loop {
         interval.tick().await;
-        if let Err(err) = sync.sync_once(Arc::clone(&service)).await {
+        if let Err(err) = sync
+            .sync_once(Arc::clone(&service), Arc::clone(&transport_stats))
+            .await
+        {
             tracing::debug!("personal sync tick failed: {err:#}");
         }
         if let Some(tx) = lock(&sync.event_tx).as_ref() {
@@ -2462,7 +2515,15 @@ async fn serve_one(
     mut stream: ByteStream,
     sync: Arc<DeviceSync>,
     service: Arc<MusicDhtService>,
+    transport_stats: Arc<crate::federation::TransportStats>,
 ) -> Result<()> {
+    crate::federation::record_stream_transport(
+        &transport_stats,
+        "device-sync",
+        "inbound",
+        "open",
+        &stream,
+    );
     match read_msg(&mut stream).await? {
         WireMessage::PairRequest {
             invite_id,

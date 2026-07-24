@@ -900,9 +900,9 @@ pub struct PlayerBar {
     pub prefetched_pos: Option<usize>,
     pub volume: u8,
     pub shuffle: bool,
-    /// Track ids in pre-shuffle order; restores the queue when shuffle is
-    /// turned off.
-    pub original_order: Option<Vec<i64>>,
+    /// Stable track keys in pre-shuffle order; restores the queue when
+    /// shuffle is turned off.
+    pub original_order: Option<Vec<String>>,
     pub repeat: RepeatMode,
 }
 
@@ -980,6 +980,7 @@ pub struct AppState {
     pub help_visible: bool,
     pub pending_keys: Option<String>,
     pub status_message: Option<String>,
+    pub spinner_frame: usize,
     pub settings_cursor: usize,
     pub player: PlayerBar,
     pub device_playback: DevicePlaybackState,
@@ -989,8 +990,8 @@ pub struct AppState {
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,
     pub playlists: PlaylistsTab,
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
-    /// Liked track ids, for the ♥ markers everywhere tracks are shown.
-    pub likes: std::collections::HashSet<i64>,
+    /// Liked local-library content ids, for the ♥ markers everywhere tracks are shown.
+    pub likes: std::collections::HashSet<String>,
     /// Liked federated tracks (DHT item ids and content ids) — likes that
     /// reference peers' tracks without downloading them.
     pub fed_likes: std::collections::HashSet<String>,
@@ -1022,6 +1023,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn advance_spinner(&mut self) {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    pub fn spinner(&self) -> &'static str {
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        FRAMES[self.spinner_frame % FRAMES.len()]
+    }
+
     pub fn connected_devices_enabled(&self) -> bool {
         self.federation.settings.enabled && !self.federation.settings.network_id.trim().is_empty()
     }
@@ -1032,7 +1042,9 @@ impl AppState {
                 .content_id
                 .as_deref()
                 .and_then(music_dht::normalize_content_id)
-                .is_some_and(|content_id| self.fed_likes.contains(&content_id))
+                .is_some_and(|content_id| {
+                    self.likes.contains(&content_id) || self.fed_likes.contains(&content_id)
+                })
     }
 
     pub fn fed_card_track_liked(&self, track: &crate::federation::FedCardTrack) -> bool {
@@ -1040,10 +1052,46 @@ impl AppState {
             .content_id
             .as_deref()
             .and_then(music_dht::normalize_content_id)
-            .is_some_and(|content_id| self.fed_likes.contains(&content_id))
+            .is_some_and(|content_id| {
+                self.likes.contains(&content_id) || self.fed_likes.contains(&content_id)
+            })
             || track
                 .sources
                 .iter()
                 .any(|(_, item_id)| self.fed_likes.contains(item_id))
     }
+
+    pub fn track_liked(&self, track: &TrackItem) -> bool {
+        if let Some(content_id) = track_content_id(track) {
+            return self.likes.contains(&content_id) || self.fed_likes.contains(&content_id);
+        }
+        track
+            .fed
+            .as_ref()
+            .is_some_and(|fed| self.fed_track_liked(fed))
+    }
+}
+
+pub fn track_content_id(track: &TrackItem) -> Option<String> {
+    track
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id)
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .and_then(|fed| fed.content_id.as_deref())
+                .and_then(music_dht::normalize_content_id)
+        })
+}
+
+pub fn track_key(track: &TrackItem) -> String {
+    if let Some(content_id) = track_content_id(track) {
+        return format!("content:{content_id}");
+    }
+    if let Some(fed) = &track.fed {
+        return format!("fed:{}:{}", fed.owner, fed.item_id);
+    }
+    format!("local:{}", track.id)
 }

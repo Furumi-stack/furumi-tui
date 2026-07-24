@@ -45,6 +45,26 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     popup::draw(frame, state);
 }
 
+pub(crate) fn loading_line(state: &AppState, text: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{} ", state.spinner()), theme::accent()),
+        Span::styled(text.into(), theme::dim()),
+    ])
+}
+
+fn is_waiting_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("loading")
+        || normalized.contains("searching")
+        || normalized.contains("fetching")
+        || normalized.contains("downloading")
+        || normalized.contains("locating")
+        || normalized.contains("importing")
+        || normalized.contains("waiting")
+        || normalized.contains("assembling")
+        || normalized.contains("resolving")
+}
+
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
     let titles = Tab::ALL
         .iter()
@@ -68,11 +88,31 @@ pub(crate) fn track_row(
     selected: bool,
     visual_selected: bool,
 ) {
-    let fed_liked = track
-        .fed
-        .as_ref()
-        .is_some_and(|fed| state.fed_track_liked(fed));
-    let heart = if state.likes.contains(&track.id) || fed_liked {
+    track_row_with_like_marker(
+        frame,
+        area,
+        state,
+        track,
+        index_label,
+        selected,
+        visual_selected,
+        true,
+    );
+}
+
+pub(crate) fn track_row_with_like_marker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    track: &crate::library::models::TrackItem,
+    index_label: String,
+    selected: bool,
+    visual_selected: bool,
+    show_like_marker: bool,
+) {
+    let heart = if !show_like_marker {
+        Span::raw("")
+    } else if state.track_liked(track) {
         Span::styled("♥ ", theme::accent())
     } else {
         Span::raw("  ")
@@ -311,7 +351,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 spans.push(Span::styled("▶ ", theme::accent()));
             }
-            if state.likes.contains(&track.id) {
+            if state.track_liked(track) {
                 spans.push(Span::styled("♥ ", theme::accent()));
             }
             spans.push(Span::raw(track.title.clone()));
@@ -340,6 +380,10 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let message = match &state.status_message {
+        Some(message) if is_waiting_message(message) => Line::from(vec![
+            Span::styled(format!("{} ", state.spinner()), theme::accent()),
+            Span::styled(message.clone(), theme::accent()),
+        ]),
         Some(message) => Line::styled(message.clone(), theme::accent()),
         None => match &state.player.current {
             // Idle line doubles as the current track's tech data display.

@@ -6,7 +6,7 @@ use crate::library::models::TrackItem;
 use super::state::{
     AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, TILE_HEIGHT, TILE_WIDTH, Tab,
     TrackSelectionScope, ViewMode, fed_release_display_order, fed_release_rows,
-    release_display_order, release_rows, settings_rows,
+    release_display_order, release_rows, settings_rows, track_content_id, track_key,
 };
 
 pub const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
@@ -283,26 +283,31 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                     .map(|track| vec![track.clone()])
                     .unwrap_or_default();
             }
-            // Local library rows are liked by id; federated tracks (pending
-            // or cached) are liked as references into the federation.
-            let mut track_ids: Vec<i64> = Vec::new();
+            let mut local_tracks: Vec<TrackItem> = Vec::new();
             let mut fed_tracks: Vec<crate::federation::FedTrack> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for track in tracks {
+                if !seen.insert(track_key(&track)) {
+                    continue;
+                }
                 match &track.fed {
                     Some(fed) => fed_tracks.push(fed.clone()),
-                    None if track.id >= 0 => track_ids.push(track.id),
+                    None if track.id >= 0 && track_content_id(&track).is_some() => {
+                        local_tracks.push(track)
+                    }
                     None => {}
                 }
             }
-            if track_ids.is_empty() && fed_tracks.is_empty() {
+            if local_tracks.is_empty() && fed_tracks.is_empty() {
                 state.status_message = Some("no track selected".into());
                 None
             } else {
-                let should_like = track_ids.iter().any(|id| !state.likes.contains(id))
+                let should_like = local_tracks.iter().any(|track| !state.track_liked(track))
                     || fed_tracks.iter().any(|fed| !state.fed_track_liked(fed));
-                let toggles: Vec<i64> = track_ids
+                let toggles: Vec<i64> = local_tracks
                     .into_iter()
-                    .filter(|id| state.likes.contains(id) != should_like)
+                    .filter(|track| state.track_liked(track) != should_like)
+                    .map(|track| track.id)
                     .collect();
                 let fed_toggles: Vec<crate::federation::FedTrack> = fed_tracks
                     .into_iter()
@@ -355,10 +360,9 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::DownloadSelected => {
-            let tracks = selected_fed_tracks(state);
+            let tracks = selected_downloadable_fed_tracks(state);
             if tracks.is_empty() {
-                state.status_message =
-                    Some("select federated tracks first (works in the federation results)".into());
+                state.status_message = Some("select federated tracks first".into());
                 None
             } else {
                 state.track_selection.clear();
@@ -614,30 +618,38 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
                     return None;
                 }
                 let track_ids: Vec<i64> = tracks.iter().map(|track| track.id).collect();
-                let content_ids: Vec<String> = tracks
-                    .iter()
-                    .filter_map(|track| {
-                        track
-                            .content_id
-                            .as_deref()
-                            .and_then(music_dht::normalize_content_id)
-                    })
-                    .collect();
+                let content_ids: Vec<String> = tracks.iter().filter_map(track_content_id).collect();
                 state.track_selection.clear();
                 if opened.id == super::state::LIKES_PLAYLIST_ID {
-                    let liked: Vec<i64> = track_ids
-                        .into_iter()
-                        .filter(|id| state.likes.contains(id))
-                        .collect();
-                    state.status_message = Some(format!("removing {} like(s)", liked.len()));
+                    let mut seen = std::collections::HashSet::new();
+                    let mut liked = Vec::new();
+                    let mut fed_tracks = Vec::new();
+                    for track in tracks {
+                        if !state.track_liked(&track) || !seen.insert(track_key(&track)) {
+                            continue;
+                        }
+                        if let Some(fed) = track.fed {
+                            fed_tracks.push(fed);
+                        } else if track.id >= 0 && track_content_id(&track).is_some() {
+                            liked.push(track.id);
+                        }
+                    }
+                    let total = liked.len() + fed_tracks.len();
+                    state.status_message = Some(format!("removing {} like(s)", total));
                     return Some(Effect::ToggleLikes {
                         track_ids: liked,
-                        fed_tracks: vec![],
+                        fed_tracks,
                     });
                 }
+                let content_ids: Vec<String> = content_ids
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let track_ids: Vec<i64> = track_ids.into_iter().filter(|id| *id >= 0).collect();
                 state.status_message = Some(format!(
                     "removing {} track(s) from playlist",
-                    track_ids.len()
+                    content_ids.len().max(track_ids.len())
                 ));
                 return Some(Effect::RemoveFromPlaylist {
                     playlist_id: opened.id,
@@ -1015,14 +1027,14 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
     }
 
     let old_queue_pos = state.player.queue_pos;
-    let current_id = state.player.current.as_ref().map(|track| track.id);
-    let current_removed = current_id.is_some_and(|id| {
+    let current_key = state.player.current.as_ref().map(track_key);
+    let current_removed = current_key.as_ref().is_some_and(|key| {
         unique.iter().any(|index| {
             state
                 .player
                 .queue
                 .get(*index)
-                .is_some_and(|track| track.id == id)
+                .is_some_and(|track| track_key(track) == *key)
         })
     });
     let removed_before_current = unique
@@ -1060,19 +1072,24 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
         };
     }
 
-    if let Some(id) = current_id {
-        if let Some(position) = state.player.queue.iter().position(|track| track.id == id) {
+    if let Some(key) = current_key.as_ref() {
+        if let Some(position) = state
+            .player
+            .queue
+            .iter()
+            .position(|track| track_key(track) == *key)
+        {
             state.player.queue_pos = position;
         }
     } else {
         state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
     }
-    state.player.current = current_id.and_then(|id| {
+    state.player.current = current_key.and_then(|key| {
         state
             .player
             .queue
             .iter()
-            .find(|track| track.id == id)
+            .find(|track| track_key(track) == key)
             .cloned()
     });
     state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
@@ -1416,7 +1433,7 @@ pub fn shuffle_upcoming(player: &mut super::state::PlayerBar) {
         return;
     }
     if player.original_order.is_none() {
-        player.original_order = Some(player.queue.iter().map(|t| t.id).collect());
+        player.original_order = Some(player.queue.iter().map(track_key).collect());
     }
     shuffle_range(player, upcoming_start(player));
 }
@@ -1440,7 +1457,7 @@ pub fn restore_queue_order(player: &mut super::state::PlayerBar) {
             let key = order
                 .iter()
                 .enumerate()
-                .position(|(slot, id)| !used[slot] && *id == track.id)
+                .position(|(slot, key)| !used[slot] && *key == track_key(&track))
                 .inspect(|&slot| used[slot] = true)
                 .unwrap_or(usize::MAX);
             (key, position, track)
@@ -2212,6 +2229,83 @@ pub(crate) fn selected_fed_tracks(state: &AppState) -> Vec<crate::federation::Fe
     }
 }
 
+fn selected_downloadable_fed_tracks(state: &AppState) -> Vec<crate::federation::FedTrack> {
+    let mut tracks = Vec::new();
+    for track in selected_tracks(state) {
+        if let Some(fed) = fed_track_for_download(&track)
+            && !tracks
+                .iter()
+                .any(|existing| same_fed_download(existing, &fed))
+        {
+            tracks.push(fed);
+        }
+    }
+    for fed in selected_fed_tracks(state) {
+        if !tracks
+            .iter()
+            .any(|existing| same_fed_download(existing, &fed))
+        {
+            tracks.push(fed);
+        }
+    }
+    tracks
+}
+
+fn fed_track_for_download(track: &TrackItem) -> Option<crate::federation::FedTrack> {
+    if let Some(fed) = &track.fed {
+        return Some(fed.clone());
+    }
+    let content_id = track
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id)?;
+    Some(crate::federation::FedTrack {
+        item_id: String::new(),
+        owner: String::new(),
+        own: false,
+        title: track.title.clone(),
+        artist_names: track
+            .artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        featured_artist_names: track
+            .featured_artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        year: track.release_year,
+        duration_seconds: (track.duration_seconds > 0.0)
+            .then(|| track.duration_seconds.round().max(0.0) as i64),
+        content_id: Some(content_id),
+        release_title: (!track.release_title.trim().is_empty())
+            .then(|| track.release_title.clone()),
+        track_number: track.track_number,
+        disc_number: track.disc_number,
+    })
+}
+
+fn same_fed_download(
+    left: &crate::federation::FedTrack,
+    right: &crate::federation::FedTrack,
+) -> bool {
+    let left_content = left
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id);
+    let right_content = right
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id);
+    if left_content.is_some() && left_content == right_content {
+        return true;
+    }
+    !left.owner.is_empty()
+        && !left.item_id.is_empty()
+        && left.owner == right.owner
+        && left.item_id == right.item_id
+}
+
 /// What Enter resolved to in the current view.
 enum Outcome {
     Push(GlobalView),
@@ -2482,7 +2576,7 @@ pub(super) fn on_new_queue(state: &mut AppState) {
     let player = &mut state.player;
     player.original_order = None;
     if player.shuffle && !player.queue.is_empty() {
-        player.original_order = Some(player.queue.iter().map(|t| t.id).collect());
+        player.original_order = Some(player.queue.iter().map(track_key).collect());
         shuffle_range(player, (player.queue_pos + 1).min(player.queue.len()));
     }
 }
@@ -2610,7 +2704,7 @@ mod tests {
             release_year: None,
             cover_path: None,
             file_path: format!("/s/{id}"),
-            content_id: None,
+            content_id: Some(format!("b3:{id:064x}")),
             audio_format: None,
             audio_bitrate: None,
             audio_sample_rate: None,
@@ -3162,7 +3256,7 @@ mod tests {
             ..AppState::default()
         };
         state.player.queue = (1..=3).map(test_track).collect();
-        state.likes.insert(1);
+        state.likes.insert(format!("b3:{:064x}", 1));
 
         update(&mut state, Action::ToggleTrackSelection);
         update(&mut state, Action::SelectLast);
@@ -3174,7 +3268,10 @@ mod tests {
             })
         );
 
-        state.likes = [1, 2, 3].into_iter().collect();
+        state.likes = [1, 2, 3]
+            .into_iter()
+            .map(|id| format!("b3:{id:064x}"))
+            .collect();
         assert_eq!(
             update(&mut state, Action::ToggleLike),
             Some(Effect::ToggleLikes {

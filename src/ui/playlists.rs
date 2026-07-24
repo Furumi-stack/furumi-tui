@@ -4,8 +4,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::{theme, track_row};
-use crate::app::state::{AppState, Loadable, TrackSelectionScope};
+use super::{loading_line, theme, track_row_with_like_marker};
+use crate::app::state::{AppState, LIKES_PLAYLIST_ID, Loadable, TrackSelectionScope};
 use crate::app::update::playlist_tracks;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -51,11 +51,7 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
             );
         }
         _ => {
-            return centered_line(
-                frame,
-                inner,
-                Line::styled("loading playlists…", theme::dim()),
-            );
+            return centered_line(frame, inner, loading_line(state, "loading playlists…"));
         }
     };
     if list.is_empty() {
@@ -112,7 +108,7 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         );
     }
     let Some(tracks) = playlist_tracks(state, id) else {
-        return centered_line(frame, inner, Line::styled("loading…", theme::dim()));
+        return centered_line(frame, inner, loading_line(state, "loading…"));
     };
     if tracks.is_empty() {
         return centered_line(
@@ -133,7 +129,7 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             width: inner.width,
             height: 1,
         };
-        track_row(
+        track_row_with_like_marker(
             frame,
             row,
             state,
@@ -143,6 +139,7 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             state
                 .track_selection
                 .contains(&TrackSelectionScope::Playlist(id), index),
+            id != LIKES_PLAYLIST_ID,
         );
     }
 }

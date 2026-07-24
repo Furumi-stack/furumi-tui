@@ -190,10 +190,18 @@ fn handle_connected_devices(
                 super::transfer_active_to_this_device(state, runtime);
                 state.status_message = Some("active playback moved to this device".into());
             } else if let Some(row) = other_rows.get(cursor.saturating_sub(1).min(last)) {
-                if let Some(snapshot) = state.device_playback.remote.get(&row.device_id).cloned() {
+                if row.active
+                    && let Some(snapshot) =
+                        state.device_playback.remote.get(&row.device_id).cloned()
+                {
                     super::become_control_device(state, runtime, snapshot);
                 } else {
-                    state.status_message = Some("device has no playback snapshot yet".into());
+                    super::transfer_active_to_remote_device(
+                        state,
+                        runtime,
+                        row.device_id.clone(),
+                        row.name.clone(),
+                    );
                 }
             }
         }

@@ -44,8 +44,10 @@ pub struct Runtime {
     /// Coalesces urgent personal-device syncs after remote playback commands.
     pub device_sync_running: Arc<std::sync::atomic::AtomicBool>,
     pub device_sync_requested: Arc<std::sync::atomic::AtomicBool>,
-    /// Placeholder ids of federated tracks being downloaded right now.
-    pub fed_resolving: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// Stable playback keys of federated tracks being resolved right now.
+    pub fed_resolving: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Stable playback keys that already started through a streaming reader.
+    pub fed_streaming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Caps concurrent artwork loads so they never starve the disk.
     pub art_semaphore: Arc<tokio::sync::Semaphore>,
     /// The terminal screen was externally disturbed and needs a full repaint.
@@ -56,6 +58,13 @@ pub struct Runtime {
     pub player_start_pending: bool,
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingPlaybackRequest {
+    volume: u8,
+    paused: bool,
+    position_secs: f64,
 }
 
 fn now_epoch_seconds() -> i64 {
@@ -176,6 +185,7 @@ pub async fn run(
         device_sync_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         device_sync_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
+        fed_streaming: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         art_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         force_redraw: false,
         search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -221,6 +231,7 @@ pub async fn run(
             },
             Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
             _ = tick.tick() => {
+                state.advance_spinner();
                 expire_quit_confirmation(&mut state);
                 sync_player_shared(&mut state, &runtime);
                 maybe_prefetch_next(&mut state, &runtime);
@@ -313,24 +324,7 @@ fn playback_track_to_ui(
 }
 
 fn track_playback_key(track: &crate::library::models::TrackItem) -> String {
-    if let Some(content_id) = track
-        .content_id
-        .as_deref()
-        .and_then(music_dht::normalize_content_id)
-        .or_else(|| {
-            track
-                .fed
-                .as_ref()
-                .and_then(|fed| fed.content_id.as_deref())
-                .and_then(music_dht::normalize_content_id)
-        })
-    {
-        return format!("content:{content_id}");
-    }
-    if let Some(fed) = &track.fed {
-        return format!("fed:{}:{}", fed.owner, fed.item_id);
-    }
-    format!("local:{}", track.id)
+    state::track_key(track)
 }
 
 fn apply_playback_state_to_ui(
@@ -545,6 +539,53 @@ pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut
     request_urgent_device_sync(runtime);
 }
 
+pub(crate) fn transfer_active_to_remote_device(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    target_device_id: String,
+    target_device_name: String,
+) {
+    if target_device_id.trim().is_empty()
+        || target_device_id == state.device_playback.self_device_id
+    {
+        transfer_active_to_this_device(state, runtime);
+        return;
+    }
+    extrapolate_control_position(state);
+    let previous_active_id = state.device_playback.active_device_id.clone();
+    if state.player.current.is_none() && !state.player.queue.is_empty() {
+        state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
+    }
+    let wire = playback_state_from_ui(state);
+    let command = crate::devices::PlaybackCommand::ActiveChanged {
+        active_device_id: target_device_id.clone(),
+        active_device_name: target_device_name.clone(),
+        state: wire.clone(),
+    };
+    record_playback_command_async(
+        runtime,
+        target_device_id.clone(),
+        command.clone(),
+        "device handoff",
+    );
+    if let Some(previous) = previous_active_id
+        && previous != target_device_id
+        && previous != state.device_playback.self_device_id
+    {
+        record_playback_command_async(runtime, previous, command.clone(), "device handoff");
+    }
+    let snapshot = crate::devices::PlaybackSnapshot {
+        device_id: target_device_id.clone(),
+        device_name: target_device_name.clone(),
+        active: true,
+        updated_at_ms: unix_time_ms(),
+        state: wire,
+    };
+    become_control_device(state, runtime, snapshot);
+    request_urgent_device_sync(runtime);
+    state.status_message = Some(format!("active playback moved to {target_device_name}"));
+}
+
 fn record_active_handoff(
     state: &mut AppState,
     runtime: &Runtime,
@@ -733,7 +774,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         let library = Arc::clone(&runtime.library);
         let tx = runtime.event_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let result = library.likes().map_err(err_string);
+            let result = library.liked_content_ids().map_err(err_string);
             let _ = tx.send(AppEvent::LikesLoaded(result));
             let result = library.fed_like_ids().map_err(err_string);
             let _ = tx.send(AppEvent::FedLikesLoaded(result));
@@ -952,12 +993,28 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
                 for track_id in track_ids {
-                    match library.toggle_like(track_id) {
+                    let content_id = match library.track_content_id_by_id(track_id) {
+                        Ok(Some(content_id)) => content_id,
+                        Ok(None) => {
+                            tracing::warn!(track_id, "cannot toggle like without content id");
+                            let _ = tx.send(AppEvent::StatusMessage(
+                                "like failed: track has no content id".to_string(),
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, track_id, "loading track content id failed");
+                            let _ =
+                                tx.send(AppEvent::StatusMessage(format!("like failed: {err:#}")));
+                            break;
+                        }
+                    };
+                    match library.toggle_like_by_content_id(&content_id) {
                         Ok(liked) => {
-                            if let Err(err) = devices.record_track_like(track_id, liked) {
+                            if let Err(err) = devices.record_content_like(&content_id, liked) {
                                 tracing::warn!(%err, track_id, "recording synced like failed");
                             }
-                            let _ = tx.send(AppEvent::LikeToggled { track_id, liked });
+                            let _ = tx.send(AppEvent::LikeToggled { content_id, liked });
                         }
                         Err(err) => {
                             tracing::warn!(%err, track_id, "like toggle failed");
@@ -987,6 +1044,12 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                         }
                     }
                 }
+                let _ = tx.send(AppEvent::LikesLoaded(
+                    library.liked_content_ids().map_err(err_string),
+                ));
+                let _ = tx.send(AppEvent::FedLikesLoaded(
+                    library.fed_like_ids().map_err(err_string),
+                ));
             });
         }
         Effect::RemoveFromPlaylist {
@@ -1348,13 +1411,13 @@ fn start_current_audio(
         if let Some(local) = local_track_for_playback(runtime, &track) {
             state.player.queue[state.player.queue_pos] = local.clone();
             track = local;
-        } else if let Some(fed) = track.fed.clone() {
+        } else if let Some(fed) = direct_fed_source(&track) {
             let mut pending = crate::federation::pending_track(&fed);
             pending.id = track.id;
             pending.play_count = track.play_count;
             state.player.queue[state.player.queue_pos] = pending.clone();
             track = pending;
-        } else if track.content_id.is_some() {
+        } else if track_content_id(&track).is_some() {
             state.player.current = Some(track.clone());
             state.player.playing = true;
             state.player.paused = paused;
@@ -1368,15 +1431,30 @@ fn start_current_audio(
                 "federation: locating \"{}\" for this device…",
                 track.title
             ));
-            spawn_content_id_resolve(runtime, &track);
+            spawn_content_id_resolve(
+                runtime,
+                &track,
+                Some(StreamingPlaybackRequest {
+                    volume: state.player.volume,
+                    paused,
+                    position_secs,
+                }),
+            );
             return;
+        } else if let Some(fed) = track.fed.clone() {
+            let mut pending = crate::federation::pending_track(&fed);
+            pending.id = track.id;
+            pending.play_count = track.play_count;
+            state.player.queue[state.player.queue_pos] = pending.clone();
+            track = pending;
         }
     }
     // The track that was playing until now was cut short by this switch.
     let previous_started_at = state.player.track_started_at;
+    let next_key = track_playback_key(&track);
     let same_track_started_at = if let Some(previous) = state.player.current.take() {
-        let same_track = previous.id == track.id;
-        if state.player.playing && previous.id != track.id {
+        let same_track = track_playback_key(&previous) == next_key;
+        if state.player.playing && !same_track {
             report_history(
                 runtime,
                 previous.id,
@@ -1404,7 +1482,15 @@ fn start_current_audio(
         // audio, download it and resume through FedTrackResolved.
         runtime.player.stop();
         state.status_message = Some(format!("federation: fetching \"{}\"…", track.title));
-        spawn_fed_resolve(runtime, &track);
+        spawn_fed_resolve(
+            runtime,
+            &track,
+            Some(StreamingPlaybackRequest {
+                volume: state.player.volume,
+                paused,
+                position_secs,
+            }),
+        );
         return;
     }
     if track_file_missing(&track) {
@@ -1454,19 +1540,32 @@ fn local_track_for_playback(
     runtime: &Runtime,
     track: &crate::library::models::TrackItem,
 ) -> Option<crate::library::models::TrackItem> {
-    let content_id = track.content_id.as_deref()?;
+    let content_id = track_content_id(track)?;
     let local = runtime
         .library
-        .track_by_content_id(content_id)
+        .track_by_content_id(&content_id)
         .ok()
         .flatten()?;
     Path::new(&local.file_path).is_file().then_some(local)
 }
 
+fn direct_fed_source(
+    track: &crate::library::models::TrackItem,
+) -> Option<crate::federation::FedTrack> {
+    let fed = track.fed.clone()?;
+    let owner_ok = fed.owner.parse::<music_dht::EndpointId>().is_ok();
+    let item_ok = fed.item_id.len() == 64 && fed.item_id.chars().all(|c| c.is_ascii_hexdigit());
+    (owner_ok && item_ok).then_some(fed)
+}
+
+fn track_content_id(track: &crate::library::models::TrackItem) -> Option<String> {
+    state::track_content_id(track)
+}
+
 fn open_track_file(path: &str) -> std::io::Result<(player::TrackReader, Option<u64>)> {
     let file = std::fs::File::open(path)?;
     let byte_len = file.metadata().ok().map(|meta| meta.len());
-    Ok((std::io::BufReader::new(file), byte_len))
+    Ok((Box::new(std::io::BufReader::new(file)), byte_len))
 }
 
 /// Open the next queue item ~30s before the current track ends and append
@@ -1488,14 +1587,28 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     let Some(next_pos) = update::peek_next_pos(player) else {
         return;
     };
-    let Some(next) = player.queue.get(next_pos).cloned() else {
+    let Some(mut next) = player.queue.get(next_pos).cloned() else {
         return;
     };
-    if next.is_fed_pending() {
-        // Download the upcoming federated track ahead of time; the gapless
-        // enqueue happens on a later tick once it resolved to a file.
-        spawn_fed_resolve(runtime, &next);
-        return;
+    if track_file_missing(&next) {
+        if let Some(local) = local_track_for_playback(runtime, &next) {
+            state.player.queue[next_pos] = local.clone();
+            next = local;
+        } else if let Some(fed) = direct_fed_source(&next) {
+            next = crate::federation::pending_track(&fed);
+            spawn_fed_resolve(runtime, &next, None);
+            return;
+        } else if track_content_id(&next).is_some() {
+            // Resolve by content id first: the actual owner/item id may be a
+            // synced placeholder from another client.
+            spawn_content_id_resolve(runtime, &next, None);
+            return;
+        } else if next.is_fed_pending() {
+            spawn_fed_resolve(runtime, &next, None);
+            return;
+        } else {
+            return;
+        }
     }
     state.player.prefetched_pos = Some(next_pos);
     tracing::debug!(title = %next.title, "prefetching next track");
@@ -1577,64 +1690,235 @@ pub(crate) fn device_connect(runtime: &Runtime, invite: String) {
     });
 }
 
+fn download_progress_sender(
+    tx: mpsc::UnboundedSender<AppEvent>,
+    title: String,
+) -> impl FnMut(crate::federation::DownloadProgress) + Send + 'static {
+    let mut last_sent: Option<std::time::Instant> = None;
+    let started = std::time::Instant::now();
+    move |progress| {
+        let now = std::time::Instant::now();
+        let complete = progress.total > 0 && progress.received >= progress.total;
+        let first = progress.received == 0;
+        let due = last_sent.is_none_or(|last| now.duration_since(last) >= TICK_INTERVAL);
+        if first || complete || due {
+            last_sent = Some(now);
+            let elapsed_secs = now.duration_since(started).as_secs_f64();
+            let bytes_per_sec = if elapsed_secs >= 0.25 && progress.received > 0 {
+                Some(progress.received as f64 / elapsed_secs)
+            } else {
+                None
+            };
+            let _ = tx.send(AppEvent::StatusMessage(format_download_progress(
+                &title,
+                progress,
+                bytes_per_sec,
+            )));
+        }
+    }
+}
+
+fn format_download_progress(
+    title: &str,
+    progress: crate::federation::DownloadProgress,
+    bytes_per_sec: Option<f64>,
+) -> String {
+    let speed = bytes_per_sec
+        .map(|bytes| format!(" · {}", format_transfer_rate(bytes)))
+        .unwrap_or_default();
+    if progress.total > 0 {
+        let percent = (progress.received as f64 / progress.total as f64 * 100.0).clamp(0.0, 100.0);
+        format!(
+            "federation: downloading \"{title}\" {:.0}% · {}/{}{speed}",
+            percent,
+            format_bytes(progress.received),
+            format_bytes(progress.total)
+        )
+    } else {
+        format!(
+            "federation: downloading \"{title}\" · {}{speed}",
+            format_bytes(progress.received),
+        )
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_transfer_rate(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes_per_sec >= MIB {
+        format!("{:.1} MB/s", bytes_per_sec / MIB)
+    } else if bytes_per_sec >= KIB {
+        format!("{:.0} KB/s", bytes_per_sec / KIB)
+    } else {
+        format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
 /// Downloads one pending federated track (into the cache, or the library
 /// when save-on-listen is enabled) and reports back with the placeholder id
 /// so the queue can swap the resolved track in.
-fn spawn_fed_resolve(runtime: &Runtime, track: &crate::library::models::TrackItem) {
+fn spawn_fed_resolve(
+    runtime: &Runtime,
+    track: &crate::library::models::TrackItem,
+    stream_playback: Option<StreamingPlaybackRequest>,
+) {
     let Some(fed_track) = track.fed.clone() else {
         return;
     };
+    let resolve_key = track_playback_key(track);
     {
         let mut resolving = runtime
             .fed_resolving
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !resolving.insert(track.id) {
+        if !resolving.insert(resolve_key.clone()) {
             return;
         }
     }
     let placeholder_id = track.id;
+    let title = track.title.clone();
     let fed = Arc::clone(&runtime.federation);
     let tx = runtime.event_tx.clone();
+    let controller = runtime.player.clone();
+    let streaming = Arc::clone(&runtime.fed_streaming);
     tokio::spawn(async move {
-        let result = fed
-            .prepare_playback(&fed_track)
+        let progress = download_progress_sender(tx.clone(), title.clone());
+        let result = if let Some(playback) =
+            stream_playback.filter(|playback| playback.position_secs <= 0.5)
+        {
+            let stream_tx = tx.clone();
+            let stream_title = title.clone();
+            let stream_controller = controller.clone();
+            let stream_resolve_key = resolve_key.clone();
+            let stream_markers = Arc::clone(&streaming);
+            let mut started = false;
+            fed.prepare_playback_streaming_with_progress(&fed_track, progress, move |stream| {
+                if started {
+                    return;
+                }
+                started = true;
+                stream_markers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(stream_resolve_key.clone());
+                stream_controller.play_stream(
+                    Box::new(stream.reader),
+                    Some(stream.mime_type),
+                    player::amplitude(playback.volume),
+                );
+                if playback.paused {
+                    stream_controller.pause();
+                }
+                let _ = stream_tx.send(AppEvent::StatusMessage(format!(
+                    "federation: streaming \"{stream_title}\" while downloading…"
+                )));
+            })
             .await
-            .map(Box::new)
-            .map_err(|err| format!("{err:#}"));
+        } else {
+            fed.prepare_playback_with_progress(&fed_track, progress)
+                .await
+        }
+        .map(Box::new)
+        .map_err(|err| format!("{err:#}"));
         let _ = tx.send(AppEvent::FedTrackResolved {
             placeholder_id,
+            resolve_key,
             result,
         });
     });
 }
 
-fn spawn_content_id_resolve(runtime: &Runtime, track: &crate::library::models::TrackItem) {
-    let Some(content_id) = track.content_id.clone() else {
+fn spawn_content_id_resolve(
+    runtime: &Runtime,
+    track: &crate::library::models::TrackItem,
+    stream_playback: Option<StreamingPlaybackRequest>,
+) {
+    let Some(content_id) = track_content_id(track) else {
         return;
     };
+    let resolve_key = track_playback_key(track);
     {
         let mut resolving = runtime
             .fed_resolving
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !resolving.insert(track.id) {
+        if !resolving.insert(resolve_key.clone()) {
             return;
         }
     }
     let placeholder_id = track.id;
     let label = format!("{} {}", track.artist_line(), track.title);
+    let title = track.title.clone();
     let fed = Arc::clone(&runtime.federation);
     let tx = runtime.event_tx.clone();
+    let controller = runtime.player.clone();
+    let streaming = Arc::clone(&runtime.fed_streaming);
     tokio::spawn(async move {
         let result = match fed.track_by_content_id(&content_id, Some(&label)).await {
-            Ok(fed_track) => fed.prepare_playback(&fed_track).await,
+            Ok(fed_track) => {
+                let _ = tx.send(AppEvent::StatusMessage(format!(
+                    "federation: found source for \"{title}\", downloading…"
+                )));
+                let progress = download_progress_sender(tx.clone(), title.clone());
+                if let Some(playback) =
+                    stream_playback.filter(|playback| playback.position_secs <= 0.5)
+                {
+                    let stream_tx = tx.clone();
+                    let stream_title = title.clone();
+                    let stream_controller = controller.clone();
+                    let stream_resolve_key = resolve_key.clone();
+                    let stream_markers = Arc::clone(&streaming);
+                    let mut started = false;
+                    fed.prepare_playback_streaming_with_progress(
+                        &fed_track,
+                        progress,
+                        move |stream| {
+                            if started {
+                                return;
+                            }
+                            started = true;
+                            stream_markers
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(stream_resolve_key.clone());
+                            stream_controller.play_stream(
+                                Box::new(stream.reader),
+                                Some(stream.mime_type),
+                                player::amplitude(playback.volume),
+                            );
+                            if playback.paused {
+                                stream_controller.pause();
+                            }
+                            let _ = stream_tx.send(AppEvent::StatusMessage(format!(
+                                "federation: streaming \"{stream_title}\" while downloading…"
+                            )));
+                        },
+                    )
+                    .await
+                } else {
+                    fed.prepare_playback_with_progress(&fed_track, progress)
+                        .await
+                }
+            }
             Err(err) => Err(err),
         }
         .map(Box::new)
         .map_err(|err| format!("{err:#}"));
         let _ = tx.send(AppEvent::FedTrackResolved {
             placeholder_id,
+            resolve_key,
             result,
         });
     });
@@ -1660,12 +1944,14 @@ pub(crate) fn fed_download_spawn(
         let mut imported_fed_tracks = Vec::new();
         let mut failed = 0usize;
         for (index, track) in tracks.iter().enumerate() {
+            let title = track.title.clone();
             let _ = tx.send(AppEvent::StatusMessage(format!(
                 "federation: downloading {}/{total}: {}",
                 index + 1,
                 track.title
             )));
-            match fed.download_to_library(track).await {
+            let progress = download_progress_sender(tx.clone(), title);
+            match fed.download_to_library_with_progress(track, progress).await {
                 Ok(imported) => {
                     imported_ids.push(imported.id);
                     imported_fed_tracks.push(track.clone());
@@ -1967,9 +2253,17 @@ fn apply_queue_refresh(
 ) {
     let by_id: std::collections::HashMap<i64, _> =
         tracks.into_iter().map(|track| (track.id, track)).collect();
+    let by_key: std::collections::HashMap<String, _> = by_id
+        .values()
+        .cloned()
+        .map(|track| (track_playback_key(&track), track))
+        .collect();
     let current_id = state.player.current.as_ref().map(|track| track.id);
+    let current_key = state.player.current.as_ref().map(track_playback_key);
     for track in &mut state.player.queue {
         if let Some(fresh) = by_id.get(&track.id) {
+            *track = fresh.clone();
+        } else if let Some(fresh) = by_key.get(&track_playback_key(track)) {
             *track = fresh.clone();
         }
     }
@@ -1995,15 +2289,29 @@ fn apply_queue_refresh(
         return;
     }
     state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
-    match current_id {
-        Some(id) if by_id.contains_key(&id) => {
-            if let Some(position) = state.player.queue.iter().position(|track| track.id == id) {
+    match (current_id, current_key) {
+        (Some(id), _) if id < 0 => {
+            // The current source can be an ephemeral federated stream while
+            // the queue is refreshed after save-on-listen. It is not a
+            // deleted library row, so keep playback untouched.
+            state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
+        }
+        (Some(id), Some(key)) if by_id.contains_key(&id) || by_key.contains_key(&key) => {
+            if let Some(position) = state
+                .player
+                .queue
+                .iter()
+                .position(|track| track_playback_key(track) == key)
+            {
                 state.player.queue_pos = position;
             }
-            state.player.current = by_id.get(&id).cloned();
+            state.player.current = by_id
+                .get(&id)
+                .cloned()
+                .or_else(|| by_key.get(&key).cloned());
             push_media_metadata(state, runtime);
         }
-        Some(_) => {
+        (Some(_), _) => {
             // The playing track was deleted from the library.
             runtime.player_start_pending = false;
             runtime.player.stop();
@@ -2013,7 +2321,7 @@ fn apply_queue_refresh(
             state.player.paused = false;
             push_media_update(state, runtime, true);
         }
-        None => {
+        (None, _) => {
             state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
         }
     }
@@ -2251,18 +2559,29 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::FedTrackResolved {
             placeholder_id,
+            resolve_key,
             result,
         } => {
             runtime
                 .fed_resolving
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&placeholder_id);
+                .remove(&resolve_key);
+            let stream_started = runtime
+                .fed_streaming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&resolve_key);
             if state.device_playback.is_control() {
+                runtime.player_start_pending = false;
                 tracing::debug!(
                     placeholder_id,
+                    resolve_key,
                     "ignored local federated track resolution while controlling remote playback"
                 );
+                if let Err(message) = result {
+                    state.status_message = Some(format!("federation: {message}"));
+                }
                 return;
             }
             let placeholder_key = state
@@ -2277,7 +2596,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         .as_ref()
                         .filter(|track| track.id == placeholder_id)
                 })
-                .map(track_playback_key);
+                .map(track_playback_key)
+                .or(Some(resolve_key.clone()));
             let queue_pos_waiting =
                 state
                     .player
@@ -2301,6 +2621,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             } else {
                 0.0
             };
+            let already_streaming = waiting && stream_started && state.player.playing;
             match result {
                 Ok(playable) => {
                     if playable.imported {
@@ -2327,7 +2648,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         }
                     }
                     if waiting {
-                        // Playback was parked on this track; start it now.
+                        // Playback was either parked on this track or already
+                        // running from the streaming reader.
                         let paused = state.player.paused;
                         if state
                             .player
@@ -2342,11 +2664,19 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         {
                             state.player.queue_pos = pos;
                         }
-                        state.player.current =
-                            state.player.queue.get(state.player.queue_pos).cloned();
-                        start_current_audio(state, runtime, resume_position_secs, paused);
-                        push_media_metadata(state, runtime);
-                        push_media_update(state, runtime, true);
+                        if already_streaming {
+                            // Do not swap the currently playing item under
+                            // the audio pipeline. The streaming reader will
+                            // play through the completed cache file naturally;
+                            // the resolved queue entry is for future starts.
+                            push_media_update(state, runtime, true);
+                        } else {
+                            state.player.current =
+                                state.player.queue.get(state.player.queue_pos).cloned();
+                            start_current_audio(state, runtime, resume_position_secs, paused);
+                            push_media_metadata(state, runtime);
+                            push_media_update(state, runtime, true);
+                        }
                     }
                 }
                 Err(message) => {
@@ -2624,6 +2954,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     content_id.and_then(|id| music_dht::normalize_content_id(&id))
                 {
                     state.fed_likes.remove(&content_id);
+                    state.likes.remove(&content_id);
                 }
             }
             // The virtual Likes playlist is stale now; refetch on next open.
@@ -2635,11 +2966,13 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 "like removed".to_string()
             });
         }
-        AppEvent::LikeToggled { track_id, liked } => {
+        AppEvent::LikeToggled { content_id, liked } => {
             if liked {
-                state.likes.insert(track_id);
+                state.fed_likes.remove(&content_id);
+                state.likes.insert(content_id);
             } else {
-                state.likes.remove(&track_id);
+                state.likes.remove(&content_id);
+                state.fed_likes.remove(&content_id);
             }
             // The virtual Likes playlist is stale now; refetch on next open.
             state.playlist_views.remove(&state::LIKES_PLAYLIST_ID);

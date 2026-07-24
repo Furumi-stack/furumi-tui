@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use music_dht::{ByteStream, EndpointId, ItemId, ItemKind, MusicDhtService, StreamAcceptor};
@@ -20,6 +21,22 @@ pub const AUDIO_ALPN: &[u8] = b"furumi-fd/audio/1";
 
 /// Maximum size of a JSON protocol line (request or response header).
 const MAX_PROTOCOL_LINE: usize = 4096;
+const STREAM_START_BUFFER_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadProgress {
+    pub stream_key: u64,
+    pub transport_phase: &'static str,
+    pub received: u64,
+    pub total: u64,
+    pub transport: Option<music_dht::ByteStreamConnectionStats>,
+}
+
+#[derive(Debug)]
+pub struct StreamingStart {
+    pub reader: crate::streaming::GrowingFileReader,
+    pub mime_type: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AudioRequest {
@@ -278,26 +295,31 @@ pub async fn fetch_metadata(
     })
 }
 
-/// Downloads a whole track (with metadata and cover art) from `owner` into
-/// `dir/<stem>.<ext>`. An already complete cached audio file is reused;
-/// the metadata and cover still come fresh from the header.
-pub async fn download_track(
+pub async fn download_track_with_streaming<F>(
     service: &MusicDhtService,
     owner: EndpointId,
     item_id_hex: &str,
     dir: &Path,
     stem: &str,
-) -> Result<Downloaded> {
+    want_images: bool,
+    mut progress: F,
+    mut stream_start: Option<&mut (dyn FnMut(StreamingStart) + Send)>,
+) -> Result<Downloaded>
+where
+    F: FnMut(DownloadProgress) + Send,
+{
+    let started = Instant::now();
     let mut stream = service
         .open_stream(owner, AUDIO_ALPN)
         .await
         .map_err(|err| anyhow::anyhow!("cannot reach the owner peer: {err}"))?;
+    let stream_key = super::stream_transport_key(&stream);
     write_line(
         &mut stream.send,
         &AudioRequest {
             item_id: item_id_hex.to_string(),
             offset: 0,
-            want_cover: true,
+            want_cover: want_images,
             metadata_only: false,
         },
     )
@@ -311,6 +333,22 @@ pub async fn download_track(
             header.error.unwrap_or_else(|| "unknown error".to_string())
         );
     }
+    progress(DownloadProgress {
+        stream_key,
+        transport_phase: "download-open",
+        received: 0,
+        total: header.total_size,
+        transport: Some(stream.connection_stats()),
+    });
+    tracing::info!(
+        owner = %owner,
+        item_id = %item_id_hex,
+        audio_bytes = header.total_size,
+        cover_bytes = header.cover_size,
+        artist_image_bytes = header.artist_image_size,
+        want_images,
+        "federated audio stream opened"
+    );
 
     // The image segments precede the audio bytes and are read regardless of
     // the cache state — they sit first in the stream.
@@ -346,6 +384,20 @@ pub async fn download_track(
         && header.total_size > 0
     {
         // Audio already fully downloaded earlier; no need to fetch again.
+        progress(DownloadProgress {
+            stream_key,
+            transport_phase: "download-done",
+            received: header.total_size,
+            total: header.total_size,
+            transport: Some(stream.connection_stats()),
+        });
+        tracing::info!(
+            owner = %owner,
+            item_id = %item_id_hex,
+            bytes = header.total_size,
+            path = %path.display(),
+            "federated audio reused from cache"
+        );
         return Ok(Downloaded {
             path,
             mime_type: header.mime_type,
@@ -357,12 +409,56 @@ pub async fn download_track(
 
     let temp_path = dir.join(format!(".{stem}.{extension}.part"));
     let mut file = tokio::fs::File::create(&temp_path).await?;
+    let mut streaming = match stream_start.as_ref() {
+        Some(_) => match crate::streaming::growing_file(&temp_path) {
+            Ok((reader, writer)) => Some((Some(reader), writer, false)),
+            Err(err) => {
+                tracing::debug!(%err, path = %temp_path.display(), "streaming reader disabled");
+                None
+            }
+        },
+        None => None,
+    };
+    let stream_start_at = stream_start_buffer(header.total_size);
     let mut received: u64 = 0;
     let mut chunk = vec![0u8; 64 * 1024];
     // quinn's inherent read returns None when the peer finished the stream.
     while let Some(n) = stream.recv.read(&mut chunk).await? {
         file.write_all(&chunk[..n]).await?;
         received += n as u64;
+        if let Some((reader, writer, started)) = &mut streaming {
+            writer.add_available(n as u64);
+            if !*started
+                && received >= stream_start_at
+                && let (Some(reader), Some(callback)) = (reader.take(), stream_start.as_mut())
+            {
+                callback(StreamingStart {
+                    reader,
+                    mime_type: header.mime_type.clone(),
+                });
+                *started = true;
+            }
+        }
+        progress(DownloadProgress {
+            stream_key,
+            transport_phase: "download",
+            received,
+            total: header.total_size,
+            transport: None,
+        });
+    }
+    if let Some((reader, writer, started)) = &mut streaming {
+        if !*started
+            && received > 0
+            && let (Some(reader), Some(callback)) = (reader.take(), stream_start.as_mut())
+        {
+            callback(StreamingStart {
+                reader,
+                mime_type: header.mime_type.clone(),
+            });
+            *started = true;
+        }
+        writer.finish();
     }
     file.flush().await?;
     drop(file);
@@ -374,6 +470,27 @@ pub async fn download_track(
         );
     }
     tokio::fs::rename(&temp_path, &path).await?;
+    progress(DownloadProgress {
+        stream_key,
+        transport_phase: "download-done",
+        received,
+        total: header.total_size,
+        transport: Some(stream.connection_stats()),
+    });
+    let elapsed = started.elapsed();
+    let kib_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        received as f64 / 1024.0 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        owner = %owner,
+        item_id = %item_id_hex,
+        bytes = received,
+        elapsed_ms = elapsed.as_millis(),
+        kib_per_sec,
+        "federated audio downloaded"
+    );
     Ok(Downloaded {
         path,
         mime_type: header.mime_type,
@@ -381,6 +498,14 @@ pub async fn download_track(
         cover,
         artist_image,
     })
+}
+
+fn stream_start_buffer(total_size: u64) -> u64 {
+    if total_size == 0 {
+        STREAM_START_BUFFER_BYTES
+    } else {
+        total_size.min(STREAM_START_BUFFER_BYTES)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,19 +591,37 @@ fn resolve_for_serving(
 /// Runs the accept loop of the audio protocol until the acceptor closes.
 /// Every track of the local library is downloadable by every peer of the
 /// network — the libraries of all participants are equal.
-pub async fn serve_peers(mut acceptor: StreamAcceptor, library: Arc<Library>, own: EndpointId) {
+pub async fn serve_peers(
+    mut acceptor: StreamAcceptor,
+    library: Arc<Library>,
+    own: EndpointId,
+    transport_stats: Arc<crate::federation::TransportStats>,
+) {
     while let Some(stream) = acceptor.accept().await {
         let library = Arc::clone(&library);
+        let transport_stats = Arc::clone(&transport_stats);
         tokio::spawn(async move {
             let peer = stream.peer_id;
-            if let Err(err) = serve_one(stream, library, own).await {
+            if let Err(err) = serve_one(stream, library, own, transport_stats).await {
                 tracing::warn!(peer = %peer, "audio stream failed: {err:#}");
             }
         });
     }
 }
 
-async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointId) -> Result<()> {
+async fn serve_one(
+    mut stream: ByteStream,
+    library: Arc<Library>,
+    own: EndpointId,
+    transport_stats: Arc<crate::federation::TransportStats>,
+) -> Result<()> {
+    crate::federation::record_stream_transport(
+        &transport_stats,
+        "audio",
+        "inbound",
+        "open",
+        &stream,
+    );
     let request: AudioRequest = serde_json::from_slice(&read_line(&mut stream.recv).await?)?;
     tracing::info!(
         peer = %stream.peer_id,
@@ -555,17 +698,54 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
         let _ = stream.send.stopped().await;
         return Ok(());
     }
+    let cover_bytes = cover.as_ref().map_or(0, |(bytes, _)| bytes.len() as u64);
+    let artist_image_bytes = artist_image
+        .as_ref()
+        .map_or(0, |(bytes, _)| bytes.len() as u64);
+    tracing::info!(
+        peer = %stream.peer_id,
+        item = %request.item_id,
+        audio_bytes = total_size.saturating_sub(offset),
+        cover_bytes,
+        artist_image_bytes,
+        want_images = request.want_cover,
+        "serving federated audio stream"
+    );
+    let started = Instant::now();
     if let Some((bytes, _)) = &cover {
         stream.send.write_all(bytes).await?;
     }
     if let Some((bytes, _)) = &artist_image {
         stream.send.write_all(bytes).await?;
     }
-    tokio::io::copy(&mut file, &mut stream.send).await?;
+    let audio_sent = tokio::io::copy(&mut file, &mut stream.send).await?;
     stream.send.finish()?;
     // Wait until the peer read everything (or gave up) before dropping the
     // stream, otherwise the tail of the file is lost.
     let _ = stream.send.stopped().await;
+    crate::federation::record_stream_transport(
+        &transport_stats,
+        "audio",
+        "inbound",
+        "done",
+        &stream,
+    );
+    let elapsed = started.elapsed();
+    let total_sent = cover_bytes + artist_image_bytes + audio_sent;
+    let kib_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        total_sent as f64 / 1024.0 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        peer = %stream.peer_id,
+        item = %request.item_id,
+        audio_bytes = audio_sent,
+        total_bytes = total_sent,
+        elapsed_ms = elapsed.as_millis(),
+        kib_per_sec,
+        "served federated audio stream"
+    );
     Ok(())
 }
 

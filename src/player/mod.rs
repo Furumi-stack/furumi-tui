@@ -15,8 +15,12 @@ use rodio::{Decoder, DeviceSinkBuilder, Player, stream::MixerDeviceSink};
 
 pub use analyzer::AudioAnalysisSnapshot;
 
-/// Local audio files are read straight from disk.
-pub type TrackReader = std::io::BufReader<std::fs::File>;
+pub trait TrackReadSeek: std::io::Read + std::io::Seek + Send + Sync {}
+
+impl<T> TrackReadSeek for T where T: std::io::Read + std::io::Seek + Send + Sync {}
+
+/// Playback sources are either ordinary files or growing streaming cache files.
+pub type TrackReader = Box<dyn TrackReadSeek>;
 
 /// Perceptual volume: cubic mapping from percent to linear amplitude, so
 /// equal percent steps sound like equal loudness steps and low percentages
@@ -40,14 +44,16 @@ pub enum PlayerEvent {
 
 enum Command {
     Play {
-        reader: Box<TrackReader>,
+        reader: TrackReader,
         byte_len: Option<u64>,
+        mime_type: Option<String>,
+        seekable: bool,
         volume: f32,
     },
     /// Append the next track behind the current one without interrupting
     /// playback — rodio switches sources back to back (gapless-ish).
     Enqueue {
-        reader: Box<TrackReader>,
+        reader: TrackReader,
         byte_len: Option<u64>,
     },
     Pause,
@@ -88,17 +94,26 @@ pub struct Controller {
 impl Controller {
     pub fn play(&self, reader: TrackReader, byte_len: Option<u64>, volume: f32) {
         let _ = self.tx.send(Command::Play {
-            reader: Box::new(reader),
+            reader,
             byte_len,
+            mime_type: None,
+            seekable: true,
+            volume,
+        });
+    }
+
+    pub fn play_stream(&self, reader: TrackReader, mime_type: Option<String>, volume: f32) {
+        let _ = self.tx.send(Command::Play {
+            reader,
+            byte_len: None,
+            mime_type,
+            seekable: false,
             volume,
         });
     }
 
     pub fn enqueue(&self, reader: TrackReader, byte_len: Option<u64>) {
-        let _ = self.tx.send(Command::Enqueue {
-            reader: Box::new(reader),
-            byte_len,
-        });
+        let _ = self.tx.send(Command::Enqueue { reader, byte_len });
     }
 
     pub fn pause(&self) {
@@ -188,6 +203,8 @@ fn handle(
         Command::Play {
             reader,
             byte_len,
+            mime_type,
+            seekable,
             volume,
         } => {
             // The device is opened lazily on first playback so the app works
@@ -211,10 +228,13 @@ fn handle(
 
             let mut builder = Decoder::builder()
                 .with_data(reader)
-                .with_seekable(true)
+                .with_seekable(seekable)
                 .with_gapless(true);
             if let Some(len) = byte_len {
                 builder = builder.with_byte_len(len);
+            }
+            if let Some(mime_type) = mime_type.as_deref() {
+                builder = builder.with_mime_type(mime_type);
             }
             match builder.build() {
                 Ok(decoder) => {

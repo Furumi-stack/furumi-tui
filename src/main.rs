@@ -7,6 +7,7 @@ mod library;
 mod media;
 mod player;
 mod share;
+mod streaming;
 mod ui;
 mod visualizer;
 

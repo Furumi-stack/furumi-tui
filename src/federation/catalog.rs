@@ -124,19 +124,37 @@ pub struct CatalogTrack {
 // ---------------------------------------------------------------------------
 
 /// Runs the catalog accept loop until the acceptor closes.
-pub async fn serve_peers(mut acceptor: StreamAcceptor, library: Arc<Library>, own: EndpointId) {
+pub async fn serve_peers(
+    mut acceptor: StreamAcceptor,
+    library: Arc<Library>,
+    own: EndpointId,
+    transport_stats: Arc<crate::federation::TransportStats>,
+) {
     while let Some(stream) = acceptor.accept().await {
         let library = Arc::clone(&library);
+        let transport_stats = Arc::clone(&transport_stats);
         tokio::spawn(async move {
             let peer = stream.peer_id;
-            if let Err(err) = serve_one(stream, library, own).await {
+            if let Err(err) = serve_one(stream, library, own, transport_stats).await {
                 tracing::warn!(peer = %peer, "catalog request failed: {err:#}");
             }
         });
     }
 }
 
-async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointId) -> Result<()> {
+async fn serve_one(
+    mut stream: ByteStream,
+    library: Arc<Library>,
+    own: EndpointId,
+    transport_stats: Arc<crate::federation::TransportStats>,
+) -> Result<()> {
+    crate::federation::record_stream_transport(
+        &transport_stats,
+        "catalog",
+        "inbound",
+        "open",
+        &stream,
+    );
     let request: CatalogRequest =
         serde_json::from_slice(&super::audio::read_line(&mut stream.recv).await?)?;
     tracing::info!(
@@ -190,6 +208,13 @@ async fn serve_one(mut stream: ByteStream, library: Arc<Library>, own: EndpointI
     }
     stream.send.finish()?;
     let _ = stream.send.stopped().await;
+    crate::federation::record_stream_transport(
+        &transport_stats,
+        "catalog",
+        "inbound",
+        "done",
+        &stream,
+    );
     Ok(())
 }
 
@@ -335,11 +360,19 @@ pub async fn fetch_catalog(
     service: &MusicDhtService,
     owner: EndpointId,
     artist: &str,
+    transport_stats: &Arc<crate::federation::TransportStats>,
 ) -> Result<CatalogArtist> {
     let mut stream = service
         .open_stream(owner, CATALOG_ALPN)
         .await
         .map_err(|err| anyhow::anyhow!("cannot reach the peer: {err}"))?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "open",
+        &stream,
+    );
     let mut line = serde_json::to_vec(&CatalogRequest {
         artist: artist.to_string(),
         want: None,
@@ -360,6 +393,13 @@ pub async fn fetch_catalog(
     );
     let response: CatalogResponse =
         serde_json::from_slice(&payload).context("malformed catalog response")?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "done",
+        &stream,
+    );
     if !response.ok {
         anyhow::bail!(
             "peer refused the catalog: {}",
@@ -379,11 +419,19 @@ pub async fn fetch_image(
     owner: EndpointId,
     artist: &str,
     release: Option<&str>,
+    transport_stats: &Arc<crate::federation::TransportStats>,
 ) -> Result<Option<(Vec<u8>, &'static str)>> {
     let mut stream = service
         .open_stream(owner, CATALOG_ALPN)
         .await
         .map_err(|err| anyhow::anyhow!("cannot reach the peer: {err}"))?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "open",
+        &stream,
+    );
     let mut line = serde_json::to_vec(&CatalogRequest {
         artist: artist.to_string(),
         want: Some(if release.is_some() {
@@ -414,6 +462,13 @@ pub async fn fetch_image(
         .read_exact(&mut bytes)
         .await
         .context("stream ended inside the image")?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "done",
+        &stream,
+    );
     let extension = match header.mime_type.as_str() {
         "image/png" => "png",
         "image/webp" => "webp",

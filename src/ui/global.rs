@@ -287,7 +287,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
         let message = if let Some(error) = &global.error {
             Line::styled(error.clone(), error_style())
         } else if global.loading {
-            Line::styled("loading artists…", theme::dim())
+            super::loading_line(state, "loading artists…")
         } else {
             Line::styled("no artists in the library", theme::dim())
         };
@@ -386,7 +386,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         Some(Loadable::Failed(error)) => {
             return centered_line(frame, inner, Line::styled(error.clone(), error_style()));
         }
-        _ => return centered_line(frame, inner, Line::styled("loading…", theme::dim())),
+        _ => return centered_line(frame, inner, super::loading_line(state, "loading…")),
     };
 
     let header_height = (ART_HEADER_HEIGHT + 1).min(inner.height);
@@ -653,7 +653,7 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
         Some(Loadable::Failed(error)) => {
             return centered_line(frame, inner, Line::styled(error.clone(), error_style()));
         }
-        _ => return centered_line(frame, inner, Line::styled("loading…", theme::dim())),
+        _ => return centered_line(frame, inner, super::loading_line(state, "loading…")),
     };
 
     let header_height = (ART_HEADER_HEIGHT + 1).min(inner.height);
@@ -751,7 +751,12 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             } else {
                 "searching…"
             };
-            return centered_line(frame, inner, Line::styled(hint, theme::dim()));
+            let line = if search.query.is_empty() {
+                Line::styled(hint, theme::dim())
+            } else {
+                super::loading_line(state, hint)
+            };
+            return centered_line(frame, inner, line);
         }
     };
     if results.len() == 0
@@ -795,7 +800,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     if !results.tracks.is_empty() {
         rows.push((Line::styled("Tracks", theme::header()), None, None));
         for track in &results.tracks {
-            let heart = if state.likes.contains(&track.id) {
+            let heart = if state.track_liked(track) {
                 Span::styled("♥ ", theme::accent())
             } else {
                 Span::raw("  ")
@@ -936,7 +941,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
             return centered_line(
                 frame,
                 inner,
-                Line::styled("assembling the card from peers…", theme::dim()),
+                super::loading_line(state, "assembling the card from peers…"),
             );
         }
         Loadable::Failed(message) => {
