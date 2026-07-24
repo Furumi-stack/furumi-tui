@@ -421,6 +421,7 @@ impl DeviceSync {
             event_tx: Arc::new(std::sync::Mutex::new(None)),
         });
         sync.ensure_identity()?;
+        sync.repair_like_order_from_sync_state()?;
         Ok(sync)
     }
 
@@ -1334,22 +1335,60 @@ impl DeviceSync {
         let effective_liked = if apply {
             liked
         } else {
-            current.map(|(liked, _, _)| liked).unwrap_or(false)
+            current
+                .as_ref()
+                .map(|(liked, _, _)| *liked)
+                .unwrap_or(false)
+        };
+        let effective_hlc_ms = if apply {
+            hlc_ms
+        } else {
+            current
+                .as_ref()
+                .map(|(_, current_hlc, _)| *current_hlc)
+                .unwrap_or(hlc_ms)
         };
         let mut changed = apply;
         if let Some(track_id) = self.library.track_id_by_content_id(&content_id)? {
-            changed |= self.library.set_like(track_id, effective_liked)?;
+            changed |= self
+                .library
+                .set_synced_like(track_id, effective_liked, effective_hlc_ms)?;
             if effective_liked {
                 changed |= self.library.remove_fed_like_by_content_id(&content_id)?;
             }
         } else if effective_liked {
             if let Some(fed) = fed {
-                changed |= self.library.upsert_synced_fed_like(&fed.to_fed_track())?;
+                changed |= self
+                    .library
+                    .upsert_synced_fed_like(&fed.to_fed_track(), effective_hlc_ms)?;
             }
         } else if apply {
             changed |= self.library.remove_fed_like_by_content_id(&content_id)?;
         }
         Ok(changed)
+    }
+
+    fn repair_like_order_from_sync_state(&self) -> Result<()> {
+        let rows = {
+            let conn = lock(&self.conn);
+            let mut stmt = conn.prepare(
+                "SELECT content_id, hlc_ms
+                 FROM sync_state_likes
+                 WHERE liked = 1",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (content_id, hlc_ms) in rows {
+            if let Some(track_id) = self.library.track_id_by_content_id(&content_id)? {
+                let _ = self.library.set_synced_like(track_id, true, hlc_ms)?;
+            } else if let Some(fed) = self.library.fed_like_by_content_id(&content_id)? {
+                let _ = self.library.upsert_synced_fed_like(&fed, hlc_ms)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_playlist_state(
@@ -3138,6 +3177,36 @@ mod tests {
                 .unwrap()
         );
         assert!(sync.library.fed_like_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn synced_fed_likes_are_ordered_by_hlc_not_receive_time() {
+        let sync = test_sync();
+        let old_content_id = format!("b3:{}", "c".repeat(64));
+        let new_content_id = format!("b3:{}", "d".repeat(64));
+        let mut old_fed = test_fed_track(&old_content_id);
+        old_fed.item_id = "fed_old".to_string();
+        old_fed.title = "Old Fed".to_string();
+        let mut new_fed = test_fed_track(&new_content_id);
+        new_fed.item_id = "fed_new".to_string();
+        new_fed.title = "New Fed".to_string();
+
+        let new_synced = SyncedFedTrack::from_fed(&new_fed).unwrap();
+        let old_synced = SyncedFedTrack::from_fed(&old_fed).unwrap();
+        sync.apply_like_state(&new_content_id, true, Some(&new_synced), 20, "dev_remote:2")
+            .unwrap();
+        sync.apply_like_state(&old_content_id, true, Some(&old_synced), 10, "dev_remote:1")
+            .unwrap();
+
+        let titles: Vec<String> = sync
+            .library
+            .playlist(crate::library::LIKES_PLAYLIST_ID)
+            .unwrap()
+            .tracks
+            .into_iter()
+            .map(|track| track.title)
+            .collect();
+        assert_eq!(titles, vec!["New Fed", "Old Fed"]);
     }
 
     #[test]

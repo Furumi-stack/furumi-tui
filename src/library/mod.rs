@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
 );
 CREATE TABLE IF NOT EXISTS likes (
     track_id  INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-    liked_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    liked_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    liked_hlc_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS fed_likes (
     item_id          TEXT PRIMARY KEY,
@@ -96,7 +97,8 @@ CREATE TABLE IF NOT EXISTS fed_likes (
     release_title    TEXT,
     track_number     INTEGER,
     disc_number      INTEGER,
-    liked_at         TEXT NOT NULL DEFAULT (datetime('now'))
+    liked_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    liked_hlc_ms     INTEGER
 );
 CREATE TABLE IF NOT EXISTS fed_playlist_tracks (
     playlist_sync_id TEXT NOT NULL,
@@ -657,34 +659,42 @@ impl Library {
                 params![],
             )?;
             let mut liked_at_by_track = HashMap::new();
-            let mut liked_stmt = conn.prepare("SELECT track_id, liked_at FROM likes")?;
-            let liked_rows = liked_stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
+            let mut liked_stmt = conn.prepare(
+                "SELECT track_id,
+                        COALESCE(liked_hlc_ms,
+                                 CAST(strftime('%s', liked_at) AS INTEGER) * 1000,
+                                 0)
+                 FROM likes",
+            )?;
+            let liked_rows = liked_stmt
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
             for row in liked_rows {
                 let (track_id, liked_at) = row?;
                 liked_at_by_track.insert(track_id, liked_at);
             }
             drop(liked_stmt);
 
-            let mut entries: Vec<(String, String, TrackItem)> = local_tracks
+            let mut entries: Vec<(i64, String, TrackItem)> = local_tracks
                 .into_iter()
                 .map(|track| {
                     let liked_at = liked_at_by_track
                         .get(&track.id)
-                        .cloned()
+                        .copied()
                         .unwrap_or_default();
                     (liked_at, track.title.clone(), track)
                 })
                 .collect();
 
             let mut fed_stmt = conn.prepare(
-                "SELECT liked_at, item_id, owner, title, artist_names, featured_artist_names,
+                "SELECT COALESCE(liked_hlc_ms,
+                                 CAST(strftime('%s', liked_at) AS INTEGER) * 1000,
+                                 0),
+                        item_id, owner, title, artist_names, featured_artist_names,
                         year, duration_seconds, content_id, release_title, track_number, disc_number
                  FROM fed_likes",
             )?;
             let fed_rows = fed_stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, fed_track_from_offset_row(row, 1)?))
+                Ok((row.get::<_, i64>(0)?, fed_track_from_offset_row(row, 1)?))
             })?;
             for row in fed_rows {
                 let (liked_at, fed) = row?;
@@ -1017,12 +1027,16 @@ impl Library {
             .optional()?)
     }
 
-    pub fn set_like(&self, track_id: i64, liked: bool) -> Result<bool> {
+    pub fn set_synced_like(&self, track_id: i64, liked: bool, liked_hlc_ms: i64) -> Result<bool> {
         let conn = self.lock();
         let changed = if liked {
             conn.execute(
-                "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
-                [track_id],
+                "INSERT INTO likes (track_id, liked_at, liked_hlc_ms)
+                 VALUES (?1, datetime(?2 / 1000, 'unixepoch'), ?2)
+                 ON CONFLICT(track_id) DO UPDATE SET
+                    liked_at = excluded.liked_at,
+                    liked_hlc_ms = excluded.liked_hlc_ms",
+                params![track_id, liked_hlc_ms],
             )?
         } else {
             conn.execute("DELETE FROM likes WHERE track_id = ?1", [track_id])?
@@ -1266,7 +1280,9 @@ impl Library {
                     year, duration_seconds, content_id, release_title, track_number, disc_number
              FROM fed_likes
              WHERE content_id = ?1
-             ORDER BY liked_at DESC
+             ORDER BY COALESCE(liked_hlc_ms,
+                               CAST(strftime('%s', liked_at) AS INTEGER) * 1000,
+                               0) DESC
              LIMIT 1",
         )?;
         let track = statement
@@ -1300,7 +1316,11 @@ impl Library {
         Ok(track)
     }
 
-    pub fn upsert_synced_fed_like(&self, fed: &crate::federation::FedTrack) -> Result<bool> {
+    pub fn upsert_synced_fed_like(
+        &self,
+        fed: &crate::federation::FedTrack,
+        liked_hlc_ms: i64,
+    ) -> Result<bool> {
         let Some(content_id) = fed
             .content_id
             .as_deref()
@@ -1323,10 +1343,12 @@ impl Library {
             Option<String>,
             Option<i32>,
             Option<i32>,
+            Option<i64>,
         )> = conn
             .query_row(
                 "SELECT owner, title, artist_names, featured_artist_names,
-                        year, duration_seconds, release_title, track_number, disc_number
+                        year, duration_seconds, release_title, track_number, disc_number,
+                        liked_hlc_ms
                  FROM fed_likes
                  WHERE item_id = ?1",
                 [&fed.item_id],
@@ -1341,6 +1363,7 @@ impl Library {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -1355,6 +1378,7 @@ impl Library {
             fed.release_title.clone(),
             fed.track_number,
             fed.disc_number,
+            Some(liked_hlc_ms),
         );
         if duplicate_rows == 0 && existing.as_ref() == Some(&incoming) {
             return Ok(false);
@@ -1362,8 +1386,9 @@ impl Library {
         conn.execute(
             "INSERT INTO fed_likes (item_id, owner, title, artist_names,
                 featured_artist_names, year, duration_seconds, content_id,
-                release_title, track_number, disc_number)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                release_title, track_number, disc_number, liked_at, liked_hlc_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     datetime(?12 / 1000, 'unixepoch'), ?12)
              ON CONFLICT(item_id) DO UPDATE SET
                 owner = excluded.owner,
                 title = excluded.title,
@@ -1374,7 +1399,9 @@ impl Library {
                 content_id = excluded.content_id,
                 release_title = excluded.release_title,
                 track_number = excluded.track_number,
-                disc_number = excluded.disc_number",
+                disc_number = excluded.disc_number,
+                liked_at = excluded.liked_at,
+                liked_hlc_ms = excluded.liked_hlc_ms",
             params![
                 fed.item_id,
                 fed.owner,
@@ -1387,6 +1414,7 @@ impl Library {
                 fed.release_title,
                 fed.track_number,
                 fed.disc_number,
+                liked_hlc_ms,
             ],
         )?;
         Ok(true)
@@ -1404,14 +1432,32 @@ impl Library {
     /// whether a transfer happened.
     pub fn transfer_fed_like(&self, item_id: &str, track_id: i64) -> Result<bool> {
         let conn = self.lock();
+        let liked: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT liked_at, liked_hlc_ms FROM fed_likes WHERE item_id = ?1",
+                [item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let removed = conn.execute("DELETE FROM fed_likes WHERE item_id = ?1", [item_id])?;
         if removed == 0 {
             return Ok(false);
         }
-        conn.execute(
-            "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
-            [track_id],
-        )?;
+        if let Some((liked_at, liked_hlc_ms)) = liked {
+            conn.execute(
+                "INSERT INTO likes (track_id, liked_at, liked_hlc_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(track_id) DO UPDATE SET
+                    liked_at = excluded.liked_at,
+                    liked_hlc_ms = excluded.liked_hlc_ms",
+                params![track_id, liked_at, liked_hlc_ms],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO likes (track_id) VALUES (?1)",
+                [track_id],
+            )?;
+        }
         Ok(true)
     }
 
@@ -1872,6 +1918,16 @@ fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     }
     if !fed_like_columns.iter().any(|column| column == "content_id") {
         conn.execute("ALTER TABLE fed_likes ADD COLUMN content_id TEXT", [])?;
+    }
+    if !fed_like_columns
+        .iter()
+        .any(|column| column == "liked_hlc_ms")
+    {
+        conn.execute("ALTER TABLE fed_likes ADD COLUMN liked_hlc_ms INTEGER", [])?;
+    }
+    let like_columns = table_columns(conn, "likes")?;
+    if !like_columns.iter().any(|column| column == "liked_hlc_ms") {
+        conn.execute("ALTER TABLE likes ADD COLUMN liked_hlc_ms INTEGER", [])?;
     }
     let track_columns = table_columns(conn, "tracks")?;
     if !track_columns.iter().any(|column| column == "content_id") {
