@@ -23,7 +23,6 @@ pub(crate) struct ConnectedDevicePopupRow {
     pub name: String,
     pub is_self: bool,
     pub online: bool,
-    pub revoked: bool,
     pub section: DevicePresenceSection,
     pub active: bool,
     pub playing: bool,
@@ -49,7 +48,6 @@ pub(crate) fn connected_device_rows(state: &AppState) -> Vec<ConnectedDevicePopu
                 name: state::device_display_name(device),
                 is_self,
                 online,
-                revoked: device.revoked,
                 section,
                 active: state::device_status_active(state, &device.device_id),
                 playing: if is_self {
@@ -83,7 +81,6 @@ pub(crate) fn connected_device_rows(state: &AppState) -> Vec<ConnectedDevicePopu
                 name: state.device_playback.self_device_name.clone(),
                 is_self: true,
                 online: true,
-                revoked: false,
                 section: DevicePresenceSection::Online,
                 active: state.device_playback.role == crate::app::state::DevicePlaybackRole::Active,
                 playing: state.player.playing,
@@ -173,7 +170,9 @@ fn handle_connected_devices(
     key: KeyEvent,
 ) {
     let rows = connected_device_rows(state);
-    let last = rows.len().saturating_sub(1);
+    let other_rows: Vec<_> = rows.iter().filter(|row| !row.is_self).cloned().collect();
+    let last = other_rows.len();
+    let cursor = cursor.min(last);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {}
         KeyCode::Up | KeyCode::Char('k') => {
@@ -187,15 +186,11 @@ fn handle_connected_devices(
             });
         }
         KeyCode::Enter => {
-            if let Some(row) = rows.get(cursor.min(last)) {
-                if row.revoked {
-                    state.status_message = Some("revoked device cannot be controlled".into());
-                } else if row.is_self {
-                    super::become_active_device(state, runtime, true);
-                    state.status_message = Some("active playback moved to this device".into());
-                } else if let Some(snapshot) =
-                    state.device_playback.remote.get(&row.device_id).cloned()
-                {
+            if cursor == 0 {
+                super::transfer_active_to_this_device(state, runtime);
+                state.status_message = Some("active playback moved to this device".into());
+            } else if let Some(row) = other_rows.get(cursor.saturating_sub(1).min(last)) {
+                if let Some(snapshot) = state.device_playback.remote.get(&row.device_id).cloned() {
                     super::become_control_device(state, runtime, snapshot);
                 } else {
                     state.status_message = Some("device has no playback snapshot yet".into());

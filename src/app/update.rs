@@ -1204,7 +1204,7 @@ fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
         } else {
             format!("queued: {count} tracks")
         });
-        return None;
+        return Some(Effect::PlaybackQueueChanged);
     }
     if let Some(id) = selected_release_id(state) {
         return Some(Effect::EnqueueRelease { id, next });
@@ -3119,7 +3119,10 @@ mod tests {
 
         update(&mut state, Action::ToggleTrackSelection);
         update(&mut state, Action::MoveDown);
-        assert_eq!(update(&mut state, Action::QueueAddLast), None,);
+        assert_eq!(
+            update(&mut state, Action::QueueAddLast),
+            Some(Effect::PlaybackQueueChanged),
+        );
         let queued: Vec<i64> = state.player.queue.iter().map(|track| track.id).collect();
         assert_eq!(queued, vec![1, 2]);
         assert!(!state.track_selection.is_active());

@@ -64,13 +64,16 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 
 fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     let rows = crate::app::popup::connected_device_rows(state);
+    let self_row = rows.iter().find(|row| row.is_self);
+    let other_rows: Vec<_> = rows.iter().filter(|row| !row.is_self).collect();
+    let cursor = cursor.min(other_rows.len());
     enum DisplayLine {
         Section(DevicePresenceSection),
         Row(usize),
     }
     let mut display_lines = Vec::new();
     let mut last_section = None;
-    for (index, row) in rows.iter().enumerate() {
+    for (index, row) in other_rows.iter().enumerate() {
         if last_section != Some(row.section) {
             display_lines.push(DisplayLine::Section(row.section));
             last_section = Some(row.section);
@@ -78,7 +81,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         display_lines.push(DisplayLine::Row(index));
     }
     let height =
-        (display_lines.len() as u16 + 6).clamp(8, frame.area().height.saturating_sub(2).max(8));
+        (display_lines.len() as u16 + 9).clamp(11, frame.area().height.saturating_sub(2).max(11));
     let area = centered(frame.area(), 76, height);
     let block = Block::bordered()
         .title(" Connected devices ")
@@ -88,8 +91,9 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let [summary_area, list_area, hint_area] = Layout::vertical([
+    let [summary_area, this_area, other_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -106,11 +110,56 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         summary_area,
     );
 
+    render_subtitle(frame, this_area, "This device");
+    let action_area = Rect {
+        x: this_area.x,
+        y: this_area.y + 1,
+        width: this_area.width,
+        height: 1,
+    };
+    let action_label =
+        if state.device_playback.role == crate::app::state::DevicePlaybackRole::Active {
+            "This device is active"
+        } else {
+            "Make this device active"
+        };
+    let self_name = self_row
+        .map(|row| row.name.as_str())
+        .unwrap_or(state.device_playback.self_device_name.as_str());
+    let self_status = self_row
+        .map(device_status_label)
+        .unwrap_or_else(|| "● · ■ Q0".to_string());
+    render_connected_action(
+        frame,
+        action_area,
+        cursor == 0,
+        action_label,
+        self_name,
+        &self_status,
+    );
+
+    render_subtitle(frame, other_area, "Other devices");
+    let list_area = Rect {
+        x: other_area.x,
+        y: other_area.y + 1,
+        width: other_area.width,
+        height: other_area.height.saturating_sub(1),
+    };
+    if other_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled("  no other devices yet", theme::dim())),
+            list_area,
+        );
+    }
+
     let visible = usize::from(list_area.height.max(1));
-    let selected = cursor.min(rows.len().saturating_sub(1));
-    let selected_line = display_lines
-        .iter()
-        .position(|line| matches!(line, DisplayLine::Row(index) if *index == selected))
+    let selected_remote = cursor.checked_sub(1);
+    let selected_line = selected_remote
+        .and_then(|selected| {
+            display_lines
+                .iter()
+                .position(|line| matches!(line, DisplayLine::Row(index) if *index == selected))
+        })
         .unwrap_or(0);
     let first = selected_line
         .saturating_sub(visible / 2)
@@ -132,70 +181,8 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
             );
             continue;
         };
-        let row = &rows[*index];
-        let role = if row.active {
-            "◆"
-        } else if row.is_self
-            && state.device_playback.role == crate::app::state::DevicePlaybackRole::Control
-        {
-            "◇"
-        } else {
-            "·"
-        };
-        let play = if row.playing && row.paused {
-            "II"
-        } else if row.playing {
-            "▶"
-        } else {
-            "■"
-        };
-        let online = if row.online { "●" } else { "○" };
-        let marker = if row.is_self { "*" } else { " " };
-        let status = format!("{online} {role} {play} Q{}", row.queue_len);
-        let marker_width = UnicodeWidthStr::width(format!("{marker} ").as_str());
-        let status_width = UnicodeWidthStr::width(status.as_str());
-        let total_width = usize::from(area.width);
-        let name_width = total_width.saturating_sub(marker_width + status_width + 1);
-        let name = clip_cells(&row.name, name_width);
-        let used_width = marker_width + UnicodeWidthStr::width(name.as_str()) + status_width;
-        let gap = " ".repeat(total_width.saturating_sub(used_width));
-        let line = Line::from(vec![
-            Span::styled(format!("{marker} "), theme::accent()),
-            Span::raw(name),
-            Span::raw(gap),
-            Span::styled(
-                online,
-                if row.online {
-                    theme::accent()
-                } else {
-                    theme::dim()
-                },
-            ),
-            Span::raw(" "),
-            Span::styled(
-                role,
-                if row.active {
-                    theme::accent()
-                } else {
-                    theme::dim()
-                },
-            ),
-            Span::raw(" "),
-            Span::styled(
-                play,
-                if row.playing {
-                    theme::accent()
-                } else {
-                    theme::dim()
-                },
-            ),
-            Span::raw(" "),
-            Span::styled(format!("Q{}", row.queue_len), theme::dim()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        if *index == selected {
-            frame.buffer_mut().set_style(area, theme::tab_active());
-        }
+        let row = other_rows[*index];
+        render_connected_device_row(frame, area, row, selected_remote == Some(*index));
     }
 
     let [legend_area, controls_area] =
@@ -210,12 +197,118 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "enter: control selected / move active here · esc close",
+            "enter: activate this device / control selected · esc close",
             theme::dim(),
         ))
         .alignment(Alignment::Center),
         controls_area,
     );
+}
+
+fn render_subtitle(frame: &mut Frame, area: Rect, title: &'static str) {
+    let rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(Line::styled(title, theme::header())), rect);
+}
+
+fn device_status_label(row: &crate::app::popup::ConnectedDevicePopupRow) -> String {
+    let online = if row.online { "●" } else { "○" };
+    let role = if row.active {
+        "◆"
+    } else if row.is_self {
+        "◇"
+    } else {
+        "·"
+    };
+    let play = if row.playing && row.paused {
+        "II"
+    } else if row.playing {
+        "▶"
+    } else {
+        "■"
+    };
+    format!("{online} {role} {play} Q{}", row.queue_len)
+}
+
+fn render_connected_action(
+    frame: &mut Frame,
+    area: Rect,
+    selected: bool,
+    label: &str,
+    device_name: &str,
+    status: &str,
+) {
+    let marker = if selected { "▶ " } else { "  " };
+    let prefix = format!("{marker}{label}");
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let status_width = UnicodeWidthStr::width(status);
+    let name_width = usize::from(area.width).saturating_sub(prefix_width + status_width + 3);
+    let suffix = format!("{}  {status}", clip_cells(device_name, name_width));
+    let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+    let total_width = usize::from(area.width);
+    let label = if prefix_width + suffix_width + 1 > total_width {
+        let available = total_width.saturating_sub(suffix_width + UnicodeWidthStr::width(marker));
+        format!("{marker}{}", clip_cells(label, available))
+    } else {
+        prefix
+    };
+    let gap = " ".repeat(total_width.saturating_sub(
+        UnicodeWidthStr::width(label.as_str()) + UnicodeWidthStr::width(suffix.as_str()),
+    ));
+    let line = Line::from(vec![
+        Span::styled(
+            label,
+            if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        ),
+        Span::raw(gap),
+        Span::styled(suffix, theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+    if selected {
+        frame.buffer_mut().set_style(area, theme::tab_active());
+    }
+}
+
+fn render_connected_device_row(
+    frame: &mut Frame,
+    area: Rect,
+    row: &crate::app::popup::ConnectedDevicePopupRow,
+    selected: bool,
+) {
+    let marker = if selected { "▶ " } else { "  " };
+    let status = device_status_label(row);
+    let marker_width = UnicodeWidthStr::width(marker);
+    let status_width = UnicodeWidthStr::width(status.as_str());
+    let total_width = usize::from(area.width);
+    let name_width = total_width.saturating_sub(marker_width + status_width + 1);
+    let name = clip_cells(&row.name, name_width);
+    let used_width = marker_width + UnicodeWidthStr::width(name.as_str()) + status_width;
+    let gap = " ".repeat(total_width.saturating_sub(used_width));
+    let line = Line::from(vec![
+        Span::styled(
+            marker,
+            if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        ),
+        Span::raw(name),
+        Span::raw(gap),
+        Span::styled(status, theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+    if selected {
+        frame.buffer_mut().set_style(area, theme::tab_active());
+    }
 }
 
 fn clip_cells(text: &str, max_width: usize) -> String {

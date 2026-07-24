@@ -409,6 +409,31 @@ pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, 
     publish_playback_snapshot(state, runtime);
 }
 
+pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut Runtime) {
+    if state.device_playback.role == state::DevicePlaybackRole::Active {
+        publish_playback_snapshot(state, runtime);
+        request_urgent_device_sync(runtime);
+        return;
+    }
+    let should_start = state.player.current.is_some() || !state.player.queue.is_empty();
+    if state.player.current.is_none() && !state.player.queue.is_empty() {
+        state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
+        state.player.position_secs = 0.0;
+    }
+    if state.player.current.is_some() {
+        state.player.playing = true;
+        state.player.paused = false;
+    }
+    become_active_device(state, runtime, false);
+    if should_start && state.player.current.is_some() {
+        start_current_audio(state, runtime, state.player.position_secs, false);
+        push_media_metadata(state, runtime);
+        push_media_update(state, runtime, true);
+    }
+    publish_playback_snapshot(state, runtime);
+    request_urgent_device_sync(runtime);
+}
+
 fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
     if !state.device_playback.is_control() {
         return;
