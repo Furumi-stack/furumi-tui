@@ -40,6 +40,9 @@ pub struct Runtime {
     pub federation: Arc<crate::federation::Federation>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
+    /// Coalesces urgent personal-device syncs after remote playback commands.
+    pub device_sync_running: Arc<std::sync::atomic::AtomicBool>,
+    pub device_sync_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Placeholder ids of federated tracks being downloaded right now.
     pub fed_resolving: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// Caps concurrent artwork loads so they never starve the disk.
@@ -111,6 +114,8 @@ pub async fn run(
         devices,
         federation,
         fed_status_at: None,
+        device_sync_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        device_sync_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
         art_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         force_redraw: false,
@@ -380,7 +385,62 @@ fn record_control_playback_state(state: &mut AppState, runtime: &Runtime) {
     if let Err(err) = runtime.devices.record_playback_command(&target, command) {
         tracing::warn!(%err, target, "recording playback command failed");
         state.status_message = Some(format!("device command failed: {err:#}"));
+    } else {
+        request_urgent_device_sync(runtime);
     }
+}
+
+fn request_urgent_device_sync(runtime: &Runtime) {
+    use std::sync::atomic::Ordering;
+
+    runtime.device_sync_requested.store(true, Ordering::SeqCst);
+    if runtime
+        .device_sync_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        spawn_urgent_device_sync(
+            Arc::clone(&runtime.federation),
+            Arc::clone(&runtime.devices),
+            runtime.event_tx.clone(),
+            Arc::clone(&runtime.device_sync_running),
+            Arc::clone(&runtime.device_sync_requested),
+        );
+    }
+}
+
+fn spawn_urgent_device_sync(
+    federation: Arc<crate::federation::Federation>,
+    devices: Arc<crate::devices::DeviceSync>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    requested: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    tokio::spawn(async move {
+        loop {
+            requested.store(false, Ordering::SeqCst);
+            match federation.device_sync_now().await {
+                Ok(()) => {}
+                Err(err) => {
+                    tracing::debug!("urgent device sync failed: {err:#}");
+                }
+            }
+            let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+            if !requested.swap(false, Ordering::SeqCst) {
+                break;
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+        if requested.load(Ordering::SeqCst)
+            && running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            spawn_urgent_device_sync(federation, devices, tx, running, requested);
+        }
+    });
 }
 
 const ARTISTS_PREFETCH_MARGIN: usize = 24;
