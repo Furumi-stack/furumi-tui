@@ -106,6 +106,8 @@ pub struct PlaybackTrack {
     pub release_id: i64,
     pub release_title: String,
     pub release_year: Option<i32>,
+    /// Legacy compatibility only. Paths are device-local, so playback sync
+    /// must resolve tracks from content/federation identifiers instead.
     #[serde(default)]
     pub file_path: String,
     pub content_id: Option<String>,
@@ -141,8 +143,11 @@ impl PlaybackTrack {
             release_id: track.release_id,
             release_title: track.release_title.clone(),
             release_year: track.release_year,
-            file_path: track.file_path.clone(),
-            content_id: track.content_id.clone(),
+            file_path: String::new(),
+            content_id: track
+                .content_id
+                .clone()
+                .or_else(|| track.fed.as_ref().and_then(|fed| fed.content_id.clone())),
             audio_format: track.audio_format.clone(),
             audio_bitrate: track.audio_bitrate,
             audio_sample_rate: track.audio_sample_rate,
@@ -174,7 +179,7 @@ impl PlaybackTrack {
             release_id: self.release_id,
             release_title: self.release_title.clone(),
             release_year: self.release_year,
-            file_path: self.file_path.clone(),
+            file_path: String::new(),
             content_id: self.content_id.clone(),
             cover_path: None,
             audio_format: self.audio_format.clone(),
@@ -3412,6 +3417,44 @@ mod tests {
             }
             .is_tombstone()
         );
+    }
+
+    #[test]
+    fn playback_tracks_do_not_sync_device_local_paths() {
+        let source = TrackItem {
+            id: 7,
+            title: "Local Song".to_string(),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_seconds: 180.0,
+            artists: vec![ArtistRef {
+                id: 1,
+                name: "Local Artist".to_string(),
+            }],
+            featured_artists: Vec::new(),
+            release_id: 2,
+            release_title: "Local Release".to_string(),
+            release_year: Some(2026),
+            file_path: r"C:\Users\me\Music\song.mp3".to_string(),
+            content_id: Some(format!("b3:{}", "a".repeat(64))),
+            cover_path: None,
+            audio_format: Some("mp3".to_string()),
+            audio_bitrate: Some(320),
+            audio_sample_rate: Some(44_100),
+            audio_bit_depth: None,
+            file_size_bytes: Some(123_456),
+            play_count: 3,
+            fed: None,
+        };
+
+        let wire = PlaybackTrack::from_track(&source);
+        assert!(wire.file_path.is_empty());
+
+        let mut legacy_wire = wire.clone();
+        legacy_wire.file_path = "/Users/me/Music/song.mp3".to_string();
+        let restored = legacy_wire.to_track_item();
+        assert!(restored.file_path.is_empty());
+        assert_eq!(restored.content_id, source.content_id);
     }
 
     #[test]

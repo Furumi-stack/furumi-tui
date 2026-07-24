@@ -154,6 +154,20 @@ pub struct FederationExport {
     pub tracks: Vec<ExportTrack>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentIdBackfillStats {
+    pub checked: usize,
+    pub normalized: usize,
+    pub hashed: usize,
+    pub failed: usize,
+}
+
+impl ContentIdBackfillStats {
+    pub fn updated(&self) -> usize {
+        self.normalized + self.hashed
+    }
+}
+
 #[derive(Debug)]
 pub struct ExportRelease {
     pub id: i64,
@@ -215,6 +229,78 @@ impl Library {
 
     pub fn covers_dir(&self) -> &Path {
         &self.covers_dir
+    }
+
+    /// Make `content_id` a local-library invariant.
+    ///
+    /// Old databases can have NULL/invalid ids because the column was added
+    /// after import already existed. This scans rows cheaply, hashes only the
+    /// tracks that actually need an id, and never holds the SQLite lock while
+    /// reading audio files from disk.
+    pub fn backfill_missing_content_ids(&self) -> Result<ContentIdBackfillStats> {
+        let rows = {
+            let conn = self.lock();
+            let mut statement =
+                conn.prepare("SELECT id, content_id, file_path FROM tracks ORDER BY id")?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut stats = ContentIdBackfillStats {
+            checked: rows.len(),
+            ..ContentIdBackfillStats::default()
+        };
+        let mut updates = Vec::new();
+        for (track_id, raw_content_id, file_path) in rows {
+            if let Some(normalized) = raw_content_id
+                .as_deref()
+                .and_then(music_dht::normalize_content_id)
+            {
+                if raw_content_id.as_deref() != Some(normalized.as_str()) {
+                    updates.push((track_id, normalized));
+                    stats.normalized += 1;
+                }
+            } else if let Some(content_id) = audio_content_id(&file_path) {
+                updates.push((track_id, content_id));
+                stats.hashed += 1;
+            } else {
+                stats.failed += 1;
+                tracing::warn!(
+                    track_id,
+                    path = %file_path,
+                    "content id backfill skipped an unreadable track"
+                );
+            }
+
+            if updates.len() >= 64 {
+                self.write_content_id_updates(&mut updates)?;
+            }
+        }
+        self.write_content_id_updates(&mut updates)?;
+        Ok(stats)
+    }
+
+    fn write_content_id_updates(&self, updates: &mut Vec<(i64, String)>) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (track_id, content_id) in updates.drain(..) {
+            tx.execute(
+                "UPDATE tracks SET content_id = ?2 WHERE id = ?1",
+                params![track_id, content_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -2228,6 +2314,60 @@ mod tests {
         assert_eq!(first, second);
         let page = lib.artists(1, 10, false).unwrap();
         assert_eq!(page.items[0].track_count, 1);
+    }
+
+    #[test]
+    fn content_id_backfill_hashes_missing_track_ids() {
+        let lib = test_library();
+        let path = std::env::temp_dir().join(format!(
+            "furumi-content-id-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"portable content id").unwrap();
+        let file_path = path.to_string_lossy().into_owned();
+        let import = import::TrackImport {
+            release_type: None,
+            file_path: file_path.clone(),
+            title: "Portable".to_string(),
+            artists: vec!["Artist".to_string()],
+            featured_artists: Vec::new(),
+            album_artists: vec!["Artist".to_string()],
+            release_title: "Album".to_string(),
+            year: Some(2026),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 60.0,
+            audio_format: Some("bin".into()),
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: Some(19),
+            cover: None,
+        };
+        let track_id = import::upsert_track(&lib, &import).unwrap().0;
+        let expected = audio_content_id(&file_path).unwrap();
+        {
+            let conn = lib.lock();
+            conn.execute(
+                "UPDATE tracks SET content_id = NULL WHERE id = ?1",
+                [track_id],
+            )
+            .unwrap();
+        }
+
+        let stats = lib.backfill_missing_content_ids().unwrap();
+        assert_eq!(stats.hashed, 1);
+        assert_eq!(stats.updated(), 1);
+        assert_eq!(
+            lib.track_content_id_by_id(track_id).unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -69,6 +69,64 @@ fn err_string(err: anyhow::Error) -> String {
     format!("{err:#}")
 }
 
+fn spawn_content_id_backfill(runtime: &Runtime) {
+    let library = Arc::clone(&runtime.library);
+    let federation = Arc::clone(&runtime.federation);
+    let devices = Arc::clone(&runtime.devices);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let stats =
+            match tokio::task::spawn_blocking(move || library.backfill_missing_content_ids()).await
+            {
+                Ok(Ok(stats)) => stats,
+                Ok(Err(err)) => {
+                    tracing::warn!("content id backfill failed: {err:#}");
+                    let _ = tx.send(AppEvent::StatusMessage(format!(
+                        "content id backfill failed: {err:#}"
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!("content id backfill task failed: {err}");
+                    let _ = tx.send(AppEvent::StatusMessage(format!(
+                        "content id backfill task failed: {err}"
+                    )));
+                    return;
+                }
+            };
+
+        if stats.updated() == 0 {
+            if stats.failed > 0 {
+                tracing::warn!(
+                    checked = stats.checked,
+                    failed = stats.failed,
+                    "content id backfill finished with unreadable tracks"
+                );
+            }
+            return;
+        }
+
+        tracing::info!(
+            checked = stats.checked,
+            normalized = stats.normalized,
+            hashed = stats.hashed,
+            failed = stats.failed,
+            "content id backfill completed"
+        );
+        let _ = tx.send(AppEvent::LibraryChanged {
+            message: Some(format!("content ids: indexed {} track(s)", stats.updated())),
+        });
+
+        if federation.status().await.running {
+            if let Err(err) = federation.sync_now().await {
+                tracing::warn!("federation sync after content id backfill failed: {err:#}");
+            }
+            let _ = tx.send(AppEvent::FederationStatus(federation.status().await));
+            let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+        }
+    });
+}
+
 pub async fn run(
     mut terminal: DefaultTerminal,
     mut keymap: Keymap,
@@ -128,6 +186,7 @@ pub async fn run(
         media_tx,
         last_media_push: None,
     };
+    spawn_content_id_backfill(&runtime);
 
     {
         let fed = Arc::clone(&runtime.federation);
@@ -1242,6 +1301,17 @@ fn start_current_audio(
         spawn_fed_resolve(runtime, &track);
         return;
     }
+    if track_file_missing(&track) {
+        runtime.player_start_pending = false;
+        runtime.player.stop();
+        state.player.playing = false;
+        state.player.paused = false;
+        state.status_message = Some(format!(
+            "playback failed: \"{}\" is not available on this device",
+            track.title
+        ));
+        return;
+    }
     let controller = runtime.player.clone();
     let volume = player::amplitude(state.player.volume);
     let tx = runtime.event_tx.clone();
@@ -1271,7 +1341,7 @@ fn start_current_audio(
 }
 
 fn track_file_missing(track: &crate::library::models::TrackItem) -> bool {
-    !track.file_path.is_empty() && !Path::new(&track.file_path).is_file()
+    track.file_path.is_empty() || !Path::new(&track.file_path).is_file()
 }
 
 fn local_track_for_playback(
