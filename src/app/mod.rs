@@ -339,6 +339,20 @@ fn active_idle_lease_expired(snapshot: &crate::devices::PlaybackSnapshot, now: i
         .is_some_and(|idle_since| now.saturating_sub(idle_since) >= ACTIVE_IDLE_LEASE_MS)
 }
 
+fn local_active_lease_protected(state: &mut AppState, now: i64) -> bool {
+    if state.device_playback.role != state::DevicePlaybackRole::Active || !state.player.playing {
+        return false;
+    }
+    if !state.player.paused {
+        return true;
+    }
+    update_local_idle_since(state);
+    state
+        .device_playback
+        .local_idle_since_ms
+        .is_some_and(|idle_since| now.saturating_sub(idle_since) < ACTIVE_IDLE_LEASE_MS)
+}
+
 fn extrapolate_control_position(state: &mut AppState) {
     let Some(snapshot) = state.device_playback.last_remote_snapshot.as_ref() else {
         return;
@@ -1162,9 +1176,37 @@ fn start_current_audio(
     position_secs: f64,
     paused: bool,
 ) {
-    let Some(track) = state.player.queue.get(state.player.queue_pos).cloned() else {
+    let Some(mut track) = state.player.queue.get(state.player.queue_pos).cloned() else {
         return;
     };
+    if track_file_missing(&track) {
+        if let Some(local) = local_track_for_playback(runtime, &track) {
+            state.player.queue[state.player.queue_pos] = local.clone();
+            track = local;
+        } else if let Some(fed) = track.fed.clone() {
+            let mut pending = crate::federation::pending_track(&fed);
+            pending.id = track.id;
+            pending.play_count = track.play_count;
+            state.player.queue[state.player.queue_pos] = pending.clone();
+            track = pending;
+        } else if track.content_id.is_some() {
+            state.player.current = Some(track.clone());
+            state.player.playing = true;
+            state.player.paused = paused;
+            state.player.position_secs = position_secs.max(0.0);
+            state.player.audio_analysis = player::AudioAnalysisSnapshot::default();
+            state.player.track_started_at = Some(now_epoch_seconds());
+            state.player.prefetched_pos = None;
+            runtime.player_start_pending = true;
+            runtime.player.stop();
+            state.status_message = Some(format!(
+                "federation: locating \"{}\" for this device…",
+                track.title
+            ));
+            spawn_content_id_resolve(runtime, &track);
+            return;
+        }
+    }
     // The track that was playing until now was cut short by this switch.
     let previous_started_at = state.player.track_started_at;
     let same_track_started_at = if let Some(previous) = state.player.current.take() {
@@ -1226,6 +1268,23 @@ fn start_current_audio(
             ))));
         }
     });
+}
+
+fn track_file_missing(track: &crate::library::models::TrackItem) -> bool {
+    !track.file_path.is_empty() && !Path::new(&track.file_path).is_file()
+}
+
+fn local_track_for_playback(
+    runtime: &Runtime,
+    track: &crate::library::models::TrackItem,
+) -> Option<crate::library::models::TrackItem> {
+    let content_id = track.content_id.as_deref()?;
+    let local = runtime
+        .library
+        .track_by_content_id(content_id)
+        .ok()
+        .flatten()?;
+    Path::new(&local.file_path).is_file().then_some(local)
 }
 
 fn open_track_file(path: &str) -> std::io::Result<(player::TrackReader, Option<u64>)> {
@@ -1367,6 +1426,37 @@ fn spawn_fed_resolve(runtime: &Runtime, track: &crate::library::models::TrackIte
             .await
             .map(Box::new)
             .map_err(|err| format!("{err:#}"));
+        let _ = tx.send(AppEvent::FedTrackResolved {
+            placeholder_id,
+            result,
+        });
+    });
+}
+
+fn spawn_content_id_resolve(runtime: &Runtime, track: &crate::library::models::TrackItem) {
+    let Some(content_id) = track.content_id.clone() else {
+        return;
+    };
+    {
+        let mut resolving = runtime
+            .fed_resolving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !resolving.insert(track.id) {
+            return;
+        }
+    }
+    let placeholder_id = track.id;
+    let label = format!("{} {}", track.artist_line(), track.title);
+    let fed = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let result = match fed.track_by_content_id(&content_id, Some(&label)).await {
+            Ok(fed_track) => fed.prepare_playback(&fed_track).await,
+            Err(err) => Err(err),
+        }
+        .map(Box::new)
+        .map_err(|err| format!("{err:#}"));
         let _ = tx.send(AppEvent::FedTrackResolved {
             placeholder_id,
             result,
@@ -1776,6 +1866,13 @@ fn handle_device_playback_snapshot(
         + 1;
 
     if !snapshot.active {
+        return;
+    }
+    if local_active_lease_protected(state, now) {
+        tracing::debug!(
+            remote = %snapshot.device_id,
+            "ignored remote active snapshot while local active playback is protected"
+        );
         return;
     }
     let lease_expired = active_idle_lease_expired(&snapshot, now);
