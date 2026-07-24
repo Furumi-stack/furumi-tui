@@ -270,13 +270,17 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
         spans.push(Span::styled(format!("  {}%", player.volume), theme::dim()));
     }
     if width >= 70 {
+        let role_style = match state.device_playback.role {
+            crate::app::state::DevicePlaybackRole::Active => Style::new().fg(Color::Green),
+            crate::app::state::DevicePlaybackRole::Control => Style::new().fg(Color::Yellow),
+        };
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!(
-                "{} · online {}",
-                state.device_playback.role.label(),
-                state.device_playback.online_devices.max(1)
-            ),
+            state.device_playback.role.label().to_string(),
+            role_style,
+        ));
+        spans.push(Span::styled(
+            format!(" · online {}", state.device_playback.online_devices.max(1)),
             theme::dim(),
         ));
     }
