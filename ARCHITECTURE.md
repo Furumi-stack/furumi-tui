@@ -212,6 +212,62 @@ The audio engine is similarly isolated. The application owns the logical
 queue, while `player::Controller` owns rodio playback and receives explicit
 commands. Prefetching prepares the next source before the current item ends.
 
+## Scripted visualizations
+
+Visualizations are an extension boundary rather than hard-coded rendering
+paths. Rust owns audio sampling, script execution, validation, and terminal
+drawing; Rhai scripts own the visual composition.
+
+```text
+rodio source
+     │
+     v
+audio analyzer ──> normalized features + scope samples
+                                      │
+                                      v
+                              Rhai render(input)
+                                      │
+                                      v
+                            validated draw commands
+                                      │
+                                      v
+                              ratatui frame buffer
+```
+
+The player analyzer derives a bounded, renderer-independent input model:
+energy, bass, mid, treble, beat strength, waveform samples, playback progress,
+volume, pause state, track metadata, time, and terminal dimensions. Each
+script implements `render(input)` and returns declarative commands such as
+clear, cell, line, rectangle, trace, and text. Scripts never receive the
+ratatui frame or audio engine directly.
+
+This command boundary is intentional:
+
+- scripts remain independent of Rust UI internals;
+- the host validates command shapes, colors, coordinates, and arrays;
+- drawing is clipped to the current terminal area;
+- script failures become an in-UI visualizer error instead of corrupting the
+  terminal or stopping playback.
+
+Rhai files live in the user's visualization directory. The runtime discovers
+them dynamically, compiles the selected script, caches its AST, and recompiles
+it when the file modification time changes. A visualization can therefore be
+created or edited while Furumi is running without rebuilding or restarting the
+application. Bundled scripts use the same path and contract as user scripts,
+so built-in and custom visualizations exercise the same runtime.
+
+The Rhai engine is configured as a sandboxed computation environment. Module
+loading through `import` and `export` is disabled, no filesystem or network API
+is exposed to scripts, and execution is bounded by limits on operations, call
+depth, variables, functions, expression depth, and collection/string sizes.
+Only the input map, Rhai language primitives, and a small set of mathematical
+helpers are available.
+
+The sandbox protects responsiveness and keeps visualization code in its
+intended role: transforming current audio features into drawing commands. It
+is not a plugin mechanism for accessing the library, network, or player
+controls.
+
 ## Persistence boundaries
 
 Furumi stores different kinds of state according to their lifetime:

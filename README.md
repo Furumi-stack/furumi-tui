@@ -65,7 +65,9 @@ inspecting connected devices, and configuring federation.
 The interface supports keyboard-driven navigation, multi-key combinations,
 context-aware bindings, and user-defined rebinding through TOML. Built-in
 audio visualizations, OS media controls, gapless queue playback, and local
-library management are included.
+library management are included. Visualizations are runtime-loadable Rhai
+scripts executed in a resource-limited sandbox, so they can be added or edited
+without rebuilding the player.
 
 ## Install
 
