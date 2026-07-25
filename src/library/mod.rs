@@ -227,8 +227,28 @@ pub struct NetworkArtistImageRequest {
 
 pub struct Library {
     conn: Mutex<Connection>,
+    db_path: PathBuf,
     /// Directory where extracted embedded covers are stored.
     covers_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalLibraryStats {
+    pub artist_count: i64,
+    pub release_count: i64,
+    pub track_count: i64,
+    pub audio_bytes: u64,
+    pub tracks_without_size: i64,
+    pub cover_bytes: u64,
+    pub database_bytes: u64,
+}
+
+impl LocalLibraryStats {
+    pub fn total_bytes(&self) -> u64 {
+        self.audio_bytes
+            .saturating_add(self.cover_bytes)
+            .saturating_add(self.database_bytes)
+    }
 }
 
 /// Default database location: `<data dir>/furumi/library.db`.
@@ -256,12 +276,49 @@ impl Library {
             .unwrap_or_else(|| PathBuf::from("covers"));
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: db_path.to_path_buf(),
             covers_dir,
         })
     }
 
     pub fn covers_dir(&self) -> &Path {
         &self.covers_dir
+    }
+
+    pub fn local_stats(&self) -> Result<LocalLibraryStats> {
+        let (artist_count, release_count, track_count, audio_bytes, tracks_without_size) = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM artists),
+                    (SELECT COUNT(*) FROM releases),
+                    (SELECT COUNT(*) FROM tracks),
+                    (SELECT COALESCE(SUM(CASE
+                        WHEN file_size_bytes IS NOT NULL AND file_size_bytes >= 0
+                        THEN file_size_bytes ELSE 0 END), 0) FROM tracks),
+                    (SELECT COUNT(*) FROM tracks WHERE file_size_bytes IS NULL)
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+        };
+        Ok(LocalLibraryStats {
+            artist_count,
+            release_count,
+            track_count,
+            audio_bytes: audio_bytes.max(0) as u64,
+            tracks_without_size,
+            cover_bytes: directory_size(&self.covers_dir),
+            database_bytes: sqlite_database_size(&self.db_path),
+        })
     }
 
     /// Make `content_id` a local-library invariant.
@@ -2559,6 +2616,40 @@ pub(crate) fn audio_content_id(path: &str) -> Option<String> {
     Some(format!("b3:{}", hasher.finalize().to_hex()))
 }
 
+fn directory_size(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| directory_size(&entry.path()))
+        .sum()
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn sqlite_database_size(path: &Path) -> u64 {
+    file_size(path)
+        .saturating_add(file_size(&path_with_suffix(path, "-wal")))
+        .saturating_add(file_size(&path_with_suffix(path, "-shm")))
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 fn now_ms_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2664,7 +2755,8 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         Library {
             conn: Mutex::new(conn),
-            covers_dir: std::env::temp_dir(),
+            db_path: std::env::temp_dir().join("furumi-test-library.db"),
+            covers_dir: std::env::temp_dir().join("furumi-test-covers-unused"),
         }
     }
 
@@ -2714,6 +2806,20 @@ mod tests {
             hide_featured_only,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn local_stats_counts_library_rows_and_audio_bytes() {
+        let lib = test_library();
+        add_track(&lib, "One", "Artist", "First");
+        add_track(&lib, "Two", "Artist", "Second");
+
+        let stats = lib.local_stats().unwrap();
+        assert_eq!(stats.artist_count, 1);
+        assert_eq!(stats.release_count, 2);
+        assert_eq!(stats.track_count, 2);
+        assert_eq!(stats.audio_bytes, 2);
+        assert_eq!(stats.tracks_without_size, 0);
     }
 
     #[test]

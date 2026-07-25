@@ -64,6 +64,8 @@ pub enum Effect {
     DeviceSetName(String),
     /// Revoke a trusted device.
     DeviceRevoke(String),
+    /// Leave the current personal-device group after publishing self-revoke.
+    DeviceLeaveGroup,
     /// Assemble the federated artist card (fan-out to the owning peers).
     FedOpenArtist(String),
     /// Download federated tracks into the local library, one by one.
@@ -2624,6 +2626,13 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
                 return None;
             }
             Some(Effect::DeviceSyncNow)
+        }
+        SettingsRow::DeviceLeaveGroup => {
+            if !require_connected_devices_enabled(state) {
+                return None;
+            }
+            state.popup = Some(Popup::ConfirmDeviceLeave);
+            None
         }
         SettingsRow::Device(index) => {
             if !require_connected_devices_enabled(state) {

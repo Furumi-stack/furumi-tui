@@ -11,8 +11,8 @@ use crate::app::state::{AppState, DevicePresenceSection, FedRow, settings_rows};
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::bordered()
         .title(" Settings ")
-        .title_style(theme::header())
-        .border_style(theme::dim());
+        .title_style(theme::header_for(state))
+        .border_style(theme::border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -68,7 +68,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut y = area.y;
     let mut cursor = 0usize;
 
-    draw_section(frame, area, &mut y, "Federation");
+    draw_section(frame, area, state, &mut y, "Federation");
     for row in FedRow::ALL {
         let (label, value) = match row {
             FedRow::Toggle => ("Federation", on_off(settings.enabled).to_string()),
@@ -98,6 +98,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         draw_row(
             frame,
             area,
+            state,
             &mut y,
             cursor,
             state.settings_cursor,
@@ -109,12 +110,13 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
 
     y = y.saturating_add(1);
     let connected_devices_enabled = state.connected_devices_enabled();
-    draw_section(frame, area, &mut y, "Connected Devices");
+    draw_section(frame, area, state, &mut y, "Connected Devices");
     let disabled_value = "enable federation first".to_string();
     let devices = state.federation.devices.as_ref();
     draw_row_enabled(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -132,6 +134,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_row_enabled(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -147,6 +150,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_row_enabled(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -162,6 +166,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_row_enabled(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -172,6 +177,22 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 "↵".to_string()
             }
+        } else {
+            disabled_value.clone()
+        },
+        connected_devices_enabled,
+    );
+    cursor += 1;
+    draw_row_enabled(
+        frame,
+        area,
+        state,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Leave device group",
+        if connected_devices_enabled {
+            "↵".to_string()
         } else {
             disabled_value.clone()
         },
@@ -219,6 +240,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             draw_row_enabled(
                 frame,
                 area,
+                state,
                 &mut y,
                 cursor,
                 state.settings_cursor,
@@ -231,10 +253,11 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     y = y.saturating_add(1);
-    draw_section(frame, area, &mut y, "Visualizations");
+    draw_section(frame, area, state, &mut y, "Visualizations");
     draw_row(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -266,6 +289,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         draw_row(
             frame,
             area,
+            state,
             &mut y,
             cursor,
             state.settings_cursor,
@@ -278,6 +302,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_row(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -290,6 +315,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         draw_row(
             frame,
             area,
+            state,
             &mut y,
             cursor,
             state.settings_cursor,
@@ -303,6 +329,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_row(
         frame,
         area,
+        state,
         &mut y,
         cursor,
         state.settings_cursor,
@@ -311,7 +338,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
-fn draw_section(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str) {
+fn draw_section(frame: &mut Frame, area: Rect, state: &AppState, y: &mut u16, title: &'static str) {
     if *y >= area.y + area.height {
         return;
     }
@@ -321,7 +348,10 @@ fn draw_section(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static str)
         width: area.width,
         height: 1,
     };
-    frame.render_widget(Paragraph::new(Line::styled(title, theme::header())), rect);
+    frame.render_widget(
+        Paragraph::new(Line::styled(title, theme::header_for(state))),
+        rect,
+    );
     *y = (*y).saturating_add(1);
 }
 
@@ -348,18 +378,20 @@ fn draw_subsection(frame: &mut Frame, area: Rect, y: &mut u16, title: &'static s
 fn draw_row(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     y: &mut u16,
     row_index: usize,
     cursor: usize,
     label: &str,
     value: String,
 ) {
-    draw_row_enabled(frame, area, y, row_index, cursor, label, value, true);
+    draw_row_enabled(frame, area, state, y, row_index, cursor, label, value, true);
 }
 
 fn draw_row_enabled(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     y: &mut u16,
     row_index: usize,
     cursor: usize,
@@ -383,7 +415,7 @@ fn draw_row_enabled(
         Span::styled(
             marker,
             if enabled {
-                theme::accent()
+                theme::accent_for(state)
             } else {
                 theme::dim()
             },
@@ -393,7 +425,7 @@ fn draw_row_enabled(
             if !enabled {
                 theme::dim()
             } else if selected {
-                theme::accent()
+                theme::accent_for(state)
             } else {
                 ratatui::style::Style::default()
             },
@@ -444,7 +476,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    if area.height < 18 || area.width < 36 {
+    if area.height < 15 || area.width < 36 {
         frame.render_widget(
             Paragraph::new(compact_status_lines(state))
                 .wrap(ratatui::widgets::Wrap { trim: false }),
@@ -453,40 +485,128 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let [node_area, _, transport_area, _, devices_area, _] = Layout::vertical([
-        Constraint::Length(5),
+    if area.width >= 60 && area.height >= 15 {
+        let [top_area, _, bottom_area] = Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(7),
+        ])
+        .areas(area);
+        let [status_area, _, local_area] = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
+        .areas(top_area);
+        let [transport_area, _, devices_area] = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
+        .areas(bottom_area);
+        draw_summary_card(
+            frame,
+            status_area,
+            state,
+            " Status ",
+            node_summary_lines(state),
+        );
+        draw_summary_card(
+            frame,
+            local_area,
+            state,
+            " Local Data ",
+            local_data_summary_lines(state),
+        );
+        draw_summary_card(
+            frame,
+            transport_area,
+            state,
+            " Iroh Transport ",
+            transport_summary_lines(state),
+        );
+        draw_summary_card(
+            frame,
+            devices_area,
+            state,
+            " Connected Devices ",
+            device_summary_lines(state),
+        );
+        return;
+    }
+
+    if area.height < 31 {
+        frame.render_widget(
+            Paragraph::new(compact_status_lines(state))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
+    let [
+        node_area,
+        _,
+        transport_area,
+        _,
+        devices_area,
+        _,
+        local_area,
+        _,
+    ] = Layout::vertical([
+        Constraint::Length(7),
         Constraint::Length(1),
-        Constraint::Length(5),
+        Constraint::Length(7),
         Constraint::Length(1),
-        Constraint::Length(5),
+        Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Length(7),
         Constraint::Min(0),
     ])
     .areas(area);
 
-    draw_summary_card(frame, node_area, " Status ", node_summary_lines(state));
+    draw_summary_card(
+        frame,
+        node_area,
+        state,
+        " Status ",
+        node_summary_lines(state),
+    );
     draw_summary_card(
         frame,
         transport_area,
+        state,
         " Iroh Transport ",
         transport_summary_lines(state),
     );
     draw_summary_card(
         frame,
         devices_area,
+        state,
         " Connected Devices ",
         device_summary_lines(state),
+    );
+    draw_summary_card(
+        frame,
+        local_area,
+        state,
+        " Local Data ",
+        local_data_summary_lines(state),
     );
 }
 
 fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::styled("Status", theme::header()));
+    lines.push(Line::styled("Status", theme::header_for(state)));
     lines.extend(node_summary_lines(state).into_iter().take(2));
     lines.push(Line::default());
-    lines.push(Line::styled("Iroh Transport", theme::header()));
+    lines.push(Line::styled("Local Data", theme::header_for(state)));
+    lines.extend(local_data_summary_lines(state).into_iter().take(3));
+    lines.push(Line::default());
+    lines.push(Line::styled("Iroh Transport", theme::header_for(state)));
     lines.extend(transport_summary_lines(state).into_iter().take(2));
     lines.push(Line::default());
-    lines.push(Line::styled("Connected Devices", theme::header()));
+    lines.push(Line::styled("Connected Devices", theme::header_for(state)));
     lines.extend(device_summary_lines(state).into_iter().take(2));
     lines
 }
@@ -494,6 +614,7 @@ fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
 fn draw_summary_card(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     title: &'static str,
     lines: Vec<Line<'static>>,
 ) {
@@ -502,8 +623,8 @@ fn draw_summary_card(
     }
     let block = Block::bordered()
         .title(title)
-        .title_style(theme::header())
-        .border_style(theme::dim());
+        .title_style(theme::header_for(state))
+        .border_style(theme::border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -626,6 +747,51 @@ fn transport_summary_lines(state: &AppState) -> Vec<Line<'static>> {
     ]
 }
 
+fn local_data_summary_lines(state: &AppState) -> Vec<Line<'static>> {
+    match &state.local_library_stats {
+        None | Some(crate::app::state::Loadable::Loading) => vec![
+            summary_line("Counts", "loading".to_string()),
+            summary_line("Media", "loading".to_string()),
+            summary_line("SQLite", "loading".to_string()),
+            summary_line("Total", "loading".to_string()),
+        ],
+        Some(crate::app::state::Loadable::Failed(message)) => vec![
+            summary_line("Counts", "unavailable".to_string()),
+            summary_line("Problem", first_line(message)),
+        ],
+        Some(crate::app::state::Loadable::Ready(stats)) => {
+            let media = if stats.tracks_without_size > 0 {
+                format!(
+                    "{} · {} unknown",
+                    short_bytes_label(stats.audio_bytes),
+                    stats.tracks_without_size
+                )
+            } else {
+                short_bytes_label(stats.audio_bytes)
+            };
+            vec![
+                summary_line(
+                    "Counts",
+                    format!(
+                        "{} artists / {} releases / {} tracks",
+                        stats.artist_count, stats.release_count, stats.track_count
+                    ),
+                ),
+                summary_line("Media", media),
+                summary_line("SQLite", short_bytes_label(stats.database_bytes)),
+                summary_line(
+                    "Total",
+                    format!(
+                        "{} (covers {})",
+                        short_bytes_label(stats.total_bytes()),
+                        short_bytes_label(stats.cover_bytes)
+                    ),
+                ),
+            ]
+        }
+    }
+}
+
 fn device_summary_lines(state: &AppState) -> Vec<Line<'static>> {
     if !state.connected_devices_enabled() {
         return vec![
@@ -718,7 +884,7 @@ pub(super) fn status_detail_sections(
 }
 
 fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = vec![Line::styled("Status", theme::header())];
+    let mut lines: Vec<Line> = vec![Line::styled("Status", theme::header_for(state))];
     match &state.federation.status {
         None => lines.push(Line::styled("loading…", theme::dim())),
         Some(status) if !status.running => {
@@ -741,6 +907,7 @@ fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Lin
                     short_id(&status.endpoint_id),
                     short_id(&status.dht_node_id)
                 ),
+                state,
                 status_cursor == 0,
             ));
             lines.push(status_line(
@@ -764,6 +931,7 @@ fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Lin
                 lines.push(status_action_line(
                     "Peer IDs",
                     peers.join(", "),
+                    state,
                     status_cursor == 1,
                 ));
             }
@@ -795,19 +963,24 @@ fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Lin
             if let Some(error) = &status.last_error {
                 lines.push(status_line("Error", first_line(error)));
             }
-            push_transport_summary_status(&mut lines, status);
+            push_transport_summary_status(&mut lines, state, status);
         }
     }
     lines
 }
 
-fn status_action_line(label: &str, value: String, selected: bool) -> Line<'static> {
+fn status_action_line(
+    label: &str,
+    value: String,
+    state: &AppState,
+    selected: bool,
+) -> Line<'static> {
     let marker = if selected { "▶" } else { " " };
     Line::from(vec![
         Span::styled(
             format!("{marker} {label:<16}"),
             if selected {
-                theme::accent()
+                theme::accent_for(state)
             } else {
                 theme::dim()
             },
@@ -819,10 +992,11 @@ fn status_action_line(label: &str, value: String, selected: bool) -> Line<'stati
 
 fn push_transport_summary_status(
     lines: &mut Vec<Line<'static>>,
+    state: &AppState,
     status: &crate::federation::FedStatus,
 ) {
     lines.push(Line::default());
-    lines.push(Line::styled("Iroh Transport", theme::header()));
+    lines.push(Line::styled("Iroh Transport", theme::header_for(state)));
     let transport = &status.transport;
     let runtime_total = transport
         .runtime_tx_bytes
@@ -934,7 +1108,7 @@ pub(super) fn status_detail_transport_logs(state: &AppState) -> Vec<Line<'static
 }
 
 fn status_detail_device_lines(state: &AppState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::styled("Connected Devices", theme::header())];
+    let mut lines = vec![Line::styled("Connected Devices", theme::header_for(state))];
     match &state.federation.devices {
         None => lines.push(Line::styled("loading…", theme::dim())),
         Some(status) => {
@@ -976,7 +1150,7 @@ fn status_detail_device_lines(state: &AppState) -> Vec<Line<'static>> {
                 lines.push(status_line("Error", first_line(last_error)));
             }
             lines.push(Line::default());
-            lines.push(Line::styled("Device List", theme::header()));
+            lines.push(Line::styled("Device List", theme::header_for(state)));
             if status.devices.is_empty() {
                 lines.push(status_line("Devices", "none recorded".to_string()));
             } else {
@@ -1047,7 +1221,7 @@ fn push_device_detail_compact(
         format!("v{}", device.client_version)
     };
     lines.push(Line::from(vec![
-        Span::styled(format!("{icon} "), theme::accent()),
+        Span::styled(format!("{icon} "), theme::accent_for(state)),
         Span::raw(crate::app::state::device_display_name(device)),
         Span::styled(
             format!(" · {} · {}", version, badges.join(", ")),

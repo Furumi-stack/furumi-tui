@@ -95,6 +95,15 @@ fn refresh_local_content_ids(runtime: &Runtime) {
     });
 }
 
+fn refresh_local_library_stats(runtime: &Runtime) {
+    let library = Arc::clone(&runtime.library);
+    let tx = runtime.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = library.local_stats().map_err(err_string);
+        let _ = tx.send(AppEvent::LocalLibraryStatsLoaded(result));
+    });
+}
+
 fn spawn_artist_federation_enrichment(runtime: &Runtime, id: i64, name: String) {
     let fed = Arc::clone(&runtime.federation);
     let tx = runtime.event_tx.clone();
@@ -870,6 +879,10 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         state.local_content_ids_loaded = true;
         refresh_local_content_ids(runtime);
     }
+    if state.local_library_stats.is_none() {
+        state.local_library_stats = Some(state::Loadable::Loading);
+        refresh_local_library_stats(runtime);
+    }
 
     // Playlists tab data (also wanted while the add-to-playlist picker is
     // open from any tab).
@@ -1423,6 +1436,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         | Effect::DeviceSyncNow
         | Effect::DeviceSetName(_)
         | Effect::DeviceRevoke(_)
+        | Effect::DeviceLeaveGroup
             if !state.connected_devices_enabled() =>
         {
             state.status_message = Some("enable federation before using connected devices".into());
@@ -1475,6 +1489,33 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 let message = match devices.revoke_device(&device_id) {
                     Ok(()) => format!("device {} revoked", &device_id[..device_id.len().min(10)]),
                     Err(err) => format!("revoke failed: {err:#}"),
+                };
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+                let _ = tx.send(AppEvent::StatusMessage(message));
+            });
+        }
+        Effect::DeviceLeaveGroup => {
+            state.status_message = Some("leaving device group…".to_string());
+            let fed = Arc::clone(&runtime.federation);
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let message = match devices.record_leave_group_revoke() {
+                    Ok(op_id) => match fed.device_sync_now().await {
+                        Ok(()) => match devices.finish_leave_group_reset() {
+                            Ok(group_id) => format!("left device group · new group {group_id}"),
+                            Err(err) => format!("leave failed after sync: {err:#}"),
+                        },
+                        Err(err) => {
+                            if let Err(rollback) = devices.cancel_leave_group_revoke(&op_id) {
+                                tracing::warn!(
+                                    "rolling back failed leave-device-group op failed: {rollback:#}"
+                                );
+                            }
+                            format!("leave failed: revoke was not synced: {err:#}")
+                        }
+                    },
+                    Err(err) => format!("leave failed: {err:#}"),
                 };
                 let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
                 let _ = tx.send(AppEvent::StatusMessage(message));
@@ -2449,6 +2490,7 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
     // until then.
     state.likes_loaded = false;
     state.local_content_ids_loaded = false;
+    state.local_library_stats = None;
 
     // Fresh copies of whatever sits in the queue. Federated placeholders
     // and ephemeral tracks (negative ids) are not library rows and keep
@@ -2785,7 +2827,26 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                             })
                             .is_some_and(|device| device.revoked)
                     });
-            if active_revoked {
+            let active_missing = state.device_playback.is_control()
+                && state
+                    .device_playback
+                    .active_device_id
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active != &state.device_playback.self_device_id
+                            && !state.federation.devices.as_ref().is_some_and(|status| {
+                                status
+                                    .devices
+                                    .iter()
+                                    .any(|device| device.device_id == *active)
+                            })
+                    });
+            if active_revoked || active_missing {
+                runtime.player.stop();
+                state.player.playing = false;
+                state.player.current = None;
+                state.player.paused = false;
+                state.player.position_secs = 0.0;
                 become_active_device(state, runtime, false);
                 state.status_message = Some("active playback moved to this device".into());
             }
@@ -3283,6 +3344,15 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 tracing::warn!(%message, "local content id load failed");
             }
         },
+        AppEvent::LocalLibraryStatsLoaded(result) => {
+            state.local_library_stats = Some(match result {
+                Ok(stats) => state::Loadable::Ready(stats),
+                Err(message) => {
+                    tracing::warn!(%message, "local library stats load failed");
+                    state::Loadable::Failed(message)
+                }
+            });
+        }
         AppEvent::LocalContentAvailable { content_id } => {
             if let Some(content_id) = music_dht::normalize_content_id(&content_id) {
                 state.local_content_ids.insert(content_id);

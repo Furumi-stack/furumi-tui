@@ -728,6 +728,8 @@ pub enum Popup {
     },
     /// Confirmation before revoking a trusted device.
     ConfirmDeviceRevoke { device_id: String, name: String },
+    /// Confirmation before this device leaves the trusted-device group.
+    ConfirmDeviceLeave,
     /// Connected playback devices and their current role/status.
     ConnectedDevices { cursor: usize },
     /// Full federation, transport and device status details.
@@ -864,6 +866,7 @@ pub enum SettingsRow {
     DeviceInvite,
     DeviceConnect,
     DeviceSyncNow,
+    DeviceLeaveGroup,
     Device(usize),
     VisualizationClock,
     VisualizationScript(usize),
@@ -1000,6 +1003,7 @@ pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     rows.push(SettingsRow::DeviceInvite);
     rows.push(SettingsRow::DeviceConnect);
     rows.push(SettingsRow::DeviceSyncNow);
+    rows.push(SettingsRow::DeviceLeaveGroup);
     rows.extend(
         device_status_order(state)
             .into_iter()
@@ -1272,6 +1276,7 @@ pub struct AppState {
     pub local_content_ids: HashSet<String>,
     pub likes_loaded: bool,
     pub local_content_ids_loaded: bool,
+    pub local_library_stats: Option<Loadable<crate::library::LocalLibraryStats>>,
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
     pub federation: FederationTab,

@@ -16,34 +16,34 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::AddToPlaylist { target, cursor }) => {
             draw_picker(frame, state, &target.label(), *cursor)
         }
-        Some(Popup::NewPlaylist { input, busy, .. }) => draw_name_entry(frame, input, *busy),
+        Some(Popup::NewPlaylist { input, busy, .. }) => draw_name_entry(frame, state, input, *busy),
         Some(Popup::Edit {
             title,
             fields,
             focus,
             error,
             ..
-        }) => draw_edit(frame, title, fields, *focus, error.as_deref()),
-        Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, label),
+        }) => draw_edit(frame, state, title, fields, *focus, error.as_deref()),
+        Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, state, label),
         Some(Popup::LibraryFilters { cursor }) => draw_library_filters(frame, state, *cursor),
         Some(Popup::TrackInfo {
             tracks,
             cursor,
             scroll,
-        }) => draw_track_info(frame, tracks, *cursor, *scroll),
+        }) => draw_track_info(frame, state, tracks, *cursor, *scroll),
         Some(Popup::TrackArtists {
             tracks,
             cursor,
             selected,
             ..
-        }) => draw_track_artists(frame, tracks, *cursor, *selected),
-        Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
+        }) => draw_track_artists(frame, state, tracks, *cursor, *selected),
+        Some(Popup::LogDetail(entry)) => draw_log_detail(frame, state, entry),
         Some(Popup::FedInput { field, input }) => {
-            draw_fed_input(frame, field.title(), field.help(), input)
+            draw_fed_input(frame, state, field.title(), field.help(), input)
         }
-        Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
+        Some(Popup::FedText { title, text }) => draw_fed_text(frame, state, title, text),
         Some(Popup::FedCopyText { title, text, help }) => {
-            draw_fed_copy_text(frame, title, text, help)
+            draw_fed_copy_text(frame, state, title, text, help)
         }
         Some(Popup::FederationStatusDetails {
             focus,
@@ -63,7 +63,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             text,
             scroll,
             parent: _,
-        }) => draw_federation_status_text(frame, title, text, *scroll),
+        }) => draw_federation_status_text(frame, state, title, text, *scroll),
         Some(Popup::FederationStatusLog { scroll, parent: _ }) => {
             draw_federation_status_log(frame, state, *scroll)
         }
@@ -76,6 +76,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..
         }) => draw_device_pairing(
             frame,
+            state,
             device_id,
             name,
             client_version,
@@ -83,8 +84,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             *requester_group_active_devices,
         ),
         Some(Popup::ConfirmDeviceRevoke { device_id, name }) => {
-            draw_device_revoke(frame, device_id, name)
+            draw_device_revoke(frame, state, device_id, name)
         }
+        Some(Popup::ConfirmDeviceLeave) => draw_device_leave(frame, state),
         Some(Popup::ConnectedDevices { cursor }) => draw_connected_devices(frame, state, *cursor),
         None => {}
     }
@@ -101,8 +103,8 @@ fn draw_federation_status_details(
     let area = federation_status_area(frame);
     let block = Block::bordered()
         .title(" Full status details ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -132,6 +134,7 @@ fn draw_federation_status_details(
         draw_status_detail_panel(
             frame,
             left,
+            state,
             " Status / Transport ",
             sections.status,
             0,
@@ -140,6 +143,7 @@ fn draw_federation_status_details(
         draw_status_detail_panel(
             frame,
             right,
+            state,
             " Connected Devices ",
             sections.devices,
             devices_scroll,
@@ -152,6 +156,7 @@ fn draw_federation_status_details(
         draw_status_detail_panel(
             frame,
             top,
+            state,
             " Status / Transport ",
             sections.status,
             0,
@@ -160,6 +165,7 @@ fn draw_federation_status_details(
         draw_status_detail_panel(
             frame,
             bottom,
+            state,
             " Connected Devices ",
             sections.devices,
             devices_scroll,
@@ -169,6 +175,7 @@ fn draw_federation_status_details(
     draw_status_log_panel(
         frame,
         logs_area,
+        state,
         sections.logs,
         focus == StatusDetailFocus::Logs,
     );
@@ -193,6 +200,7 @@ fn federation_status_area(frame: &Frame) -> Rect {
 fn draw_status_detail_panel(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     title: &'static str,
     lines: Vec<Line<'static>>,
     scroll: usize,
@@ -203,9 +211,9 @@ fn draw_status_detail_panel(
     }
     let block = Block::bordered()
         .title(title)
-        .title_style(theme::header())
+        .title_style(theme::header_for(state))
         .border_style(if focused {
-            theme::accent()
+            theme::strong_border_for(state)
         } else {
             theme::dim()
         });
@@ -218,15 +226,21 @@ fn draw_status_detail_panel(
     );
 }
 
-fn draw_status_log_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, focused: bool) {
+fn draw_status_log_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    lines: Vec<Line<'static>>,
+    focused: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let block = Block::bordered()
         .title(" Connection log ")
-        .title_style(theme::header())
+        .title_style(theme::header_for(state))
         .border_style(if focused {
-            theme::accent()
+            theme::strong_border_for(state)
         } else {
             theme::dim()
         });
@@ -236,12 +250,18 @@ fn draw_status_log_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>
     frame.render_widget(Paragraph::new(preview), inner);
 }
 
-fn draw_federation_status_text(frame: &mut Frame, title: &str, text: &str, scroll: usize) {
+fn draw_federation_status_text(
+    frame: &mut Frame,
+    state: &AppState,
+    title: &str,
+    text: &str,
+    scroll: usize,
+) {
     let area = federation_status_area(frame);
     let block = Block::bordered()
         .title(format!(" {title} "))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -268,8 +288,8 @@ fn draw_federation_status_log(frame: &mut Frame, state: &AppState, scroll: usize
     let area = federation_status_area(frame);
     let block = Block::bordered()
         .title(" Connection log ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -313,8 +333,8 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     let area = centered(frame.area(), 76, height);
     let block = Block::bordered()
         .title(" Connected devices ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -330,7 +350,10 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Role ", theme::dim()),
-            Span::styled(state.device_playback.role.label(), theme::accent()),
+            Span::styled(
+                format!(" {} ", state.device_playback.role.label()),
+                theme::role_pill(state.device_playback.role),
+            ),
             Span::raw("  "),
             Span::styled("Active ", theme::dim()),
             Span::raw(active),
@@ -338,7 +361,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         summary_area,
     );
 
-    render_subtitle(frame, this_area, "This device");
+    render_subtitle(frame, this_area, state, "This device");
     let action_area = Rect {
         x: this_area.x,
         y: this_area.y + 1,
@@ -364,9 +387,10 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         action_label,
         self_name,
         &self_status,
+        state,
     );
 
-    render_subtitle(frame, other_area, "Other devices");
+    render_subtitle(frame, other_area, state, "Other devices");
     let list_area = Rect {
         x: other_area.x,
         y: other_area.y + 1,
@@ -404,13 +428,13 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
                 continue;
             };
             frame.render_widget(
-                Paragraph::new(Line::styled(section.title(), theme::header())),
+                Paragraph::new(Line::styled(section.title(), theme::header_for(state))),
                 area,
             );
             continue;
         };
         let row = other_rows[*index];
-        render_connected_device_row(frame, area, row, selected_remote == Some(*index));
+        render_connected_device_row(frame, area, row, state, selected_remote == Some(*index));
     }
 
     let [legend_area, controls_area] =
@@ -433,14 +457,17 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     );
 }
 
-fn render_subtitle(frame: &mut Frame, area: Rect, title: &'static str) {
+fn render_subtitle(frame: &mut Frame, area: Rect, state: &AppState, title: &'static str) {
     let rect = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
         height: 1,
     };
-    frame.render_widget(Paragraph::new(Line::styled(title, theme::header())), rect);
+    frame.render_widget(
+        Paragraph::new(Line::styled(title, theme::header_for(state))),
+        rect,
+    );
 }
 
 fn device_status_label(row: &crate::app::popup::ConnectedDevicePopupRow) -> String {
@@ -469,6 +496,7 @@ fn render_connected_action(
     label: &str,
     device_name: &str,
     status: &str,
+    state: &AppState,
 ) {
     let marker = if selected { "▶ " } else { "  " };
     let prefix = format!("{marker}{label}");
@@ -491,7 +519,7 @@ fn render_connected_action(
         Span::styled(
             label,
             if selected {
-                theme::accent()
+                theme::accent_for(state)
             } else {
                 theme::dim()
             },
@@ -501,7 +529,9 @@ fn render_connected_action(
     ]);
     frame.render_widget(Paragraph::new(line), area);
     if selected {
-        frame.buffer_mut().set_style(area, theme::tab_active());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::tab_active_for(state));
     }
 }
 
@@ -509,6 +539,7 @@ fn render_connected_device_row(
     frame: &mut Frame,
     area: Rect,
     row: &crate::app::popup::ConnectedDevicePopupRow,
+    state: &AppState,
     selected: bool,
 ) {
     let marker = if selected { "▶ " } else { "  " };
@@ -524,7 +555,7 @@ fn render_connected_device_row(
         Span::styled(
             marker,
             if selected {
-                theme::accent()
+                theme::accent_for(state)
             } else {
                 theme::dim()
             },
@@ -535,7 +566,9 @@ fn render_connected_device_row(
     ]);
     frame.render_widget(Paragraph::new(line), area);
     if selected {
-        frame.buffer_mut().set_style(area, theme::tab_active());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::tab_active_for(state));
     }
 }
 
@@ -568,8 +601,8 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
     let area = centered(frame.area(), 54, 9);
     let block = Block::bordered()
         .title(" Library filters ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -588,7 +621,7 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
         "[ ]"
     };
     rows.push(Line::from(vec![
-        Span::styled(format!("{checked} "), theme::accent()),
+        Span::styled(format!("{checked} "), theme::accent_for(state)),
         Span::raw("Hide featured only"),
     ]));
     for mode in crate::config::settings::LibrarySourceMode::ALL {
@@ -598,7 +631,7 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
             "( )"
         };
         rows.push(Line::from(vec![
-            Span::styled(format!("{marker} "), theme::accent()),
+            Span::styled(format!("{marker} "), theme::accent_for(state)),
             Span::raw(mode.label()),
             Span::styled(format!("  {}", mode.description()), theme::dim()),
         ]));
@@ -611,7 +644,9 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
         };
         frame.render_widget(Paragraph::new(line), row);
         if cursor == index {
-            frame.buffer_mut().set_style(row, theme::tab_active());
+            frame
+                .buffer_mut()
+                .set_style(row, theme::tab_active_for(state));
         }
     }
     frame.render_widget(
@@ -622,12 +657,18 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
 }
 
 /// One-line text entry on the Federation tab (network id / peer ticket).
-fn draw_fed_input(frame: &mut Frame, title: &str, help: &str, input: &crate::app::input::LineEdit) {
+fn draw_fed_input(
+    frame: &mut Frame,
+    state: &AppState,
+    title: &str,
+    help: &str,
+    input: &crate::app::input::LineEdit,
+) {
     let area = centered(frame.area(), 72, 8);
     let block = Block::bordered()
         .title(format!(" {title} "))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -653,7 +694,7 @@ fn draw_fed_input(frame: &mut Frame, title: &str, help: &str, input: &crate::app
 }
 
 /// Read-only wrapped text (this peer's federation ticket).
-fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
+fn draw_fed_text(frame: &mut Frame, state: &AppState, title: &str, text: &str) {
     let width = frame.area().width.saturating_sub(8).clamp(24, 90);
     let text_width = usize::from(width.saturating_sub(2));
     let lines_needed = (text.chars().count() / text_width.max(1) + 3) as u16;
@@ -664,8 +705,8 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
     );
     let block = Block::bordered()
         .title(format!(" {title} "))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -676,7 +717,7 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
 }
 
 /// Wrapped text with an explicit copy-and-close action.
-fn draw_fed_copy_text(frame: &mut Frame, title: &str, text: &str, help: &str) {
+fn draw_fed_copy_text(frame: &mut Frame, state: &AppState, title: &str, text: &str, help: &str) {
     let width = frame.area().width.saturating_sub(8).clamp(36, 96);
     let text_width = usize::from(width.saturating_sub(2));
     let text_lines = (text.chars().count() / text_width.max(1) + 1) as u16;
@@ -685,8 +726,8 @@ fn draw_fed_copy_text(frame: &mut Frame, title: &str, text: &str, help: &str) {
     let area = centered(frame.area(), width, height);
     let block = Block::bordered()
         .title(format!(" {title} "))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -711,7 +752,7 @@ fn draw_fed_copy_text(frame: &mut Frame, title: &str, text: &str, help: &str) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             " Copy to clipboard and close ",
-            theme::tab_active(),
+            theme::tab_active_for(state),
         ))
         .alignment(Alignment::Center),
         button_area,
@@ -725,6 +766,7 @@ fn draw_fed_copy_text(frame: &mut Frame, title: &str, text: &str, help: &str) {
 
 fn draw_device_pairing(
     frame: &mut Frame,
+    state: &AppState,
     device_id: &str,
     name: &str,
     client_version: &str,
@@ -739,8 +781,8 @@ fn draw_device_pairing(
     );
     let block = Block::bordered()
         .title(" Pair device ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -778,7 +820,7 @@ fn draw_device_pairing(
             ),
             Line::default(),
             Line::from(vec![
-                Span::styled("  Recommended  ", theme::tab_active()),
+                Span::styled("  Recommended  ", theme::tab_active_for(state)),
                 Span::raw("  "),
                 Span::styled("  Cancel  ", theme::danger_button()),
             ])
@@ -795,12 +837,12 @@ fn draw_device_pairing(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
+fn draw_device_revoke(frame: &mut Frame, state: &AppState, device_id: &str, name: &str) {
     let area = centered(frame.area(), 64, 8);
     let block = Block::bordered()
         .title(" Revoke device ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -827,7 +869,7 @@ fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
         Paragraph::new(Line::from(vec![
             Span::styled("  Yes  ", theme::danger_button()),
             Span::raw("  "),
-            Span::styled("  Cancel  ", theme::tab_active()),
+            Span::styled("  Cancel  ", theme::tab_active_for(state)),
         ]))
         .alignment(Alignment::Center),
         buttons,
@@ -839,10 +881,58 @@ fn draw_device_revoke(frame: &mut Frame, device_id: &str, name: &str) {
     );
 }
 
+fn draw_device_leave(frame: &mut Frame, state: &AppState) {
+    let area = centered(frame.area(), 72, 9);
+    let block = Block::bordered()
+        .title(" Leave device group ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body, _, buttons, hint, _] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("This device will revoke itself from the current device group."),
+            Line::raw("After the revoke is synced, it will start a new empty group."),
+            Line::styled(
+                "Local music, likes and playlists stay on this device.",
+                theme::dim(),
+            ),
+        ]),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Yes  ", theme::danger_button()),
+            Span::raw("  "),
+            Span::styled("  Cancel  ", theme::tab_active_for(state)),
+        ]))
+        .alignment(Alignment::Center),
+        buttons,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "y leave group · enter/esc cancel",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        hint,
+    );
+}
+
 /// Metadata edit form: one bordered input per field, the focused field gets
 /// the accent border and a cursor block.
 fn draw_edit(
     frame: &mut Frame,
+    state: &AppState,
     title: &str,
     fields: &[EditField],
     focus: usize,
@@ -852,8 +942,8 @@ fn draw_edit(
     let area = centered(frame.area(), 60, height);
     let block = Block::bordered()
         .title(format!(" {title} "))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -868,7 +958,7 @@ fn draw_edit(
         let field_block = Block::bordered()
             .title(field.label)
             .border_style(if focused {
-                theme::accent()
+                theme::strong_border_for(state)
             } else {
                 theme::dim()
             });
@@ -890,19 +980,19 @@ fn draw_edit(
 
     let footer = areas[areas.len() - 1];
     let hint = match error {
-        Some(error) => Line::styled(error.to_string(), theme::accent()),
+        Some(error) => Line::styled(error.to_string(), theme::accent_for(state)),
         None => Line::styled("tab/↑↓ field · enter save · esc cancel", theme::dim()),
     };
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
 }
 
-fn draw_confirm_delete(frame: &mut Frame, label: &str) {
+fn draw_confirm_delete(frame: &mut Frame, state: &AppState, label: &str) {
     let width = 64.min(frame.area().width.saturating_sub(4)).max(30);
     let area = centered(frame.area(), width, 7);
     let block = Block::bordered()
         .title(" Delete? ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -921,15 +1011,15 @@ fn draw_confirm_delete(frame: &mut Frame, label: &str) {
     );
 }
 
-fn draw_log_detail(frame: &mut Frame, entry: &crate::config::logging::LogEntry) {
+fn draw_log_detail(frame: &mut Frame, state: &AppState, entry: &crate::config::logging::LogEntry) {
     let width = 90.min(frame.area().width.saturating_sub(4)).max(40);
     let height = 18.min(frame.area().height.saturating_sub(2)).max(7);
     let area = centered(frame.area(), width, height);
 
     let block = Block::bordered()
         .title(format!(" Log entry — {} {} ", entry.time, entry.level))
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -955,7 +1045,13 @@ fn draw_log_detail(frame: &mut Frame, entry: &crate::config::logging::LogEntry) 
     );
 }
 
-fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scroll: usize) {
+fn draw_track_info(
+    frame: &mut Frame,
+    state: &AppState,
+    tracks: &[TrackItem],
+    cursor: usize,
+    scroll: usize,
+) {
     let Some(track) = tracks.get(cursor.min(tracks.len().saturating_sub(1))) else {
         return;
     };
@@ -970,8 +1066,8 @@ fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scrol
 
     let block = Block::bordered()
         .title(title)
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -1002,7 +1098,13 @@ fn draw_track_info(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, scrol
     );
 }
 
-fn draw_track_artists(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, selected: usize) {
+fn draw_track_artists(
+    frame: &mut Frame,
+    state: &AppState,
+    tracks: &[TrackItem],
+    cursor: usize,
+    selected: usize,
+) {
     let Some(track) = tracks.get(cursor.min(tracks.len().saturating_sub(1))) else {
         return;
     };
@@ -1025,8 +1127,8 @@ fn draw_track_artists(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, se
 
     let block = Block::bordered()
         .title(" Open artist ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -1059,7 +1161,9 @@ fn draw_track_artists(frame: &mut Frame, tracks: &[TrackItem], cursor: usize, se
         };
         frame.render_widget(Paragraph::new(line), row);
         if index == selected {
-            frame.buffer_mut().set_style(row, theme::tab_active());
+            frame
+                .buffer_mut()
+                .set_style(row, theme::tab_active_for(state));
         }
     }
 
@@ -1212,8 +1316,8 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
 
     let block = Block::bordered()
         .title(" Add to playlist ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -1230,15 +1334,15 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
         lines.push(Line::styled("loading playlists…", theme::dim()));
     } else if matches!(&state.playlists.list, Some(Loadable::Failed(_))) {
         lines.push(Line::styled("playlist list unavailable", theme::dim()));
-        lines.push(Line::styled("+ New playlist…", theme::accent()));
+        lines.push(Line::styled("+ New playlist…", theme::accent_for(state)));
     } else if options.is_empty() {
         lines.push(Line::styled("no playlists yet", theme::dim()));
-        lines.push(Line::styled("+ New playlist…", theme::accent()));
+        lines.push(Line::styled("+ New playlist…", theme::accent_for(state)));
     } else {
         for (_, title) in &options {
             lines.push(Line::raw(title.clone()));
         }
-        lines.push(Line::styled("+ New playlist…", theme::accent()));
+        lines.push(Line::styled("+ New playlist…", theme::accent_for(state)));
     }
     let selected_line = if loading {
         0
@@ -1260,7 +1364,9 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
         };
         frame.render_widget(Paragraph::new(line), row);
         if index == selected_line {
-            frame.buffer_mut().set_style(row, theme::tab_active());
+            frame
+                .buffer_mut()
+                .set_style(row, theme::tab_active_for(state));
         }
     }
 
@@ -1275,12 +1381,17 @@ fn draw_picker(frame: &mut Frame, state: &AppState, track_title: &str, cursor: u
     );
 }
 
-fn draw_name_entry(frame: &mut Frame, input: &crate::app::input::LineEdit, busy: bool) {
+fn draw_name_entry(
+    frame: &mut Frame,
+    state: &AppState,
+    input: &crate::app::input::LineEdit,
+    busy: bool,
+) {
     let area = centered(frame.area(), 44, 7);
     let block = Block::bordered()
         .title(" New playlist ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -1294,14 +1405,14 @@ fn draw_name_entry(frame: &mut Frame, input: &crate::app::input::LineEdit, busy:
 
     let name_block = Block::bordered()
         .title("Name")
-        .border_style(theme::accent());
+        .border_style(theme::strong_border_for(state));
     let name_inner = name_block.inner(field);
     frame.render_widget(name_block, field);
     let spans = super::line_edit_spans(input, usize::from(name_inner.width));
     frame.render_widget(Paragraph::new(Line::from(spans)), name_inner);
 
     let hint = if busy {
-        Line::styled("creating…", theme::accent())
+        Line::styled("creating…", theme::accent_for(state))
     } else {
         Line::styled("enter create · esc back", theme::dim())
     };

@@ -192,6 +192,7 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConfirmDeviceRevoke { device_id, name } => {
             handle_device_revoke(state, runtime, device_id, name, key);
         }
+        Popup::ConfirmDeviceLeave => handle_device_leave(state, runtime, key),
         Popup::ConnectedDevices { cursor } => {
             handle_connected_devices(state, runtime, cursor, key);
         }
@@ -582,6 +583,16 @@ fn handle_device_revoke(
             );
         }
         _ => state.popup = Some(Popup::ConfirmDeviceRevoke { device_id, name }),
+    }
+}
+
+fn handle_device_leave(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('q') => {}
+        KeyCode::Char('y') => {
+            super::perform_effect(state, runtime, crate::app::update::Effect::DeviceLeaveGroup);
+        }
+        _ => state.popup = Some(Popup::ConfirmDeviceLeave),
     }
 }
 

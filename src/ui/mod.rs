@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     if state.visualizer.active {
         crate::visualizer::draw(frame, state);
         if state.shutting_down {
-            draw_shutdown(frame);
+            draw_shutdown(frame, state);
         }
         return;
     }
@@ -65,22 +65,22 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     draw_status(frame, status_area, state);
 
     if state.help_visible {
-        draw_help(frame, keymap);
+        draw_help(frame, keymap, state);
     }
     popup::draw(frame, state);
     if state.shutting_down {
-        draw_shutdown(frame);
+        draw_shutdown(frame, state);
     }
 }
 
-fn draw_shutdown(frame: &mut Frame) {
+fn draw_shutdown(frame: &mut Frame, state: &AppState) {
     let area = centered(frame.area(), 28, 5);
     frame.render_widget(Clear, area);
-    let block = Block::bordered().border_style(theme::accent());
+    let block = Block::bordered().border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(Line::styled("Shutting down...", theme::header()))
+        Paragraph::new(Line::styled("Shutting down...", theme::header_for(state)))
             .alignment(Alignment::Center),
         Rect {
             y: inner.y + inner.height / 2,
@@ -103,7 +103,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 pub(crate) fn loading_line(state: &AppState, text: impl Into<String>) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{} ", state.spinner()), theme::accent()),
+        Span::styled(format!("{} ", state.spinner()), theme::accent_for(state)),
         Span::styled(text.into(), theme::dim()),
     ])
 }
@@ -128,7 +128,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
     let tabs = Tabs::new(titles)
         .select(state.active_tab.index())
         .style(theme::dim())
-        .highlight_style(theme::tab_active())
+        .highlight_style(theme::tab_active_for(state))
         .divider("");
     frame.render_widget(tabs, area);
 }
@@ -169,7 +169,7 @@ pub(crate) fn track_row_with_like_marker(
     let heart = if !show_like_marker {
         Span::raw("")
     } else if state.track_liked(track) {
-        Span::styled("♥ ", theme::accent())
+        Span::styled("♥ ", theme::accent_for(state))
     } else {
         Span::raw("  ")
     };
@@ -198,10 +198,14 @@ pub(crate) fn track_row_with_like_marker(
         area,
     );
     if visual_selected {
-        frame.buffer_mut().set_style(area, theme::selection());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::selection_for(state));
     }
     if selected {
-        frame.buffer_mut().set_style(area, theme::tab_active());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::tab_active_for(state));
     }
 }
 
@@ -246,8 +250,8 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
             " Queue — {} tracks · enter: play · d: remove · shift-v: select · :clear ",
             player.queue.len()
         ))
-        .title_style(theme::header())
-        .border_style(theme::dim());
+        .title_style(theme::header_for(state))
+        .border_style(theme::border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -329,7 +333,7 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
         if bar_width > 0 && track.duration_seconds > 0.0 {
             let ratio = (player.position_secs / track.duration_seconds).clamp(0.0, 1.0);
             let filled = (ratio * bar_width as f64).round() as usize;
-            spans.push(Span::styled("━".repeat(filled), theme::accent()));
+            spans.push(Span::styled("━".repeat(filled), theme::accent_for(state)));
             spans.push(Span::styled("─".repeat(bar_width - filled), theme::dim()));
             spans.push(Span::raw(" "));
         } else {
@@ -347,14 +351,14 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
         let volume_cells = usize::from(player.volume / 10);
         spans.extend([
             Span::styled("  vol ", theme::dim()),
-            Span::styled("█".repeat(volume_cells), theme::accent()),
+            Span::styled("█".repeat(volume_cells), theme::accent_for(state)),
             Span::styled("░".repeat(10 - volume_cells), theme::dim()),
             Span::raw(format!(" {:3}%", player.volume)),
             Span::raw("  "),
         ]);
         // Enabled modes light up as filled chips; disabled stay dim text.
         if player.shuffle {
-            spans.push(Span::styled(" shuffle ", theme::tab_active()));
+            spans.push(Span::styled(" shuffle ", theme::tab_active_for(state)));
         } else {
             spans.push(Span::styled("shuffle off", theme::dim()));
         }
@@ -364,21 +368,17 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
         } else {
             spans.push(Span::styled(
                 format!(" repeat {} ", player.repeat.label()),
-                theme::tab_active(),
+                theme::tab_active_for(state),
             ));
         }
     } else {
         spans.push(Span::styled(format!("  {}%", player.volume), theme::dim()));
     }
     if width >= 70 {
-        let role_style = match state.device_playback.role {
-            crate::app::state::DevicePlaybackRole::Active => Style::new().fg(Color::Green),
-            crate::app::state::DevicePlaybackRole::Control => Style::new().fg(Color::Yellow),
-        };
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            state.device_playback.role.label().to_string(),
-            role_style,
+            format!(" {} ", state.device_playback.role.label()),
+            theme::role_pill(state.device_playback.role),
         ));
         spans.push(Span::styled(
             format!(" · online {}", state.device_playback.online_devices.max(1)),
@@ -410,10 +410,10 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             if player.paused {
                 spans.push(Span::styled("⏸ ", theme::dim()));
             } else {
-                spans.push(Span::styled("▶ ", theme::accent()));
+                spans.push(Span::styled("▶ ", theme::accent_for(state)));
             }
             if state.track_liked(track) {
-                spans.push(Span::styled("♥ ", theme::accent()));
+                spans.push(Span::styled("♥ ", theme::accent_for(state)));
             }
             spans.push(Span::raw(track.title.clone()));
             spans.push(Span::styled(
@@ -430,7 +430,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if state.cmdline.active {
         // Vim-style command line takes over the message row.
-        let mut spans = vec![Span::styled(":", theme::header())];
+        let mut spans = vec![Span::styled(":", theme::header_for(state))];
         spans.extend(line_edit_spans(
             &state.cmdline.input,
             usize::from(message_row.width.saturating_sub(2)),
@@ -442,10 +442,10 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let message = match &state.status_message {
         Some(message) if is_waiting_message(message) => Line::from(vec![
-            Span::styled(format!("{} ", state.spinner()), theme::accent()),
-            Span::styled(message.clone(), theme::accent()),
+            Span::styled(format!("{} ", state.spinner()), theme::accent_for(state)),
+            Span::styled(message.clone(), theme::accent_for(state)),
         ]),
-        Some(message) => Line::styled(message.clone(), theme::accent()),
+        Some(message) => Line::styled(message.clone(), theme::accent_for(state)),
         None => match active_artist_peer_search(state) {
             Some(message) => loading_line(state, message),
             None => match &state.player.current {
@@ -461,8 +461,11 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     draw_version(frame, message_row);
 
     if let Some(pending) = &state.pending_keys {
-        let pending = Paragraph::new(Line::styled(format!("{pending} …"), theme::header()))
-            .alignment(Alignment::Right);
+        let pending = Paragraph::new(Line::styled(
+            format!("{pending} …"),
+            theme::header_for(state),
+        ))
+        .alignment(Alignment::Right);
         frame.render_widget(pending, message_row);
     }
 }
@@ -494,7 +497,7 @@ fn draw_version(frame: &mut Frame, area: Rect) {
 
 /// Help window: bindings merged per action (j / down on one row), grouped
 /// into titled sections and laid out in two balanced columns.
-fn draw_help(frame: &mut Frame, keymap: &Keymap) {
+fn draw_help(frame: &mut Frame, keymap: &Keymap, state: &AppState) {
     use crate::app::action::{Action, Category};
     use crate::config::keymap::KeyContext;
 
@@ -528,7 +531,7 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap) {
         if rows.is_empty() {
             continue;
         }
-        let mut lines = vec![Line::styled(category.title(), theme::header())];
+        let mut lines = vec![Line::styled(category.title(), theme::header_for(state))];
         for row in rows {
             let keys = row.keys.join(" / ");
             let context = if row.context == KeyContext::Global {
@@ -538,19 +541,19 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap) {
             };
             let command = row.action.command_hint().unwrap_or("");
             lines.push(Line::from(vec![
-                Span::styled(format!("{keys:<13}"), theme::accent()),
+                Span::styled(format!("{keys:<13}"), theme::accent_for(state)),
                 Span::raw(format!(
                     "{:<24}",
                     format!("{}{context}", row.action.describe())
                 )),
-                Span::styled(command.to_string(), theme::accent()),
+                Span::styled(command.to_string(), theme::accent_for(state)),
             ]));
         }
         lines.push(Line::default());
         blocks.push(lines);
     }
     blocks.push(vec![
-        Line::styled("Status icons", theme::header()),
+        Line::styled("Status icons", theme::header_for(state)),
         Line::from(vec![
             Span::styled("●", Style::new().fg(Color::Green)),
             Span::raw("  Local on this device"),
@@ -560,7 +563,7 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap) {
             Span::raw("  Local + peer sources"),
         ]),
         Line::from(vec![
-            Span::styled("⇅", theme::accent()),
+            Span::styled("⇅", theme::accent_for(state)),
             Span::raw("  Network only"),
         ]),
         Line::default(),
@@ -585,8 +588,8 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap) {
 
     let block = Block::bordered()
         .title(" Keybindings & commands ")
-        .title_style(theme::header())
-        .border_style(theme::accent());
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);

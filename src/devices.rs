@@ -957,6 +957,94 @@ impl DeviceSync {
         Ok(())
     }
 
+    pub fn record_leave_group_revoke(&self) -> Result<String> {
+        let op = self.record_local_op_generated(
+            |identity, seq| {
+                Ok(SyncOpPayload::DeviceRevoked {
+                    target_device_id: identity.device_id.clone(),
+                    target_max_seq_seen: seq,
+                })
+            },
+            false,
+        )?;
+        Ok(op.op_id)
+    }
+
+    pub fn cancel_leave_group_revoke(&self, op_id: &str) -> Result<()> {
+        let identity = self.ensure_identity()?;
+        let conn = lock(&self.conn);
+        conn.execute("DELETE FROM sync_ops WHERE op_id = ?1", [op_id])?;
+        conn.execute(
+            "UPDATE sync_devices
+             SET revoked_at_ms = NULL,
+                 revoked_by = NULL,
+                 revoke_cutoff_seq = NULL
+             WHERE device_id = ?1",
+            [&identity.device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_leave_group_reset(&self) -> Result<String> {
+        let identity = self.ensure_identity()?;
+        let new_group_id = format!(
+            "grp_{}",
+            &blake3::hash(random_hex(32).as_bytes()).to_hex()[..24]
+        );
+        let now = now_ms();
+        {
+            let conn = lock(&self.conn);
+            set_meta(&conn, "group_id", &new_group_id)?;
+            set_meta(&conn, "last_sync", "left previous device group")?;
+            delete_meta(&conn, "last_error")?;
+            conn.execute("DELETE FROM sync_invites", [])?;
+            conn.execute("DELETE FROM sync_pending_pairing", [])?;
+            conn.execute("DELETE FROM sync_ops", [])?;
+            conn.execute("DELETE FROM sync_vectors", [])?;
+            conn.execute("DELETE FROM sync_peer_acks", [])?;
+            conn.execute("DELETE FROM sync_compacted", [])?;
+            conn.execute("DELETE FROM sync_playback_applied", [])?;
+            conn.execute(
+                "DELETE FROM sync_devices WHERE device_id != ?1",
+                [&identity.device_id],
+            )?;
+            conn.execute(
+                "INSERT INTO sync_devices
+                    (device_id, name, client_version, protocol_version, endpoint_id,
+                     endpoint_ticket, trusted_at_ms, last_seen_ms, revoked_at_ms,
+                     revoked_by, revoke_cutoff_seq)
+                 VALUES (?1, ?2, ?3, ?4, '', '', ?5, ?5, NULL, NULL, NULL)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    name = excluded.name,
+                    client_version = excluded.client_version,
+                    protocol_version = excluded.protocol_version,
+                    trusted_at_ms = excluded.trusted_at_ms,
+                    last_seen_ms = excluded.last_seen_ms,
+                    revoked_at_ms = NULL,
+                    revoked_by = NULL,
+                    revoke_cutoff_seq = NULL",
+                params![
+                    identity.device_id,
+                    identity.name,
+                    CLIENT_VERSION,
+                    PROTOCOL_VERSION,
+                    now,
+                ],
+            )?;
+            let local_seq = get_meta(&conn, "local_seq")?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO sync_vectors (device_id, max_seq)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(device_id) DO UPDATE SET max_seq = excluded.max_seq",
+                params![identity.device_id, local_seq],
+            )?;
+        }
+        lock(&self.playback).remote.clear();
+        Ok(new_group_id)
+    }
+
     pub fn record_content_like(&self, content_id: &str, liked: bool) -> Result<()> {
         let Some(content_id) = music_dht::normalize_content_id(content_id) else {
             return Ok(());
@@ -1269,6 +1357,15 @@ impl DeviceSync {
     }
 
     fn record_local_op(&self, payload: SyncOpPayload) -> Result<()> {
+        self.record_local_op_generated(|_, _| Ok(payload), true)
+            .map(|_| ())
+    }
+
+    fn record_local_op_generated(
+        &self,
+        make_payload: impl FnOnce(&LocalIdentity, i64) -> Result<SyncOpPayload>,
+        gc_after_record: bool,
+    ) -> Result<SyncOpWire> {
         let identity = self.ensure_identity()?;
         let (op, payload_json, tombstone) = {
             let conn = lock(&self.conn);
@@ -1281,6 +1378,7 @@ impl DeviceSync {
                 .unwrap_or(0);
             let hlc_ms = now_ms().max(last_hlc + 1);
             let op_id = format!("{}:{seq}", identity.device_id);
+            let payload = make_payload(&identity, seq)?;
             let payload_json = serde_json::to_string(&payload)?;
             let tombstone = payload.is_tombstone();
             conn.execute(
@@ -1327,8 +1425,10 @@ impl DeviceSync {
             payload = %payload_json,
             "recorded personal-sync op"
         );
-        let _ = self.gc_tombstones();
-        Ok(())
+        if gc_after_record {
+            let _ = self.gc_tombstones();
+        }
+        Ok(op)
     }
 
     fn apply_ops(&self, ops: Vec<SyncOpWire>) -> Result<()> {
@@ -3586,6 +3686,50 @@ mod tests {
 
         sync.revoke_device(device_id).unwrap();
         assert!(!device_known(&sync, device_id));
+    }
+
+    #[test]
+    fn leave_group_self_revokes_then_resets_to_new_group() {
+        let sync = test_sync();
+        let identity = sync.ensure_identity().unwrap();
+        let old_group = identity.group_id.clone();
+        sync.apply_device_trusted("dev_peer", 10).unwrap();
+
+        let op_id = sync.record_leave_group_revoke().unwrap();
+        assert!(device_revoked(&sync, &identity.device_id));
+        {
+            let conn = lock(&sync.conn);
+            let payload_json: String = conn
+                .query_row(
+                    "SELECT payload_json FROM sync_ops WHERE op_id = ?1",
+                    [&op_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let payload: SyncOpPayload = serde_json::from_str(&payload_json).unwrap();
+            match payload {
+                SyncOpPayload::DeviceRevoked {
+                    target_device_id,
+                    target_max_seq_seen,
+                } => {
+                    assert_eq!(target_device_id, identity.device_id);
+                    assert_eq!(target_max_seq_seen, 1);
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            }
+        }
+
+        let new_group = sync.finish_leave_group_reset().unwrap();
+        assert_ne!(old_group, new_group);
+        let status = sync.status();
+        assert_eq!(status.group_id, new_group);
+        assert_eq!(status.active_devices, 1);
+        assert_eq!(status.devices.len(), 1);
+        assert!(status.devices[0].is_self);
+        assert!(!status.devices[0].revoked);
+        assert_eq!(status.ops_total, 0);
+        assert_eq!(status.outbox_ops, 0);
+        assert!(!device_known(&sync, "dev_peer"));
     }
 
     #[test]

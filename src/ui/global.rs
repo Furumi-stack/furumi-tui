@@ -37,12 +37,19 @@ fn error_style() -> Style {
     Style::new().fg(Color::Red)
 }
 
-fn bordered(frame: &mut Frame, area: Rect, title: String) -> Rect {
-    bordered_line(frame, area, Line::styled(title, theme::header()))
+fn bordered(frame: &mut Frame, area: Rect, state: &AppState, title: String) -> Rect {
+    bordered_line(
+        frame,
+        area,
+        state,
+        Line::styled(title, theme::header_for(state)),
+    )
 }
 
-fn bordered_line(frame: &mut Frame, area: Rect, title: Line<'static>) -> Rect {
-    let block = Block::bordered().title(title).border_style(theme::dim());
+fn bordered_line(frame: &mut Frame, area: Rect, state: &AppState, title: Line<'static>) -> Rect {
+    let block = Block::bordered()
+        .title(title)
+        .border_style(theme::border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
@@ -88,6 +95,7 @@ fn draw_art(frame: &mut Frame, area: Rect, art_state: Option<&ArtState>) {
 fn draw_tile_with_availability(
     frame: &mut Frame,
     tile: Rect,
+    state: &AppState,
     art_state: Option<&ArtState>,
     title: &str,
     meta: &str,
@@ -97,9 +105,9 @@ fn draw_tile_with_availability(
     let block = if selected {
         Block::bordered()
             .border_type(ratatui::widgets::BorderType::Thick)
-            .border_style(theme::accent())
+            .border_style(theme::strong_border_for(state))
     } else {
-        Block::bordered().border_style(theme::dim())
+        Block::bordered().border_style(theme::border_for(state))
     };
     let inner = block.inner(tile);
     frame.render_widget(block, tile);
@@ -121,7 +129,9 @@ fn draw_tile_with_availability(
             name_area,
         );
         if selected {
-            frame.buffer_mut().set_style(name_area, theme::tab_active());
+            frame
+                .buffer_mut()
+                .set_style(name_area, theme::tab_active_for(state));
         }
     }
     if inner.height > ART_CELL_HEIGHT + 1 {
@@ -130,13 +140,14 @@ fn draw_tile_with_availability(
             height: 1,
             ..inner
         };
-        draw_tile_meta(frame, meta_area, meta, availability, selected);
+        draw_tile_meta(frame, meta_area, state, meta, availability, selected);
     }
 }
 
 fn draw_tile_meta(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     meta: &str,
     availability: Option<Availability>,
     selected: bool,
@@ -162,7 +173,9 @@ fn draw_tile_meta(
         text_area,
     );
     if selected {
-        frame.buffer_mut().set_style(area, theme::tab_active());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::tab_active_for(state));
     }
     if let Some((label, style)) = marker
         && marker_width > 0
@@ -294,7 +307,14 @@ fn marquee_phase(total_width: usize) -> usize {
 
 /// One selectable row: left content, optional right-aligned suffix, full-row
 /// highlight when selected.
-fn draw_row(frame: &mut Frame, area: Rect, line: Line, right: Option<String>, selected: bool) {
+fn draw_row(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    line: Line,
+    right: Option<String>,
+    selected: bool,
+) {
     frame.render_widget(Paragraph::new(line), area);
     if let Some(right) = right {
         frame.render_widget(
@@ -303,7 +323,9 @@ fn draw_row(frame: &mut Frame, area: Rect, line: Line, right: Option<String>, se
         );
     }
     if selected {
-        frame.buffer_mut().set_style(area, theme::tab_active());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::tab_active_for(state));
     }
 }
 
@@ -368,12 +390,12 @@ fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!(" Library · {} ", global.filters.source_mode.label())
     };
-    let mut title_spans = vec![Span::styled(title, theme::tab_active())];
+    let mut title_spans = vec![Span::styled(title, theme::tab_active_for(state))];
     if global.filters.is_active() {
         title_spans.push(Span::raw(" "));
-        title_spans.push(Span::styled(" FILTERED ", theme::tab_active()));
+        title_spans.push(Span::styled(" FILTERED ", theme::tab_active_for(state)));
     }
-    let inner = bordered_line(frame, area, Line::from(title_spans));
+    let inner = bordered_line(frame, area, state, Line::from(title_spans));
 
     if global.artists.is_empty() {
         let message = if let Some(error) = &global.error {
@@ -418,6 +440,7 @@ fn draw_grid_tiles(frame: &mut Frame, inner: Rect, state: &AppState) {
         draw_tile_with_availability(
             frame,
             tile,
+            state,
             tile_art(state, artist.image_path.as_ref()),
             &artist.name,
             &artist_tile_meta(artist),
@@ -439,7 +462,7 @@ fn draw_grid_table(frame: &mut Frame, inner: Rect, state: &AppState) {
         .map(|(offset, artist)| {
             let index = first + offset;
             let style = if index == global.selected {
-                theme::tab_active()
+                theme::tab_active_for(state)
             } else {
                 Style::new()
             };
@@ -458,7 +481,7 @@ fn draw_grid_table(frame: &mut Frame, inner: Rect, state: &AppState) {
             Constraint::Length(7),
         ],
     )
-    .header(Row::new(vec!["Artist", "Releases", "Tracks"]).style(theme::header()));
+    .header(Row::new(vec!["Artist", "Releases", "Tracks"]).style(theme::header_for(state)));
     frame.render_widget(table, inner);
 }
 
@@ -472,7 +495,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         Some(Loadable::Ready(detail)) => detail.name.clone(),
         _ => "Artist".to_string(),
     };
-    let inner = bordered(frame, area, format!(" Library ▸ {name} "));
+    let inner = bordered(frame, area, state, format!(" Library ▸ {name} "));
 
     let detail = match loadable {
         Some(Loadable::Ready(detail)) => detail,
@@ -538,7 +561,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
     };
     let mut info = vec![
         Line::default(),
-        Line::styled(detail.name.clone(), theme::header()),
+        Line::styled(detail.name.clone(), theme::header_for(state)),
         Line::default(),
         Line::styled(
             format!(
@@ -569,7 +592,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         );
     }
     if tracks > 0 {
-        items.push(PlanItem::Header("Top tracks".to_string()));
+        items.push(PlanItem::Header("Liked tracks".to_string()));
         for index in 0..tracks {
             if cursor == index {
                 cursor_item = Some(items.len());
@@ -674,6 +697,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                     draw_tile_with_availability(
                         frame,
                         tile,
+                        state,
                         tile_art(state, release.cover_path.as_ref()),
                         &release.title,
                         &artist_release_tile_meta(release),
@@ -688,6 +712,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                 draw_row(
                     frame,
                     rect,
+                    state,
                     Line::from(vec![
                         Span::raw(release.title.clone()),
                         Span::styled(format!("  {year}"), theme::dim()),
@@ -732,7 +757,7 @@ fn release_tile_meta(release: &ReleaseCard) -> String {
 fn render_plan(
     frame: &mut Frame,
     area: Rect,
-    _state: &AppState,
+    state: &AppState,
     items: &[PlanItem],
     cursor_item: Option<usize>,
     draw_item: &mut dyn FnMut(&mut Frame, Rect, &PlanItem),
@@ -761,7 +786,7 @@ fn render_plan(
         };
         match item {
             PlanItem::Header(label) => frame.render_widget(
-                Paragraph::new(Line::styled(label.clone(), theme::header())),
+                Paragraph::new(Line::styled(label.clone(), theme::header_for(state))),
                 rect,
             ),
             PlanItem::Gap => {}
@@ -780,7 +805,7 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
         Some(Loadable::Ready(detail)) => detail.title.clone(),
         _ => "Release".to_string(),
     };
-    let inner = bordered(frame, area, format!(" Library ▸ {title} "));
+    let inner = bordered(frame, area, state, format!(" Library ▸ {title} "));
 
     let detail = match loadable {
         Some(Loadable::Ready(detail)) => detail,
@@ -813,7 +838,7 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
     let year = detail.year.map(|y| format!(" · {y}")).unwrap_or_default();
     let info = vec![
         Line::default(),
-        Line::styled(detail.title.clone(), theme::header()),
+        Line::styled(detail.title.clone(), theme::header_for(state)),
         Line::raw(artists.join(", ")),
         Line::default(),
         Line::styled(
@@ -868,7 +893,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     if search.loading {
         title.push_str("· searching… ");
     }
-    let inner = bordered(frame, area, title);
+    let inner = bordered(frame, area, state, title);
 
     let empty_results = SearchResults::default();
     let results = match &search.results {
@@ -905,7 +930,11 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     let mut rows: Vec<(Line, Option<String>, Option<usize>)> = Vec::new();
     let mut index = 0;
     if !results.artists.is_empty() {
-        rows.push((Line::styled("Artists", theme::header()), None, None));
+        rows.push((
+            Line::styled("Artists", theme::header_for(state)),
+            None,
+            None,
+        ));
         for artist in &results.artists {
             rows.push((
                 Line::raw(artist.name.clone()),
@@ -917,7 +946,11 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         rows.push((Line::default(), None, None));
     }
     if !results.releases.is_empty() {
-        rows.push((Line::styled("Releases", theme::header()), None, None));
+        rows.push((
+            Line::styled("Releases", theme::header_for(state)),
+            None,
+            None,
+        ));
         for release in &results.releases {
             rows.push((
                 Line::from(vec![
@@ -932,10 +965,10 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         rows.push((Line::default(), None, None));
     }
     if !results.tracks.is_empty() {
-        rows.push((Line::styled("Tracks", theme::header()), None, None));
+        rows.push((Line::styled("Tracks", theme::header_for(state)), None, None));
         for track in &results.tracks {
             let heart = if state.track_liked(track) {
-                Span::styled("♥ ", theme::accent())
+                Span::styled("♥ ", theme::accent_for(state))
             } else {
                 Span::raw("  ")
             };
@@ -968,7 +1001,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         } else {
             "Federation"
         };
-        rows.push((Line::styled(header, theme::header()), None, None));
+        rows.push((Line::styled(header, theme::header_for(state)), None, None));
         for hit in &state.search.fed_artists {
             rows.push((
                 Line::from(vec![
@@ -987,7 +1020,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         }
         for fed in &state.search.fed_tracks {
             let heart = if state.fed_track_liked(fed) {
-                Span::styled("♥ ", theme::accent())
+                Span::styled("♥ ", theme::accent_for(state))
             } else {
                 Span::raw("  ")
             };
@@ -1055,9 +1088,11 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             && fed_selected.contains(&row_index)
             && row_index != cursor
         {
-            frame.buffer_mut().set_style(rect, theme::selection());
+            frame
+                .buffer_mut()
+                .set_style(rect, theme::selection_for(state));
         }
-        draw_row(frame, rect, line, right, row_cursor == Some(cursor));
+        draw_row(frame, rect, state, line, right, row_cursor == Some(cursor));
     }
 }
 
@@ -1069,7 +1104,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
     let Some((name, data)) = &state.fed_artist_view else {
         return centered_line(frame, area, Line::styled("no card is open", theme::dim()));
     };
-    let inner = bordered(frame, area, format!(" Federation ▸ {name} "));
+    let inner = bordered(frame, area, state, format!(" Federation ▸ {name} "));
     let card = match data {
         Loadable::Loading => {
             return centered_line(
@@ -1128,7 +1163,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
     }
     let info = vec![
         Line::default(),
-        Line::styled(name.clone(), theme::header()),
+        Line::styled(name.clone(), theme::header_for(state)),
         Line::default(),
         Line::styled(stats, theme::dim()),
         Line::styled("enter: open release / play track · esc: back", theme::dim()),
@@ -1203,6 +1238,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
                     draw_tile_with_availability(
                         frame,
                         tile,
+                        state,
                         tile_art(state, release.cover_path.as_ref()),
                         &release.title,
                         &meta,
@@ -1246,7 +1282,7 @@ fn draw_fed_appearance_row(
     let track = &appearance.track;
     let liked = state.fed_card_track_liked(track);
     let heart = if liked {
-        Span::styled("♥ ", theme::accent())
+        Span::styled("♥ ", theme::accent_for(state))
     } else {
         Span::raw("  ")
     };
@@ -1284,11 +1320,14 @@ fn draw_fed_appearance_row(
         meta.push_str(&format!("{} peers", track.sources.len()));
     }
     if visual_selected && !selected {
-        frame.buffer_mut().set_style(area, theme::selection());
+        frame
+            .buffer_mut()
+            .set_style(area, theme::selection_for(state));
     }
     draw_row(
         frame,
         area,
+        state,
         line,
         (!meta.is_empty()).then_some(meta),
         selected,
@@ -1338,6 +1377,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
     let inner = bordered(
         frame,
         area,
+        state,
         format!(" Federation ▸ {name} ▸ {} ", release.title),
     );
 
@@ -1375,9 +1415,9 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
         meta.push_str(&format!(" · {track_count} tracks · local only"));
     }
     let button_style = if cursor == 0 {
-        theme::tab_active()
+        theme::tab_active_for(state)
     } else {
-        theme::accent()
+        theme::accent_for(state)
     };
     let action_line = if state.global.filters.source_mode.includes_network() {
         Line::styled(
@@ -1389,7 +1429,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
     };
     let info = vec![
         Line::default(),
-        Line::styled(release.title.clone(), theme::header()),
+        Line::styled(release.title.clone(), theme::header_for(state)),
         Line::styled(meta, theme::dim()),
         Line::default(),
         action_line,
@@ -1454,7 +1494,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
         let in_selection = state.track_selection.contains(&scope, position);
         let liked = state.fed_card_track_liked(track);
         let heart = if liked {
-            Span::styled("♥ ", theme::accent())
+            Span::styled("♥ ", theme::accent_for(state))
         } else {
             Span::raw("  ")
         };
@@ -1464,8 +1504,17 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
             Span::raw(format!("{number}{}", track.title)),
         ]);
         if in_selection && cursor != position + 1 {
-            frame.buffer_mut().set_style(rect, theme::selection());
+            frame
+                .buffer_mut()
+                .set_style(rect, theme::selection_for(state));
         }
-        draw_row(frame, rect, line, Some(right), cursor == position + 1);
+        draw_row(
+            frame,
+            rect,
+            state,
+            line,
+            Some(right),
+            cursor == position + 1,
+        );
     }
 }

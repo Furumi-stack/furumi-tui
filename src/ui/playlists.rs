@@ -15,11 +15,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-fn bordered(frame: &mut Frame, area: Rect, title: String) -> Rect {
+fn bordered(frame: &mut Frame, area: Rect, state: &AppState, title: String) -> Rect {
     let block = Block::bordered()
         .title(title)
-        .title_style(theme::header())
-        .border_style(theme::dim());
+        .title_style(theme::header_for(state))
+        .border_style(theme::border_for(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
@@ -38,7 +38,7 @@ fn centered_line(frame: &mut Frame, area: Rect, line: Line) {
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
-    let inner = bordered(frame, area, " Playlists ".to_string());
+    let inner = bordered(frame, area, state, " Playlists ".to_string());
     let selected = state.playlists.selected;
 
     let list = match &state.playlists.list {
@@ -70,7 +70,7 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
             height: 1,
         };
         let marker = if playlist.kind == "likes" {
-            Span::styled("♥ ", theme::accent())
+            Span::styled("♥ ", theme::accent_for(state))
         } else {
             Span::raw("  ")
         };
@@ -87,7 +87,9 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
             row,
         );
         if index == selected {
-            frame.buffer_mut().set_style(row, theme::tab_active());
+            frame
+                .buffer_mut()
+                .set_style(row, theme::tab_active_for(state));
         }
     }
 }
@@ -98,7 +100,7 @@ fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         Some(Loadable::Ready(detail)) => format!(" Playlists ▸ {} ", detail.title),
         _ => " Playlists ▸ … ".to_string(),
     };
-    let inner = bordered(frame, area, title);
+    let inner = bordered(frame, area, state, title);
 
     if let Some(Loadable::Failed(error)) = loadable {
         return centered_line(

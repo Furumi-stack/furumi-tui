@@ -54,6 +54,8 @@ pub enum AppEvent {
     LikesLoaded(Result<Vec<String>, String>),
     /// Local-library content ids for availability markers.
     LocalContentIdsLoaded(Result<Vec<String>, String>),
+    /// Counts and storage footprint of the local library/database.
+    LocalLibraryStatsLoaded(Result<crate::library::LocalLibraryStats, String>),
     /// One content id became available locally while the UI is open.
     LocalContentAvailable {
         content_id: String,
