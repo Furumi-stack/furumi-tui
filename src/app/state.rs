@@ -5,7 +5,7 @@ use crate::app::input::LineEdit;
 use crate::art::ArtImage;
 use crate::config::keymap::KeyContext;
 use crate::library::models::{
-    ArtistCard, ArtistDetail, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
+    ArtistCard, ArtistDetail, Availability, PlaylistCard, PlaylistDetail, ReleaseDetail,
     SearchResults, TrackItem,
 };
 
@@ -122,19 +122,6 @@ impl Default for GlobalTab {
     }
 }
 
-/// Releases of an artist in display order: grouped by type (albums, singles,
-/// EPs, compilations, then anything else), newest first within each group.
-/// Returns (group label, indices into the original slice). Cursor positions
-/// use this flattened order, so update() and ui must both go through here.
-pub fn release_groups(releases: &[ReleaseCard]) -> Vec<(&'static str, Vec<usize>)> {
-    release_type_groups(
-        releases,
-        |release| &release.release_type,
-        |release| release.year,
-        |release| &release.title,
-    )
-}
-
 fn release_type_groups<T>(
     items: &[T],
     release_type: impl Fn(&T) -> &str,
@@ -183,21 +170,6 @@ fn sort_release_indices<T>(
     });
 }
 
-/// Flattened display order of releases (concatenated groups).
-pub fn release_display_order(releases: &[ReleaseCard]) -> Vec<usize> {
-    release_groups(releases)
-        .into_iter()
-        .flat_map(|(_, indices)| indices)
-        .collect()
-}
-
-/// Visual tile-grid rows of the releases section: each group starts its own
-/// rows, chunked by the column count. Values are display-order positions.
-/// Vertical cursor movement must follow these rows to match the rendering.
-pub fn release_rows(releases: &[ReleaseCard], columns: usize) -> Vec<Vec<usize>> {
-    grouped_release_rows(release_groups(releases), columns)
-}
-
 pub fn fed_release_groups(
     releases: &[crate::federation::FedRelease],
 ) -> Vec<(&'static str, Vec<usize>)> {
@@ -225,6 +197,39 @@ pub fn fed_release_rows(
     grouped_release_rows(fed_release_groups(releases), columns)
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtistReleaseSlot {
+    pub title: String,
+    pub release_type: String,
+    pub year: Option<i32>,
+    pub cover_path: Option<String>,
+    pub local_index: Option<usize>,
+    pub fed_index: Option<usize>,
+    pub local_track_count: usize,
+    pub total_track_count: usize,
+    pub availability: Availability,
+}
+
+pub fn artist_release_groups(releases: &[ArtistReleaseSlot]) -> Vec<(&'static str, Vec<usize>)> {
+    release_type_groups(
+        releases,
+        |release| &release.release_type,
+        |release| release.year,
+        |release| &release.title,
+    )
+}
+
+pub fn artist_release_display_order(releases: &[ArtistReleaseSlot]) -> Vec<usize> {
+    artist_release_groups(releases)
+        .into_iter()
+        .flat_map(|(_, indices)| indices)
+        .collect()
+}
+
+pub fn artist_release_rows(releases: &[ArtistReleaseSlot], columns: usize) -> Vec<Vec<usize>> {
+    grouped_release_rows(artist_release_groups(releases), columns)
+}
+
 fn grouped_release_rows(
     groups: Vec<(&'static str, Vec<usize>)>,
     columns: usize,
@@ -245,14 +250,16 @@ fn grouped_release_rows(
 mod tests {
     use super::*;
 
-    fn release(id: i64, title: &str, release_type: &str, year: Option<i32>) -> ReleaseCard {
-        ReleaseCard {
-            id,
+    fn release(title: &str, release_type: &str, year: Option<i32>) -> ArtistReleaseSlot {
+        ArtistReleaseSlot {
             title: title.to_string(),
             release_type: release_type.to_string(),
             year,
             cover_path: None,
-            track_count: 1,
+            local_index: None,
+            fed_index: None,
+            local_track_count: 1,
+            total_track_count: 1,
             availability: crate::library::models::Availability::Local,
         }
     }
@@ -273,14 +280,14 @@ mod tests {
     #[test]
     fn release_display_order_is_newest_first_within_each_type() {
         let releases = vec![
-            release(1, "Old Album", "album", Some(1991)),
-            release(2, "New Single", "single", Some(2024)),
-            release(3, "New Album", "album", Some(2020)),
-            release(4, "Undated Album", "album", None),
-            release(5, "Old Single", "single", Some(1999)),
+            release("Old Album", "album", Some(1991)),
+            release("New Single", "single", Some(2024)),
+            release("New Album", "album", Some(2020)),
+            release("Undated Album", "album", None),
+            release("Old Single", "single", Some(1999)),
         ];
 
-        assert_eq!(release_display_order(&releases), vec![2, 0, 3, 1, 4]);
+        assert_eq!(artist_release_display_order(&releases), vec![2, 0, 3, 1, 4]);
     }
 
     #[test]
@@ -294,6 +301,178 @@ mod tests {
         ];
 
         assert_eq!(fed_release_display_order(&releases), vec![2, 0, 3, 1, 4]);
+    }
+
+    #[test]
+    fn artist_merged_releases_marks_partially_local_federated_release() {
+        let local_id = "b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let remote_id = "b3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let detail = ArtistDetail {
+            id: 7,
+            name: "Artist".to_string(),
+            image_path: None,
+            total_track_count: 1,
+            total_play_count: 0,
+            top_tracks: Vec::new(),
+            releases: vec![crate::library::models::ReleaseCard {
+                id: 11,
+                title: "Album".to_string(),
+                release_type: "album".to_string(),
+                year: Some(2024),
+                cover_path: None,
+                track_count: 1,
+                availability: Availability::Local,
+            }],
+            featured_tracks: Vec::new(),
+        };
+        let mut state = AppState::default();
+        state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::My;
+        state.local_content_ids.insert(local_id.to_string());
+        state.artist_fed_views.insert(
+            detail.id,
+            Loadable::Ready(crate::federation::FedArtistCard {
+                name: detail.name.clone(),
+                own_owner: None,
+                peers: 1,
+                owners: vec!["peer".to_string()],
+                image_path: None,
+                releases: vec![crate::federation::FedRelease {
+                    title: "Album".to_string(),
+                    release_type: "album".to_string(),
+                    year: Some(2024),
+                    tracks: vec![
+                        crate::federation::FedCardTrack {
+                            title: "Local".to_string(),
+                            content_id: Some(local_id.to_string()),
+                            ..Default::default()
+                        },
+                        crate::federation::FedCardTrack {
+                            title: "Remote".to_string(),
+                            content_id: Some(remote_id.to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                appears_on: Vec::new(),
+            }),
+        );
+
+        let merged = artist_merged_releases(&state, detail.id, &detail);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].local_track_count, 1);
+        assert_eq!(merged[0].total_track_count, 2);
+        assert_eq!(merged[0].availability, Availability::Mixed);
+        assert_eq!(merged[0].local_index, Some(0));
+        assert_eq!(merged[0].fed_index, Some(0));
+    }
+
+    #[test]
+    fn artist_merged_releases_ignores_federation_in_local_filter() {
+        let detail = ArtistDetail {
+            id: 7,
+            name: "Artist".to_string(),
+            image_path: None,
+            total_track_count: 1,
+            total_play_count: 0,
+            top_tracks: Vec::new(),
+            releases: vec![crate::library::models::ReleaseCard {
+                id: 11,
+                title: "Album".to_string(),
+                release_type: "album".to_string(),
+                year: Some(2024),
+                cover_path: None,
+                track_count: 1,
+                availability: Availability::Local,
+            }],
+            featured_tracks: Vec::new(),
+        };
+        let mut state = AppState::default();
+        state.artist_fed_views.insert(
+            detail.id,
+            Loadable::Ready(crate::federation::FedArtistCard {
+                name: detail.name.clone(),
+                peers: 1,
+                releases: vec![crate::federation::FedRelease {
+                    title: "Album".to_string(),
+                    release_type: "album".to_string(),
+                    tracks: vec![crate::federation::FedCardTrack {
+                        title: "Remote".to_string(),
+                        content_id: Some(
+                            "b3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+
+        let merged = artist_merged_releases(&state, detail.id, &detail);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].total_track_count, 1);
+        assert_eq!(merged[0].availability, Availability::Local);
+        assert_eq!(merged[0].fed_index, None);
+    }
+
+    #[test]
+    fn artist_cursor_anchor_restores_release_after_federation_enrichment() {
+        let detail = ArtistDetail {
+            id: 7,
+            name: "Artist".to_string(),
+            image_path: None,
+            total_track_count: 1,
+            total_play_count: 0,
+            top_tracks: Vec::new(),
+            releases: vec![crate::library::models::ReleaseCard {
+                id: 11,
+                title: "Old Local".to_string(),
+                release_type: "album".to_string(),
+                year: Some(2001),
+                cover_path: None,
+                track_count: 1,
+                availability: Availability::Local,
+            }],
+            featured_tracks: Vec::new(),
+        };
+        let mut state = AppState::default();
+        state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::My;
+        let artist_id = detail.id;
+        let artist_name = detail.name.clone();
+        state
+            .artist_views
+            .insert(artist_id, Loadable::Ready(detail));
+        state.global.stack.push(GlobalView::Artist {
+            id: artist_id,
+            cursor: 0,
+        });
+
+        let anchor = artist_cursor_anchor(&state, artist_id);
+        state.artist_fed_views.insert(
+            artist_id,
+            Loadable::Ready(crate::federation::FedArtistCard {
+                name: artist_name,
+                peers: 1,
+                releases: vec![crate::federation::FedRelease {
+                    title: "New Remote".to_string(),
+                    release_type: "album".to_string(),
+                    year: Some(2024),
+                    owners: vec!["peer".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        restore_artist_cursor_anchor(&mut state, artist_id, anchor);
+
+        assert!(matches!(
+            state.global.stack.last(),
+            Some(GlobalView::Artist { cursor: 1, .. })
+        ));
     }
 }
 
@@ -993,6 +1172,8 @@ pub struct AppState {
     pub visualizer: crate::visualizer::VisualizerState,
     pub global: GlobalTab,
     pub artist_views: HashMap<i64, Loadable<ArtistDetail>>,
+    /// Federated card data that enriches a local artist page in-place.
+    pub artist_fed_views: HashMap<i64, Loadable<crate::federation::FedArtistCard>>,
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,
     pub playlists: PlaylistsTab,
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
@@ -1011,10 +1192,6 @@ pub struct AppState {
     /// The one federated artist card being viewed (name + loading state);
     /// opening another card replaces it.
     pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,
-    /// The "search this artist in the federation" button of the open local
-    /// artist view has the focus (reached by pressing Up from the first
-    /// row, like the download button on a federated release).
-    pub artist_fed_button: bool,
     pub track_selection: TrackSelection,
     /// Shift-J jump in flight: focus this (release, track) once the release
     /// view finishes loading.
@@ -1102,6 +1279,296 @@ impl AppState {
             .fed
             .as_ref()
             .is_some_and(|fed| self.fed_track_liked(fed))
+    }
+}
+
+pub fn artist_fed_card(state: &AppState, id: i64) -> Option<&crate::federation::FedArtistCard> {
+    match state.artist_fed_views.get(&id) {
+        Some(Loadable::Ready(card)) => Some(card),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtistCursorAnchor {
+    TopTrack(i64),
+    Release {
+        local_id: Option<i64>,
+        title_key: String,
+    },
+    FeaturedTrack(i64),
+}
+
+pub fn artist_cursor_anchor(state: &AppState, id: i64) -> Option<ArtistCursorAnchor> {
+    let Some(GlobalView::Artist {
+        id: current_id,
+        cursor,
+    }) = state.global.stack.last()
+    else {
+        return None;
+    };
+    if *current_id != id {
+        return None;
+    }
+    let Some(Loadable::Ready(detail)) = state.artist_views.get(&id) else {
+        return None;
+    };
+    if *cursor < detail.top_tracks.len() {
+        return detail
+            .top_tracks
+            .get(*cursor)
+            .map(|track| ArtistCursorAnchor::TopTrack(track.id));
+    }
+
+    let releases = artist_merged_releases(state, id, detail);
+    let release_order = artist_release_display_order(&releases);
+    let release_position = cursor.checked_sub(detail.top_tracks.len())?;
+    if let Some(&slot_index) = release_order.get(release_position) {
+        let slot = &releases[slot_index];
+        let local_id = slot
+            .local_index
+            .and_then(|index| detail.releases.get(index))
+            .map(|release| release.id);
+        return Some(ArtistCursorAnchor::Release {
+            local_id,
+            title_key: release_merge_key(&slot.title),
+        });
+    }
+
+    let featured_position = cursor.checked_sub(detail.top_tracks.len() + release_order.len())?;
+    detail
+        .featured_tracks
+        .get(featured_position)
+        .map(|track| ArtistCursorAnchor::FeaturedTrack(track.id))
+}
+
+pub fn restore_artist_cursor_anchor(
+    state: &mut AppState,
+    id: i64,
+    anchor: Option<ArtistCursorAnchor>,
+) {
+    let Some(anchor) = anchor else {
+        return;
+    };
+    let Some(Loadable::Ready(detail)) = state.artist_views.get(&id) else {
+        return;
+    };
+    let releases = artist_merged_releases(state, id, detail);
+    let release_order = artist_release_display_order(&releases);
+    let next_cursor = match anchor {
+        ArtistCursorAnchor::TopTrack(track_id) => detail
+            .top_tracks
+            .iter()
+            .position(|track| track.id == track_id),
+        ArtistCursorAnchor::Release {
+            local_id,
+            title_key,
+        } => release_order
+            .iter()
+            .position(|&slot_index| {
+                let slot = &releases[slot_index];
+                if let Some(wanted_id) = local_id {
+                    let local_matches = slot
+                        .local_index
+                        .and_then(|index| detail.releases.get(index))
+                        .is_some_and(|release| release.id == wanted_id);
+                    if local_matches {
+                        return true;
+                    }
+                }
+                release_merge_key(&slot.title) == title_key
+            })
+            .map(|position| detail.top_tracks.len() + position),
+        ArtistCursorAnchor::FeaturedTrack(track_id) => detail
+            .featured_tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .map(|position| detail.top_tracks.len() + release_order.len() + position),
+    };
+    let Some(next_cursor) = next_cursor else {
+        return;
+    };
+    if let Some(GlobalView::Artist {
+        id: current_id,
+        cursor,
+    }) = state.global.stack.last_mut()
+        && *current_id == id
+    {
+        *cursor = next_cursor;
+    }
+}
+
+pub fn artist_merged_releases(
+    state: &AppState,
+    id: i64,
+    detail: &ArtistDetail,
+) -> Vec<ArtistReleaseSlot> {
+    let mut slots: Vec<ArtistReleaseSlot> = detail
+        .releases
+        .iter()
+        .enumerate()
+        .map(|(index, release)| ArtistReleaseSlot {
+            title: release.title.clone(),
+            release_type: release.release_type.clone(),
+            year: release.year,
+            cover_path: release.cover_path.clone(),
+            local_index: Some(index),
+            fed_index: None,
+            local_track_count: release.track_count.max(0) as usize,
+            total_track_count: release.track_count.max(0) as usize,
+            availability: release.availability,
+        })
+        .collect();
+
+    if !state.global.filters.source_mode.includes_network() {
+        return slots;
+    }
+
+    let mut by_key: HashMap<String, usize> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot_index, release)| {
+            let key = release_merge_key(&release.title);
+            (!key.is_empty()).then_some((key, slot_index))
+        })
+        .collect();
+
+    let Some(card) = artist_fed_card(state, id) else {
+        return slots;
+    };
+    for (fed_index, release) in card.releases.iter().enumerate() {
+        let key = release_merge_key(&release.title);
+        let existing = by_key.get(&key).copied();
+        let local_from_fed = release
+            .tracks
+            .iter()
+            .filter(|track| state.fed_card_track_local(track))
+            .count();
+        let fed_total = release.tracks.len();
+        let local_count = existing
+            .and_then(|slot_index| slots.get(slot_index))
+            .map(|slot| slot.local_track_count)
+            .unwrap_or(0)
+            .max(local_from_fed);
+        let availability =
+            fed_release_slot_availability(local_count, fed_total, existing.is_some());
+        match existing {
+            Some(slot_index) => {
+                let slot = &mut slots[slot_index];
+                slot.fed_index = Some(fed_index);
+                slot.release_type = prefer_text(&slot.release_type, &release.release_type);
+                slot.year = slot.year.or(release.year);
+                if slot.cover_path.is_none() {
+                    slot.cover_path = release.cover_path.clone();
+                }
+                slot.total_track_count = slot.total_track_count.max(fed_total);
+                slot.local_track_count = slot.local_track_count.max(local_from_fed);
+                slot.availability = availability;
+            }
+            None => {
+                by_key.insert(key, slots.len());
+                slots.push(ArtistReleaseSlot {
+                    title: release.title.clone(),
+                    release_type: release.release_type.clone(),
+                    year: release.year,
+                    cover_path: release.cover_path.clone(),
+                    local_index: None,
+                    fed_index: Some(fed_index),
+                    local_track_count: local_from_fed,
+                    total_track_count: fed_total,
+                    availability,
+                });
+            }
+        }
+    }
+    slots
+}
+
+pub fn fed_card_track_visible(state: &AppState, track: &crate::federation::FedCardTrack) -> bool {
+    state.global.filters.source_mode.includes_network() || state.fed_card_track_local(track)
+}
+
+pub fn fed_release_visible_track_indices(
+    state: &AppState,
+    release: &crate::federation::FedRelease,
+) -> Vec<usize> {
+    release
+        .tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| fed_card_track_visible(state, track).then_some(index))
+        .collect()
+}
+
+pub fn fed_release_visible(state: &AppState, release: &crate::federation::FedRelease) -> bool {
+    state.global.filters.source_mode.includes_network()
+        || release
+            .tracks
+            .iter()
+            .any(|track| state.fed_card_track_local(track))
+}
+
+pub fn fed_appearance_visible(
+    state: &AppState,
+    appearance: &crate::federation::FedAppearsOn,
+) -> bool {
+    fed_card_track_visible(state, &appearance.track)
+}
+
+pub fn fed_artist_visible_release_indices(
+    state: &AppState,
+    card: &crate::federation::FedArtistCard,
+) -> Vec<usize> {
+    card.releases
+        .iter()
+        .enumerate()
+        .filter_map(|(index, release)| fed_release_visible(state, release).then_some(index))
+        .collect()
+}
+
+pub fn fed_artist_visible_appearance_indices(
+    state: &AppState,
+    card: &crate::federation::FedArtistCard,
+) -> Vec<usize> {
+    card.appears_on
+        .iter()
+        .enumerate()
+        .filter_map(|(index, appearance)| {
+            fed_appearance_visible(state, appearance).then_some(index)
+        })
+        .collect()
+}
+
+fn release_merge_key(title: &str) -> String {
+    music_dht::normalize_name(title)
+}
+
+fn prefer_text(left: &str, right: &str) -> String {
+    if left.trim().is_empty() {
+        right.to_string()
+    } else {
+        left.to_string()
+    }
+}
+
+fn fed_release_slot_availability(
+    local: usize,
+    total: usize,
+    has_local_release: bool,
+) -> Availability {
+    if total == 0 {
+        return if has_local_release {
+            Availability::Local
+        } else {
+            Availability::Remote
+        };
+    }
+    if local == 0 {
+        Availability::Remote
+    } else if local >= total {
+        Availability::Local
+    } else {
+        Availability::Mixed
     }
 }
 

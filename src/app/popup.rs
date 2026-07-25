@@ -267,7 +267,7 @@ fn handle_library_filters(
             super::save_app_settings(state);
             super::reset_artist_pagination(state);
             super::refresh_artists(state, runtime);
-            state.popup = Some(Popup::LibraryFilters { cursor });
+            super::update::apply_library_filter_change(state);
         }
         _ => state.popup = Some(Popup::LibraryFilters { cursor }),
     }

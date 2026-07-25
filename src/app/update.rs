@@ -5,8 +5,10 @@ use crate::library::models::TrackItem;
 
 use super::state::{
     AppState, GlobalView, Loadable, OpenedPlaylist, SearchState, TILE_HEIGHT, TILE_WIDTH, Tab,
-    TrackSelectionScope, ViewMode, fed_release_display_order, fed_release_rows,
-    release_display_order, release_rows, settings_rows, track_content_id, track_key,
+    TrackSelectionScope, ViewMode, artist_merged_releases, artist_release_display_order,
+    artist_release_rows, fed_artist_visible_appearance_indices, fed_artist_visible_release_indices,
+    fed_release_display_order, fed_release_rows, fed_release_visible_track_indices, settings_rows,
+    track_content_id, track_key,
 };
 
 pub const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
@@ -236,7 +238,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::OpenLibraryFilters => {
-            if state.active_tab == Tab::Global && state.global.stack.is_empty() {
+            if state.active_tab == Tab::Global {
                 state.popup = Some(super::state::Popup::LibraryFilters { cursor: 0 });
             }
             None
@@ -729,10 +731,12 @@ fn selected_release_card(state: &AppState) -> Option<crate::library::models::Rel
         GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
             Loadable::Ready(detail) => {
                 let position = cursor.checked_sub(detail.top_tracks.len())?;
-                let order = release_display_order(&detail.releases);
+                let merged = artist_merged_releases(state, *id, detail);
+                let order = artist_release_display_order(&merged);
                 order
                     .get(position)
-                    .map(|&index| detail.releases[index].clone())
+                    .and_then(|&index| merged[index].local_index)
+                    .map(|index| detail.releases[index].clone())
             }
             _ => None,
         },
@@ -805,7 +809,8 @@ fn set_track_scope_cursor(state: &mut AppState, scope: &TrackSelectionScope, val
             let Some(Loadable::Ready(detail)) = state.artist_views.get(id) else {
                 return;
             };
-            let flat = detail.top_tracks.len() + detail.releases.len() + value;
+            let releases = artist_merged_releases(state, *id, detail).len();
+            let flat = detail.top_tracks.len() + releases + value;
             set_view_cursor(state, flat);
         }
         TrackSelectionScope::Release(id) => {
@@ -838,22 +843,19 @@ fn set_track_scope_cursor(state: &mut AppState, scope: &TrackSelectionScope, val
             let Some((_, Loadable::Ready(card))) = &state.fed_artist_view else {
                 return;
             };
-            let release_count = card.releases.len();
+            let release_count = fed_artist_visible_release_indices(state, card).len();
             set_view_cursor(state, release_count + value);
         }
     }
 }
 
 fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, usize, usize)> {
-    if state.artist_fed_button {
-        return None;
-    }
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
                 Loadable::Ready(detail) => {
                     let tracks = detail.top_tracks.len();
-                    let releases = detail.releases.len();
+                    let releases = artist_merged_releases(state, *id, detail).len();
                     if *cursor < tracks {
                         Some((TrackSelectionScope::ArtistTop(*id), *cursor, tracks))
                     } else {
@@ -884,7 +886,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
                 (relative < len).then_some((TrackSelectionScope::FedSearch, relative, len))
             }
             GlobalView::FedRelease { index, cursor } => {
-                let len = fed_card_release(state, *index)?.tracks.len();
+                let len = fed_release_tracks(state, *index).len();
                 let relative = cursor.checked_sub(1)?;
                 (relative < len).then_some((TrackSelectionScope::FedRelease(*index), relative, len))
             }
@@ -892,11 +894,13 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
                 let Some((_, Loadable::Ready(card))) = &state.fed_artist_view else {
                     return None;
                 };
-                let relative = cursor.checked_sub(card.releases.len())?;
-                (relative < card.appears_on.len()).then_some((
+                let release_count = fed_artist_visible_release_indices(state, card).len();
+                let appearance_count = fed_artist_visible_appearance_indices(state, card).len();
+                let relative = cursor.checked_sub(release_count)?;
+                (relative < appearance_count).then_some((
                     TrackSelectionScope::FedAppearsOn,
                     relative,
-                    card.appears_on.len(),
+                    appearance_count,
                 ))
             }
         },
@@ -920,7 +924,7 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
                 Loadable::Ready(detail) => {
                     let tracks = detail.top_tracks.len();
-                    let releases = detail.releases.len();
+                    let releases = artist_merged_releases(state, *id, detail).len();
                     if *cursor < tracks {
                         Some((
                             TrackSelectionScope::ArtistTop(*id),
@@ -964,9 +968,6 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
 }
 
 pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
-    if state.artist_fed_button {
-        return Vec::new();
-    }
     // Federated contexts produce queueable placeholders that behave like
     // regular tracks (queue, info, playback-on-demand).
     {
@@ -1109,9 +1110,6 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
 
 /// The track under the cursor in whatever view is showing tracks.
 pub fn selected_track(state: &AppState) -> Option<TrackItem> {
-    if state.artist_fed_button {
-        return None;
-    }
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
@@ -1120,8 +1118,9 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                     if *cursor < tracks {
                         detail.top_tracks.get(*cursor).cloned()
                     } else {
+                        let releases = artist_merged_releases(state, *id, detail).len();
                         cursor
-                            .checked_sub(tracks + detail.releases.len())
+                            .checked_sub(tracks + releases)
                             .and_then(|i| detail.featured_tracks.get(i).cloned())
                     }
                 }
@@ -1152,9 +1151,12 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 let Some((_, Loadable::Ready(card))) = &state.fed_artist_view else {
                     return None;
                 };
-                let index = cursor.checked_sub(card.releases.len())?;
-                card.appears_on
+                let release_count = fed_artist_visible_release_indices(state, card).len();
+                let appearance_indices = fed_artist_visible_appearance_indices(state, card);
+                let index = cursor.checked_sub(release_count)?;
+                appearance_indices
                     .get(index)
+                    .and_then(|&appearance_index| card.appears_on.get(appearance_index))
                     .and_then(|appearance| {
                         fed_track_from_appearance(appearance, card.own_owner.as_deref())
                     })
@@ -1195,8 +1197,12 @@ fn selected_release_id(state: &AppState) -> Option<i64> {
         GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
             Loadable::Ready(detail) => {
                 let position = cursor.checked_sub(detail.top_tracks.len())?;
-                let order = release_display_order(&detail.releases);
-                order.get(position).map(|&i| detail.releases[i].id)
+                let merged = artist_merged_releases(state, *id, detail);
+                let order = artist_release_display_order(&merged);
+                order
+                    .get(position)
+                    .and_then(|&i| merged[i].local_index)
+                    .map(|i| detail.releases[i].id)
             }
             _ => None,
         },
@@ -1288,7 +1294,6 @@ pub(crate) fn open_artist_ref(
 ) -> Option<Effect> {
     let origin = state.active_tab;
     state.active_tab = Tab::Global;
-    state.artist_fed_button = false;
     let effect = if artist.id >= 0 {
         match state.global.stack.last() {
             Some(GlobalView::Artist { id, .. }) if *id == artist.id => {}
@@ -1511,8 +1516,9 @@ fn page_step(state: &AppState) -> isize {
         Some(GlobalView::Artist { id, cursor }) => {
             let in_release_tiles = match state.artist_views.get(id) {
                 Some(Loadable::Ready(detail)) => {
+                    let releases = artist_merged_releases(state, *id, detail).len();
                     *cursor >= detail.top_tracks.len()
-                        && *cursor < detail.top_tracks.len() + detail.releases.len()
+                        && *cursor < detail.top_tracks.len() + releases
                 }
                 _ => false,
             };
@@ -1527,7 +1533,9 @@ fn page_step(state: &AppState) -> isize {
         | Some(GlobalView::FedRelease { .. }) => lines,
         Some(GlobalView::FedArtist { cursor }) => {
             let in_release_tiles = match &state.fed_artist_view {
-                Some((_, Loadable::Ready(card))) => *cursor < card.releases.len(),
+                Some((_, Loadable::Ready(card))) => {
+                    *cursor < fed_artist_visible_release_indices(state, card).len()
+                }
                 _ => false,
             };
             if in_release_tiles { tile_rows } else { lines }
@@ -1622,22 +1630,12 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             state.track_selection.clear();
         }
         Some(GlobalView::Artist { id, cursor }) => {
-            if state.artist_fed_button {
-                // Down leaves the federation-search button; other keys stay.
-                if dy > 0 {
-                    state.artist_fed_button = false;
-                }
-                return;
-            }
-            if cursor == 0 && dy < 0 && state.federation.settings.enabled {
-                state.artist_fed_button = true;
-                return;
-            }
             let Some(Loadable::Ready(detail)) = state.artist_views.get(&id) else {
                 return;
             };
+            let merged = artist_merged_releases(state, id, detail);
             let tracks = detail.top_tracks.len();
-            let releases = detail.releases.len();
+            let releases = merged.len();
             let featured = detail.featured_tracks.len();
             let total = tracks + releases + featured;
             if total == 0 {
@@ -1654,7 +1652,7 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             } else {
                 // Release tiles: move by visual rows (groups break rows),
                 // keeping the column, so Up lands on the tile above.
-                let rows = release_rows(&detail.releases, grid_columns());
+                let rows = artist_release_rows(&merged, grid_columns());
                 let position = cursor - tracks;
                 let (row, column) = rows
                     .iter()
@@ -1714,8 +1712,9 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             let Some((_, Loadable::Ready(card))) = &state.fed_artist_view else {
                 return;
             };
-            let releases = card.releases.len();
-            let appears_on = card.appears_on.len();
+            let release_indices = fed_artist_visible_release_indices(state, card);
+            let releases = release_indices.len();
+            let appears_on = fed_artist_visible_appearance_indices(state, card).len();
             let total = (releases + appears_on) as isize;
             if total == 0 {
                 return;
@@ -1724,7 +1723,11 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             let next = if !in_release_tiles {
                 (cursor as isize + dy).clamp(0, total - 1) as usize
             } else {
-                let rows = fed_release_rows(&card.releases, grid_columns());
+                let visible_releases: Vec<_> = release_indices
+                    .iter()
+                    .map(|&index| card.releases[index].clone())
+                    .collect();
+                let rows = fed_release_rows(&visible_releases, grid_columns());
                 let (row, column) = rows
                     .iter()
                     .enumerate()
@@ -1748,7 +1751,9 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             state.track_selection.clear();
         }
         Some(GlobalView::FedRelease { index, cursor }) => {
-            let tracks = fed_card_release(state, index).map_or(0, |r| r.tracks.len()) as isize;
+            let tracks = fed_card_release(state, index)
+                .map_or(0, |r| fed_release_visible_track_indices(state, r).len())
+                as isize;
             // Row 0 is the download button, 1..=tracks are the tracks.
             let next = (cursor as isize + dy).clamp(0, tracks);
             set_view_cursor(state, next as usize);
@@ -1760,7 +1765,10 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
 /// Selectable rows of the open federated artist card: releases, then appearances.
 pub(crate) fn fed_card_len(state: &AppState) -> usize {
     match &state.fed_artist_view {
-        Some((_, Loadable::Ready(card))) => card.releases.len() + card.appears_on.len(),
+        Some((_, Loadable::Ready(card))) => {
+            fed_artist_visible_release_indices(state, card).len()
+                + fed_artist_visible_appearance_indices(state, card).len()
+        }
         _ => 0,
     }
 }
@@ -1802,7 +1810,8 @@ fn current_view_len(state: &AppState) -> usize {
         None => state.global.artists.len(),
         Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
             Some(Loadable::Ready(d)) => {
-                d.top_tracks.len() + d.releases.len() + d.featured_tracks.len()
+                let releases = artist_merged_releases(state, *id, d).len();
+                d.top_tracks.len() + releases + d.featured_tracks.len()
             }
             _ => 0,
         },
@@ -1816,14 +1825,67 @@ fn current_view_len(state: &AppState) -> usize {
                 + state.search.fed_tracks.len()
         }
         Some(GlobalView::FedArtist { .. }) => fed_card_len(state),
-        Some(GlobalView::FedRelease { index, .. }) => {
-            fed_card_release(state, *index).map_or(0, |r| r.tracks.len() + 1)
+        Some(GlobalView::FedRelease { index, .. }) => fed_card_release(state, *index)
+            .map_or(0, |r| fed_release_visible_track_indices(state, r).len() + 1),
+    }
+}
+
+pub(crate) fn apply_library_filter_change(state: &mut AppState) {
+    state.track_selection.clear();
+    let len = current_view_len(state);
+    if state.active_tab == Tab::Global {
+        if state.global.stack.is_empty() {
+            state.global.selected = state.global.selected.min(len.saturating_sub(1));
+        } else if let Some(view) = state.global.stack.last_mut() {
+            let cursor = match view {
+                GlobalView::Artist { cursor, .. }
+                | GlobalView::Release { cursor, .. }
+                | GlobalView::Search { cursor }
+                | GlobalView::FedArtist { cursor }
+                | GlobalView::FedRelease { cursor, .. } => cursor,
+            };
+            *cursor = (*cursor).min(len.saturating_sub(1));
         }
+    }
+
+    if state.global.filters.source_mode.includes_network() {
+        return;
+    }
+    let message = match state.global.stack.last() {
+        Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
+            Some(Loadable::Ready(detail))
+                if detail.top_tracks.is_empty()
+                    && artist_merged_releases(state, *id, detail).is_empty()
+                    && detail.featured_tracks.is_empty() =>
+            {
+                Some(format!(
+                    "local filter: \"{}\" is not available locally",
+                    detail.name
+                ))
+            }
+            _ => None,
+        },
+        Some(GlobalView::FedArtist { .. }) if fed_card_len(state) == 0 => {
+            let name = state
+                .fed_artist_view
+                .as_ref()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("artist");
+            Some(format!("local filter: \"{name}\" is not available locally"))
+        }
+        Some(GlobalView::FedRelease { index, .. })
+            if fed_release_tracks(state, *index).is_empty() =>
+        {
+            Some("local filter: release is not available locally".to_string())
+        }
+        _ => None,
+    };
+    if let Some(message) = message {
+        state.status_message = Some(message);
     }
 }
 
 fn jump_selection(state: &mut AppState, first: bool) {
-    state.artist_fed_button = false;
     if state.track_selection.is_active()
         && let Some((scope, _, len)) = current_track_list_context(state)
     {
@@ -1950,12 +2012,6 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     }
     let outcome = match state.global.stack.last().copied() {
         None => match state.global.artists.get(state.global.selected) {
-            Some(artist)
-                if state.global.filters.source_mode.includes_network()
-                    && artist.availability.is_remoteish() =>
-            {
-                Outcome::OpenFedArtist(artist.name.clone())
-            }
             Some(artist) if artist.id >= 0 => Outcome::Push(GlobalView::Artist {
                 id: artist.id,
                 cursor: 0,
@@ -1963,41 +2019,59 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             Some(artist) => Outcome::OpenFedArtist(artist.name.clone()),
             None => Outcome::Nothing,
         },
-        Some(GlobalView::Artist { id, cursor: _ }) if state.artist_fed_button => {
-            match state.artist_views.get(&id) {
-                Some(Loadable::Ready(detail)) => {
-                    state.artist_fed_button = false;
-                    Outcome::OpenFedArtist(detail.name.clone())
-                }
-                _ => Outcome::Nothing,
-            }
-        }
         Some(GlobalView::Artist { id, cursor }) => match state.artist_views.get(&id) {
             Some(Loadable::Ready(detail)) => {
                 let tracks = detail.top_tracks.len();
-                let releases = detail.releases.len();
+                let releases = artist_merged_releases(state, id, detail);
+                let releases_len = releases.len();
                 if cursor < tracks {
                     Outcome::Play {
                         tracks: detail.top_tracks.clone(),
                         start: cursor,
                     }
-                } else if cursor < tracks + releases {
-                    let order = release_display_order(&detail.releases);
+                } else if cursor < tracks + releases_len {
+                    let order = artist_release_display_order(&releases);
                     match order.get(cursor - tracks) {
-                        Some(&original) => Outcome::Push(GlobalView::Release {
-                            id: detail.releases[original].id,
-                            cursor: 0,
-                        }),
+                        Some(&original) => {
+                            let slot = &releases[original];
+                            if slot.availability.is_remoteish()
+                                && let Some(index) = slot.fed_index
+                                && let Some(card) =
+                                    crate::app::state::artist_fed_card(state, id).cloned()
+                            {
+                                Outcome::OpenFedRelease {
+                                    name: detail.name.clone(),
+                                    card,
+                                    index,
+                                }
+                            } else if let Some(index) = slot.local_index {
+                                Outcome::Push(GlobalView::Release {
+                                    id: detail.releases[index].id,
+                                    cursor: 0,
+                                })
+                            } else if let Some(index) = slot.fed_index
+                                && let Some(card) =
+                                    crate::app::state::artist_fed_card(state, id).cloned()
+                            {
+                                Outcome::OpenFedRelease {
+                                    name: detail.name.clone(),
+                                    card,
+                                    index,
+                                }
+                            } else {
+                                Outcome::Nothing
+                            }
+                        }
                         None => Outcome::Nothing,
                     }
                 } else if detail
                     .featured_tracks
-                    .get(cursor - tracks - releases)
+                    .get(cursor - tracks - releases_len)
                     .is_some()
                 {
                     Outcome::Play {
                         tracks: detail.featured_tracks.clone(),
-                        start: cursor - tracks - releases,
+                        start: cursor - tracks - releases_len,
                     }
                 } else {
                     Outcome::Nothing
@@ -2038,40 +2112,53 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             None => fed_outcome(state, cursor),
         },
         Some(GlobalView::FedArtist { cursor }) => match &state.fed_artist_view {
-            Some((_, Loadable::Ready(card))) if cursor < card.releases.len() => {
-                let order = fed_release_display_order(&card.releases);
-                let Some(&release_index) = order.get(cursor) else {
-                    return None;
-                };
-                // Focus starts on the first track; Up from it reaches the
-                // download-release button (row 0).
-                let start = if card.releases[release_index].tracks.is_empty() {
-                    0
-                } else {
-                    1
-                };
-                Outcome::Push(GlobalView::FedRelease {
-                    index: release_index,
-                    cursor: start,
-                })
-            }
             Some((_, Loadable::Ready(card))) => {
-                let start = cursor - card.releases.len();
-                if card.appears_on.get(start).is_none() {
-                    Outcome::Nothing
-                } else {
-                    let tracks: Vec<_> = card
-                        .appears_on
+                let release_indices = fed_artist_visible_release_indices(state, card);
+                if cursor < release_indices.len() {
+                    let visible_releases: Vec<_> = release_indices
                         .iter()
-                        .filter_map(|appearance| {
-                            fed_track_from_appearance(appearance, card.own_owner.as_deref())
-                        })
-                        .map(|fed| crate::federation::pending_track(&fed))
+                        .map(|&index| card.releases[index].clone())
                         .collect();
-                    if tracks.is_empty() {
+                    let order = fed_release_display_order(&visible_releases);
+                    let Some(&visible_index) = order.get(cursor) else {
+                        return None;
+                    };
+                    let Some(&release_index) = release_indices.get(visible_index) else {
+                        return None;
+                    };
+                    // Focus starts on the first track; Up from it reaches the
+                    // download-release button (row 0).
+                    let start =
+                        if fed_release_visible_track_indices(state, &card.releases[release_index])
+                            .is_empty()
+                        {
+                            0
+                        } else {
+                            1
+                        };
+                    Outcome::Push(GlobalView::FedRelease {
+                        index: release_index,
+                        cursor: start,
+                    })
+                } else {
+                    let appearance_indices = fed_artist_visible_appearance_indices(state, card);
+                    let start = cursor - release_indices.len();
+                    if appearance_indices.get(start).is_none() {
                         Outcome::Nothing
                     } else {
-                        Outcome::Play { tracks, start }
+                        let tracks: Vec<_> = appearance_indices
+                            .iter()
+                            .filter_map(|&appearance_index| card.appears_on.get(appearance_index))
+                            .filter_map(|appearance| {
+                                fed_track_from_appearance(appearance, card.own_owner.as_deref())
+                            })
+                            .map(|fed| crate::federation::pending_track(&fed))
+                            .collect();
+                        if tracks.is_empty() {
+                            Outcome::Nothing
+                        } else {
+                            Outcome::Play { tracks, start }
+                        }
                     }
                 }
             }
@@ -2106,7 +2193,6 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     };
     match outcome {
         Outcome::Push(view) => {
-            state.artist_fed_button = false;
             state.global.stack.push(view);
             None
         }
@@ -2121,6 +2207,23 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             state.global.stack.push(GlobalView::FedArtist { cursor: 0 });
             state.active_tab = Tab::Global;
             Some(Effect::FedOpenArtist(name))
+        }
+        Outcome::OpenFedRelease { name, card, index } => {
+            let start =
+                if card.releases.get(index).is_some_and(|release| {
+                    fed_release_visible_track_indices(state, release).is_empty()
+                }) {
+                    0
+                } else {
+                    1
+                };
+            state.fed_artist_view = Some((name, Loadable::Ready(card)));
+            state.global.stack.push(GlobalView::FedRelease {
+                index,
+                cursor: start,
+            });
+            state.active_tab = Tab::Global;
+            None
         }
         Outcome::DownloadFed(tracks) => {
             state.status_message = Some(format!(
@@ -2144,7 +2247,7 @@ pub(crate) fn fed_card_release(
     }
 }
 
-/// Every track of one card release as playable FedTracks.
+/// Every visible track of one card release as playable FedTracks.
 pub(crate) fn fed_release_tracks(
     state: &AppState,
     index: usize,
@@ -2158,6 +2261,7 @@ pub(crate) fn fed_release_tracks(
     release
         .tracks
         .iter()
+        .filter(|track| crate::app::state::fed_card_track_visible(state, track))
         .filter_map(|track| fed_track_from_card(name, release, track, card.own_owner.as_deref()))
         .collect()
 }
@@ -2168,6 +2272,7 @@ pub(crate) fn fed_appears_on_tracks(state: &AppState) -> Vec<crate::federation::
     };
     card.appears_on
         .iter()
+        .filter(|appearance| crate::app::state::fed_appearance_visible(state, appearance))
         .filter_map(|appearance| fed_track_from_appearance(appearance, card.own_owner.as_deref()))
         .collect()
 }
@@ -2234,8 +2339,9 @@ pub(crate) fn selected_fed_tracks(state: &AppState) -> Vec<crate::federation::Fe
             let Some((_, Loadable::Ready(card))) = &state.fed_artist_view else {
                 return Vec::new();
             };
+            let release_count = fed_artist_visible_release_indices(state, card).len();
             cursor
-                .checked_sub(card.releases.len())
+                .checked_sub(release_count)
                 .and_then(|i| fed_appears_on_tracks(state).into_iter().nth(i))
                 .into_iter()
                 .collect()
@@ -2329,6 +2435,11 @@ enum Outcome {
         start: usize,
     },
     OpenFedArtist(String),
+    OpenFedRelease {
+        name: String,
+        card: crate::federation::FedArtistCard,
+        index: usize,
+    },
     DownloadFed(Vec<crate::federation::FedTrack>),
     Nothing,
 }
@@ -2622,7 +2733,6 @@ fn shuffle_range(player: &mut super::state::PlayerBar, start: usize) {
 /// Esc/Backspace: pop the navigation stack; leaving a search view resets the
 /// search so the next `:/` starts clean.
 fn go_back(state: &mut AppState) {
-    state.artist_fed_button = false;
     state.track_selection.clear();
     match state.active_tab {
         Tab::Playlists => {
@@ -2653,7 +2763,6 @@ fn go_back(state: &mut AppState) {
 }
 
 fn switch_tab(state: &mut AppState, tab: Tab) {
-    state.artist_fed_button = false;
     state.active_tab = tab;
     state.help_visible = false;
     state.track_selection.clear();
@@ -2787,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn library_filters_popup_opens_only_on_root() {
+    fn library_filters_popup_opens_on_library_screens() {
         let mut state = AppState::default();
         update(&mut state, Action::OpenLibraryFilters);
         assert!(matches!(
@@ -2797,6 +2906,14 @@ mod tests {
 
         state.popup = None;
         state.global.stack.push(GlobalView::Search { cursor: 0 });
+        update(&mut state, Action::OpenLibraryFilters);
+        assert!(matches!(
+            state.popup,
+            Some(crate::app::state::Popup::LibraryFilters { .. })
+        ));
+
+        state.popup = None;
+        state.active_tab = Tab::Queue;
         update(&mut state, Action::OpenLibraryFilters);
         assert!(state.popup.is_none());
     }

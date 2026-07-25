@@ -113,6 +113,12 @@ pub enum AppEvent {
         name: String,
         result: Result<crate::federation::FedArtistCard, String>,
     },
+    /// Federated enrichment for an already-open local artist view.
+    ArtistFederationLoaded {
+        id: i64,
+        name: String,
+        result: Result<crate::federation::FedArtistCard, String>,
+    },
     /// A network-library source refreshed its cached top-artist slice.
     NetworkArtistCacheUpdated {
         source_id: String,

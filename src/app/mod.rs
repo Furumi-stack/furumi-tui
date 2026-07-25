@@ -95,6 +95,62 @@ fn refresh_local_content_ids(runtime: &Runtime) {
     });
 }
 
+fn spawn_artist_federation_enrichment(runtime: &Runtime, id: i64, name: String) {
+    let fed = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let result = fed
+            .artist_card(&name)
+            .await
+            .map_err(|err| format!("{err:#}"));
+        let card = result.as_ref().ok().cloned();
+        let _ = tx.send(AppEvent::ArtistFederationLoaded {
+            id,
+            name: name.clone(),
+            result,
+        });
+        let Some(card) = card else { return };
+        if let Some(path) = fed.card_image(&card.owners, &name, None).await {
+            let _ = tx.send(AppEvent::FedCardArt {
+                name: name.clone(),
+                release: None,
+                path,
+            });
+        }
+        for release in &card.releases {
+            let Some(path) = fed
+                .card_image(&release.owners, &name, Some(&release.title))
+                .await
+            else {
+                continue;
+            };
+            let _ = tx.send(AppEvent::FedCardArt {
+                name: name.clone(),
+                release: Some(release.title.clone()),
+                path,
+            });
+        }
+    });
+}
+
+fn maybe_enrich_open_artist(state: &mut AppState, runtime: &Runtime) {
+    if !state.federation.settings.enabled || state.active_tab != state::Tab::Global {
+        return;
+    }
+    let Some(state::GlobalView::Artist { id, .. }) = state.global.stack.last().copied() else {
+        return;
+    };
+    if state.artist_fed_views.contains_key(&id) {
+        return;
+    }
+    let Some(state::Loadable::Ready(detail)) = state.artist_views.get(&id) else {
+        return;
+    };
+    let name = detail.name.clone();
+    state.artist_fed_views.insert(id, state::Loadable::Loading);
+    spawn_artist_federation_enrichment(runtime, id, name);
+}
+
 fn spawn_content_id_backfill(runtime: &Runtime) {
     let library = Arc::clone(&runtime.library);
     let federation = Arc::clone(&runtime.federation);
@@ -796,6 +852,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
 
     maybe_refresh_network_library(state, runtime);
     maybe_fetch_network_artist_images(state, runtime);
+    maybe_enrich_open_artist(state, runtime);
 
     // Liked ids load once per session — markers are shown everywhere.
     if !state.likes_loaded {
@@ -914,6 +971,19 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
             && let Some(path) = &detail.cover_path
         {
             wanted.push((path.clone(), header.0, header.1));
+        }
+    }
+    for card in state.artist_fed_views.values() {
+        if let state::Loadable::Ready(card) = card {
+            if let Some(path) = &card.image_path {
+                wanted.push((path.clone(), header.0, header.1));
+            }
+            for release in &card.releases {
+                if let Some(path) = &release.cover_path {
+                    wanted.push((path.clone(), tile.0, tile.1));
+                    wanted.push((path.clone(), header.0, header.1));
+                }
+            }
         }
     }
     if let Some((_, state::Loadable::Ready(card))) = &state.fed_artist_view {
@@ -2981,6 +3051,18 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 };
             }
         }
+        AppEvent::ArtistFederationLoaded { id, name, result } => {
+            let cursor_anchor = state::artist_cursor_anchor(state, id);
+            let entry = match result {
+                Ok(card) => state::Loadable::Ready(card),
+                Err(message) => {
+                    tracing::debug!(artist = id, %name, %message, "artist federation enrichment failed");
+                    state::Loadable::Failed(message)
+                }
+            };
+            state.artist_fed_views.insert(id, entry);
+            state::restore_artist_cursor_anchor(state, id, cursor_anchor);
+        }
         AppEvent::NetworkArtistCacheUpdated { source_id, count } => {
             tracing::debug!(source = %source_id, count, "network artist cache updated");
             if state.active_tab == state::Tab::Global && state.global.stack.is_empty() {
@@ -2995,11 +3077,27 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             if let Some((current, state::Loadable::Ready(card))) = &mut state.fed_artist_view
                 && *current == name
             {
-                match release {
-                    None => card.image_path = Some(path),
+                match &release {
+                    None => card.image_path = Some(path.clone()),
                     Some(title) => {
-                        if let Some(slot) = card.releases.iter_mut().find(|r| r.title == title) {
-                            slot.cover_path = Some(path);
+                        if let Some(slot) = card.releases.iter_mut().find(|r| r.title == *title) {
+                            slot.cover_path = Some(path.clone());
+                        }
+                    }
+                }
+            }
+            for data in state.artist_fed_views.values_mut() {
+                let state::Loadable::Ready(card) = data else {
+                    continue;
+                };
+                if music_dht::normalize_name(&card.name) != music_dht::normalize_name(&name) {
+                    continue;
+                }
+                match &release {
+                    None => card.image_path = Some(path.clone()),
+                    Some(title) => {
+                        if let Some(slot) = card.releases.iter_mut().find(|r| r.title == *title) {
+                            slot.cover_path = Some(path.clone());
                         }
                     }
                 }
@@ -3074,6 +3172,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             };
             state.artist_views.insert(id, entry);
+            maybe_enrich_open_artist(state, runtime);
         }
         AppEvent::ReleaseViewLoaded { id, result } => {
             let entry = match result {

@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 
 use crate::app::input::LineEdit;
-use crate::app::state::{AppState, Tab, TrackSelectionScope};
+use crate::app::state::{AppState, GlobalView, Loadable, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
 use crate::library::models::Availability;
 
@@ -446,12 +446,15 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(message.clone(), theme::accent()),
         ]),
         Some(message) => Line::styled(message.clone(), theme::accent()),
-        None => match &state.player.current {
-            // Idle line doubles as the current track's tech data display.
-            Some(track) if state.player.playing && !track.tech_label_full().is_empty() => {
-                Line::styled(track.tech_label_full(), theme::dim())
-            }
-            _ => Line::styled("press ? for keybindings", theme::dim()),
+        None => match active_artist_peer_search(state) {
+            Some(message) => loading_line(state, message),
+            None => match &state.player.current {
+                // Idle line doubles as the current track's tech data display.
+                Some(track) if state.player.playing && !track.tech_label_full().is_empty() => {
+                    Line::styled(track.tech_label_full(), theme::dim())
+                }
+                _ => Line::styled("press ? for keybindings", theme::dim()),
+            },
         },
     };
     frame.render_widget(Paragraph::new(message), message_row);
@@ -462,6 +465,23 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             .alignment(Alignment::Right);
         frame.render_widget(pending, message_row);
     }
+}
+
+fn active_artist_peer_search(state: &AppState) -> Option<String> {
+    if state.active_tab != Tab::Global {
+        return None;
+    }
+    let Some(GlobalView::Artist { id, .. }) = state.global.stack.last() else {
+        return None;
+    };
+    if !matches!(state.artist_fed_views.get(id), Some(Loadable::Loading)) {
+        return None;
+    }
+    let name = match state.artist_views.get(id) {
+        Some(Loadable::Ready(detail)) => detail.name.as_str(),
+        _ => "artist",
+    };
+    Some(format!("searching peers for \"{name}\"…"))
 }
 
 fn draw_version(frame: &mut Frame, area: Rect) {

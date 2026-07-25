@@ -8,8 +8,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::{art, availability_marker, availability_prefix, theme};
 use crate::app::state::{
     ART_CELL_HEIGHT, ART_CELL_WIDTH, ART_HEADER_HEIGHT, ART_HEADER_WIDTH, AppState, ArtState,
-    GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, fed_release_display_order,
-    fed_release_groups, release_groups,
+    GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, artist_merged_releases,
+    artist_release_display_order, artist_release_groups, fed_artist_visible_appearance_indices,
+    fed_artist_visible_release_indices, fed_release_display_order, fed_release_groups,
+    fed_release_visible_track_indices,
 };
 use crate::art::cache_key;
 use crate::library::models::{ArtistCard, Availability, ReleaseCard, SearchResults};
@@ -497,12 +499,43 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             height: ART_HEADER_HEIGHT.min(art_area.height),
             ..art_area
         },
-        header_art(state, detail.image_path.as_ref()),
+        header_art(
+            state,
+            detail.image_path.as_ref().or_else(|| {
+                crate::app::state::artist_fed_card(state, id)
+                    .and_then(|card| card.image_path.as_ref())
+            }),
+        ),
     );
-    let mut about = format!("{} releases", detail.releases.len());
+    let merged_releases = artist_merged_releases(state, id, detail);
+    let mut about = format!("{} releases", merged_releases.len());
     if !detail.featured_tracks.is_empty() {
         about.push_str(&format!(" · appears on {}", detail.featured_tracks.len()));
     }
+    let federation_line = match state.artist_fed_views.get(&id) {
+        Some(Loadable::Loading) => Some(super::loading_line(state, "searching peers…")),
+        Some(Loadable::Ready(card)) => {
+            let tracks: usize = card
+                .releases
+                .iter()
+                .map(|release| release.tracks.len())
+                .sum();
+            Some(Line::styled(
+                format!(
+                    "federation: {} releases · {} tracks · {} peers",
+                    card.releases.len(),
+                    tracks,
+                    card.peers
+                ),
+                theme::dim(),
+            ))
+        }
+        Some(Loadable::Failed(_)) => Some(Line::styled("federation: unavailable", theme::dim())),
+        None if state.federation.settings.enabled => {
+            Some(Line::styled("federation: pending", theme::dim()))
+        }
+        None => None,
+    };
     let mut info = vec![
         Line::default(),
         Line::styled(detail.name.clone(), theme::header()),
@@ -516,25 +549,15 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         ),
         Line::styled(about, theme::dim()),
     ];
-    if state.federation.settings.enabled {
-        // Reached with Up from the first row, like the download button on
-        // a federated release.
-        info.push(Line::default());
-        info.push(Line::styled(
-            " ⌕ Search this artist in the federation ",
-            if state.artist_fed_button {
-                theme::tab_active()
-            } else {
-                theme::accent()
-            },
-        ));
+    if let Some(line) = federation_line {
+        info.push(line);
     }
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Scrollable content: top tracks, releases grouped by type, then the
     // tracks this artist is featured on.
     let tracks = detail.top_tracks.len();
-    let releases_len = detail.releases.len();
+    let releases_len = merged_releases.len();
     let featured_len = detail.featured_tracks.len();
     let mut items = Vec::new();
     let mut cursor_item = None;
@@ -559,7 +582,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
     }
     let columns = usize::from((content_area.width / TILE_WIDTH).max(1));
     let mut position = 0;
-    for (label, group) in release_groups(&detail.releases) {
+    for (label, group) in artist_release_groups(&merged_releases) {
         items.push(PlanItem::Header(format!("{label} ({})", group.len())));
         match state.global.view {
             ViewMode::Tiles => {
@@ -596,7 +619,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         items.push(PlanItem::Gap);
     }
 
-    let display_order = crate::app::state::release_display_order(&detail.releases);
+    let display_order = artist_release_display_order(&merged_releases);
     render_plan(
         frame,
         content_area,
@@ -637,7 +660,7 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
             }
             PlanItem::TileRow(row) => {
                 for (column, position) in row.iter().enumerate() {
-                    let release = &detail.releases[display_order[*position]];
+                    let release = &merged_releases[display_order[*position]];
                     let tile = Rect {
                         x: rect.x + column as u16 * TILE_WIDTH,
                         y: rect.y,
@@ -653,14 +676,14 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                         tile,
                         tile_art(state, release.cover_path.as_ref()),
                         &release.title,
-                        &release_tile_meta(release),
+                        &artist_release_tile_meta(release),
                         cursor == tracks + position,
                         Some(release.availability),
                     );
                 }
             }
             PlanItem::TableRow(position) => {
-                let release = &detail.releases[display_order[*position]];
+                let release = &merged_releases[display_order[*position]];
                 let year = release.year.map(|y| y.to_string()).unwrap_or_default();
                 draw_row(
                     frame,
@@ -669,13 +692,32 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                         Span::raw(release.title.clone()),
                         Span::styled(format!("  {year}"), theme::dim()),
                     ]),
-                    Some(format!("{} trk", release.track_count)),
+                    Some(artist_release_count_meta(release)),
                     cursor == tracks + position,
                 );
             }
             _ => unreachable!("headers and gaps are rendered by render_plan"),
         },
     );
+}
+
+fn artist_release_tile_meta(release: &crate::app::state::ArtistReleaseSlot) -> String {
+    match release.year {
+        Some(year) => format!("{year} · {}", artist_release_count_meta(release)),
+        None => artist_release_count_meta(release),
+    }
+}
+
+fn artist_release_count_meta(release: &crate::app::state::ArtistReleaseSlot) -> String {
+    match release.availability {
+        Availability::Mixed => format!(
+            "{}/{} local",
+            release.local_track_count.min(release.total_track_count),
+            release.total_track_count
+        ),
+        Availability::Remote => format!("{} network", release.total_track_count),
+        Availability::Local => format!("{} trk", release.total_track_count),
+    }
 }
 
 fn release_tile_meta(release: &ReleaseCard) -> String {
@@ -1060,17 +1102,30 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         },
         header_art(state, card.image_path.as_ref()),
     );
-    let release_tracks_total: usize = card.releases.iter().map(|r| r.tracks.len()).sum();
-    let appears_on_len = card.appears_on.len();
+    let release_indices = fed_artist_visible_release_indices(state, card);
+    let appearance_indices = fed_artist_visible_appearance_indices(state, card);
+    let visible_releases: Vec<_> = release_indices
+        .iter()
+        .map(|&index| card.releases[index].clone())
+        .collect();
+    let release_tracks_total: usize = visible_releases
+        .iter()
+        .map(|release| fed_release_visible_track_indices(state, release).len())
+        .sum();
+    let appears_on_len = appearance_indices.len();
     let mut stats = format!(
         "{} releases · {} tracks",
-        card.releases.len(),
+        visible_releases.len(),
         release_tracks_total
     );
     if appears_on_len > 0 {
         stats.push_str(&format!(" · appears on {appears_on_len}"));
     }
-    stats.push_str(&format!(" · from {} peers", card.peers));
+    if state.global.filters.source_mode.includes_network() {
+        stats.push_str(&format!(" · from {} peers", card.peers));
+    } else {
+        stats.push_str(" · local only");
+    }
     let info = vec![
         Line::default(),
         Line::styled(name.clone(), theme::header()),
@@ -1080,24 +1135,22 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
-    if card.releases.is_empty() && card.appears_on.is_empty() {
-        return centered_line(
-            frame,
-            content_area,
-            Line::styled(
-                "the peers returned no releases or appearances",
-                theme::dim(),
-            ),
-        );
+    if visible_releases.is_empty() && appearance_indices.is_empty() {
+        let message = if state.global.filters.source_mode.includes_network() {
+            "the peers returned no releases or appearances"
+        } else {
+            "artist is not available locally"
+        };
+        return centered_line(frame, content_area, Line::styled(message, theme::dim()));
     }
 
     // Release tiles grouped by type, then featured appearances as tracks.
     let columns = usize::from((content_area.width / TILE_WIDTH).max(1));
-    let releases_len = card.releases.len();
+    let releases_len = visible_releases.len();
     let mut items = Vec::new();
     let mut cursor_item = None;
     let mut position = 0;
-    for (label, group) in fed_release_groups(&card.releases) {
+    for (label, group) in fed_release_groups(&visible_releases) {
         items.push(PlanItem::Header(format!("{label} ({})", group.len())));
         for chunk in group.chunks(columns) {
             let row: Vec<usize> = (position..position + chunk.len()).collect();
@@ -1121,7 +1174,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         items.push(PlanItem::Gap);
     }
 
-    let display_order = fed_release_display_order(&card.releases);
+    let display_order = fed_release_display_order(&visible_releases);
     let appears_scope = crate::app::state::TrackSelectionScope::FedAppearsOn;
     render_plan(
         frame,
@@ -1132,7 +1185,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
         &mut |frame, rect, item| match item {
             PlanItem::TileRow(row) => {
                 for (column, position) in row.iter().enumerate() {
-                    let release = &card.releases[display_order[*position]];
+                    let release = &visible_releases[display_order[*position]];
                     let tile = Rect {
                         x: rect.x + column as u16 * TILE_WIDTH,
                         y: rect.y,
@@ -1160,7 +1213,10 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
             }
             PlanItem::Track { cursor_index } => {
                 let index = cursor_index - releases_len;
-                let Some(appearance) = card.appears_on.get(index) else {
+                let Some(&appearance_index) = appearance_indices.get(index) else {
+                    return;
+                };
+                let Some(appearance) = card.appears_on.get(appearance_index) else {
                     return;
                 };
                 draw_fed_appearance_row(
@@ -1307,47 +1363,72 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
     if let Some(year) = release.year {
         meta.push_str(&format!(" · {year}"));
     }
-    meta.push_str(&format!(
-        " · {} tracks · from {} peers",
-        release.tracks.len(),
-        release.owners.len().max(1)
-    ));
+    let visible_track_indices = fed_release_visible_track_indices(state, release);
+    let track_count = visible_track_indices.len();
+    if state.global.filters.source_mode.includes_network() {
+        meta.push_str(&format!(
+            " · {} tracks · from {} peers",
+            track_count,
+            release.owners.len().max(1)
+        ));
+    } else {
+        meta.push_str(&format!(" · {track_count} tracks · local only"));
+    }
     let button_style = if cursor == 0 {
         theme::tab_active()
     } else {
         theme::accent()
+    };
+    let action_line = if state.global.filters.source_mode.includes_network() {
+        Line::styled(
+            format!(" ⤓ Download the whole release ({track_count}) "),
+            button_style,
+        )
+    } else {
+        Line::styled(" Local filter is active ", button_style)
     };
     let info = vec![
         Line::default(),
         Line::styled(release.title.clone(), theme::header()),
         Line::styled(meta, theme::dim()),
         Line::default(),
+        action_line,
         Line::styled(
-            format!(" ⤓ Download the whole release ({}) ", release.tracks.len()),
-            button_style,
-        ),
-        Line::styled(
-            "shift+v: select · y: download · p: add to playlist",
+            if state.global.filters.source_mode.includes_network() {
+                "shift+v: select · y: download · p: add to playlist"
+            } else {
+                "shift+v: select · enter: play · p: add to playlist"
+            },
             theme::dim(),
         ),
     ];
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Tracklist: rows 1..=n of the cursor space.
+    if visible_track_indices.is_empty() {
+        let message = if state.global.filters.source_mode.includes_network() {
+            "the peers returned no tracks"
+        } else {
+            "release is not available locally"
+        };
+        return centered_line(frame, content_area, Line::styled(message, theme::dim()));
+    }
     let scope = crate::app::state::TrackSelectionScope::FedRelease(index);
     let visible = usize::from(content_area.height.max(1));
     let cursor_track = cursor.saturating_sub(1);
     let first = cursor_track
         .saturating_sub(visible / 2)
-        .min(release.tracks.len().saturating_sub(visible));
-    for (offset, (position, track)) in release
-        .tracks
+        .min(visible_track_indices.len().saturating_sub(visible));
+    for (offset, (position, track_index)) in visible_track_indices
         .iter()
         .enumerate()
         .skip(first)
         .take(visible)
         .enumerate()
     {
+        let Some(track) = release.tracks.get(*track_index) else {
+            continue;
+        };
         let rect = Rect {
             x: content_area.x,
             y: content_area.y + offset as u16,
