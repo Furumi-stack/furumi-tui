@@ -47,6 +47,8 @@ pub struct Runtime {
         Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
     pub library_network_done: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub library_network_mode: crate::config::settings::LibrarySourceMode,
+    pub library_network_art_fetching: Arc<std::sync::atomic::AtomicBool>,
+    pub library_network_art_attempted: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Coalesces urgent personal-device syncs after remote playback commands.
     pub device_sync_running: Arc<std::sync::atomic::AtomicBool>,
     pub device_sync_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -82,6 +84,15 @@ fn now_epoch_seconds() -> i64 {
 
 fn err_string(err: anyhow::Error) -> String {
     format!("{err:#}")
+}
+
+fn refresh_local_content_ids(runtime: &Runtime) {
+    let library = Arc::clone(&runtime.library);
+    let tx = runtime.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = library.local_content_ids().map_err(err_string);
+        let _ = tx.send(AppEvent::LocalContentIdsLoaded(result));
+    });
 }
 
 fn spawn_content_id_backfill(runtime: &Runtime) {
@@ -193,6 +204,10 @@ pub async fn run(
         library_network_cursors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         library_network_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         library_network_mode: crate::config::settings::LibrarySourceMode::Local,
+        library_network_art_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        library_network_art_attempted: Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )),
         device_sync_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         device_sync_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -254,6 +269,8 @@ pub async fn run(
         }
 
         if state.should_quit {
+            state.shutting_down = true;
+            terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
             runtime.federation.shutdown().await;
             return Ok(());
         }
@@ -778,6 +795,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
     }
 
     maybe_refresh_network_library(state, runtime);
+    maybe_fetch_network_artist_images(state, runtime);
 
     // Liked ids load once per session — markers are shown everywhere.
     if !state.likes_loaded {
@@ -790,6 +808,10 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
             let result = library.fed_like_ids().map_err(err_string);
             let _ = tx.send(AppEvent::FedLikesLoaded(result));
         });
+    }
+    if !state.local_content_ids_loaded {
+        state.local_content_ids_loaded = true;
+        refresh_local_content_ids(runtime);
     }
 
     // Playlists tab data (also wanted while the add-to-playlist picker is
@@ -933,6 +955,9 @@ fn maybe_refresh_network_library(state: &AppState, runtime: &mut Runtime) {
         if let Ok(mut done) = runtime.library_network_done.lock() {
             done.clear();
         }
+        if let Ok(mut attempted) = runtime.library_network_art_attempted.lock() {
+            attempted.clear();
+        }
     }
     let near_end = state
         .global
@@ -1021,6 +1046,103 @@ fn maybe_refresh_network_library(state: &AppState, runtime: &mut Runtime) {
         .await;
         if let Err(err) = result {
             tracing::debug!("network library refresh skipped: {err:#}");
+        }
+        running.store(false, Ordering::SeqCst);
+    });
+}
+
+fn maybe_fetch_network_artist_images(state: &AppState, runtime: &mut Runtime) {
+    if state.active_tab != state::Tab::Global
+        || !state.global.stack.is_empty()
+        || !state.global.filters.source_mode.includes_network()
+        || !state.federation.settings.enabled
+    {
+        return;
+    }
+    let capacity = artist_grid_capacity().max(24);
+    let start = state.global.selected.saturating_sub(capacity / 2);
+    let names = state
+        .global
+        .artists
+        .iter()
+        .skip(start)
+        .take(capacity * 2)
+        .filter(|artist| artist.image_path.is_none() && artist.availability.is_remoteish())
+        .map(|artist| artist.name.clone())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    if runtime
+        .library_network_art_fetching
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let filters = state.global.filters;
+    let library = Arc::clone(&runtime.library);
+    let federation = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    let attempted = Arc::clone(&runtime.library_network_art_attempted);
+    let running = Arc::clone(&runtime.library_network_art_fetching);
+    tokio::spawn(async move {
+        let query_library = Arc::clone(&library);
+        let requests = tokio::task::spawn_blocking(move || {
+            query_library.network_artist_image_requests(filters, &names, 8)
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("network art query failed: {err:#}"))
+        .and_then(|result| result);
+        let requests = match requests {
+            Ok(requests) => requests,
+            Err(err) => {
+                tracing::debug!("network artist image requests failed: {err:#}");
+                running.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        for request in requests {
+            let attempt_key = format!("{}:{}", request.source_id, request.artist_key);
+            let should_try = attempted
+                .lock()
+                .map(|mut attempted| attempted.insert(attempt_key))
+                .unwrap_or(false);
+            if !should_try {
+                continue;
+            }
+            let Some(path) = federation
+                .card_image(
+                    std::slice::from_ref(&request.source_id),
+                    &request.name,
+                    None,
+                )
+                .await
+            else {
+                continue;
+            };
+            let update_library = Arc::clone(&library);
+            let source_id = request.source_id.clone();
+            let artist_key = request.artist_key.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                update_library.set_network_artist_image(&source_id, &artist_key, &path)
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("network art save failed: {err:#}"))
+            .and_then(|result| result);
+            match saved {
+                Ok(true) => {
+                    let _ = tx.send(AppEvent::NetworkArtistCacheUpdated {
+                        source_id: request.source_id,
+                        count: 1,
+                    });
+                }
+                Ok(false) => {}
+                Err(err) => tracing::debug!("network artist image save failed: {err:#}"),
+            }
         }
         running.store(false, Ordering::SeqCst);
     });
@@ -2075,6 +2197,9 @@ pub(crate) fn fed_download_spawn(
             let progress = download_progress_sender(tx.clone(), title);
             match fed.download_to_library_with_progress(track, progress).await {
                 Ok(imported) => {
+                    if let Some(content_id) = track_content_id(&imported) {
+                        let _ = tx.send(AppEvent::LocalContentAvailable { content_id });
+                    }
                     imported_ids.push(imported.id);
                     imported_fed_tracks.push(track.clone());
                 }
@@ -2288,6 +2413,7 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
     // Likes reload on the next maintenance pass; the old set stays visible
     // until then.
     state.likes_loaded = false;
+    state.local_content_ids_loaded = false;
 
     // Fresh copies of whatever sits in the queue. Federated placeholders
     // and ephemeral tracks (negative ids) are not library rows and keep
@@ -2747,6 +2873,12 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             match result {
                 Ok(playable) => {
                     if playable.imported {
+                        if let Some(content_id) = state::track_content_id(&playable.track) {
+                            state.local_content_ids.insert(content_id.clone());
+                            let _ = runtime
+                                .event_tx
+                                .send(AppEvent::LocalContentAvailable { content_id });
+                        }
                         // Save-on-listen imported the file; refresh the
                         // library views through the standard change path.
                         let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
@@ -3072,6 +3204,20 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             Err(message) => tracing::warn!(%message, "likes load failed"),
         },
+        AppEvent::LocalContentIdsLoaded(result) => match result {
+            Ok(ids) => {
+                state.local_content_ids = ids.into_iter().collect();
+            }
+            Err(message) => {
+                state.local_content_ids_loaded = false;
+                tracing::warn!(%message, "local content id load failed");
+            }
+        },
+        AppEvent::LocalContentAvailable { content_id } => {
+            if let Some(content_id) = music_dht::normalize_content_id(&content_id) {
+                state.local_content_ids.insert(content_id);
+            }
+        }
         AppEvent::FedLikesLoaded(result) => match result {
             Ok(ids) => state.fed_likes = ids.into_iter().collect(),
             Err(message) => tracing::warn!(%message, "federated likes load failed"),

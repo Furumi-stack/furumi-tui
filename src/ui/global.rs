@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{art, theme};
+use super::{art, availability_marker, availability_prefix, theme};
 use crate::app::state::{
     ART_CELL_HEIGHT, ART_CELL_WIDTH, ART_HEADER_HEIGHT, ART_HEADER_WIDTH, AppState, ArtState,
     GlobalView, Loadable, TILE_HEIGHT, TILE_WIDTH, ViewMode, fed_release_display_order,
@@ -107,9 +107,6 @@ fn draw_tile_with_availability(
         ..inner
     };
     draw_art(frame, art_area, art_state);
-    if let Some(availability) = availability {
-        draw_availability_badge(frame, art_area, availability);
-    }
 
     if inner.height > ART_CELL_HEIGHT {
         let name_area = Rect {
@@ -131,35 +128,56 @@ fn draw_tile_with_availability(
             height: 1,
             ..inner
         };
-        frame.render_widget(
-            Paragraph::new(Line::styled(meta.to_string(), theme::dim())),
-            meta_area,
-        );
-        if selected {
-            frame.buffer_mut().set_style(meta_area, theme::tab_active());
-        }
+        draw_tile_meta(frame, meta_area, meta, availability, selected);
     }
 }
 
-fn draw_availability_badge(frame: &mut Frame, area: Rect, availability: Availability) {
-    if area.width < 2 || area.height == 0 {
-        return;
-    }
-    let (label, style) = match availability {
-        Availability::Local => ("●", Style::new().fg(Color::Green)),
-        Availability::Mixed => ("◐", Style::new().fg(Color::Yellow)),
-        Availability::Remote => ("⇅", theme::accent()),
-    };
-    let badge = Rect {
-        x: area.x + area.width.saturating_sub(2),
-        y: area.y,
-        width: 2,
-        height: 1,
+fn draw_tile_meta(
+    frame: &mut Frame,
+    area: Rect,
+    meta: &str,
+    availability: Option<Availability>,
+    selected: bool,
+) {
+    let marker = availability.map(|availability| availability_marker(availability, selected));
+    let marker_width = marker
+        .map(|(label, _)| UnicodeWidthStr::width(label) as u16)
+        .unwrap_or(0)
+        .max(u16::from(marker.is_some()) * 2)
+        .min(area.width);
+    let marker_pad = u16::from(marker_width > 0 && area.width > marker_width);
+    let reserved_width = marker_width.saturating_add(marker_pad).min(area.width);
+    let text_area = if reserved_width > 0 && area.width > reserved_width {
+        Rect {
+            width: area.width - reserved_width,
+            ..area
+        }
+    } else {
+        area
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(label, style)).alignment(Alignment::Right),
-        badge,
+        Paragraph::new(Line::styled(meta.to_string(), theme::dim())),
+        text_area,
     );
+    if selected {
+        frame.buffer_mut().set_style(area, theme::tab_active());
+    }
+    if let Some((label, style)) = marker
+        && marker_width > 0
+    {
+        let marker_area = Rect {
+            x: area
+                .x
+                .saturating_add(area.width.saturating_sub(reserved_width)),
+            y: area.y,
+            width: marker_width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(label, style)).alignment(Alignment::Right),
+            marker_area,
+        );
+    }
 }
 
 fn tile_title(title: &str, width: u16, selected: bool) -> String {
@@ -171,6 +189,49 @@ fn tile_title(title: &str, width: u16, selected: bool) -> String {
         return title.to_string();
     }
     marquee_window(title, width)
+}
+
+fn fed_track_availability_prefix(
+    state: &AppState,
+    track: &crate::federation::FedTrack,
+) -> Span<'static> {
+    let availability = if state.fed_track_local(track) {
+        Availability::Local
+    } else {
+        Availability::Remote
+    };
+    availability_prefix(availability)
+}
+
+fn fed_card_track_availability_prefix(
+    state: &AppState,
+    track: &crate::federation::FedCardTrack,
+) -> Span<'static> {
+    let availability = if state.fed_card_track_local(track) {
+        Availability::Local
+    } else {
+        Availability::Remote
+    };
+    availability_prefix(availability)
+}
+
+fn fed_release_availability(
+    state: &AppState,
+    release: &crate::federation::FedRelease,
+) -> Availability {
+    if release.tracks.is_empty() {
+        return Availability::Remote;
+    }
+    let local = release
+        .tracks
+        .iter()
+        .filter(|track| state.fed_card_track_local(track))
+        .count();
+    match local {
+        0 => Availability::Remote,
+        count if count == release.tracks.len() => Availability::Local,
+        _ => Availability::Mixed,
+    }
 }
 
 fn marquee_window(title: &str, width: usize) -> String {
@@ -331,7 +392,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn artist_tile_meta(artist: &ArtistCard) -> String {
-    format!("{} rel · {} trk", artist.release_count, artist.track_count)
+    format!("{} rel {} trk", artist.release_count, artist.track_count)
 }
 
 fn draw_grid_tiles(frame: &mut Frame, inner: Rect, state: &AppState) {
@@ -869,7 +930,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         for hit in &state.search.fed_artists {
             rows.push((
                 Line::from(vec![
-                    Span::styled("⇅ ", theme::accent()),
+                    availability_prefix(Availability::Remote),
                     Span::raw(hit.name.clone()),
                     Span::styled("  artist · open the card", theme::dim()),
                 ]),
@@ -903,7 +964,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             rows.push((
                 Line::from(vec![
                     heart,
-                    Span::styled("⇅ ", theme::accent()),
+                    fed_track_availability_prefix(state, fed),
                     Span::raw(fed.title.clone()),
                     Span::styled(
                         format!("  {} · {}", fed.artist_line(), origin),
@@ -1093,7 +1154,7 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
                         &release.title,
                         &meta,
                         cursor == *position,
-                        Some(Availability::Remote),
+                        Some(fed_release_availability(state, release)),
                     );
                 }
             }
@@ -1143,7 +1204,7 @@ fn draw_fed_appearance_row(
     let line = Line::from(vec![
         Span::styled(format!("{number:>3} "), theme::dim()),
         heart,
-        Span::styled("⇅ ", theme::accent()),
+        fed_card_track_availability_prefix(state, track),
         Span::raw(track.title.clone()),
         Span::styled(format!("  {context}"), theme::dim()),
     ]);
@@ -1318,7 +1379,7 @@ fn draw_fed_release(frame: &mut Frame, area: Rect, state: &AppState, index: usiz
         };
         let line = Line::from(vec![
             heart,
-            Span::styled("⇅ ", theme::accent()),
+            fed_card_track_availability_prefix(state, track),
             Span::raw(format!("{number}{}", track.title)),
         ]);
         if in_selection && cursor != position + 1 {

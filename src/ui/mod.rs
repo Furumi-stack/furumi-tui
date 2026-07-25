@@ -15,10 +15,35 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use crate::app::input::LineEdit;
 use crate::app::state::{AppState, Tab, TrackSelectionScope};
 use crate::config::keymap::Keymap;
+use crate::library::models::Availability;
+
+pub(crate) fn availability_marker(
+    availability: Availability,
+    selected: bool,
+) -> (&'static str, Style) {
+    let (label, style) = match availability {
+        Availability::Local => ("●", Style::new().fg(Color::Green)),
+        Availability::Mixed => ("◐", Style::new().fg(Color::Yellow)),
+        Availability::Remote => ("⇅", theme::accent()),
+    };
+    if selected {
+        (label, theme::tab_active())
+    } else {
+        (label, style)
+    }
+}
+
+pub(crate) fn availability_prefix(availability: Availability) -> Span<'static> {
+    let (label, style) = availability_marker(availability, false);
+    Span::styled(format!("{label} "), style)
+}
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     if state.visualizer.active {
         crate::visualizer::draw(frame, state);
+        if state.shutting_down {
+            draw_shutdown(frame);
+        }
         return;
     }
 
@@ -43,6 +68,37 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         draw_help(frame, keymap);
     }
     popup::draw(frame, state);
+    if state.shutting_down {
+        draw_shutdown(frame);
+    }
+}
+
+fn draw_shutdown(frame: &mut Frame) {
+    let area = centered(frame.area(), 28, 5);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Line::styled("Shutting down...", theme::header()))
+            .alignment(Alignment::Center),
+        Rect {
+            y: inner.y + inner.height / 2,
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 pub(crate) fn loading_line(state: &AppState, text: impl Into<String>) -> Line<'static> {
@@ -118,7 +174,12 @@ pub(crate) fn track_row_with_like_marker(
         Span::raw("  ")
     };
     let fed_marker = if track.fed.is_some() {
-        Span::styled("⇅ ", theme::accent())
+        let availability = if state.track_content_local(track) {
+            Availability::Local
+        } else {
+            Availability::Remote
+        };
+        availability_prefix(availability)
     } else {
         Span::raw("")
     };
@@ -468,6 +529,22 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap) {
         lines.push(Line::default());
         blocks.push(lines);
     }
+    blocks.push(vec![
+        Line::styled("Status icons", theme::header()),
+        Line::from(vec![
+            Span::styled("●", Style::new().fg(Color::Green)),
+            Span::raw("  Local on this device"),
+        ]),
+        Line::from(vec![
+            Span::styled("◐", Style::new().fg(Color::Yellow)),
+            Span::raw("  Local + peer sources"),
+        ]),
+        Line::from(vec![
+            Span::styled("⇅", theme::accent()),
+            Span::raw("  Network only"),
+        ]),
+        Line::default(),
+    ]);
 
     // Balance the blocks across two columns.
     let total: usize = blocks.iter().map(Vec::len).sum();

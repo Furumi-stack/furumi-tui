@@ -10,7 +10,7 @@
 pub mod import;
 pub mod models;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS network_artist_cache (
     artist_key     TEXT NOT NULL,
     name           TEXT NOT NULL,
     image_path     TEXT,
+    remote_image_hint TEXT,
     release_count  INTEGER NOT NULL DEFAULT 0,
     track_count    INTEGER NOT NULL DEFAULT 0,
     seen_at_ms     INTEGER NOT NULL,
@@ -215,6 +216,13 @@ pub struct NetworkArtistPreview {
     pub image_path: Option<String>,
     pub release_count: i64,
     pub track_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkArtistImageRequest {
+    pub source_id: String,
+    pub artist_key: String,
+    pub name: String,
 }
 
 pub struct Library {
@@ -595,7 +603,7 @@ impl Library {
         source_id: &str,
         source_kind: &str,
         artists: &[NetworkArtistPreview],
-        replace_source: bool,
+        _replace_source: bool,
     ) -> Result<usize> {
         let source_id = source_id.trim();
         let source_kind = source_kind.trim();
@@ -605,23 +613,18 @@ impl Library {
         let now = now_ms_i64();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        if replace_source {
-            tx.execute(
-                "DELETE FROM network_artist_cache WHERE source_id = ?1",
-                [source_id],
-            )?;
-        }
         let mut inserted = 0usize;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO network_artist_cache
-                    (source_id, source_kind, artist_key, name, image_path,
+                    (source_id, source_kind, artist_key, name, image_path, remote_image_hint,
                      release_count, track_count, seen_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(source_id, artist_key) DO UPDATE SET
                     source_kind = excluded.source_kind,
                     name = excluded.name,
-                    image_path = excluded.image_path,
+                    image_path = COALESCE(network_artist_cache.image_path, excluded.image_path),
+                    remote_image_hint = excluded.remote_image_hint,
                     release_count = excluded.release_count,
                     track_count = excluded.track_count,
                     seen_at_ms = excluded.seen_at_ms",
@@ -640,6 +643,7 @@ impl Library {
                     source_kind,
                     artist_key,
                     artist.name.trim(),
+                    Option::<&str>::None,
                     artist.image_path.as_deref(),
                     artist.release_count.max(0),
                     artist.track_count.max(0),
@@ -650,6 +654,76 @@ impl Library {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    pub fn network_artist_image_requests(
+        &self,
+        filters: crate::config::settings::LibraryFilters,
+        artist_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<NetworkArtistImageRequest>> {
+        if !filters.source_mode.includes_network() || artist_names.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let cutoff = now_ms_i64().saturating_sub(NETWORK_ARTIST_CACHE_TTL_MS);
+        let source_predicate = if filters.source_mode.includes_global_peers() {
+            "seen_at_ms >= ?2"
+        } else {
+            "seen_at_ms >= ?2 AND source_kind = 'personal'"
+        };
+        let sql = format!(
+            "SELECT source_id, artist_key, name
+             FROM network_artist_cache
+             WHERE artist_key = ?1
+               AND {source_predicate}
+               AND image_path IS NULL
+               AND remote_image_hint IS NOT NULL
+               AND remote_image_hint <> ''
+             ORDER BY CASE source_kind WHEN 'personal' THEN 0 ELSE 1 END,
+                      seen_at_ms DESC
+             LIMIT 1"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut seen_keys = HashSet::new();
+        let mut requests = Vec::new();
+        for name in artist_names {
+            let artist_key = music_dht::normalize_name(name);
+            if artist_key.is_empty() || !seen_keys.insert(artist_key.clone()) {
+                continue;
+            }
+            let row = statement
+                .query_row(params![artist_key, cutoff], |row| {
+                    Ok(NetworkArtistImageRequest {
+                        source_id: row.get(0)?,
+                        artist_key: row.get(1)?,
+                        name: row.get(2)?,
+                    })
+                })
+                .optional()?;
+            if let Some(request) = row {
+                requests.push(request);
+                if requests.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(requests)
+    }
+
+    pub fn set_network_artist_image(
+        &self,
+        source_id: &str,
+        artist_key: &str,
+        image_path: &str,
+    ) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE network_artist_cache
+             SET image_path = ?3
+             WHERE source_id = ?1 AND artist_key = ?2",
+            params![source_id, artist_key, image_path],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn artist(&self, id: i64) -> Result<ArtistDetail> {
@@ -1555,6 +1629,22 @@ impl Library {
              FROM likes k
              JOIN tracks t ON t.id = k.track_id
              WHERE t.content_id IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|content_id| music_dht::normalize_content_id(&content_id))
+            .collect())
+    }
+
+    pub fn local_content_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT content_id
+             FROM tracks
+             WHERE content_id IS NOT NULL",
         )?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -2521,6 +2611,16 @@ fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    let network_artist_columns = table_columns(conn, "network_artist_cache")?;
+    if !network_artist_columns
+        .iter()
+        .any(|column| column == "remote_image_hint")
+    {
+        conn.execute(
+            "ALTER TABLE network_artist_cache ADD COLUMN remote_image_hint TEXT",
+            [],
+        )?;
+    }
     let mut rows = conn.prepare("SELECT id, title FROM playlists WHERE sync_id IS NULL")?;
     let missing = rows
         .query_map([], |row| {
@@ -2643,6 +2743,47 @@ mod tests {
         let filtered = lib.artists(1, 10, artist_filters(true)).unwrap();
         assert!(filtered.items.iter().all(|artist| artist.release_count > 0));
         assert!(!filtered.items.iter().any(|artist| artist.name == "Guest"));
+    }
+
+    #[test]
+    fn network_artist_image_hint_becomes_local_image_after_fetch() {
+        let lib = test_library();
+        let artist_key = music_dht::normalize_name("Remote Artist");
+        lib.replace_network_artist_cache(
+            "peer-a",
+            "personal",
+            &[NetworkArtistPreview {
+                artist_key: artist_key.clone(),
+                name: "Remote Artist".into(),
+                image_path: Some("peer-local/image.jpg".into()),
+                release_count: 1,
+                track_count: 3,
+            }],
+            true,
+        )
+        .unwrap();
+
+        let filters = crate::config::settings::LibraryFilters {
+            source_mode: crate::config::settings::LibrarySourceMode::My,
+            ..Default::default()
+        };
+        let page = lib.artists(1, 10, filters).unwrap();
+        assert_eq!(page.items[0].image_path, None);
+
+        let requests = lib
+            .network_artist_image_requests(filters, &["Remote Artist".into()], 8)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source_id, "peer-a");
+        assert_eq!(requests[0].artist_key, artist_key);
+
+        lib.set_network_artist_image("peer-a", &artist_key, "/tmp/remote-artist.jpg")
+            .unwrap();
+        let page = lib.artists(1, 10, filters).unwrap();
+        assert_eq!(
+            page.items[0].image_path.as_deref(),
+            Some("/tmp/remote-artist.jpg")
+        );
     }
 
     #[test]

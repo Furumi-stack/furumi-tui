@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::app::input::LineEdit;
@@ -979,6 +979,7 @@ impl DevicePlaybackState {
 pub struct AppState {
     pub active_tab: Tab,
     pub should_quit: bool,
+    pub shutting_down: bool,
     /// Double-press quit confirmation: set by the first Quit press, expires
     /// after a short window (any other action also cancels it).
     pub quit_armed_until: Option<std::time::Instant>,
@@ -996,11 +997,14 @@ pub struct AppState {
     pub playlists: PlaylistsTab,
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
     /// Liked local-library content ids, for the ♥ markers everywhere tracks are shown.
-    pub likes: std::collections::HashSet<String>,
+    pub likes: HashSet<String>,
     /// Liked federated tracks (DHT item ids and content ids) — likes that
     /// reference peers' tracks without downloading them.
-    pub fed_likes: std::collections::HashSet<String>,
+    pub fed_likes: HashSet<String>,
+    /// Content ids that currently have a local playable file.
+    pub local_content_ids: HashSet<String>,
     pub likes_loaded: bool,
+    pub local_content_ids_loaded: bool,
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
     pub federation: FederationTab,
@@ -1064,6 +1068,30 @@ impl AppState {
                 .sources
                 .iter()
                 .any(|(_, item_id)| self.fed_likes.contains(item_id))
+    }
+
+    pub fn content_id_local(&self, content_id: &str) -> bool {
+        music_dht::normalize_content_id(content_id)
+            .is_some_and(|content_id| self.local_content_ids.contains(&content_id))
+    }
+
+    pub fn fed_track_local(&self, track: &crate::federation::FedTrack) -> bool {
+        track
+            .content_id
+            .as_deref()
+            .is_some_and(|content_id| self.content_id_local(content_id))
+    }
+
+    pub fn fed_card_track_local(&self, track: &crate::federation::FedCardTrack) -> bool {
+        track
+            .content_id
+            .as_deref()
+            .is_some_and(|content_id| self.content_id_local(content_id))
+    }
+
+    pub fn track_content_local(&self, track: &TrackItem) -> bool {
+        track_content_id(track)
+            .is_some_and(|content_id| self.local_content_ids.contains(&content_id))
     }
 
     pub fn track_liked(&self, track: &TrackItem) -> bool {

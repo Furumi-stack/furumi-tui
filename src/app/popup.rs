@@ -261,6 +261,9 @@ fn handle_library_filters(
             if let Ok(mut done) = runtime.library_network_done.lock() {
                 done.clear();
             }
+            if let Ok(mut attempted) = runtime.library_network_art_attempted.lock() {
+                attempted.clear();
+            }
             super::save_app_settings(state);
             super::reset_artist_pagination(state);
             super::refresh_artists(state, runtime);

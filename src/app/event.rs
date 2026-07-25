@@ -52,6 +52,12 @@ pub enum AppEvent {
     },
     /// Liked local content ids for the ♥ markers.
     LikesLoaded(Result<Vec<String>, String>),
+    /// Local-library content ids for availability markers.
+    LocalContentIdsLoaded(Result<Vec<String>, String>),
+    /// One content id became available locally while the UI is open.
+    LocalContentAvailable {
+        content_id: String,
+    },
     LikeToggled {
         content_id: String,
         liked: bool,

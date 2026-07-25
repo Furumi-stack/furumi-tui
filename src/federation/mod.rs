@@ -942,7 +942,7 @@ impl Federation {
                     artist.artist_key
                 },
                 name: artist.name,
-                image_path: None,
+                image_path: artist.image_path,
                 release_count: artist.release_count,
                 track_count: artist.track_count,
             })
