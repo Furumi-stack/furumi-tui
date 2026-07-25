@@ -1,6 +1,20 @@
 //! Data shapes the views render. They mirror what the furumusic API used to
 //! return, but every field is now filled from the local SQLite library.
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Availability {
+    #[default]
+    Local,
+    Mixed,
+    Remote,
+}
+
+impl Availability {
+    pub fn is_remoteish(self) -> bool {
+        matches!(self, Availability::Mixed | Availability::Remote)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtistCard {
     pub id: i64,
@@ -9,6 +23,7 @@ pub struct ArtistCard {
     pub image_path: Option<String>,
     pub release_count: i64,
     pub track_count: i64,
+    pub availability: Availability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +122,7 @@ pub struct ReleaseCard {
     pub year: Option<i32>,
     pub cover_path: Option<String>,
     pub track_count: i64,
+    pub availability: Availability,
 }
 
 #[derive(Debug)]

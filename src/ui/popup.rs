@@ -371,7 +371,7 @@ fn clip_cells(text: &str, max_width: usize) -> String {
 }
 
 fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
-    let area = centered(frame.area(), 46, 6);
+    let area = centered(frame.area(), 54, 9);
     let block = Block::bordered()
         .title(" Library filters ")
         .title_style(theme::header())
@@ -381,33 +381,47 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
     frame.render_widget(block, area);
 
     let [list_area, _, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(4),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
 
+    let mut rows: Vec<Line<'static>> = Vec::new();
     let checked = if state.global.filters.hide_featured_only {
         "[x]"
     } else {
         "[ ]"
     };
-    let row = Rect {
-        height: 1,
-        ..list_area
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("{checked} "), theme::accent()),
-            Span::raw("Hide featured only"),
-        ])),
-        row,
-    );
-    if cursor == 0 {
-        frame.buffer_mut().set_style(row, theme::tab_active());
+    rows.push(Line::from(vec![
+        Span::styled(format!("{checked} "), theme::accent()),
+        Span::raw("Hide featured only"),
+    ]));
+    for mode in crate::config::settings::LibrarySourceMode::ALL {
+        let marker = if state.global.filters.source_mode == mode {
+            "(*)"
+        } else {
+            "( )"
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{marker} "), theme::accent()),
+            Span::raw(mode.label()),
+            Span::styled(format!("  {}", mode.description()), theme::dim()),
+        ]));
+    }
+    for (index, line) in rows.into_iter().enumerate() {
+        let row = Rect {
+            y: list_area.y + index as u16,
+            height: 1,
+            ..list_area
+        };
+        frame.render_widget(Paragraph::new(line), row);
+        if cursor == index {
+            frame.buffer_mut().set_style(row, theme::tab_active());
+        }
     }
     frame.render_widget(
-        Paragraph::new(Line::styled("space/enter toggle · esc close", theme::dim()))
+        Paragraph::new(Line::styled("space/enter select · esc close", theme::dim()))
             .alignment(Alignment::Center),
         footer,
     );

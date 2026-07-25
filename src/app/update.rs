@@ -498,6 +498,10 @@ fn open_edit_popup(state: &mut AppState) {
         let Some(artist) = state.global.artists.get(state.global.selected).cloned() else {
             return;
         };
+        if artist.id < 0 {
+            state.status_message = Some("remote artists cannot be edited here".into());
+            return;
+        }
         state.popup = Some(artist_edit_popup(
             artist.id,
             &artist.name,
@@ -664,6 +668,10 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
     }
     if state.global.stack.is_empty() {
         let artist = state.global.artists.get(state.global.selected).cloned()?;
+        if artist.id < 0 {
+            state.status_message = Some("remote artists cannot be deleted here".into());
+            return None;
+        }
         state.popup = Some(Popup::ConfirmDelete {
             target: DeleteTarget::Artist(artist.id),
             label: format!(
@@ -1942,10 +1950,17 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     }
     let outcome = match state.global.stack.last().copied() {
         None => match state.global.artists.get(state.global.selected) {
-            Some(artist) => Outcome::Push(GlobalView::Artist {
+            Some(artist)
+                if state.global.filters.source_mode.includes_network()
+                    && artist.availability.is_remoteish() =>
+            {
+                Outcome::OpenFedArtist(artist.name.clone())
+            }
+            Some(artist) if artist.id >= 0 => Outcome::Push(GlobalView::Artist {
                 id: artist.id,
                 cursor: 0,
             }),
+            Some(artist) => Outcome::OpenFedArtist(artist.name.clone()),
             None => Outcome::Nothing,
         },
         Some(GlobalView::Artist { id, cursor: _ }) if state.artist_fed_button => {
@@ -2689,6 +2704,7 @@ mod tests {
                 image_path: None,
                 release_count: 1,
                 track_count: 2,
+                availability: crate::library::models::Availability::Local,
             })
             .collect();
         state
@@ -2854,6 +2870,7 @@ mod tests {
             year: None,
             cover_path: None,
             track_count: 1,
+            availability: crate::library::models::Availability::Local,
         };
         let columns = grid_columns();
         // The terminal size can be visible to tests. Build enough albums to

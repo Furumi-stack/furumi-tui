@@ -253,6 +253,7 @@ mod tests {
             year,
             cover_path: None,
             track_count: 1,
+            availability: crate::library::models::Availability::Local,
         }
     }
 

@@ -107,6 +107,11 @@ pub enum AppEvent {
         name: String,
         result: Result<crate::federation::FedArtistCard, String>,
     },
+    /// A network-library source refreshed its cached top-artist slice.
+    NetworkArtistCacheUpdated {
+        source_id: String,
+        count: usize,
+    },
     /// A streamed image for the open card arrived (artist image when
     /// `release` is None, a release cover otherwise).
     FedCardArt {

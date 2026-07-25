@@ -41,6 +41,12 @@ pub struct Runtime {
     pub federation: Arc<crate::federation::Federation>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
+    pub library_network_refresh_at: Option<std::time::Instant>,
+    pub library_network_refreshing: Arc<std::sync::atomic::AtomicBool>,
+    pub library_network_cursors:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+    pub library_network_done: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub library_network_mode: crate::config::settings::LibrarySourceMode,
     /// Coalesces urgent personal-device syncs after remote playback commands.
     pub device_sync_running: Arc<std::sync::atomic::AtomicBool>,
     pub device_sync_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -182,6 +188,11 @@ pub async fn run(
         devices,
         federation,
         fed_status_at: None,
+        library_network_refresh_at: None,
+        library_network_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        library_network_cursors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        library_network_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        library_network_mode: crate::config::settings::LibrarySourceMode::Local,
         device_sync_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         device_sync_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fed_resolving: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -753,20 +764,20 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         {
             global.loading = true;
             let page = global.next_page;
-            let hide_featured_only = global.filters.hide_featured_only;
+            let filters = global.filters;
             let limit = *global
                 .page_limit
                 .get_or_insert_with(|| (needed as i64).clamp(48, 200));
             let library = Arc::clone(&runtime.library);
             let tx = runtime.event_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let result = library
-                    .artists(page, limit, hide_featured_only)
-                    .map_err(err_string);
+                let result = library.artists(page, limit, filters).map_err(err_string);
                 let _ = tx.send(AppEvent::ArtistsLoaded(result));
             });
         }
     }
+
+    maybe_refresh_network_library(state, runtime);
 
     // Liked ids load once per session — markers are shown everywhere.
     if !state.likes_loaded {
@@ -902,6 +913,117 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
         state.art.insert(key.clone(), state::ArtState::Loading);
         spawn_art_fetch(runtime, key, path, width, height);
     }
+}
+
+fn maybe_refresh_network_library(state: &AppState, runtime: &mut Runtime) {
+    if state.active_tab != state::Tab::Global
+        || !state.global.stack.is_empty()
+        || !state.global.filters.source_mode.includes_network()
+        || !state.federation.settings.enabled
+    {
+        return;
+    }
+    let mode = state.global.filters.source_mode;
+    if runtime.library_network_mode != mode {
+        runtime.library_network_mode = mode;
+        runtime.library_network_refresh_at = None;
+        if let Ok(mut cursors) = runtime.library_network_cursors.lock() {
+            cursors.clear();
+        }
+        if let Ok(mut done) = runtime.library_network_done.lock() {
+            done.clear();
+        }
+    }
+    let near_end = state
+        .global
+        .artists
+        .len()
+        .saturating_sub(state.global.selected)
+        <= ARTISTS_PREFETCH_MARGIN
+        || state.global.artists.len() < artist_grid_capacity();
+    let refresh_interval = if near_end {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(60)
+    };
+    let due = runtime
+        .library_network_refresh_at
+        .is_none_or(|at| at.elapsed() > refresh_interval);
+    if !due {
+        return;
+    }
+    if !near_end {
+        if let Ok(mut cursors) = runtime.library_network_cursors.lock() {
+            cursors.clear();
+        }
+        if let Ok(mut done) = runtime.library_network_done.lock() {
+            done.clear();
+        }
+    }
+    use std::sync::atomic::Ordering;
+    if runtime
+        .library_network_refreshing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    runtime.library_network_refresh_at = Some(std::time::Instant::now());
+    let federation = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    let running = Arc::clone(&runtime.library_network_refreshing);
+    let cursors = Arc::clone(&runtime.library_network_cursors);
+    let done = Arc::clone(&runtime.library_network_done);
+    let limit = if near_end { 64 } else { 96 };
+    tokio::spawn(async move {
+        let result = async {
+            let sources = federation.network_library_sources(mode).await?;
+            for source in sources {
+                let source_id = source.endpoint_id.clone();
+                if done
+                    .lock()
+                    .map(|done| done.contains(&source_id))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let cursor = cursors
+                    .lock()
+                    .ok()
+                    .and_then(|cursors| cursors.get(&source_id).cloned())
+                    .flatten();
+                match tokio::time::timeout(
+                    Duration::from_secs(4),
+                    federation.cache_artist_slice_from_source(source, cursor.clone(), limit),
+                )
+                .await
+                {
+                    Ok(Ok((count, next_cursor))) => {
+                        if let Some(next_cursor) = next_cursor {
+                            if let Ok(mut cursors) = cursors.lock() {
+                                cursors.insert(source_id.clone(), Some(next_cursor));
+                            }
+                        } else if let Ok(mut done) = done.lock() {
+                            done.insert(source_id.clone());
+                        }
+                        let _ = tx.send(AppEvent::NetworkArtistCacheUpdated { source_id, count });
+                    }
+                    Ok(Err(err)) => {
+                        tracing::debug!(source = %source_id, "network library source failed: {err:#}");
+                    }
+                    Err(_) => {
+                        tracing::debug!(source = %source_id, "network library source timed out");
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::debug!("network library refresh skipped: {err:#}");
+        }
+        running.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Load and decode a local image file for the art cache.
@@ -2208,12 +2330,12 @@ fn refresh_artists(state: &mut AppState, runtime: &Runtime) {
     let global = &mut state.global;
     let needed = artist_grid_capacity() + ARTISTS_PREFETCH_MARGIN;
     let limit = (global.artists.len().max(needed) as i64).clamp(48, 1000);
-    let hide_featured_only = global.filters.hide_featured_only;
+    let filters = global.filters;
     global.reloading = true;
     let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let event = match library.artists(1, limit, hide_featured_only) {
+        let event = match library.artists(1, limit, filters) {
             Ok(page) => AppEvent::ArtistsReloaded { page, limit },
             Err(err) => AppEvent::ArtistsLoaded(Err(err_string(err))),
         };
@@ -2727,6 +2849,12 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 };
             }
         }
+        AppEvent::NetworkArtistCacheUpdated { source_id, count } => {
+            tracing::debug!(source = %source_id, count, "network artist cache updated");
+            if state.active_tab == state::Tab::Global && state.global.stack.is_empty() {
+                refresh_artists(state, runtime);
+            }
+        }
         AppEvent::FedCardArt {
             name,
             release,
@@ -2779,6 +2907,10 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::ArtistsReloaded { page, limit } => {
             let global = &mut state.global;
+            let selected_key = global
+                .artists
+                .get(global.selected)
+                .map(|artist| music_dht::normalize_name(&artist.name));
             global.reloading = false;
             global.loading = false;
             global.error = None;
@@ -2788,7 +2920,15 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             global.page_limit = Some(limit);
             global.artists = page.items;
             if !global.artists.is_empty() {
-                global.selected = global.selected.min(global.artists.len() - 1);
+                global.selected = selected_key
+                    .as_deref()
+                    .and_then(|key| {
+                        global
+                            .artists
+                            .iter()
+                            .position(|artist| music_dht::normalize_name(&artist.name) == key)
+                    })
+                    .unwrap_or_else(|| global.selected.min(global.artists.len() - 1));
             } else {
                 global.selected = 0;
             }

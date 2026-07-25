@@ -2239,6 +2239,22 @@ impl DeviceSync {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn active_remote_endpoint_ids(&self) -> Result<Vec<String>> {
+        let own = self.ensure_identity()?.device_id;
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT endpoint_id
+             FROM sync_devices
+             WHERE trusted_at_ms IS NOT NULL
+               AND revoked_at_ms IS NULL
+               AND device_id != ?1
+               AND endpoint_id != ''
+             ORDER BY last_seen_ms DESC",
+        )?;
+        let rows = stmt.query_map([own], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn active_device_count(&self) -> Result<usize> {
         let conn = lock(&self.conn);
         Ok(conn.query_row(

@@ -18,12 +18,13 @@ use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use models::{
-    ArtistCard, ArtistDetail, ArtistRef, ArtistsPage, PlaylistCard, PlaylistDetail, ReleaseCard,
-    ReleaseDetail, ReleaseEdit, SearchResults, TrackEdit, TrackItem,
+    ArtistCard, ArtistDetail, ArtistRef, ArtistsPage, Availability, PlaylistCard, PlaylistDetail,
+    ReleaseCard, ReleaseDetail, ReleaseEdit, SearchResults, TrackEdit, TrackItem,
 };
 
 /// The virtual "Liked tracks" playlist id, kept from the server API.
 pub const LIKES_PLAYLIST_ID: i64 = -1;
+const NETWORK_ARTIST_CACHE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS artists (
@@ -132,6 +133,21 @@ CREATE INDEX IF NOT EXISTS idx_history_track ON history(track_id);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_fed_playlist_tracks_playlist
     ON fed_playlist_tracks(playlist_sync_id, position);
+CREATE TABLE IF NOT EXISTS network_artist_cache (
+    source_id      TEXT NOT NULL,
+    source_kind    TEXT NOT NULL,
+    artist_key     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    image_path     TEXT,
+    release_count  INTEGER NOT NULL DEFAULT 0,
+    track_count    INTEGER NOT NULL DEFAULT 0,
+    seen_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (source_id, artist_key)
+);
+CREATE INDEX IF NOT EXISTS idx_network_artist_cache_kind
+    ON network_artist_cache(source_kind, seen_at_ms);
+CREATE INDEX IF NOT EXISTS idx_network_artist_cache_artist
+    ON network_artist_cache(artist_key);
 ";
 
 /// The SELECT column list every TrackItem row is built from; artist lists
@@ -190,6 +206,15 @@ pub struct ExportTrack {
     pub track_number: Option<i32>,
     pub disc_number: Option<i32>,
     pub content_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkArtistPreview {
+    pub artist_key: String,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub release_count: i64,
+    pub track_count: i64,
 }
 
 pub struct Library {
@@ -314,7 +339,24 @@ impl Library {
     // Reads (same shapes the API used to return)
     // -----------------------------------------------------------------
 
-    pub fn artists(&self, page: i64, limit: i64, hide_featured_only: bool) -> Result<ArtistsPage> {
+    pub fn artists(
+        &self,
+        page: i64,
+        limit: i64,
+        filters: crate::config::settings::LibraryFilters,
+    ) -> Result<ArtistsPage> {
+        if !filters.source_mode.includes_network() {
+            return self.local_artists(page, limit, filters.hide_featured_only);
+        }
+        self.merged_artists(page, limit, filters)
+    }
+
+    fn local_artists(
+        &self,
+        page: i64,
+        limit: i64,
+        hide_featured_only: bool,
+    ) -> Result<ArtistsPage> {
         let conn = self.lock();
         let hide_featured_only = i64::from(hide_featured_only);
         let total: i64 = conn.query_row(
@@ -356,6 +398,7 @@ impl Library {
                     image_path: row.get(2)?,
                     release_count: row.get(3)?,
                     track_count: row.get(4)?,
+                    availability: Availability::Local,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -366,6 +409,247 @@ impl Library {
             total,
             page: page.max(1),
         })
+    }
+
+    fn local_artist_cards(&self, hide_featured_only: bool) -> Result<Vec<ArtistCard>> {
+        let conn = self.lock();
+        let hide_featured_only = i64::from(hide_featured_only);
+        let mut statement = conn.prepare(
+            "SELECT a.id, a.name, a.image_path,
+                (SELECT COUNT(DISTINCT ra.release_id)
+                 FROM release_artists ra
+                 WHERE ra.artist_id = a.id) AS release_count,
+                (SELECT COUNT(DISTINCT ta.track_id)
+                 FROM track_artists ta
+                 WHERE ta.artist_id = a.id) AS track_count
+             FROM artists a
+             WHERE ?1 = 0
+                OR EXISTS (
+                    SELECT 1
+                    FROM release_artists ra
+                    WHERE ra.artist_id = a.id
+                )",
+        )?;
+        statement
+            .query_map(params![hide_featured_only], |row| {
+                Ok(ArtistCard {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    image_path: row.get(2)?,
+                    release_count: row.get(3)?,
+                    track_count: row.get(4)?,
+                    availability: Availability::Local,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn merged_artists(
+        &self,
+        page: i64,
+        limit: i64,
+        filters: crate::config::settings::LibraryFilters,
+    ) -> Result<ArtistsPage> {
+        let mut by_key: HashMap<String, ArtistCard> = HashMap::new();
+        for artist in self.local_artist_cards(filters.hide_featured_only)? {
+            let key = music_dht::normalize_name(&artist.name);
+            if !key.is_empty() {
+                by_key.insert(key, artist);
+            }
+        }
+
+        let conn = self.lock();
+        let cutoff = now_ms_i64().saturating_sub(NETWORK_ARTIST_CACHE_TTL_MS);
+        let source_predicate = if filters.source_mode.includes_global_peers() {
+            "seen_at_ms >= ?1"
+        } else {
+            "seen_at_ms >= ?1 AND source_kind = 'personal'"
+        };
+        let release_predicate = if filters.hide_featured_only {
+            " AND release_count > 0"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT artist_key,
+                    COALESCE(NULLIF(MIN(name), ''), artist_key) AS name,
+                    MAX(image_path) AS image_path,
+                    MAX(release_count) AS release_count,
+                    MAX(track_count) AS track_count
+             FROM network_artist_cache
+             WHERE {source_predicate}{release_predicate}
+             GROUP BY artist_key"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (artist_key, name, image_path, release_count, track_count) = row?;
+            if artist_key.trim().is_empty() || track_count <= 0 {
+                continue;
+            }
+            match by_key.get_mut(&artist_key) {
+                Some(local) => {
+                    if release_count > local.release_count || track_count > local.track_count {
+                        local.availability = Availability::Mixed;
+                    }
+                    local.release_count = local.release_count.max(release_count);
+                    local.track_count = local.track_count.max(track_count);
+                    if local.image_path.is_none() {
+                        local.image_path = image_path;
+                    }
+                }
+                None => {
+                    by_key.insert(
+                        artist_key.clone(),
+                        ArtistCard {
+                            id: remote_artist_id(&artist_key),
+                            name,
+                            image_path,
+                            release_count,
+                            track_count,
+                            availability: Availability::Remote,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut items: Vec<ArtistCard> = by_key.into_values().collect();
+        items.sort_by(|left, right| {
+            right
+                .release_count
+                .cmp(&left.release_count)
+                .then_with(|| right.track_count.cmp(&left.track_count))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        let total = items.len() as i64;
+        let offset = (page.max(1) - 1) * limit;
+        let page_items = items
+            .into_iter()
+            .skip(offset.max(0) as usize)
+            .take(limit.max(0) as usize)
+            .collect::<Vec<_>>();
+        let has_more = offset + (page_items.len() as i64) < total;
+        Ok(ArtistsPage {
+            items: page_items,
+            total,
+            page: page.max(1),
+            has_more,
+        })
+    }
+
+    pub fn artist_preview_slice(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<NetworkArtistPreview>, Option<String>)> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT a.name, a.image_path,
+                (SELECT COUNT(DISTINCT ra.release_id)
+                 FROM release_artists ra
+                 WHERE ra.artist_id = a.id) AS release_count,
+                (SELECT COUNT(DISTINCT ta.track_id)
+                 FROM track_artists ta
+                 WHERE ta.artist_id = a.id) AS track_count
+             FROM artists a
+             WHERE EXISTS (
+                 SELECT 1 FROM track_artists ta WHERE ta.artist_id = a.id
+             )
+             ORDER BY release_count DESC, track_count DESC, a.name COLLATE NOCASE
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let items = statement
+            .query_map(params![limit as i64 + 1, offset as i64], |row| {
+                let name: String = row.get(0)?;
+                Ok(NetworkArtistPreview {
+                    artist_key: music_dht::normalize_name(&name),
+                    name,
+                    image_path: row.get(1)?,
+                    release_count: row.get(2)?,
+                    track_count: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > limit;
+        let mut items: Vec<_> = items
+            .into_iter()
+            .take(limit)
+            .filter(|artist| !artist.artist_key.is_empty() && artist.track_count > 0)
+            .collect();
+        let next = has_more.then(|| (offset + items.len()).to_string());
+        Ok((std::mem::take(&mut items), next))
+    }
+
+    pub fn replace_network_artist_cache(
+        &self,
+        source_id: &str,
+        source_kind: &str,
+        artists: &[NetworkArtistPreview],
+        replace_source: bool,
+    ) -> Result<usize> {
+        let source_id = source_id.trim();
+        let source_kind = source_kind.trim();
+        if source_id.is_empty() || source_kind.is_empty() {
+            return Ok(0);
+        }
+        let now = now_ms_i64();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if replace_source {
+            tx.execute(
+                "DELETE FROM network_artist_cache WHERE source_id = ?1",
+                [source_id],
+            )?;
+        }
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO network_artist_cache
+                    (source_id, source_kind, artist_key, name, image_path,
+                     release_count, track_count, seen_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(source_id, artist_key) DO UPDATE SET
+                    source_kind = excluded.source_kind,
+                    name = excluded.name,
+                    image_path = excluded.image_path,
+                    release_count = excluded.release_count,
+                    track_count = excluded.track_count,
+                    seen_at_ms = excluded.seen_at_ms",
+            )?;
+            for artist in artists {
+                let artist_key = if artist.artist_key.trim().is_empty() {
+                    music_dht::normalize_name(&artist.name)
+                } else {
+                    artist.artist_key.clone()
+                };
+                if artist_key.is_empty() || artist.track_count <= 0 {
+                    continue;
+                }
+                stmt.execute(params![
+                    source_id,
+                    source_kind,
+                    artist_key,
+                    artist.name.trim(),
+                    artist.image_path.as_deref(),
+                    artist.release_count.max(0),
+                    artist.track_count.max(0),
+                    now,
+                ])?;
+                inserted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     pub fn artist(&self, id: i64) -> Result<ArtistDetail> {
@@ -519,6 +803,7 @@ impl Library {
                     image_path: row.get(2)?,
                     release_count: row.get(3)?,
                     track_count: row.get(4)?,
+                    availability: Availability::Local,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1994,6 +2279,7 @@ fn release_card_from_row(row: &rusqlite::Row) -> rusqlite::Result<ReleaseCard> {
         year: row.get(3)?,
         cover_path: row.get(4)?,
         track_count: row.get(5)?,
+        availability: Availability::Local,
     })
 }
 
@@ -2183,6 +2469,20 @@ pub(crate) fn audio_content_id(path: &str) -> Option<String> {
     Some(format!("b3:{}", hasher.finalize().to_hex()))
 }
 
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn remote_artist_id(artist_key: &str) -> i64 {
+    let hash = blake3::hash(artist_key.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    -(i64::from_be_bytes(bytes) & i64::MAX).max(1)
+}
+
 fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     let fed_like_columns = table_columns(conn, "fed_likes")?;
     if !fed_like_columns
@@ -2309,6 +2609,13 @@ mod tests {
         id
     }
 
+    fn artist_filters(hide_featured_only: bool) -> crate::config::settings::LibraryFilters {
+        crate::config::settings::LibraryFilters {
+            hide_featured_only,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn artists_page_prioritizes_releases_then_tracks() {
         let lib = test_library();
@@ -2316,7 +2623,7 @@ mod tests {
         add_track_with_featured(&lib, "Guest One", "A Host", &["Guest"], "A Host Album");
         add_track_with_featured(&lib, "Guest Two", "B Host", &["Guest"], "B Host Album");
 
-        let page = lib.artists(1, 10, false).unwrap();
+        let page = lib.artists(1, 10, artist_filters(false)).unwrap();
         let zed_pos = page
             .items
             .iter()
@@ -2333,7 +2640,7 @@ mod tests {
         assert_eq!(guest.track_count, 2);
         assert!(zed_pos < guest_pos);
 
-        let filtered = lib.artists(1, 10, true).unwrap();
+        let filtered = lib.artists(1, 10, artist_filters(true)).unwrap();
         assert!(filtered.items.iter().all(|artist| artist.release_count > 0));
         assert!(!filtered.items.iter().any(|artist| artist.name == "Guest"));
     }
@@ -2342,7 +2649,7 @@ mod tests {
     fn import_creates_artist_release_track() {
         let lib = test_library();
         let track_id = add_track(&lib, "Song", "Artist", "Album");
-        let page = lib.artists(1, 10, false).unwrap();
+        let page = lib.artists(1, 10, artist_filters(false)).unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].name, "Artist");
         assert_eq!(page.items[0].track_count, 1);
@@ -2363,7 +2670,7 @@ mod tests {
         let first = add_track(&lib, "Song", "Artist", "Album");
         let second = add_track(&lib, "Song", "Artist", "Album");
         assert_eq!(first, second);
-        let page = lib.artists(1, 10, false).unwrap();
+        let page = lib.artists(1, 10, artist_filters(false)).unwrap();
         assert_eq!(page.items[0].track_count, 1);
     }
 
@@ -2675,9 +2982,9 @@ mod tests {
     fn deleting_artist_cleans_up_own_content() {
         let lib = test_library();
         add_track(&lib, "Song", "Solo", "Solo Album");
-        let page = lib.artists(1, 10, false).unwrap();
+        let page = lib.artists(1, 10, artist_filters(false)).unwrap();
         lib.delete_artist(page.items[0].id).unwrap();
-        assert_eq!(lib.artists(1, 10, false).unwrap().total, 0);
+        assert_eq!(lib.artists(1, 10, artist_filters(false)).unwrap().total, 0);
         assert_eq!(lib.search("Song", 10).unwrap().len(), 0);
     }
 
@@ -2687,7 +2994,7 @@ mod tests {
         let track_id = add_track(&lib, "Only", "Artist", "Album");
         lib.delete_track(track_id).unwrap();
         let detail = lib
-            .artist(lib.artists(1, 10, false).unwrap().items[0].id)
+            .artist(lib.artists(1, 10, artist_filters(false)).unwrap().items[0].id)
             .unwrap();
         assert!(detail.releases.is_empty());
     }

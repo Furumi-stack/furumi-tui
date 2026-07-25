@@ -11,113 +11,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+pub use music_dht::catalog::{
+    CATALOG_ALPN, CatalogAppearance, CatalogArtist, CatalogArtistPreview, CatalogRelease,
+    CatalogTrack,
+};
+use music_dht::catalog::{CatalogImageHeader as ImageHeader, CatalogRequest, CatalogResponse};
 use music_dht::{ByteStream, EndpointId, ItemKind, MusicDhtService, StreamAcceptor};
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::library::Library;
 
-/// ALPN of the catalog protocol.
-pub const CATALOG_ALPN: &[u8] = b"furumi-fd/catalog/1";
-
 /// Upper bound for one catalog response (thousands of tracks fit easily).
 const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CatalogRequest {
-    /// Artist display name; matched case-insensitively by the owner.
-    artist: String,
-    /// What is being asked for: `None`/"catalog" — the JSON catalog;
-    /// "artist_image" — the artist's image; "release_cover" — the cover of
-    /// `release`. Image responses are a JSON header line + raw bytes.
-    #[serde(default)]
-    want: Option<String>,
-    #[serde(default)]
-    release: Option<String>,
-}
-
-/// Header line preceding raw image bytes (artist image / release cover).
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ImageHeader {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    mime_type: String,
-    #[serde(default)]
-    size: u64,
-}
-
 /// Images above this size are skipped rather than transferred.
 const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct CatalogResponse {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    artist: Option<CatalogArtist>,
-}
-
-/// One peer's library slice for an artist.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CatalogArtist {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub releases: Vec<CatalogRelease>,
-    /// Tracks where the requested artist is featured instead of being a
-    /// release/main artist.
-    #[serde(default)]
-    pub appears_on: Vec<CatalogAppearance>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CatalogRelease {
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub release_type: String,
-    #[serde(default)]
-    pub year: Option<i32>,
-    #[serde(default)]
-    pub tracks: Vec<CatalogTrack>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CatalogAppearance {
-    #[serde(default)]
-    pub release_title: String,
-    #[serde(default)]
-    pub release_type: String,
-    #[serde(default)]
-    pub year: Option<i32>,
-    #[serde(default)]
-    pub track: CatalogTrack,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CatalogTrack {
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub artists: Vec<String>,
-    #[serde(default)]
-    pub featured_artists: Vec<String>,
-    #[serde(default)]
-    pub track_number: Option<i32>,
-    #[serde(default)]
-    pub disc_number: Option<i32>,
-    #[serde(default)]
-    pub duration_seconds: Option<f64>,
-    /// Stable audio content id (`b3:<64 hex>`) when known.
-    #[serde(default)]
-    pub content_id: Option<String>,
-    /// Hex DHT item id — the key the audio is requested by (FedPlay).
-    #[serde(default)]
-    pub item_id: String,
-}
 
 // ---------------------------------------------------------------------------
 // Serving side
@@ -165,14 +73,28 @@ async fn serve_one(
     );
 
     match request.want.as_deref() {
-        None | Some("catalog") => {
+        Some("artists") => {
+            let cursor = request.cursor.clone();
+            let limit = request.limit.unwrap_or(64).clamp(1, 200);
+            let response =
+                tokio::task::spawn_blocking(move || build_artist_slice(&library, cursor, limit))
+                    .await?
+                    .unwrap_or_else(|err| CatalogResponse {
+                        ok: false,
+                        error: Some(format!("artist slice failed: {err:#}")),
+                        ..CatalogResponse::default()
+                    });
+            let payload = serde_json::to_vec(&response)?;
+            stream.send.write_all(&payload).await?;
+        }
+        None | Some("catalog") | Some("artist") => {
             let response =
                 tokio::task::spawn_blocking(move || build_catalog(&library, own, &request.artist))
                     .await?
                     .unwrap_or_else(|err| CatalogResponse {
                         ok: false,
                         error: Some(format!("catalog lookup failed: {err:#}")),
-                        artist: None,
+                        ..CatalogResponse::default()
                     });
             let payload = serde_json::to_vec(&response)?;
             stream.send.write_all(&payload).await?;
@@ -198,7 +120,7 @@ async fn serve_one(
             let response = CatalogResponse {
                 ok: false,
                 error: Some(format!("unknown request kind '{other}'")),
-                artist: None,
+                ..CatalogResponse::default()
             };
             stream
                 .send
@@ -273,13 +195,41 @@ fn build_catalog(library: &Library, own: EndpointId, artist: &str) -> Result<Cat
         return Ok(CatalogResponse {
             ok: false,
             error: Some("artist not found in the library".to_string()),
-            artist: None,
+            ..CatalogResponse::default()
         });
     };
     Ok(CatalogResponse {
         ok: true,
         error: None,
         artist: Some(artist),
+        ..CatalogResponse::default()
+    })
+}
+
+fn build_artist_slice(
+    library: &Library,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<CatalogResponse> {
+    let offset = cursor
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let (artists, next_cursor) = library.artist_preview_slice(offset, limit)?;
+    Ok(CatalogResponse {
+        ok: true,
+        artists: artists
+            .into_iter()
+            .map(|artist| CatalogArtistPreview {
+                artist_key: artist.artist_key,
+                name: artist.name,
+                image_path: artist.image_path,
+                release_count: artist.release_count,
+                track_count: artist.track_count,
+            })
+            .collect(),
+        next_cursor,
+        ..CatalogResponse::default()
     })
 }
 
@@ -377,6 +327,8 @@ pub async fn fetch_catalog(
         artist: artist.to_string(),
         want: None,
         release: None,
+        cursor: None,
+        limit: None,
     })?;
     line.push(b'\n');
     stream.send.write_all(&line).await?;
@@ -411,6 +363,64 @@ pub async fn fetch_catalog(
     response.artist.context("empty catalog response")
 }
 
+/// Fetches a thin top-artist slice from one peer.
+pub async fn fetch_artist_slice(
+    service: &MusicDhtService,
+    owner: EndpointId,
+    cursor: Option<&str>,
+    limit: usize,
+    transport_stats: &Arc<crate::federation::TransportStats>,
+) -> Result<(Vec<CatalogArtistPreview>, Option<String>)> {
+    let mut stream = service
+        .open_stream(owner, CATALOG_ALPN)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot reach the peer: {err}"))?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "open",
+        &stream,
+    );
+    let mut line = serde_json::to_vec(&CatalogRequest {
+        artist: String::new(),
+        want: Some("artists".to_string()),
+        release: None,
+        cursor: cursor.map(str::to_string),
+        limit: Some(limit),
+    })?;
+    line.push(b'\n');
+    stream.send.write_all(&line).await?;
+    stream.send.finish()?;
+
+    let mut payload = Vec::new();
+    tokio::io::AsyncReadExt::take(StreamReader(&mut stream), MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut payload)
+        .await?;
+    anyhow::ensure!(
+        payload.len() as u64 <= MAX_CATALOG_BYTES,
+        "catalog response exceeds {MAX_CATALOG_BYTES} bytes"
+    );
+    let response: CatalogResponse =
+        serde_json::from_slice(&payload).context("malformed catalog response")?;
+    crate::federation::record_stream_transport(
+        transport_stats,
+        "catalog",
+        "outbound",
+        "done",
+        &stream,
+    );
+    if !response.ok {
+        anyhow::bail!(
+            "peer refused the artist slice: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok((response.artists, response.next_cursor))
+}
+
 /// Fetches an image (artist image or a release cover) from a peer over the
 /// catalog protocol. `release: None` asks for the artist image. Returns the
 /// raw bytes and a file extension, or None when the peer has no image.
@@ -440,6 +450,8 @@ pub async fn fetch_image(
             "artist_image".to_string()
         }),
         release: release.map(str::to_string),
+        cursor: None,
+        limit: None,
     })?;
     line.push(b'\n');
     stream.send.write_all(&line).await?;

@@ -226,14 +226,41 @@ fn handle_connected_devices(
     }
 }
 
-fn handle_library_filters(state: &mut AppState, runtime: &Runtime, cursor: usize, key: KeyEvent) {
+fn handle_library_filters(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    cursor: usize,
+    key: KeyEvent,
+) {
+    let max_cursor = crate::config::settings::LibrarySourceMode::ALL.len();
+    let cursor = cursor.min(max_cursor);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {}
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
-            state.popup = Some(Popup::LibraryFilters { cursor: 0 });
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.popup = Some(Popup::LibraryFilters {
+                cursor: cursor.saturating_sub(1),
+            });
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.popup = Some(Popup::LibraryFilters {
+                cursor: (cursor + 1).min(max_cursor),
+            });
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            state.global.filters.hide_featured_only = !state.global.filters.hide_featured_only;
+            if cursor == 0 {
+                state.global.filters.hide_featured_only = !state.global.filters.hide_featured_only;
+            } else if let Some(mode) =
+                crate::config::settings::LibrarySourceMode::ALL.get(cursor - 1)
+            {
+                state.global.filters.source_mode = *mode;
+            }
+            runtime.library_network_refresh_at = None;
+            if let Ok(mut cursors) = runtime.library_network_cursors.lock() {
+                cursors.clear();
+            }
+            if let Ok(mut done) = runtime.library_network_done.lock() {
+                done.clear();
+            }
             super::save_app_settings(state);
             super::reset_artist_pagination(state);
             super::refresh_artists(state, runtime);

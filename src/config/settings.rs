@@ -2,14 +2,57 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySourceMode {
+    #[default]
+    Local,
+    My,
+    Global,
+}
+
+impl LibrarySourceMode {
+    pub const ALL: [LibrarySourceMode; 3] = [
+        LibrarySourceMode::Local,
+        LibrarySourceMode::My,
+        LibrarySourceMode::Global,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibrarySourceMode::Local => "Local",
+            LibrarySourceMode::My => "My",
+            LibrarySourceMode::Global => "Global",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            LibrarySourceMode::Local => "only this device",
+            LibrarySourceMode::My => "this device + connected devices",
+            LibrarySourceMode::Global => "my devices + known federation peers",
+        }
+    }
+
+    pub fn includes_network(self) -> bool {
+        !matches!(self, LibrarySourceMode::Local)
+    }
+
+    pub fn includes_global_peers(self) -> bool {
+        matches!(self, LibrarySourceMode::Global)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryFilters {
     #[serde(default)]
     pub hide_featured_only: bool,
+    #[serde(default)]
+    pub source_mode: LibrarySourceMode,
 }
 
 impl LibraryFilters {
     pub fn is_active(&self) -> bool {
-        self.hide_featured_only
+        self.hide_featured_only || self.source_mode != LibrarySourceMode::Local
     }
 }
 
@@ -98,5 +141,6 @@ hide_featured_only = true
         assert_eq!(settings.volume, 100);
         assert!(settings.library.hide_featured_only);
         assert!(settings.library.is_active());
+        assert_eq!(settings.library.source_mode, LibrarySourceMode::Local);
     }
 }

@@ -12,7 +12,7 @@ use crate::app::state::{
     fed_release_groups, release_groups,
 };
 use crate::art::cache_key;
-use crate::library::models::{ArtistCard, ReleaseCard, SearchResults};
+use crate::library::models::{ArtistCard, Availability, ReleaseCard, SearchResults};
 
 const TILE_MARQUEE_STEP_MS: u128 = 250;
 const TILE_MARQUEE_PAUSE_STEPS: u128 = 4;
@@ -83,13 +83,14 @@ fn draw_art(frame: &mut Frame, area: Rect, art_state: Option<&ArtState>) {
 /// Bordered tile with artwork, a title line and a dim meta line. The
 /// selected tile gets a thick accent border and an inverted (filled)
 /// caption so it stands out in a large grid; the artwork stays untouched.
-fn draw_tile(
+fn draw_tile_with_availability(
     frame: &mut Frame,
     tile: Rect,
     art_state: Option<&ArtState>,
     title: &str,
     meta: &str,
     selected: bool,
+    availability: Option<Availability>,
 ) {
     let block = if selected {
         Block::bordered()
@@ -106,6 +107,9 @@ fn draw_tile(
         ..inner
     };
     draw_art(frame, art_area, art_state);
+    if let Some(availability) = availability {
+        draw_availability_badge(frame, art_area, availability);
+    }
 
     if inner.height > ART_CELL_HEIGHT {
         let name_area = Rect {
@@ -135,6 +139,27 @@ fn draw_tile(
             frame.buffer_mut().set_style(meta_area, theme::tab_active());
         }
     }
+}
+
+fn draw_availability_badge(frame: &mut Frame, area: Rect, availability: Availability) {
+    if area.width < 2 || area.height == 0 {
+        return;
+    }
+    let (label, style) = match availability {
+        Availability::Local => ("●", Style::new().fg(Color::Green)),
+        Availability::Mixed => ("◐", Style::new().fg(Color::Yellow)),
+        Availability::Remote => ("⇅", theme::accent()),
+    };
+    let badge = Rect {
+        x: area.x + area.width.saturating_sub(2),
+        y: area.y,
+        width: 2,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(label, style)).alignment(Alignment::Right),
+        badge,
+    );
 }
 
 fn tile_title(title: &str, width: u16, selected: bool) -> String {
@@ -272,9 +297,13 @@ fn scroll_offset(items: &[PlanItem], cursor_item: Option<usize>, viewport: u16) 
 fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
     let global = &state.global;
     let title = if global.total > 0 {
-        format!(" Library — {} artists ", global.total)
+        format!(
+            " Library — {} artists · {} ",
+            global.total,
+            global.filters.source_mode.label()
+        )
     } else {
-        " Library ".to_string()
+        format!(" Library · {} ", global.filters.source_mode.label())
     };
     let mut title_spans = vec![Span::styled(title, theme::tab_active())];
     if global.filters.is_active() {
@@ -323,13 +352,14 @@ fn draw_grid_tiles(frame: &mut Frame, inner: Rect, state: &AppState) {
             width: TILE_WIDTH,
             height: TILE_HEIGHT,
         };
-        draw_tile(
+        draw_tile_with_availability(
             frame,
             tile,
             tile_art(state, artist.image_path.as_ref()),
             &artist.name,
             &artist_tile_meta(artist),
             index == global.selected,
+            Some(artist.availability),
         );
     }
 }
@@ -557,13 +587,14 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
                     if tile.width < 3 {
                         break;
                     }
-                    draw_tile(
+                    draw_tile_with_availability(
                         frame,
                         tile,
                         tile_art(state, release.cover_path.as_ref()),
                         &release.title,
                         &release_tile_meta(release),
                         cursor == tracks + position,
+                        Some(release.availability),
                     );
                 }
             }
@@ -1055,13 +1086,14 @@ fn draw_fed_artist(frame: &mut Frame, area: Rect, state: &AppState, cursor: usiz
                     if let Some(year) = release.year {
                         meta = format!("{meta} · {year}");
                     }
-                    draw_tile(
+                    draw_tile_with_availability(
                         frame,
                         tile,
                         tile_art(state, release.cover_path.as_ref()),
                         &release.title,
                         &meta,
                         cursor == *position,
+                        Some(Availability::Remote),
                     );
                 }
             }

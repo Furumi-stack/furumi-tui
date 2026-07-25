@@ -32,6 +32,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
 use crate::library::Library;
+use crate::library::NetworkArtistPreview;
 use crate::library::models::{ArtistRef, TrackItem};
 
 pub use audio::{AUDIO_ALPN, DownloadProgress, StreamingStart, TrackMetadata};
@@ -393,6 +394,12 @@ pub struct FedPlayable {
     pub track: TrackItem,
     /// The file was imported into the local library (save-on-listen).
     pub imported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetworkLibrarySource {
+    pub endpoint_id: String,
+    pub kind: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +867,93 @@ impl Federation {
         }
         status.transport = self.transport_stats.snapshot();
         status
+    }
+
+    pub async fn network_library_sources(
+        &self,
+        mode: crate::config::settings::LibrarySourceMode,
+    ) -> Result<Vec<NetworkLibrarySource>> {
+        if !mode.includes_network() {
+            return Ok(Vec::new());
+        }
+        let service = self.service().await?;
+        let own = service.endpoint_id().to_string();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(own);
+        let mut sources = Vec::new();
+        for endpoint_id in self.devices.active_remote_endpoint_ids()? {
+            if seen.insert(endpoint_id.clone()) {
+                sources.push(NetworkLibrarySource {
+                    endpoint_id,
+                    kind: "personal",
+                });
+            }
+        }
+        if mode.includes_global_peers() {
+            for endpoint in service
+                .connected_peers()
+                .into_iter()
+                .map(|peer| peer.to_string())
+                .chain(
+                    service
+                        .known_peers()
+                        .into_iter()
+                        .map(|peer| peer.peer_id.to_string()),
+                )
+            {
+                if seen.insert(endpoint.clone()) {
+                    sources.push(NetworkLibrarySource {
+                        endpoint_id: endpoint,
+                        kind: "federation",
+                    });
+                }
+                if sources.len() >= 32 {
+                    break;
+                }
+            }
+        }
+        Ok(sources)
+    }
+
+    pub async fn cache_artist_slice_from_source(
+        &self,
+        source: NetworkLibrarySource,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<(usize, Option<String>)> {
+        let service = self.service().await?;
+        let owner = EndpointId::from_str(&source.endpoint_id)
+            .map_err(|_| anyhow::anyhow!("malformed endpoint id '{}'", source.endpoint_id))?;
+        let replace_source = cursor.is_none();
+        let (artists, next_cursor) = catalog::fetch_artist_slice(
+            &service,
+            owner,
+            cursor.as_deref(),
+            limit,
+            &self.transport_stats,
+        )
+        .await?;
+        let artists: Vec<NetworkArtistPreview> = artists
+            .into_iter()
+            .map(|artist| NetworkArtistPreview {
+                artist_key: if artist.artist_key.trim().is_empty() {
+                    music_dht::normalize_name(&artist.name)
+                } else {
+                    artist.artist_key
+                },
+                name: artist.name,
+                image_path: None,
+                release_count: artist.release_count,
+                track_count: artist.track_count,
+            })
+            .collect();
+        let count = self.library.replace_network_artist_cache(
+            &source.endpoint_id,
+            source.kind,
+            &artists,
+            replace_source,
+        )?;
+        Ok((count, next_cursor))
     }
 
     /// Searches the federated network: matching tracks plus the artists a
