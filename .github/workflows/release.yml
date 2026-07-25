@@ -57,6 +57,7 @@ jobs:
           mkdir -p "$package_dir"
           cp "target/release/${{ matrix.binary_name }}" "$package_dir/"
           cp README.md "$package_dir/"
+          cp LICENSE "$package_dir/"
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             (cd dist && 7z a "../${archive_name}" "${{ matrix.asset_name }}")

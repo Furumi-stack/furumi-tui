@@ -1,240 +1,148 @@
-# furumi_cli — Architecture
+# furumi architecture
 
-Cross-platform terminal client (cmus-style TUI) for the furumusic backend.
-Targets: macOS, Linux (ALSA/Pulse/PipeWire), Windows (WASAPI, Windows Terminal).
+`furumi` is a single Rust binary organized around an Elm-style state/update
+loop. The UI state remains synchronous and deterministic; filesystem, SQLite,
+audio, networking, artwork, and media-control work is performed by runtime
+services and reported back as application events.
 
-## 1. Technology choices
+## Runtime flow
 
-### TUI: ratatui 0.30 + crossterm 0.29
-
-Evaluated: **ratatui**, cursive, tui-realm, iocraft.
-
-- **ratatui 0.30.x** — the de-facto standard (gitui, yazi, spotify-player all use it).
-  0.30 split the project into workspace crates (`ratatui-core`, `ratatui-widgets`,
-  `ratatui-crossterm`) with a stable core API. Stock widgets cover everything we
-  need: `Tabs`, `List`, `Table`, nested `Layout` for tile grids.
-- cursive — maintenance mode since 2024, rejected.
-- tui-realm — viable framework on top of ratatui (termusic uses it), but a
-  single-maintainer abstraction layer; we prefer plain ratatui with our own
-  thin component layer.
-- iocraft — too young, optimized for inline CLI output rather than fullscreen apps.
-- termion — Unix-only, eliminated (we need Windows).
-
-crossterm is the only backend that covers Windows. Caveats to handle:
-- Enable kitty keyboard enhancement flags only when
-  `supports_keyboard_enhancement()` returns true; always pop flags on exit.
-- Filter key events to `KeyEventKind::Press` (Windows and kitty-enhanced
-  terminals also deliver Repeat/Release — otherwise bindings double-fire).
-- Restore the terminal on panic (panic hook) — a TUI that corrupts the shell
-  is the #1 reliability complaint.
-
-### Keybindings: crokey + TOML keymap
-
-- **crokey 1.4** — parses/formats key combos (`ctrl-a`, `g`), serde support, used
-  for the config file format.
-- Keymap model copied from spotify-player: a `[[keymaps]]` TOML table mapping a
-  *key sequence* (space-separated chords, e.g. `"g g"`, `"C-c x"`) to a
-  `Command` enum, optionally parameterized (`{ SeekForward = { seconds = 10 } }`).
-- A small chord state machine resolves sequences; bindings are layered:
-  built-in defaults ← user config (`~/.config/furumi/keymap.toml`).
-- Bindings resolve per *input context* (Global, LibraryGrid, TrackList,
-  TextInput, Popup) so the same key can mean different things per view.
-
-### Audio: rodio 0.22 + stream-download, behind a backend trait
-
-Evaluated: **rodio**, kira, raw cpal+symphonia, gstreamer-rs, libmpv.
-
-- **rodio 0.22** (`Player` / `DeviceSinkBuilder` API — note the 0.21/0.22 renames;
-  most older tutorials are outdated). Symphonia is the default decoder; enable
-  the `aac`, `isomp4`, `alac` features for m4a support. Pure Rust → trivial
-  cross-compilation; cpal covers CoreAudio / ALSA / WASAPI.
-- **stream-download 0.24** bridges HTTP to rodio: background download exposing
-  blocking `Read + Seek`, built on reqwest (shares our authenticated client,
-  auth headers included), seek into undownloaded regions via HTTP Range
-  (the backend's `/stream/{id}` supports Range), temp-file storage, retries.
-- kira — game-audio oriented, no network story, rejected.
-- gstreamer / libmpv — best playback quality but heavy system dependencies;
-  not acceptable as the only backend for a portable CLI.
-
-Playback lives behind a trait so backends can be added later (termusic ships
-rodio + mpv + gstreamer this way):
-
-```rust
-trait AudioBackend {
-    fn play(&mut self, source: TrackSource) -> Result<()>;
-    fn pause(&mut self); fn resume(&mut self);
-    fn seek(&mut self, pos: Duration) -> Result<()>;
-    fn set_volume(&mut self, v: f32);
-    fn position(&self) -> Duration;
-    fn events(&self) -> Receiver<PlayerEvent>; // TrackEnded, Failed, ...
-}
+```text
+terminal/media/player/network events
+                 |
+                 v
+          app::event::AppEvent
+                 |
+                 v
+       input/keymap -> Action
+                 |
+                 v
+           app::update()
+        mutates AppState and
+        requests an Effect
+                 |
+                 v
+       app runtime performs I/O
+                 |
+                 +----> new AppEvent
 ```
 
-Gapless-ish playback: pre-open the `stream-download` source and decoder for the
-next queue item and append it to the rodio `Player` before the current track
-ends. (True gapless is impossible for AAC/M4A anyway — symphonia has no AAC
-gapless trim.)
+`AppState` is the single UI source of truth. Rendering modules receive shared
+state and do not own background tasks. Blocking database and file operations
+run outside the terminal event loop.
 
-### Async runtime: tokio
+## Module layout
 
-Needed for: crossterm `EventStream`, reqwest, stream-download, device-sync
-polling, debounced search. The audio decode thread is rodio's own; everything
-else is async tasks talking over channels.
-
-## 2. Application architecture
-
-Elm-style (TEA) core with a component-per-view UI layer — the pattern from the
-official ratatui component template and spotify-player.
-
-```
-                 ┌────────────────────────────────────────────┐
-                 │                  main loop                  │
-                 │  recv Event -> keymap -> Action -> update() │
-                 │  tick -> draw(&state)                       │
-                 └───────▲──────────────────────────┬──────────┘
-        Event (mpsc)     │                          │ Command (spawn task / send msg)
-   ┌─────────────────────┼──────────────┐           │
-   │ terminal input (crossterm stream)  │   ┌───────▼────────┐
-   │ api task results                   │   │  side effects  │
-   │ player events (TrackEnded, ...)    │   │ api::Client    │
-   │ device-sync poll results/commands  │   │ player::Engine │
-   │ tick (render + position updates)   │   │ sync::Poller   │
-   └────────────────────────────────────┘   └────────────────┘
-```
-
-Key rules:
-
-- **Single source of truth**: one `AppState` struct, mutated only in `update()`.
-  Views are pure render functions over `&AppState`.
-- **No blocking in the UI loop.** All I/O (HTTP, audio open) happens in spawned
-  tasks that report back via the event channel. Every remote list is a
-  `Loadable<T> { NotAsked, Loading, Loaded(T), Failed(Error) }` so views can
-  render spinners and errors honestly.
-- **Input → Action indirection**: raw key events are translated by the keymap
-  into semantic `Action`s (`PlayPause`, `FocusNextTab`, `Select`, `Back`,
-  `SeekForward(10)`). Views never see raw keys; this is what makes bindings
-  configurable and the app testable.
-
-### Module layout (single crate now, splittable later)
-
-```
+```text
 src/
-  main.rs            // setup: terminal guard, tokio, channels, run loop
-  config/            // Config + keymap loading (figment or manual TOML merge)
-  api/               // typed client for /api/player/*
-    client.rs        //   reqwest wrapper: base_url, bearer auth, retries
-    auth.rs          //   password login, token store, auto-refresh (15min TTL)
-    models.rs        //   ArtistCard, Release, TrackItem, PlaylistCard, ...
-  player/            // playback engine
-    backend.rs       //   AudioBackend trait
-    rodio_backend.rs //   rodio Player + stream-download sources
-    queue.rs         //   queue, shuffle, repeat_mode, next-track prefetch
-  sync/              // connected devices: heartbeat/poll loop, command handling
-  app/               // AppState, Action, Event, update()
-  ui/                // ratatui rendering
-    views/           //   library_grid, artist, release, playlists, search,
-                     //   queue, devices, now_playing bar, popups
-    theme.rs
+  main.rs             process, terminal, Tokio, and OS-media setup
+  app/
+    state.rs          UI and navigation state
+    action.rs         semantic user actions
+    event.rs          runtime-to-UI events
+    update.rs         pure state transitions and requested effects
+    update_tests.rs   update/selection/queue behavior tests
+    mod.rs            runtime orchestration and effect execution
+    popup.rs          popup submission behavior
+    input.rs          editable text input
+    command.rs        command model
+    cmdline.rs        command-line execution
+  library/
+    mod.rs            SQLite-backed library operations
+    import.rs         tags, audio metadata, and directory import
+    models.rs         library-facing data types
+    tests.rs          library integration tests
+  player/
+    mod.rs            rodio playback controller
+    analyzer.rs       visualization audio analysis
+  federation/
+    mod.rs            DHT manager, search, downloads, and caching
+    catalog.rs        peer catalog protocol and merge logic
+    audio.rs          peer audio transport
+    tests.rs          federation ranking/appearance tests
+  devices/
+    tests.rs          trusted-device sync tests
+  devices.rs          trusted-device operation log and wire protocol
+  ui/                 ratatui rendering by screen
+  config/             settings, logging, and keymaps
+  media.rs            platform media-key/now-playing integration
+  visualizer.rs       Rhai visualization host
+  visualizations/     bundled Rhai scripts
+  art.rs              image decode and terminal-cell preparation
+  share.rs            share-link parsing and generation
+  streaming.rs        growing-file reader used during downloads
 ```
 
-The `api`, `player`, and `app` layers do not import `ui` or ratatui. If a
-shared core for furumi_macos/android ever makes sense, those modules extract
-into workspace crates without surgery.
+Large orchestration modules are intentionally separated from their tests.
+When they are split further, boundaries should follow services rather than
+line count: playback coordination, network-library maintenance, device
+storage, and device transport are the natural seams.
 
-## 3. UI model
+## Local library
 
-Persistent layout: a tab bar on top, the active view in the middle, a
-now-playing/status bar at the bottom (track, position gauge, volume, shuffle/
-repeat, active device indicator).
+`library::Library` owns a mutex-protected SQLite connection. It is the only
+layer that issues library SQL and returns typed models to the rest of the
+application. The schema covers artists, releases, tracks, artist relations,
+playlists, likes, playback history, federated pending tracks, and cached
+network artists.
 
-Tabs (each owns a navigation stack, like a browser per tab):
+Imports read tags with `lofty`, inspect audio properties, calculate content
+identifiers, and upsert normalized library records. File paths remain
+device-local.
 
-1. **Library** — paginated grid of artist tiles (`GET /artists`).
-   `Enter` on a tile pushes **Artist view** (`GET /artists/{id}`: metadata,
-   top tracks, releases list). Selecting a release pushes **Release view**
-   (`GET /releases/{id}`: metadata + track list). `Esc`/`Backspace` pops.
-2. **Search** — debounced `GET /search?q=` with artists/releases/tracks sections.
-3. **Playlists** — own + saved playlists, likes ("Liked tracks" virtual playlist).
-4. **Queue** — current play queue, reorder/remove.
-5. **Devices** — connected devices list, pick active device, transfer playback.
+## Playback
 
-Navigation state is `Vec<Route>` per tab; a `Route` is an enum
-(`ArtistGrid { page }`, `Artist { id }`, `Release { id }`, ...). Views cache
-their loaded data in `AppState` keyed by route so Back is instant.
+`player::Controller` owns the rodio audio thread. The application maintains
+the logical queue and playback state, while the controller receives play,
+pause, seek, volume, and prefetch commands. The next source is opened early
+for gapless transitions. The analyzer publishes levels and scope samples for
+Rhai visualization scripts.
 
-Tile grid: computed from terminal width (`Layout` columns × rows), each tile a
-bordered block with artist name (cover art rendering in-terminal is a later,
-optional feature — e.g. ratatui-image with kitty/sixel detection, never a
-hard dependency).
+OS media commands enter through `media.rs`; current metadata and position are
+published back to the platform now-playing surface.
 
-## 4. Backend integration notes
+## Federation
 
-(Verified against the furumusic source; base path `/api/player`.)
+Federation uses `music-dht` for discovery and byte streams:
 
-- **Auth**: `POST /api/auth/password` → access token (15 min) + refresh token
-  (60 days). Client stores tokens at `~/.config/furumi/credentials.json`
-  (0600) and refreshes proactively via `POST /api/auth/refresh`. All API calls
-  go through one client that retries once on 401 after refreshing.
-- **Streaming**: `GET /api/player/stream/{track_id}` with `Accept-Ranges:
-  bytes` — exactly what stream-download needs for seek. Original files are
-  served untranscoded (mp3/flac/ogg/m4a/...), hence the symphonia feature set.
-- **Playback state**: persisted server-side via `PUT /api/player/state`
-  (queue, position, shuffle, repeat, volume). We push throttled updates
-  (on track change + every ~10s while playing) and restore on startup.
-- **History/scrobbling**: `POST /history` on track completion;
-  `POST /lastfm/now-playing` and `/lastfm/scrobble` if last.fm is connected.
-- **Connected devices**: *polling, not websockets.* The sync task:
-  - sends `POST /devices/poll` every ~5s while the app runs (device TTL is
-    30s; commands TTL 20s) with our stable `device_id` (generated once,
-    persisted) and current `playback_state`;
-  - applies returned commands (`transfer_state` → load queue/position and
-    start/stop locally; play/pause/seek commands when we are the active
-    device but controlled remotely);
-  - feeds the device list into the Devices tab. Activating another device =
-    `POST /devices/active`; we then stop local audio and become a remote
-    control (UI keeps working, actions are sent via `POST /devices/command`).
-- **Jams** (collaborative sessions) exist in the API — out of scope for v1,
-  but the sync task's command-handling design must not preclude them.
+- the local library publishes metadata-only item specifications;
+- search merges DHT records, peer catalogs, and cached metadata;
+- catalog requests provide richer artist/release views;
+- audio requests stream content from peers;
+- downloads may remain cached or be imported into the local library.
 
-## 5. Reliability checklist
+Federation is disabled until configured by the user. Paths are never
+published as portable identifiers; content hashes and peer item IDs are used
+instead.
 
-- Terminal guard type + panic hook: raw mode/alternate screen/keyboard flags
-  always restored, even on panic.
-- Every spawned task's failure becomes an `Event::TaskFailed` rendered as a
-  status-bar error — no silent hangs, no `unwrap` on I/O.
-- Token refresh races guarded by a single-flight lock.
-- Audio device disappearance (headphones unplugged) → backend emits
-  `PlayerEvent::Failed`, engine retries on default device, pauses on repeated
-  failure.
-- Config/keymap parse errors are reported with line context and fall back to
-  defaults — a typo in keymap.toml must not brick the app.
+## Trusted-device sync
 
-## 6. Suggested initial dependencies
+`devices.rs` implements a separate trusted-device protocol over a dedicated
+ALPN. Likes, playlists, membership changes, and playback control are
+represented as an append-only operation log with materialized SQLite tables.
+Hybrid logical timestamps and acknowledgements make offline merging and
+tombstone compaction deterministic.
 
-```toml
-[dependencies]
-ratatui = "0.30"
-crossterm = "0.29"
-crokey = "1.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-rodio = { version = "0.22", features = ["symphonia-aac", "symphonia-isomp4", "symphonia-alac"] } # check exact feature names
-stream-download = { version = "0.24", features = ["reqwest"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-thiserror = "2"
-anyhow = "1"
-directories = "6"      # config/cache paths per-OS
-tracing = "0.1"        # file-based logging (never stdout — it's the UI)
-tracing-subscriber = "0.3"
-```
+Pairing uses short-lived invites. Device-local file paths are deliberately
+excluded from synchronized playback tracks; receiving devices resolve them
+through content IDs, their own library, or federation metadata.
 
-## 7. Build order (milestones)
+## Configuration and persistence
 
-1. Skeleton: terminal guard, event loop, tab bar, status bar, keymap with defaults.
-2. `api` crate-module: auth + artists/releases/tracks; Library grid → Artist → Release navigation.
-3. Playback: rodio backend + stream-download, queue, now-playing bar, seek/volume.
-4. Likes, playlists, search, history reporting.
-5. Device sync: heartbeat/poll, transfer playback, remote-control mode.
-6. Polish: server-side state restore, last.fm, config file, themes, optional cover art.
+The `directories` crate selects platform-standard config, data, and cache
+locations. Settings, keymaps, device identity, and federation configuration
+are separate files. SQLite databases and downloaded covers/audio are stored
+under application data/cache directories rather than the repository.
+
+## Reliability rules
+
+- Terminal raw mode, bracketed paste, and keyboard enhancements are restored
+  on normal exit and panic.
+- stderr from native audio libraries is captured into tracing so it cannot
+  corrupt the alternate screen.
+- Blocking work is kept out of the UI loop.
+- Runtime failures are converted to visible status/events where recovery is
+  possible.
+- Device paths are not treated as portable network identities.
+- Formatting, all-target compilation, Clippy, and unit tests should pass
+  before a release tag is pushed.
