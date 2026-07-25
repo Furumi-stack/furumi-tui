@@ -13,7 +13,7 @@ use crate::app::Runtime;
 use crate::app::event::AppEvent;
 use crate::app::state::{
     self, AppState, DeleteTarget, DevicePresenceSection, EditField, EditTarget, FedInputField,
-    Loadable, Popup, addable_playlists,
+    FederationStatusPopupState, Loadable, Popup, StatusDetailFocus, addable_playlists,
 };
 use crate::library::models::{ReleaseEdit, TrackEdit, TrackItem};
 
@@ -136,8 +136,40 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::FedText { title, text }),
         },
-        Popup::FederationStatusDetails { scroll } => {
-            handle_federation_status_details(state, scroll, key);
+        Popup::FedCopyText { title, text, help } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {}
+            KeyCode::Enter | KeyCode::Char('c') => match copy_to_clipboard(&text) {
+                Ok(()) => state.status_message = Some("copied to clipboard".to_string()),
+                Err(err) => {
+                    state.status_message = Some(format!("copy failed: {err}"));
+                    state.popup = Some(Popup::FedCopyText { title, text, help });
+                }
+            },
+            _ => state.popup = Some(Popup::FedCopyText { title, text, help }),
+        },
+        Popup::FederationStatusDetails {
+            focus,
+            status_cursor,
+            devices_scroll,
+            logs_scroll,
+        } => handle_federation_status_details(
+            state,
+            FederationStatusPopupState {
+                focus,
+                status_cursor,
+                devices_scroll,
+                logs_scroll,
+            },
+            key,
+        ),
+        Popup::FederationStatusText {
+            parent,
+            title,
+            text,
+            scroll,
+        } => handle_federation_status_child(state, parent, title, text, scroll, key),
+        Popup::FederationStatusLog { parent, scroll } => {
+            handle_federation_status_log(state, parent, scroll, key);
         }
         Popup::DevicePairing {
             request_id,
@@ -166,18 +198,160 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     }
 }
 
-fn handle_federation_status_details(state: &mut AppState, scroll: usize, key: KeyEvent) {
+fn handle_federation_status_details(
+    state: &mut AppState,
+    mut parent: FederationStatusPopupState,
+    key: KeyEvent,
+) {
+    let action_count = status_detail_action_count(state);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Left | KeyCode::Char('h') => parent.focus = parent.focus.previous(),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => parent.focus = parent.focus.next(),
+        KeyCode::Up | KeyCode::Char('k') => match parent.focus {
+            StatusDetailFocus::Status => {
+                parent.status_cursor = parent.status_cursor.saturating_sub(1)
+            }
+            StatusDetailFocus::Devices => {
+                parent.devices_scroll = parent.devices_scroll.saturating_sub(1)
+            }
+            StatusDetailFocus::Logs => {
+                if action_count > 0 {
+                    parent.focus = StatusDetailFocus::Status;
+                    parent.status_cursor = action_count - 1;
+                }
+            }
+        },
+        KeyCode::Down | KeyCode::Char('j') => match parent.focus {
+            StatusDetailFocus::Status => {
+                if parent.status_cursor + 1 < action_count {
+                    parent.status_cursor += 1;
+                } else {
+                    parent.focus = StatusDetailFocus::Logs;
+                }
+            }
+            StatusDetailFocus::Devices => {
+                parent.devices_scroll = parent.devices_scroll.saturating_add(1)
+            }
+            StatusDetailFocus::Logs => {}
+        },
+        KeyCode::PageUp => match parent.focus {
+            StatusDetailFocus::Status => parent.status_cursor = 0,
+            StatusDetailFocus::Devices => {
+                parent.devices_scroll = parent.devices_scroll.saturating_sub(8)
+            }
+            StatusDetailFocus::Logs => {}
+        },
+        KeyCode::PageDown => match parent.focus {
+            StatusDetailFocus::Status => {
+                parent.status_cursor = action_count.saturating_sub(1);
+                parent.focus = StatusDetailFocus::Logs;
+            }
+            StatusDetailFocus::Devices => {
+                parent.devices_scroll = parent.devices_scroll.saturating_add(8)
+            }
+            StatusDetailFocus::Logs => {}
+        },
+        KeyCode::Enter if parent.focus == StatusDetailFocus::Status => {
+            if let Some((title, text)) = status_detail_action_text(state, parent.status_cursor) {
+                state.popup = Some(Popup::FederationStatusText {
+                    parent,
+                    title,
+                    text,
+                    scroll: 0,
+                });
+                return;
+            }
+        }
+        KeyCode::Enter if parent.focus == StatusDetailFocus::Logs => {
+            state.popup = Some(Popup::FederationStatusLog { parent, scroll: 0 });
+            return;
+        }
+        _ => {}
+    }
+    parent.status_cursor = parent.status_cursor.min(action_count.saturating_sub(1));
+    state.popup = Some(parent.into());
+}
+
+fn handle_federation_status_child(
+    state: &mut AppState,
+    parent: FederationStatusPopupState,
+    title: String,
+    text: String,
+    scroll: usize,
+    key: KeyEvent,
+) {
     let next_scroll = match key.code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return,
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            state.popup = Some(parent.into());
+            return;
+        }
         KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => scroll + 1,
-        KeyCode::PageUp => scroll.saturating_sub(8),
-        KeyCode::PageDown => scroll + 8,
+        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
+        KeyCode::PageUp => scroll.saturating_sub(10),
+        KeyCode::PageDown => scroll.saturating_add(10),
         _ => scroll,
     };
-    state.popup = Some(Popup::FederationStatusDetails {
+    state.popup = Some(Popup::FederationStatusText {
+        parent,
+        title,
+        text,
         scroll: next_scroll,
     });
+}
+
+fn handle_federation_status_log(
+    state: &mut AppState,
+    parent: FederationStatusPopupState,
+    scroll: usize,
+    key: KeyEvent,
+) {
+    let next_scroll = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.popup = Some(parent.into());
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
+        KeyCode::PageUp => scroll.saturating_sub(10),
+        KeyCode::PageDown => scroll.saturating_add(10),
+        _ => scroll,
+    };
+    state.popup = Some(Popup::FederationStatusLog {
+        parent,
+        scroll: next_scroll,
+    });
+}
+
+fn status_detail_action_count(state: &AppState) -> usize {
+    state
+        .federation
+        .status
+        .as_ref()
+        .filter(|status| status.running)
+        .map(|status| 1 + usize::from(!status.connected_peers.is_empty()))
+        .unwrap_or(0)
+}
+
+fn status_detail_action_text(state: &AppState, cursor: usize) -> Option<(String, String)> {
+    let status = state
+        .federation
+        .status
+        .as_ref()
+        .filter(|status| status.running)?;
+    match cursor {
+        0 => Some((
+            "Endpoint IDs".to_string(),
+            format!(
+                "Endpoint ID\n{}\n\nDHT node ID\n{}",
+                status.endpoint_id, status.dht_node_id
+            ),
+        )),
+        1 if !status.connected_peers.is_empty() => {
+            Some(("Peer IDs".to_string(), status.connected_peers.join("\n")))
+        }
+        _ => None,
+    }
 }
 
 fn handle_connected_devices(

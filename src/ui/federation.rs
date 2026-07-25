@@ -73,7 +73,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         let (label, value) = match row {
             FedRow::Toggle => ("Federation", on_off(settings.enabled).to_string()),
             FedRow::NetworkId => (
-                "Network ID (shared secret)",
+                "Network ID",
                 if settings.network_id.is_empty() {
                     "(not set — press enter)".to_string()
                 } else {
@@ -84,7 +84,14 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
                 "Save federated tracks to the library on listen",
                 on_off(settings.save_on_listen).to_string(),
             ),
-            FedRow::SyncNow => ("Publish the library now", "↵".to_string()),
+            FedRow::SyncNow => (
+                "Publish the library now",
+                if state.federation.publishing {
+                    format!("{} publishing", state.spinner())
+                } else {
+                    "↵".to_string()
+                },
+            ),
             FedRow::ShowTicket => ("Show my connection ticket", "↵".to_string()),
             FedRow::Connect => ("Connect to a peer by ticket…", "↵".to_string()),
         };
@@ -160,7 +167,11 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         state.settings_cursor,
         "Sync devices now",
         if connected_devices_enabled {
-            "↵".to_string()
+            if state.federation.device_syncing {
+                format!("{} syncing", state.spinner())
+            } else {
+                "↵".to_string()
+            }
         } else {
             disabled_value.clone()
         },
@@ -428,107 +439,6 @@ fn short_id(id: &str) -> String {
     id.chars().take(12).collect::<String>() + "…"
 }
 
-fn push_transport_status(lines: &mut Vec<Line<'static>>, status: &crate::federation::FedStatus) {
-    lines.push(Line::default());
-    lines.push(Line::styled("Iroh Transport", theme::header()));
-    let transport = &status.transport;
-    if transport.total_samples == 0 {
-        lines.push(status_line("Streams", "no samples yet".to_string()));
-        return;
-    }
-    let runtime_total = transport
-        .runtime_tx_bytes
-        .saturating_add(transport.runtime_rx_bytes);
-    lines.push(status_line(
-        "Runtime traffic",
-        format!(
-            "{} · tx {} · rx {} · active {}",
-            short_bytes_label(runtime_total),
-            short_bytes_label(transport.runtime_tx_bytes),
-            short_bytes_label(transport.runtime_rx_bytes),
-            transport.active_streams
-        ),
-    ));
-    if transport.runtime_lost_packets > 0 || transport.runtime_lost_bytes > 0 {
-        lines.push(status_line(
-            "Runtime loss",
-            format!(
-                "{} pkts · {}",
-                transport.runtime_lost_packets,
-                short_bytes_label(transport.runtime_lost_bytes)
-            ),
-        ));
-    }
-    lines.push(status_line(
-        "Samples",
-        format!(
-            "{} total · direct {} · relay {} · custom {} · unknown {}",
-            transport.total_samples,
-            transport.direct_samples,
-            transport.relay_samples,
-            transport.custom_samples,
-            transport.unknown_samples
-        ),
-    ));
-    lines.push(status_line(
-        "Protocols",
-        format!(
-            "audio {} · catalog {} · sync {}",
-            transport.audio_samples, transport.catalog_samples, transport.sync_samples
-        ),
-    ));
-    if let Some(sample) = transport.last.first() {
-        lines.push(status_line(
-            "Last stream",
-            format!(
-                "{} {} {} · {} · {}",
-                sample.protocol,
-                sample.direction,
-                sample.phase,
-                sample.selected_path,
-                rtt_label(sample.selected_rtt_ms)
-            ),
-        ));
-        lines.push(status_line(
-            "Last peer",
-            format!(
-                "{} · paths d/r/c/open {}/{}/{}/{}",
-                sample.peer_id,
-                sample.direct_paths,
-                sample.relay_paths,
-                sample.custom_paths,
-                sample.open_paths
-            ),
-        ));
-        lines.push(status_line(
-            "Last bytes",
-            format!(
-                "sel {}/{} · total {}/{} · lost {} / {}",
-                short_bytes_label(sample.selected_tx_bytes),
-                short_bytes_label(sample.selected_rx_bytes),
-                short_bytes_label(sample.total_tx_bytes),
-                short_bytes_label(sample.total_rx_bytes),
-                sample.lost_packets,
-                short_bytes_label(sample.lost_bytes)
-            ),
-        ));
-    }
-    for sample in &transport.last {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", sample.at), theme::dim()),
-            Span::raw(format!(
-                "{} {} {} · {} · tx {} rx {}",
-                sample.protocol,
-                sample.direction,
-                sample.phase,
-                sample.selected_path,
-                short_bytes_label(sample.total_tx_bytes),
-                short_bytes_label(sample.total_rx_bytes)
-            )),
-        ]));
-    }
-}
-
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -790,64 +700,90 @@ fn first_line(value: &str) -> String {
     value.lines().next().unwrap_or(value).to_string()
 }
 
-pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
+pub(super) struct StatusDetailSections {
+    pub status: Vec<Line<'static>>,
+    pub devices: Vec<Line<'static>>,
+    pub logs: Vec<Line<'static>>,
+}
+
+pub(super) fn status_detail_sections(
+    state: &AppState,
+    status_cursor: usize,
+) -> StatusDetailSections {
+    StatusDetailSections {
+        status: status_detail_status_lines(state, status_cursor),
+        devices: status_detail_device_lines(state),
+        logs: status_detail_transport_logs(state),
+    }
+}
+
+fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![Line::styled("Status", theme::header())];
     match &state.federation.status {
         None => lines.push(Line::styled("loading…", theme::dim())),
         Some(status) if !status.running => {
             lines.push(status_line("Node", "stopped".to_string()));
             if let Some(error) = &status.last_error {
-                lines.push(status_line("Error", error.clone()));
+                lines.push(status_line("Error", first_line(error)));
             }
             lines.push(Line::default());
             lines.push(Line::styled(
-                "Enable federation and set a network id — every instance using the",
-                theme::dim(),
-            ));
-            lines.push(Line::styled(
-                "same id (furumi TUI or furumi-fd) finds the others automatically.",
+                "Set the same Network ID on each client.",
                 theme::dim(),
             ));
         }
         Some(status) => {
             lines.push(status_line("Node", format!("running · {}", status.network)));
-            lines.push(status_line(
+            lines.push(status_action_line(
                 "Endpoint",
-                format!("{} · dht {}", status.endpoint_id, status.dht_node_id),
-            ));
-            let peers = if status.connected_peers.is_empty() {
-                format!("none · contacts {}", status.known_contacts)
-            } else {
-                let names: Vec<String> = status.connected_peers.iter().map(String::clone).collect();
-                let more = status.connected_peers.len().saturating_sub(names.len());
-                let more = if more > 0 {
-                    format!(" +{more}")
-                } else {
-                    String::new()
-                };
                 format!(
-                    "{} connected{} · contacts {} · {}",
+                    "{} · dht {}",
+                    short_id(&status.endpoint_id),
+                    short_id(&status.dht_node_id)
+                ),
+                status_cursor == 0,
+            ));
+            lines.push(status_line(
+                "Peers",
+                format!(
+                    "{} connected · {} contacts",
                     status.connected_peers.len(),
-                    more,
-                    status.known_contacts,
-                    names.join(", ")
-                )
-            };
-            lines.push(status_line("Peers", peers));
+                    status.known_contacts
+                ),
+            ));
+            if !status.connected_peers.is_empty() {
+                let mut peers: Vec<String> = status
+                    .connected_peers
+                    .iter()
+                    .take(4)
+                    .map(|peer| short_id(peer))
+                    .collect();
+                if status.connected_peers.len() > peers.len() {
+                    peers.push(format!("+{}", status.connected_peers.len() - peers.len()));
+                }
+                lines.push(status_action_line(
+                    "Peer IDs",
+                    peers.join(", "),
+                    status_cursor == 1,
+                ));
+            }
             lines.push(status_line(
                 "DHT",
                 format!(
-                    "{} records · {} · {} published",
+                    "{} records · {}",
                     status
                         .stored_dht_records
                         .map(|count| count.to_string())
-                        .unwrap_or_else(|| "unavailable".to_string()),
+                        .unwrap_or_else(|| "n/a".to_string()),
                     status
                         .stored_dht_bytes
                         .map(short_bytes_label)
-                        .unwrap_or_else(|| "unavailable".to_string()),
-                    status.published_items
+                        .unwrap_or_else(|| "n/a".to_string())
                 ),
+            ));
+            lines.push(status_line(
+                "Published",
+                format!("{} items", status.published_items),
             ));
             lines.push(status_line(
                 "Last sync",
@@ -857,13 +793,148 @@ pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
                     .unwrap_or_else(|| "not yet".to_string()),
             ));
             if let Some(error) = &status.last_error {
-                lines.push(status_line("Error", error.clone()));
+                lines.push(status_line("Error", first_line(error)));
             }
-            push_transport_status(&mut lines, status);
+            push_transport_summary_status(&mut lines, status);
         }
     }
+    lines
+}
+
+fn status_action_line(label: &str, value: String, selected: bool) -> Line<'static> {
+    let marker = if selected { "▶" } else { " " };
+    Line::from(vec![
+        Span::styled(
+            format!("{marker} {label:<16}"),
+            if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        ),
+        Span::raw(value),
+        Span::styled("  ↵", theme::dim()),
+    ])
+}
+
+fn push_transport_summary_status(
+    lines: &mut Vec<Line<'static>>,
+    status: &crate::federation::FedStatus,
+) {
     lines.push(Line::default());
-    lines.push(Line::styled("Connected Devices", theme::header()));
+    lines.push(Line::styled("Iroh Transport", theme::header()));
+    let transport = &status.transport;
+    let runtime_total = transport
+        .runtime_tx_bytes
+        .saturating_add(transport.runtime_rx_bytes);
+    lines.push(status_line(
+        "Traffic",
+        format!(
+            "{} · tx {} · rx {}",
+            short_bytes_label(runtime_total),
+            short_bytes_label(transport.runtime_tx_bytes),
+            short_bytes_label(transport.runtime_rx_bytes)
+        ),
+    ));
+    lines.push(status_line(
+        "Active",
+        format!("{} streams", transport.active_streams),
+    ));
+    if transport.runtime_lost_packets > 0 || transport.runtime_lost_bytes > 0 {
+        lines.push(status_line(
+            "Loss",
+            format!(
+                "{} pkts · {}",
+                transport.runtime_lost_packets,
+                short_bytes_label(transport.runtime_lost_bytes)
+            ),
+        ));
+    }
+    lines.push(status_line(
+        "Samples",
+        format!(
+            "{} total · {} direct · {} relay · {} unknown",
+            transport.total_samples,
+            transport.direct_samples,
+            transport.relay_samples,
+            transport.unknown_samples
+        ),
+    ));
+    lines.push(status_line(
+        "Protocols",
+        format!(
+            "audio {} · catalog {} · sync {}",
+            transport.audio_samples, transport.catalog_samples, transport.sync_samples
+        ),
+    ));
+    if let Some(sample) = transport.last.first() {
+        lines.push(status_line(
+            "Last stream",
+            format!(
+                "{} {} {} · {} · {}",
+                sample.protocol,
+                sample.direction,
+                sample.phase,
+                sample.selected_path,
+                rtt_label(sample.selected_rtt_ms)
+            ),
+        ));
+        lines.push(status_line(
+            "Last peer",
+            format!(
+                "{} · paths {}/{}/{}/{}",
+                short_id(&sample.peer_id),
+                sample.direct_paths,
+                sample.relay_paths,
+                sample.custom_paths,
+                sample.open_paths
+            ),
+        ));
+        lines.push(status_line(
+            "Last bytes",
+            format!(
+                "sel {}/{} · total {}/{} · lost {}",
+                short_bytes_label(sample.selected_tx_bytes),
+                short_bytes_label(sample.selected_rx_bytes),
+                short_bytes_label(sample.total_tx_bytes),
+                short_bytes_label(sample.total_rx_bytes),
+                short_bytes_label(sample.lost_bytes)
+            ),
+        ));
+    }
+}
+
+pub(super) fn status_detail_transport_logs(state: &AppState) -> Vec<Line<'static>> {
+    let Some(status) = &state.federation.status else {
+        return vec![Line::styled("transport status is loading", theme::dim())];
+    };
+    if status.transport.last.is_empty() {
+        return vec![Line::styled("no connection samples yet", theme::dim())];
+    }
+    status
+        .transport
+        .last
+        .iter()
+        .map(|sample| {
+            Line::from(vec![
+                Span::styled(format!("{:<12}", sample.at), theme::dim()),
+                Span::raw(format!(
+                    "{} {} {} · {} · {} · tx {} rx {}",
+                    sample.protocol,
+                    sample.direction,
+                    sample.phase,
+                    sample.selected_path,
+                    rtt_label(sample.selected_rtt_ms),
+                    short_bytes_label(sample.total_tx_bytes),
+                    short_bytes_label(sample.total_rx_bytes)
+                )),
+            ])
+        })
+        .collect()
+}
+
+fn status_detail_device_lines(state: &AppState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled("Connected Devices", theme::header())];
     match &state.federation.devices {
         None => lines.push(Line::styled("loading…", theme::dim())),
         Some(status) => {
@@ -882,30 +953,27 @@ pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
             lines.push(status_line(
                 "Sync log",
                 format!(
-                    "{} ops · {} outbox · {} tombstones ({} gc)",
-                    status.ops_total,
-                    status.outbox_ops,
-                    status.tombstone_ops,
-                    status.compactable_tombstones
+                    "{} ops · {} outbox · {} tombstones",
+                    status.ops_total, status.outbox_ops, status.tombstone_ops
                 ),
             ));
             lines.push(status_line(
                 "Snapshot",
                 format!(
-                    "{} likes, {} playlists, {} items",
+                    "{} likes · {} playlists · {} items",
                     status.snapshot_likes, status.snapshot_playlists, status.snapshot_items
                 ),
             ));
             lines.push(status_line(
-                "Unresolved items",
+                "Unresolved",
                 status.unresolved_playlist_items.to_string(),
             ));
-            lines.push(status_line("Peer ack floor", status.peer_ack_floor.clone()));
+            lines.push(status_line("Ack floor", status.peer_ack_floor.clone()));
             if let Some(last_sync) = &status.last_sync {
-                lines.push(status_line("Last device sync", last_sync.clone()));
+                lines.push(status_line("Last sync", last_sync.clone()));
             }
             if let Some(last_error) = &status.last_error {
-                lines.push(status_line("Device error", last_error.clone()));
+                lines.push(status_line("Error", first_line(last_error)));
             }
             lines.push(Line::default());
             lines.push(Line::styled("Device List", theme::header()));
@@ -914,14 +982,29 @@ pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
             } else {
                 let ordered = crate::app::state::device_status_order(state);
                 let now = crate::app::state::unix_time_ms();
+                let mut emitted = Vec::new();
                 for index in &ordered {
                     if let Some(device) = status.devices.get(*index) {
-                        push_device_detail(&mut lines, state, device, now);
+                        push_device_detail_compact(
+                            &mut lines,
+                            state,
+                            device,
+                            now,
+                            !emitted.is_empty(),
+                        );
+                        emitted.push(*index);
                     }
                 }
                 for (index, device) in status.devices.iter().enumerate() {
-                    if !ordered.contains(&index) {
-                        push_device_detail(&mut lines, state, device, now);
+                    if !emitted.contains(&index) {
+                        push_device_detail_compact(
+                            &mut lines,
+                            state,
+                            device,
+                            now,
+                            !emitted.is_empty(),
+                        );
+                        emitted.push(index);
                     }
                 }
             }
@@ -930,47 +1013,80 @@ pub(super) fn status_detail_lines(state: &AppState) -> Vec<Line<'static>> {
     lines
 }
 
-fn push_device_detail(
+fn push_device_detail_compact(
     lines: &mut Vec<Line<'static>>,
     state: &AppState,
     device: &crate::devices::DeviceStatusRow,
     now_ms: i64,
+    separator: bool,
 ) {
-    let mut name = crate::app::state::device_display_name(device);
-    if device.is_self {
-        name.push_str(" (this device)");
+    if separator {
+        lines.push(Line::styled(
+            "────────────────────────────────",
+            theme::dim(),
+        ));
     }
-    if device.revoked {
-        name.push_str(" (revoked)");
-    }
-    let presence = match crate::app::state::device_presence_section(state, device, now_ms) {
-        DevicePresenceSection::Online => "online",
-        DevicePresenceSection::Offline => "offline",
-        DevicePresenceSection::Revoked => "revoked",
+    let presence = crate::app::state::device_presence_section(state, device, now_ms);
+    let icon = match presence {
+        DevicePresenceSection::Online => "●",
+        DevicePresenceSection::Offline => "○",
+        DevicePresenceSection::Revoked => "×",
     };
-    lines.push(status_line("Device", name));
+    let mut badges = Vec::new();
+    if device.is_self {
+        badges.push("this");
+    }
+    match presence {
+        DevicePresenceSection::Online => badges.push("online"),
+        DevicePresenceSection::Offline => badges.push("offline"),
+        DevicePresenceSection::Revoked => badges.push("revoked"),
+    }
+    let version = if device.client_version.trim().is_empty() {
+        "v?".to_string()
+    } else {
+        format!("v{}", device.client_version)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{icon} "), theme::accent()),
+        Span::raw(crate::app::state::device_display_name(device)),
+        Span::styled(
+            format!(" · {} · {}", version, badges.join(", ")),
+            theme::dim(),
+        ),
+    ]));
     lines.push(status_line("Device ID", device.device_id.clone()));
     lines.push(status_line(
-        "Endpoint ID",
+        "Endpoint",
         if device.endpoint_id.trim().is_empty() {
             "unavailable".to_string()
         } else {
-            device.endpoint_id.clone()
+            short_id(&device.endpoint_id)
         },
     ));
     lines.push(status_line(
-        "Version",
-        if device.client_version.trim().is_empty() {
-            "unknown".to_string()
-        } else {
-            device.client_version.clone()
-        },
+        "Last seen",
+        relative_time_label(device.last_seen_ms, now_ms),
     ));
-    lines.push(status_line(
-        "Presence",
-        match device.last_seen_ms {
-            Some(seen) => format!("{presence} · last seen {seen} ms"),
-            None => format!("{presence} · last seen unavailable"),
-        },
-    ));
+}
+
+fn relative_time_label(value_ms: Option<i64>, now_ms: i64) -> String {
+    let Some(value_ms) = value_ms else {
+        return "unavailable".to_string();
+    };
+    let delta_ms = now_ms.saturating_sub(value_ms);
+    if delta_ms < 0 {
+        return "in the future".to_string();
+    }
+    let seconds = delta_ms / 1000;
+    if seconds < 5 {
+        "just now".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 60 * 60 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h ago", seconds / 60 / 60)
+    } else {
+        format!("{}d ago", seconds / 60 / 60 / 24)
+    }
 }

@@ -6,7 +6,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme;
 use crate::app::state::{
-    AppState, DevicePresenceSection, EditField, Loadable, Popup, addable_playlists,
+    AppState, DevicePresenceSection, EditField, Loadable, Popup, StatusDetailFocus,
+    addable_playlists,
 };
 use crate::library::models::{ArtistRef, TrackItem};
 
@@ -37,10 +38,34 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..
         }) => draw_track_artists(frame, tracks, *cursor, *selected),
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, entry),
-        Some(Popup::FedInput { field, input }) => draw_fed_input(frame, field.title(), input),
+        Some(Popup::FedInput { field, input }) => {
+            draw_fed_input(frame, field.title(), field.help(), input)
+        }
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, title, text),
-        Some(Popup::FederationStatusDetails { scroll }) => {
-            draw_federation_status_details(frame, state, *scroll)
+        Some(Popup::FedCopyText { title, text, help }) => {
+            draw_fed_copy_text(frame, title, text, help)
+        }
+        Some(Popup::FederationStatusDetails {
+            focus,
+            status_cursor,
+            devices_scroll,
+            logs_scroll,
+        }) => draw_federation_status_details(
+            frame,
+            state,
+            *focus,
+            *status_cursor,
+            *devices_scroll,
+            *logs_scroll,
+        ),
+        Some(Popup::FederationStatusText {
+            title,
+            text,
+            scroll,
+            parent: _,
+        }) => draw_federation_status_text(frame, title, text, *scroll),
+        Some(Popup::FederationStatusLog { scroll, parent: _ }) => {
+            draw_federation_status_log(frame, state, *scroll)
         }
         Some(Popup::DevicePairing {
             device_id,
@@ -65,10 +90,15 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     }
 }
 
-fn draw_federation_status_details(frame: &mut Frame, state: &AppState, scroll: usize) {
-    let width = frame.area().width.saturating_sub(6).clamp(52, 104);
-    let height = frame.area().height.saturating_sub(4).clamp(10, 32);
-    let area = centered(frame.area(), width, height);
+fn draw_federation_status_details(
+    frame: &mut Frame,
+    state: &AppState,
+    focus: StatusDetailFocus,
+    status_cursor: usize,
+    devices_scroll: usize,
+    _logs_scroll: usize,
+) {
+    let area = federation_status_area(frame);
     let block = Block::bordered()
         .title(" Full status details ")
         .title_style(theme::header())
@@ -77,18 +107,182 @@ fn draw_federation_status_details(frame: &mut Frame, state: &AppState, scroll: u
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    let lines = super::federation::status_detail_lines(state);
-    let max_scroll = lines.len().saturating_sub(usize::from(body.height));
+    let log_height = if inner.height >= 22 {
+        (inner.height / 3)
+            .clamp(7, 12)
+            .min(inner.height.saturating_sub(9))
+    } else {
+        inner.height.saturating_sub(7).clamp(3, 6)
+    };
+    let [summary_area, logs_area, footer] = Layout::vertical([
+        Constraint::Min(8),
+        Constraint::Length(log_height),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let sections = super::federation::status_detail_sections(state, status_cursor);
+    if summary_area.width >= 78 {
+        let [left, _, right] = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
+        .areas(summary_area);
+        draw_status_detail_panel(
+            frame,
+            left,
+            " Status / Transport ",
+            sections.status,
+            0,
+            focus == StatusDetailFocus::Status,
+        );
+        draw_status_detail_panel(
+            frame,
+            right,
+            " Connected Devices ",
+            sections.devices,
+            devices_scroll,
+            focus == StatusDetailFocus::Devices,
+        );
+    } else {
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(summary_area);
+        draw_status_detail_panel(
+            frame,
+            top,
+            " Status / Transport ",
+            sections.status,
+            0,
+            focus == StatusDetailFocus::Status,
+        );
+        draw_status_detail_panel(
+            frame,
+            bottom,
+            " Connected Devices ",
+            sections.devices,
+            devices_scroll,
+            focus == StatusDetailFocus::Devices,
+        );
+    }
+    draw_status_log_panel(
+        frame,
+        logs_area,
+        sections.logs,
+        focus == StatusDetailFocus::Logs,
+    );
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(Line::styled(
+            "h/l focus panels · j/k move/scroll selected · enter open selected detail/log · esc close",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        footer,
+    );
+}
+
+fn federation_status_area(frame: &Frame) -> Rect {
+    let max_width = frame.area().width.saturating_sub(2).max(1);
+    let max_height = frame.area().height.saturating_sub(2).max(1);
+    let width = max_width.min(150).max(max_width.min(72));
+    let height = max_height.min(44).max(max_height.min(22));
+    centered(frame.area(), width, height)
+}
+
+fn draw_status_detail_panel(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(title)
+        .title_style(theme::header())
+        .border_style(if focused {
+            theme::accent()
+        } else {
+            theme::dim()
+        });
+    let inner = block.inner(area);
+    let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll.min(max_scroll) as u16, 0)),
+        inner,
+    );
+}
+
+fn draw_status_log_panel(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, focused: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(" Connection log ")
+        .title_style(theme::header())
+        .border_style(if focused {
+            theme::accent()
+        } else {
+            theme::dim()
+        });
+    let inner = block.inner(area);
+    let preview: Vec<_> = lines.into_iter().take(10).collect();
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(preview), inner);
+}
+
+fn draw_federation_status_text(frame: &mut Frame, title: &str, text: &str, scroll: usize) {
+    let area = federation_status_area(frame);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let line_count = text.lines().count().max(1);
+    let max_scroll = line_count.saturating_sub(usize::from(body.height));
+    frame.render_widget(
+        Paragraph::new(text.to_string())
             .wrap(Wrap { trim: false })
             .scroll((scroll.min(max_scroll) as u16, 0)),
         body,
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "j/k scroll - pgup/pgdn page - esc close",
+            "j/k scroll · pgup/pgdn page · esc return",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
+        footer,
+    );
+}
+
+fn draw_federation_status_log(frame: &mut Frame, state: &AppState, scroll: usize) {
+    let area = federation_status_area(frame);
+    let block = Block::bordered()
+        .title(" Connection log ")
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let lines = super::federation::status_detail_transport_logs(state);
+    let max_scroll = lines.len().saturating_sub(usize::from(body.height));
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll.min(max_scroll) as u16, 0)),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "j/k scroll · pgup/pgdn page · esc return",
             theme::dim(),
         ))
         .alignment(Alignment::Center),
@@ -428,8 +622,8 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
 }
 
 /// One-line text entry on the Federation tab (network id / peer ticket).
-fn draw_fed_input(frame: &mut Frame, title: &str, input: &crate::app::input::LineEdit) {
-    let area = centered(frame.area(), 64, 5);
+fn draw_fed_input(frame: &mut Frame, title: &str, help: &str, input: &crate::app::input::LineEdit) {
+    let area = centered(frame.area(), 72, 8);
     let block = Block::bordered()
         .title(format!(" {title} "))
         .title_style(theme::header())
@@ -437,8 +631,18 @@ fn draw_fed_input(frame: &mut Frame, title: &str, input: &crate::app::input::Lin
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let [entry_area, hint_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let [help_area, entry_area, hint_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(help.to_string())
+            .wrap(Wrap { trim: true })
+            .style(theme::dim()),
+        help_area,
+    );
     let spans = super::line_edit_spans(input, usize::from(entry_area.width.saturating_sub(1)));
     frame.render_widget(Paragraph::new(Line::from(spans)), entry_area);
     frame.render_widget(
@@ -468,6 +672,54 @@ fn draw_fed_text(frame: &mut Frame, title: &str, text: &str) {
     frame.render_widget(
         Paragraph::new(text.to_string()).wrap(Wrap { trim: false }),
         inner,
+    );
+}
+
+/// Wrapped text with an explicit copy-and-close action.
+fn draw_fed_copy_text(frame: &mut Frame, title: &str, text: &str, help: &str) {
+    let width = frame.area().width.saturating_sub(8).clamp(36, 96);
+    let text_width = usize::from(width.saturating_sub(2));
+    let text_lines = (text.chars().count() / text_width.max(1) + 1) as u16;
+    let help_lines = (help.chars().count() / text_width.max(1) + 1) as u16;
+    let height = (text_lines + help_lines + 5).clamp(8, frame.area().height);
+    let area = centered(frame.area(), width, height);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_style(theme::header())
+        .border_style(theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [help_area, body_area, button_area, footer_area] = Layout::vertical([
+        Constraint::Length(help_lines),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(help.to_string())
+            .wrap(Wrap { trim: true })
+            .style(theme::dim()),
+        help_area,
+    );
+    frame.render_widget(
+        Paragraph::new(text.to_string()).wrap(Wrap { trim: false }),
+        body_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            " Copy to clipboard and close ",
+            theme::tab_active(),
+        ))
+        .alignment(Alignment::Center),
+        button_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("enter/c copy · esc close", theme::dim()))
+            .alignment(Alignment::Center),
+        footer_area,
     );
 }
 

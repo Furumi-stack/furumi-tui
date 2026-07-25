@@ -7,9 +7,9 @@ pub(crate) mod popup;
 pub mod state;
 pub mod update;
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1397,6 +1397,8 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         }
         Effect::FedApplySettings => fed_apply_settings(state, runtime),
         Effect::FedSyncNow => {
+            state.federation.publishing = true;
+            state.status_message = Some("publishing library…".to_string());
             let fed = Arc::clone(&runtime.federation);
             let tx = runtime.event_tx.clone();
             tokio::spawn(async move {
@@ -1405,7 +1407,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                     Err(err) => format!("federation sync failed: {err:#}"),
                 };
                 let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
-                let _ = tx.send(AppEvent::StatusMessage(message));
+                let _ = tx.send(AppEvent::FedSyncFinished(message));
             });
         }
         Effect::FedShowTicket => {
@@ -1438,6 +1440,8 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         }
         Effect::DeviceConnectInvite(invite) => device_connect(runtime, invite),
         Effect::DeviceSyncNow => {
+            state.federation.device_syncing = true;
+            state.status_message = Some("syncing devices…".to_string());
             let fed = Arc::clone(&runtime.federation);
             let devices = Arc::clone(&runtime.devices);
             let tx = runtime.event_tx.clone();
@@ -1447,7 +1451,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                     Err(err) => format!("devices: {err:#}"),
                 };
                 let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
-                let _ = tx.send(AppEvent::StatusMessage(message));
+                let _ = tx.send(AppEvent::DeviceSyncFinished(message));
             });
         }
         Effect::DeviceSetName(name) => {
@@ -1665,45 +1669,6 @@ fn open_visualizer_editor(path: &Path) -> Result<()> {
 fn shell_quote(path: &Path) -> String {
     let value = path.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn copy_text_to_clipboard(text: &str) -> bool {
-    let command: &[&str] = if cfg!(target_os = "macos") {
-        &["pbcopy"]
-    } else if cfg!(target_os = "windows") {
-        &["clip"]
-    } else {
-        &["wl-copy"]
-    };
-    let Some((program, args)) = command.split_first() else {
-        return false;
-    };
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) if !cfg!(target_os = "macos") && !cfg!(target_os = "windows") => {
-            match Command::new("xclip")
-                .args(["-selection", "clipboard"])
-                .stdin(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(_) => return false,
-            }
-        }
-        Err(_) => return false,
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return false;
-    };
-    if stdin.write_all(text.as_bytes()).is_err() {
-        return false;
-    }
-    drop(stdin);
-    child.wait().is_ok_and(|status| status.success())
 }
 
 /// Start playing `queue[queue_pos]`: open the local file in a background
@@ -2826,18 +2791,22 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             clamp_settings_cursor(state);
         }
+        AppEvent::FedSyncFinished(message) => {
+            state.federation.publishing = false;
+            state.status_message = Some(message);
+        }
+        AppEvent::DeviceSyncFinished(message) => {
+            state.federation.device_syncing = false;
+            state.status_message = Some(message);
+        }
         AppEvent::DeviceInvite(result) => match result {
             Ok(invite) => {
-                let copied = copy_text_to_clipboard(&invite);
-                state.popup = Some(state::Popup::FedText {
+                state.popup = Some(state::Popup::FedCopyText {
                     title: "Device invite".to_string(),
                     text: invite,
+                    help: "Use this invite on another client within 10 minutes to pair it with this device group.".to_string(),
                 });
-                state.status_message = Some(if copied {
-                    "device invite copied to clipboard".to_string()
-                } else {
-                    "device invite generated".to_string()
-                });
+                state.status_message = Some("device invite generated".to_string());
             }
             Err(message) => state.status_message = Some(format!("device invite: {message}")),
         },
@@ -3105,9 +3074,11 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::FedTicket(result) => match result {
             Ok(ticket) => {
-                state.popup = Some(state::Popup::FedText {
-                    title: "Federation ticket (share with a peer)".to_string(),
+                state.popup = Some(state::Popup::FedCopyText {
+                    title: "Connection ticket".to_string(),
                     text: ticket,
+                    help: "Copy this ticket and paste it into Connect to a peer on another client."
+                        .to_string(),
                 });
             }
             Err(message) => state.status_message = Some(message),

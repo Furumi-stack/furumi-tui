@@ -2579,7 +2579,12 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             None
         }
         SettingsRow::StatusDetails => {
-            state.popup = Some(Popup::FederationStatusDetails { scroll: 0 });
+            state.popup = Some(Popup::FederationStatusDetails {
+                focus: super::state::StatusDetailFocus::Status,
+                status_cursor: 0,
+                devices_scroll: 0,
+                logs_scroll: 0,
+            });
             None
         }
         SettingsRow::DeviceName => {
