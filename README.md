@@ -71,8 +71,25 @@ without rebuilding the player.
 
 ## Install
 
-Download a prebuilt archive from the project releases, or build Furumi from
-source with Rust 1.97 or newer:
+### macOS
+
+On Apple Silicon Macs, install Furumi from the Homebrew tap:
+
+```bash
+brew install house-of-vanity/tap/furumi
+```
+
+Run it with:
+
+```bash
+furumi
+```
+
+### Linux, Windows, and other platforms
+
+Download a prebuilt archive from the
+[GitHub releases](https://github.com/house-of-vanity/furumi_tui/releases), or
+build Furumi from source with Rust 1.88 or newer:
 
 ```bash
 cargo build --release --locked
