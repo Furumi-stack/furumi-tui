@@ -89,7 +89,7 @@ furumi
 
 Download a prebuilt archive from the
 [GitHub releases](https://github.com/house-of-vanity/furumi_tui/releases), or
-build Furumi from source with Rust 1.88 or newer:
+build Furumi from source with Rust 1.97 or newer:
 
 ```bash
 cargo build --release --locked

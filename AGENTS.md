@@ -29,7 +29,7 @@ Preserve these architectural invariants:
 
 ## Toolchain and checks
 
-The crate uses Rust edition 2024 and Rust 1.88 or newer.
+The crate uses Rust edition 2024 and Rust 1.97 or newer.
 
 Run the checks relevant to every code change:
 

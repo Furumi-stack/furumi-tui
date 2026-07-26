@@ -2,7 +2,7 @@
 name = "furumi_tui"
 version = "0.1.6"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 description = "A federated P2P player for personal music libraries"
 license = "WTFPL"
 
