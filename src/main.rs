@@ -20,6 +20,11 @@ use crossterm::event::{
 };
 
 fn main() -> Result<()> {
+    if std::env::args_os().any(|arg| arg == "--version" || arg == "-V") {
+        println!("furumi {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mut startup_warning = None;
     if let Err(err) = config::logging::init() {
         startup_warning = Some(format!("logging disabled: {err:#}"));

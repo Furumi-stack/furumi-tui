@@ -24,7 +24,7 @@ jobs:
             archive_ext: tar.gz
             binary_name: furumi
           - os: macos-latest
-            asset_name: furumi-macos-x86_64
+            asset_name: furumi-macos-aarch64
             archive_ext: tar.gz
             binary_name: furumi
           - os: windows-latest
