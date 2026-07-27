@@ -18,13 +18,6 @@ pub fn dim() -> Style {
     Style::new().fg(DIM)
 }
 
-pub fn tab_active() -> Style {
-    Style::new()
-        .fg(Color::Black)
-        .bg(ACCENT)
-        .add_modifier(Modifier::BOLD)
-}
-
 pub fn tab_active_for(state: &AppState) -> Style {
     Style::new()
         .fg(Color::Black)

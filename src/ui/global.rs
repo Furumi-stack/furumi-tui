@@ -152,7 +152,8 @@ fn draw_tile_meta(
     availability: Option<Availability>,
     selected: bool,
 ) {
-    let marker = availability.map(|availability| availability_marker(availability, selected));
+    let selected_style = selected.then(|| theme::tab_active_for(state));
+    let marker = availability.map(|availability| availability_marker(availability, selected_style));
     let marker_width = marker
         .map(|(label, _)| UnicodeWidthStr::width(label) as u16)
         .unwrap_or(0)

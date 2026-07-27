@@ -19,23 +19,34 @@ use crate::library::models::Availability;
 
 pub(crate) fn availability_marker(
     availability: Availability,
-    selected: bool,
+    selected_style: Option<Style>,
 ) -> (&'static str, Style) {
     let (label, style) = match availability {
         Availability::Local => ("●", Style::new().fg(Color::Green)),
         Availability::Mixed => ("◐", Style::new().fg(Color::Yellow)),
         Availability::Remote => ("⇅", theme::accent()),
     };
-    if selected {
-        (label, theme::tab_active())
-    } else {
-        (label, style)
-    }
+    (label, selected_style.unwrap_or(style))
 }
 
 pub(crate) fn availability_prefix(availability: Availability) -> Span<'static> {
-    let (label, style) = availability_marker(availability, false);
+    let (label, style) = availability_marker(availability, None);
     Span::styled(format!("{label} "), style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_availability_marker_uses_the_supplied_mode_style() {
+        let client_style = Style::new().fg(Color::Black).bg(Color::Yellow);
+
+        let (label, style) = availability_marker(Availability::Local, Some(client_style));
+
+        assert_eq!(label, "●");
+        assert_eq!(style, client_style);
+    }
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
