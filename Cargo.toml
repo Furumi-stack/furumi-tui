@@ -21,7 +21,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 lofty = "0.22"
 # P2P federation: library index in a shared DHT + audio streaming between
 # peers (same protocol as furumi-fd).
-music-dht = { git = "https://gt.hexor.cy/ab/frid.git" }
+music-dht = { git = "https://gt.hexor.cy/ab/frid.git", rev = "a9012351dcdbdf8dbaa1f5dd71e498b4bc678d99" }
 ratatui = "0.30.1"
 rhai = { version = "1", features = ["sync"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "symphonia-aac", "symphonia-isomp4", "symphonia-alac"] }

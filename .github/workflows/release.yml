@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
 
 jobs:
   build:
@@ -43,8 +44,11 @@ jobs:
       - name: Show Rust version
         run: rustc --version && cargo --version
 
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --offline
 
       - name: Package
         shell: bash
