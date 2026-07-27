@@ -425,14 +425,21 @@ fn apply_playback_state_to_ui(
     wire: &crate::devices::PlaybackStateWire,
     library: Option<&Library>,
 ) {
-    state.player.queue = wire
+    let queue: Vec<_> = wire
         .queue
         .iter()
         .map(|track| playback_track_to_ui(track, library))
         .collect();
-    state.player.queue_pos = wire
-        .queue_pos
-        .min(state.player.queue.len().saturating_sub(1));
+    let queue_pos = queue
+        .iter()
+        .take(wire.queue_pos)
+        .filter(|track| update::track_allowed_by_source_mode(state, track))
+        .count();
+    state.player.queue = queue
+        .into_iter()
+        .filter(|track| update::track_allowed_by_source_mode(state, track))
+        .collect();
+    state.player.queue_pos = queue_pos.min(state.player.queue.len().saturating_sub(1));
     state.player.playing = wire.playing && !state.player.queue.is_empty();
     state.player.paused = wire.paused;
     state.device_playback.local_idle_since_ms = if state.player.playing && !state.player.paused {
@@ -1291,6 +1298,24 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         }
         Effect::SetOptions => {}
         Effect::PlaybackQueueChanged => {}
+        Effect::SourceModeChanged => {
+            runtime.library_network_refresh_at = None;
+            if let Ok(mut cursors) = runtime.library_network_cursors.lock() {
+                cursors.clear();
+            }
+            if let Ok(mut done) = runtime.library_network_done.lock() {
+                done.clear();
+            }
+            if let Ok(mut attempted) = runtime.library_network_art_attempted.lock() {
+                attempted.clear();
+            }
+            save_app_settings(state);
+            reset_artist_pagination(state);
+            refresh_artists(state, runtime);
+            if let Some(effect) = update::apply_library_filter_change(state) {
+                perform_effect(state, runtime, effect);
+            }
+        }
         Effect::EnqueueRelease { id, next } => {
             let library = Arc::clone(&runtime.library);
             let tx = runtime.event_tx.clone();
@@ -3410,10 +3435,13 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             });
         }
         AppEvent::EnqueueTracks { tracks, next } => {
-            let count = tracks.len();
+            let previous_len = state.player.queue.len();
             update::enqueue_tracks(state, tracks, next);
+            let count = state.player.queue.len().saturating_sub(previous_len);
             record_control_playback_state(state, runtime, false);
-            state.status_message = Some(if next {
+            state.status_message = Some(if count == 0 {
+                "no tracks available in the current source mode".to_string()
+            } else if next {
                 format!("{count} tracks queued next")
             } else {
                 format!("{count} tracks queued")

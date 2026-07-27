@@ -427,6 +427,21 @@ mod tests {
     }
 
     #[test]
+    fn default_source_mode_key_resolves_on_content_tabs() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        for context in [
+            KeyContext::Library,
+            KeyContext::Playlists,
+            KeyContext::Queue,
+        ] {
+            assert_eq!(
+                km.resolve(key!(m), context),
+                KeyResolution::Action(Action::CycleSourceMode)
+            );
+        }
+    }
+
+    #[test]
     fn default_shift_n_is_unbound() {
         let mut km = keymap_from(DEFAULT_KEYMAP);
         let shift_n = KeyCombination::new(KeyCode::Char('N'), KeyModifiers::SHIFT);

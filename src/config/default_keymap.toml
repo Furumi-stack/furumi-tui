@@ -226,6 +226,10 @@ key_sequence = "v"
 command = "ToggleViewMode"
 
 [[keymaps]]
+key_sequence = "m"
+command = "CycleSourceMode"
+
+[[keymaps]]
 key_sequence = "f"
 command = "OpenLibraryFilters"
 context = "library"

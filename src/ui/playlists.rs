@@ -38,7 +38,15 @@ fn centered_line(frame: &mut Frame, area: Rect, line: Line) {
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
-    let inner = bordered(frame, area, state, " Playlists ".to_string());
+    let inner = bordered(
+        frame,
+        area,
+        state,
+        format!(
+            " Playlists · Mode: {} ",
+            state.global.filters.source_mode.label()
+        ),
+    );
     let selected = state.playlists.selected;
 
     let list = match &state.playlists.list {
@@ -97,8 +105,15 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_opened(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor: usize) {
     let loadable = state.playlist_views.get(&id);
     let title = match loadable {
-        Some(Loadable::Ready(detail)) => format!(" Playlists ▸ {} ", detail.title),
-        _ => " Playlists ▸ … ".to_string(),
+        Some(Loadable::Ready(detail)) => format!(
+            " Playlists ▸ {} · Mode: {} ",
+            detail.title,
+            state.global.filters.source_mode.label()
+        ),
+        _ => format!(
+            " Playlists ▸ … · Mode: {} ",
+            state.global.filters.source_mode.label()
+        ),
     };
     let inner = bordered(frame, area, state, title);
 

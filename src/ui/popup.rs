@@ -598,7 +598,7 @@ fn clip_cells(text: &str, max_width: usize) -> String {
 }
 
 fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
-    let area = centered(frame.area(), 54, 9);
+    let area = centered(frame.area(), 44, 6);
     let block = Block::bordered()
         .title(" Library filters ")
         .title_style(theme::header_for(state))
@@ -608,7 +608,7 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
     frame.render_widget(block, area);
 
     let [list_area, _, footer] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -624,18 +624,6 @@ fn draw_library_filters(frame: &mut Frame, state: &AppState, cursor: usize) {
         Span::styled(format!("{checked} "), theme::accent_for(state)),
         Span::raw("Hide featured only"),
     ]));
-    for mode in crate::config::settings::LibrarySourceMode::ALL {
-        let marker = if state.global.filters.source_mode == mode {
-            "(*)"
-        } else {
-            "( )"
-        };
-        rows.push(Line::from(vec![
-            Span::styled(format!("{marker} "), theme::accent_for(state)),
-            Span::raw(mode.label()),
-            Span::styled(format!("  {}", mode.description()), theme::dim()),
-        ]));
-    }
     for (index, line) in rows.into_iter().enumerate() {
         let row = Rect {
             y: list_area.y + index as u16,

@@ -383,15 +383,15 @@ fn draw_grid(frame: &mut Frame, area: Rect, state: &AppState) {
     let global = &state.global;
     let title = if global.total > 0 {
         format!(
-            " Library — {} artists · {} ",
+            " Library — {} artists · Mode: {} ",
             global.total,
             global.filters.source_mode.label()
         )
     } else {
-        format!(" Library · {} ", global.filters.source_mode.label())
+        format!(" Library · Mode: {} ", global.filters.source_mode.label())
     };
     let mut title_spans = vec![Span::styled(title, theme::tab_active_for(state))];
-    if global.filters.is_active() {
+    if global.filters.hide_featured_only {
         title_spans.push(Span::raw(" "));
         title_spans.push(Span::styled(" FILTERED ", theme::tab_active_for(state)));
     }

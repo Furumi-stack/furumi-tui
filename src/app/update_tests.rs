@@ -41,6 +41,23 @@ fn test_track(id: i64) -> TrackItem {
     }
 }
 
+fn pending_fed_track(id: i64) -> TrackItem {
+    crate::federation::pending_track(&crate::federation::FedTrack {
+        item_id: format!("fed-{id}"),
+        owner: "peer".into(),
+        own: false,
+        title: format!("remote-{id}"),
+        artist_names: vec!["remote artist".into()],
+        featured_artist_names: vec![],
+        year: None,
+        duration_seconds: Some(1),
+        content_id: Some(format!("b3:{id:064x}")),
+        release_title: Some("remote release".into()),
+        track_number: None,
+        disc_number: None,
+    })
+}
+
 #[test]
 fn quit_needs_double_press() {
     let mut state = AppState::default();
@@ -113,6 +130,36 @@ fn library_filters_popup_opens_on_library_screens() {
     state.active_tab = Tab::Queue;
     update(&mut state, Action::OpenLibraryFilters);
     assert!(state.popup.is_none());
+}
+
+#[test]
+fn source_mode_cycles_on_library_playlists_and_queue_tabs() {
+    use crate::config::settings::LibrarySourceMode;
+
+    let mut state = AppState::default();
+    assert_eq!(
+        update(&mut state, Action::CycleSourceMode),
+        Some(Effect::SourceModeChanged)
+    );
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::My);
+
+    state.active_tab = Tab::Playlists;
+    assert_eq!(
+        update(&mut state, Action::CycleSourceMode),
+        Some(Effect::SourceModeChanged)
+    );
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Global);
+
+    state.active_tab = Tab::Queue;
+    assert_eq!(
+        update(&mut state, Action::CycleSourceMode),
+        Some(Effect::SourceModeChanged)
+    );
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Local);
+
+    state.active_tab = Tab::Federation;
+    assert_eq!(update(&mut state, Action::CycleSourceMode), None);
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Local);
 }
 
 #[test]
@@ -385,6 +432,118 @@ fn queue_tab_select_and_clear() {
     );
     assert!(state.player.queue.is_empty());
     assert!(!state.player.playing);
+}
+
+#[test]
+fn local_mode_hides_pending_federation_tracks_from_playlists_and_playback() {
+    let mut state = AppState {
+        active_tab: Tab::Playlists,
+        ..AppState::default()
+    };
+    state.playlists.opened = Some(OpenedPlaylist { id: 7, cursor: 1 });
+    state.playlist_views.insert(
+        7,
+        Loadable::Ready(crate::library::models::PlaylistDetail {
+            id: 7,
+            title: "mixed".into(),
+            description: None,
+            tracks: vec![test_track(1), pending_fed_track(2), test_track(3)],
+        }),
+    );
+
+    assert_eq!(
+        playlist_tracks(&state, 7)
+            .unwrap()
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(
+        update(&mut state, Action::Select),
+        Some(Effect::PlayCurrent)
+    );
+    assert_eq!(
+        state
+            .player
+            .queue
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(state.player.queue_pos, 1);
+}
+
+#[test]
+fn network_modes_show_pending_federation_playlist_tracks() {
+    let mut state = AppState::default();
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::My;
+    state.playlist_views.insert(
+        7,
+        Loadable::Ready(crate::library::models::PlaylistDetail {
+            id: 7,
+            title: "mixed".into(),
+            description: None,
+            tracks: vec![test_track(1), pending_fed_track(2)],
+        }),
+    );
+
+    assert_eq!(playlist_tracks(&state, 7).unwrap().len(), 2);
+}
+
+#[test]
+fn local_mode_rejects_async_federation_queue_additions() {
+    let mut state = AppState::default();
+
+    enqueue_tracks(
+        &mut state,
+        vec![test_track(1), pending_fed_track(2), test_track(3)],
+        false,
+    );
+
+    assert_eq!(
+        state
+            .player
+            .queue
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn switching_to_local_mode_removes_pending_federation_queue_tracks() {
+    let mut state = AppState::default();
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::My;
+    state.player.queue = vec![test_track(1), pending_fed_track(2), test_track(3)];
+    state.player.queue_pos = 1;
+    state.player.current = Some(state.player.queue[1].clone());
+    state.player.playing = true;
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
+
+    let effect = apply_library_filter_change(&mut state);
+
+    assert!(matches!(
+        effect,
+        Some(Effect::RemoveQueueIndices {
+            indices,
+            restart_paused: Some(false),
+            stop: false,
+        }) if indices == vec![1]
+    ));
+    assert_eq!(
+        state
+            .player
+            .queue
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(state.player.queue_pos, 1);
+    assert_eq!(state.player.current.as_ref().map(|track| track.id), Some(3));
 }
 
 #[test]

@@ -11,25 +11,11 @@ pub enum LibrarySourceMode {
 }
 
 impl LibrarySourceMode {
-    pub const ALL: [LibrarySourceMode; 3] = [
-        LibrarySourceMode::Local,
-        LibrarySourceMode::My,
-        LibrarySourceMode::Global,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             LibrarySourceMode::Local => "Local",
             LibrarySourceMode::My => "My",
             LibrarySourceMode::Global => "Global",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            LibrarySourceMode::Local => "only this device",
-            LibrarySourceMode::My => "this device + connected devices",
-            LibrarySourceMode::Global => "my devices + known federation peers",
         }
     }
 
@@ -40,6 +26,14 @@ impl LibrarySourceMode {
     pub fn includes_global_peers(self) -> bool {
         matches!(self, LibrarySourceMode::Global)
     }
+
+    pub fn next(self) -> Self {
+        match self {
+            LibrarySourceMode::Local => LibrarySourceMode::My,
+            LibrarySourceMode::My => LibrarySourceMode::Global,
+            LibrarySourceMode::Global => LibrarySourceMode::Local,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,12 +42,6 @@ pub struct LibraryFilters {
     pub hide_featured_only: bool,
     #[serde(default)]
     pub source_mode: LibrarySourceMode,
-}
-
-impl LibraryFilters {
-    pub fn is_active(&self) -> bool {
-        self.hide_featured_only || self.source_mode != LibrarySourceMode::Local
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +128,6 @@ hide_featured_only = true
 
         assert_eq!(settings.volume, 100);
         assert!(settings.library.hide_featured_only);
-        assert!(settings.library.is_active());
         assert_eq!(settings.library.source_mode, LibrarySourceMode::Local);
     }
 }

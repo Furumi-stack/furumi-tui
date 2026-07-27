@@ -48,6 +48,8 @@ pub enum Effect {
     },
     /// Queue/options changed without a direct audio engine action.
     PlaybackQueueChanged,
+    /// Persist and apply a Local / My / Global source-mode change.
+    SourceModeChanged,
     /// Persist the federation settings and start/stop the node.
     FedApplySettings,
     /// Force an immediate library publish into the DHT.
@@ -238,6 +240,18 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 _ => {}
             }
             None
+        }
+        Action::CycleSourceMode => {
+            if matches!(state.active_tab, Tab::Global | Tab::Playlists | Tab::Queue) {
+                state.global.filters.source_mode = state.global.filters.source_mode.next();
+                state.status_message = Some(format!(
+                    "source mode: {}",
+                    state.global.filters.source_mode.label()
+                ));
+                Some(Effect::SourceModeChanged)
+            } else {
+                None
+            }
         }
         Action::OpenLibraryFilters => {
             if state.active_tab == Tab::Global {
@@ -920,7 +934,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
     }
 }
 
-fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &[TrackItem])> {
+fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, Vec<&TrackItem>)> {
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
@@ -931,23 +945,25 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
                         Some((
                             TrackSelectionScope::ArtistTop(*id),
                             *cursor,
-                            &detail.top_tracks,
+                            detail.top_tracks.iter().collect(),
                         ))
                     } else {
                         let featured = cursor.checked_sub(tracks + releases)?;
                         (featured < detail.featured_tracks.len()).then_some((
                             TrackSelectionScope::ArtistFeatured(*id),
                             featured,
-                            &detail.featured_tracks,
+                            detail.featured_tracks.iter().collect(),
                         ))
                     }
                 }
                 _ => None,
             },
             GlobalView::Release { id, cursor } => match state.release_views.get(id)? {
-                Loadable::Ready(detail) => {
-                    Some((TrackSelectionScope::Release(*id), *cursor, &detail.tracks))
-                }
+                Loadable::Ready(detail) => Some((
+                    TrackSelectionScope::Release(*id),
+                    *cursor,
+                    detail.tracks.iter().collect(),
+                )),
                 _ => None,
             },
             _ => None,
@@ -963,7 +979,7 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, &
         Tab::Queue => Some((
             TrackSelectionScope::Queue,
             state.queue_tab.cursor,
-            &state.player.queue,
+            state.player.queue.iter().collect(),
         )),
         Tab::Federation | Tab::Logs => None,
     }
@@ -987,7 +1003,7 @@ pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
         .unwrap_or_else(|| vec![cursor.min(tracks.len().saturating_sub(1))]);
     indices
         .into_iter()
-        .filter_map(|index| tracks.get(index).cloned())
+        .filter_map(|index| tracks.get(index).map(|track| (*track).clone()))
         .collect()
 }
 
@@ -1175,19 +1191,30 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
             let opened = state.playlists.opened.as_ref()?;
             playlist_tracks(state, opened.id)?
                 .get(opened.cursor)
-                .cloned()
+                .map(|track| (*track).clone())
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
         Tab::Federation | Tab::Logs => None,
     }
 }
 
-/// Tracks backing an opened playlist, if loaded.
-pub fn playlist_tracks(state: &AppState, id: i64) -> Option<&Vec<TrackItem>> {
+/// Visible tracks backing an opened playlist. Local mode excludes pending
+/// federation entries so they cannot be selected or copied into playback.
+pub fn playlist_tracks(state: &AppState, id: i64) -> Option<Vec<&TrackItem>> {
     match state.playlist_views.get(&id)? {
-        Loadable::Ready(detail) => Some(&detail.tracks),
+        Loadable::Ready(detail) => Some(
+            detail
+                .tracks
+                .iter()
+                .filter(|track| track_allowed_by_source_mode(state, track))
+                .collect(),
+        ),
         _ => None,
     }
+}
+
+pub(crate) fn track_allowed_by_source_mode(state: &AppState, track: &TrackItem) -> bool {
+    state.global.filters.source_mode.includes_network() || !track.is_fed_pending()
 }
 
 /// A *release* under the cursor (artist-view tile/row or a search release).
@@ -1334,6 +1361,10 @@ pub(crate) fn track_artist_refs(track: &TrackItem) -> Vec<crate::library::models
 /// Insert tracks after the playing one (`next`) or at the end. Keeps the
 /// gapless prefetch index pointing at the same track if items shift.
 pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) {
+    let tracks: Vec<_> = tracks
+        .into_iter()
+        .filter(|track| track_allowed_by_source_mode(state, track))
+        .collect();
     let player = &mut state.player;
     if tracks.is_empty() {
         return;
@@ -1790,7 +1821,7 @@ fn set_view_cursor(state: &mut AppState, value: usize) {
 /// Items in the playlists tab's current view (list or opened playlist).
 fn playlists_view_len(state: &AppState) -> usize {
     match &state.playlists.opened {
-        Some(opened) => playlist_tracks(state, opened.id).map_or(0, Vec::len),
+        Some(opened) => playlist_tracks(state, opened.id).map_or(0, |tracks| tracks.len()),
         None => match &state.playlists.list {
             Some(Loadable::Ready(list)) => list.len(),
             _ => 0,
@@ -1832,7 +1863,7 @@ fn current_view_len(state: &AppState) -> usize {
     }
 }
 
-pub(crate) fn apply_library_filter_change(state: &mut AppState) {
+pub(crate) fn apply_library_filter_change(state: &mut AppState) -> Option<Effect> {
     state.track_selection.clear();
     let len = current_view_len(state);
     if state.active_tab == Tab::Global {
@@ -1848,11 +1879,32 @@ pub(crate) fn apply_library_filter_change(state: &mut AppState) {
             };
             *cursor = (*cursor).min(len.saturating_sub(1));
         }
+    } else if state.active_tab == Tab::Playlists
+        && let Some(opened) = &mut state.playlists.opened
+    {
+        opened.cursor = opened.cursor.min(len.saturating_sub(1));
     }
 
     if state.global.filters.source_mode.includes_network() {
-        return;
+        return None;
     }
+    let remote_indices: Vec<_> = state
+        .player
+        .queue
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| track.is_fed_pending().then_some(index))
+        .collect();
+    let queue_effect = if remote_indices.is_empty() {
+        None
+    } else {
+        let outcome = remove_queue_indices(state, &remote_indices);
+        Some(Effect::RemoveQueueIndices {
+            indices: remote_indices,
+            restart_paused: outcome.restart_paused,
+            stop: outcome.stop,
+        })
+    };
     let message = match state.global.stack.last() {
         Some(GlobalView::Artist { id, .. }) => match state.artist_views.get(id) {
             Some(Loadable::Ready(detail))
@@ -1885,6 +1937,7 @@ pub(crate) fn apply_library_filter_change(state: &mut AppState) {
     if let Some(message) = message {
         state.status_message = Some(message);
     }
+    queue_effect
 }
 
 fn jump_selection(state: &mut AppState, first: bool) {
@@ -1954,7 +2007,10 @@ fn jump_selection(state: &mut AppState, first: bool) {
 fn select_playlist(state: &mut AppState) -> Option<Effect> {
     match state.playlists.opened {
         Some(opened) => {
-            let tracks = playlist_tracks(state, opened.id)?.clone();
+            let tracks: Vec<_> = playlist_tracks(state, opened.id)?
+                .into_iter()
+                .cloned()
+                .collect();
             if tracks.is_empty() {
                 return None;
             }
