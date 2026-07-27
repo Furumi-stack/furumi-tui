@@ -1201,7 +1201,11 @@ impl Library {
                         .get(&track.id)
                         .copied()
                         .unwrap_or_default();
-                    (liked_at, track.title.clone(), track)
+                    let stable_key = track
+                        .content_id
+                        .clone()
+                        .unwrap_or_else(|| format!("local:{:020}", track.id));
+                    (liked_at, stable_key, track)
                 })
                 .collect();
 
@@ -1218,11 +1222,11 @@ impl Library {
             })?;
             for row in fed_rows {
                 let (liked_at, fed) = row?;
-                entries.push((
-                    liked_at,
-                    fed.title.clone(),
-                    crate::federation::pending_track(&fed),
-                ));
+                let stable_key = fed
+                    .content_id
+                    .clone()
+                    .unwrap_or_else(|| format!("fed:{}", fed.item_id));
+                entries.push((liked_at, stable_key, crate::federation::pending_track(&fed)));
             }
             entries.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
             return Ok(PlaylistDetail {
