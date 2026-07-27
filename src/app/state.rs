@@ -1170,6 +1170,8 @@ pub struct PlayerBar {
     pub audio_analysis: crate::player::AudioAnalysisSnapshot,
     /// Epoch seconds when the current track started (for history reports).
     pub track_started_at: Option<i64>,
+    /// Stable id reused for every report of the current playback session.
+    pub listen_id: Option<String>,
     /// Queue index already enqueued in the audio thread for gapless play.
     pub prefetched_pos: Option<usize>,
     pub volume: u8,
@@ -1191,6 +1193,7 @@ impl Default for PlayerBar {
             position_secs: 0.0,
             audio_analysis: crate::player::AudioAnalysisSnapshot::default(),
             track_started_at: None,
+            listen_id: None,
             prefetched_pos: None,
             original_order: None,
             volume: 80,

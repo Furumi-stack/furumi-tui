@@ -1769,6 +1769,7 @@ fn start_current_audio(
             state.player.position_secs = position_secs.max(0.0);
             state.player.audio_analysis = player::AudioAnalysisSnapshot::default();
             state.player.track_started_at = Some(now_epoch_seconds());
+            state.player.listen_id = Some(runtime.devices.new_listen_id());
             state.player.prefetched_pos = None;
             runtime.player_start_pending = true;
             runtime.player.stop();
@@ -1796,16 +1797,19 @@ fn start_current_audio(
     }
     // The track that was playing until now was cut short by this switch.
     let previous_started_at = state.player.track_started_at;
+    let previous_listen_id = state.player.listen_id.take();
     let next_key = track_playback_key(&track);
+    let mut same_track = false;
     let same_track_started_at = if let Some(previous) = state.player.current.take() {
-        let same_track = track_playback_key(&previous) == next_key;
+        same_track = track_playback_key(&previous) == next_key;
         if state.player.playing && !same_track {
             report_history(
                 runtime,
-                previous.id,
+                &previous,
+                previous_listen_id.as_deref(),
                 state.player.track_started_at,
-                state.player.position_secs.round() as i32,
-                false,
+                (state.player.position_secs * 1_000.0).round() as i64,
+                music_dht::device_sync::ListenEndReason::Replaced,
             );
         }
         same_track.then_some(previous_started_at).flatten()
@@ -1818,6 +1822,11 @@ fn start_current_audio(
     state.player.position_secs = position_secs.max(0.0);
     state.player.audio_analysis = player::AudioAnalysisSnapshot::default();
     state.player.track_started_at = same_track_started_at.or_else(|| Some(now_epoch_seconds()));
+    state.player.listen_id = if same_track {
+        previous_listen_id
+    } else {
+        Some(runtime.devices.new_listen_id())
+    };
     state.player.prefetched_pos = None;
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
 
@@ -1972,18 +1981,28 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
 /// than 5s are noise.
 fn report_history(
     runtime: &Runtime,
-    track_id: i64,
+    track: &crate::library::models::TrackItem,
+    listen_id: Option<&str>,
     started_at: Option<i64>,
-    listened: i32,
-    completed: bool,
+    listened_ms: i64,
+    ended_reason: music_dht::device_sync::ListenEndReason,
 ) {
-    // Ephemeral federated tracks are not library rows; no history for them.
-    if listened < 5 || track_id < 0 {
+    let Some(listen_id) = listen_id else {
         return;
-    }
-    let library = Arc::clone(&runtime.library);
+    };
+    let Some(event) = runtime.devices.listen_event_for_track(
+        listen_id.to_string(),
+        track,
+        started_at.unwrap_or_else(now_epoch_seconds) * 1_000,
+        listened_ms,
+        ended_reason,
+    ) else {
+        tracing::warn!(title = %track.title, "history skipped: track has no content id");
+        return;
+    };
+    let devices = Arc::clone(&runtime.devices);
     tokio::task::spawn_blocking(move || {
-        if let Err(err) = library.add_history(track_id, started_at, listened, completed) {
+        if let Err(err) = devices.record_listen(event) {
             tracing::warn!(%err, "history write failed");
         }
     });
@@ -3292,10 +3311,11 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             if let Some(finished) = state.player.current.clone() {
                 report_history(
                     runtime,
-                    finished.id,
+                    &finished,
+                    state.player.listen_id.as_deref(),
                     state.player.track_started_at,
-                    finished.duration_seconds.round() as i32,
-                    true,
+                    (finished.duration_seconds * 1_000.0).round() as i64,
+                    music_dht::device_sync::ListenEndReason::Finished,
                 );
             }
             if has_next {
@@ -3309,10 +3329,12 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
                 state.player.position_secs = 0.0;
                 state.player.track_started_at = Some(now_epoch_seconds());
+                state.player.listen_id = Some(runtime.devices.new_listen_id());
                 push_media_metadata(state, runtime);
                 push_media_update(state, runtime, true);
             } else {
                 state.player.current = None;
+                state.player.listen_id = None;
                 state.player.prefetched_pos = None;
                 if let Some(effect) = update::advance_after_finish(state) {
                     perform_effect(state, runtime, effect);

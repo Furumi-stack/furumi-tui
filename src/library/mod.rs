@@ -126,10 +126,43 @@ CREATE TABLE IF NOT EXISTS history (
     completed         INTEGER NOT NULL DEFAULT 0,
     played_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS listen_events (
+    listen_id          TEXT PRIMARY KEY,
+    content_id         TEXT NOT NULL,
+    local_track_id     INTEGER REFERENCES tracks(id) ON DELETE SET NULL,
+    origin_device_id   TEXT NOT NULL,
+    started_at_ms      INTEGER NOT NULL,
+    listened_ms        INTEGER NOT NULL,
+    track_duration_ms  INTEGER,
+    ended_reason       TEXT NOT NULL,
+    qualified          INTEGER NOT NULL,
+    metadata_json      TEXT NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE INDEX IF NOT EXISTS idx_tracks_release ON tracks(release_id);
 CREATE INDEX IF NOT EXISTS idx_track_artists_artist ON track_artists(artist_id);
 CREATE INDEX IF NOT EXISTS idx_release_artists_artist ON release_artists(artist_id);
 CREATE INDEX IF NOT EXISTS idx_history_track ON history(track_id);
+CREATE INDEX IF NOT EXISTS idx_listen_events_content
+    ON listen_events(content_id, started_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_listen_events_local_track
+    ON listen_events(local_track_id, qualified);
+CREATE TRIGGER IF NOT EXISTS reconcile_listen_events_after_track_insert
+AFTER INSERT ON tracks
+WHEN NEW.content_id IS NOT NULL
+BEGIN
+    UPDATE listen_events
+       SET local_track_id = NEW.id
+     WHERE content_id = NEW.content_id;
+END;
+CREATE TRIGGER IF NOT EXISTS reconcile_listen_events_after_track_content_id
+AFTER UPDATE OF content_id ON tracks
+WHEN NEW.content_id IS NOT NULL
+BEGIN
+    UPDATE listen_events
+       SET local_track_id = NEW.id
+     WHERE content_id = NEW.content_id;
+END;
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_fed_playlist_tracks_playlist
     ON fed_playlist_tracks(playlist_sync_id, position);
@@ -159,7 +192,9 @@ const TRACK_COLUMNS: &str = "
     t.file_path, t.audio_format, t.audio_bitrate, t.audio_sample_rate,
     t.audio_bit_depth, t.file_size_bytes,
     t.content_id,
-    (SELECT COUNT(*) FROM history h WHERE h.track_id = t.id AND h.completed = 1)
+    ((SELECT COUNT(*) FROM history h WHERE h.track_id = t.id AND h.completed = 1)
+     + (SELECT COUNT(*) FROM listen_events le
+        WHERE le.local_track_id = t.id AND le.qualified = 1))
 ";
 
 /// Plain rows handed to the federation for publishing (see
@@ -798,9 +833,14 @@ impl Library {
             |row| row.get(0),
         )?;
         let total_play_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM history h
-             WHERE h.completed = 1 AND h.track_id IN
-                (SELECT track_id FROM track_artists WHERE artist_id = ?1)",
+            "SELECT
+                (SELECT COUNT(*) FROM history h
+                 WHERE h.completed = 1 AND h.track_id IN
+                    (SELECT track_id FROM track_artists WHERE artist_id = ?1))
+                +
+                (SELECT COUNT(*) FROM listen_events le
+                 WHERE le.qualified = 1 AND le.local_track_id IN
+                    (SELECT track_id FROM track_artists WHERE artist_id = ?1))",
             [id],
             |row| row.get(0),
         )?;
@@ -2196,20 +2236,45 @@ impl Library {
         Ok(true)
     }
 
-    pub fn add_history(
+    /// Idempotently materialize a portable trusted-device listen event.
+    pub fn apply_listen_event(
         &self,
-        track_id: i64,
-        started_at: Option<i64>,
-        listened_seconds: i32,
-        completed: bool,
-    ) -> Result<()> {
+        event: &music_dht::device_sync::ListenEvent,
+        origin_device_id: &str,
+    ) -> Result<bool> {
+        if !event.should_record() || origin_device_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let content_id = music_dht::normalize_content_id(&event.content_id)
+            .context("invalid listen content id")?;
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO history (track_id, started_at, listened_seconds, completed)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![track_id, started_at, listened_seconds, completed],
+        let local_track_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM tracks WHERE content_id = ?1 LIMIT 1",
+                [&content_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO listen_events
+                (listen_id, content_id, local_track_id, origin_device_id,
+                 started_at_ms, listened_ms, track_duration_ms, ended_reason,
+                 qualified, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.listen_id,
+                content_id,
+                local_track_id,
+                origin_device_id,
+                event.started_at_ms,
+                event.listened_ms,
+                event.track_duration_ms,
+                serde_json::to_string(&event.ended_reason)?,
+                i64::from(event.qualifies_as_play()),
+                serde_json::to_string(&event.track)?,
+            ],
         )?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     // -----------------------------------------------------------------

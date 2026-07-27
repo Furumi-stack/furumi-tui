@@ -1092,6 +1092,7 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
         state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
         state.player.position_secs = 0.0;
         state.player.track_started_at = None;
+        state.player.listen_id = None;
         state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
         return QueueRemovalOutcome {
             restart_paused: was_loaded.then_some(was_paused),

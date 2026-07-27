@@ -502,8 +502,28 @@ fn delete_track_drops_empty_release() {
 fn history_counts_completed_plays() {
     let lib = test_library();
     let track_id = add_track(&lib, "Song", "Artist", "Album");
-    lib.add_history(track_id, None, 60, true).unwrap();
-    lib.add_history(track_id, None, 10, false).unwrap();
+    let content_id = lib
+        .tracks_by_ids(&[track_id])
+        .unwrap()
+        .remove(0)
+        .content_id
+        .unwrap();
+    let event = music_dht::device_sync::ListenEvent {
+        listen_id: "listen-1".to_string(),
+        content_id,
+        started_at_ms: 1_700_000_000_000,
+        listened_ms: 60_000,
+        track_duration_ms: Some(60_000),
+        ended_reason: music_dht::device_sync::ListenEndReason::Finished,
+        track: music_dht::device_sync::ListenTrackMetadata {
+            title: "Song".to_string(),
+            artist_names: vec!["Artist".to_string()],
+            featured_artist_names: Vec::new(),
+            release_title: Some("Album".to_string()),
+        },
+    };
+    assert!(lib.apply_listen_event(&event, "device-a").unwrap());
+    assert!(!lib.apply_listen_event(&event, "device-a").unwrap());
     let track = lib.tracks_by_ids(&[track_id]).unwrap().remove(0);
     assert_eq!(track.play_count, 1);
 }

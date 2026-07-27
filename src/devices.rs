@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use music_dht::device_sync::{ListenEvent, ListenTrackMetadata};
 use music_dht::{ByteStream, MusicDhtService, NetworkId, PeerTicket, SecretKey, StreamAcceptor};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -21,9 +22,9 @@ use crate::app::event::AppEvent;
 use crate::library::Library;
 use crate::library::models::{ArtistRef, TrackItem};
 
-pub const SYNC_ALPN: &[u8] = b"furumi/sync/1";
+pub const SYNC_ALPN: &[u8] = b"furumi/sync/2";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
 const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -366,6 +367,9 @@ pub enum SyncOpPayload {
         target_device_id: String,
         command: PlaybackCommand,
     },
+    ListenRecorded {
+        event: ListenEvent,
+    },
 }
 
 impl SyncOpPayload {
@@ -635,6 +639,10 @@ impl DeviceSync {
     pub fn identity_summary(&self) -> Result<(String, String)> {
         let identity = self.ensure_identity()?;
         Ok((identity.device_id, identity.name))
+    }
+
+    pub fn new_listen_id(&self) -> String {
+        format!("{}-{}", now_ms(), random_hex(12))
     }
 
     pub fn publish_playback(&self, mut snapshot: PlaybackSnapshot) {
@@ -1071,6 +1079,52 @@ impl DeviceSync {
             fed: liked.then(|| SyncedFedTrack::from_fed(fed)).flatten(),
         })?;
         Ok(())
+    }
+
+    pub fn record_listen(&self, event: ListenEvent) -> Result<()> {
+        if !event.should_record() {
+            return Ok(());
+        }
+        self.record_local_op(SyncOpPayload::ListenRecorded { event })
+    }
+
+    pub fn listen_event_for_track(
+        &self,
+        listen_id: String,
+        track: &TrackItem,
+        started_at_ms: i64,
+        listened_ms: i64,
+        ended_reason: music_dht::device_sync::ListenEndReason,
+    ) -> Option<ListenEvent> {
+        let content_id = track
+            .content_id
+            .as_deref()
+            .or_else(|| track.fed.as_ref()?.content_id.as_deref())
+            .and_then(music_dht::normalize_content_id)?;
+        Some(ListenEvent {
+            listen_id,
+            content_id,
+            started_at_ms,
+            listened_ms,
+            track_duration_ms: (track.duration_seconds > 0.0)
+                .then_some((track.duration_seconds * 1_000.0).round() as i64),
+            ended_reason,
+            track: ListenTrackMetadata {
+                title: track.title.clone(),
+                artist_names: track
+                    .artists
+                    .iter()
+                    .map(|artist| artist.name.clone())
+                    .collect(),
+                featured_artist_names: track
+                    .featured_artists
+                    .iter()
+                    .map(|artist| artist.name.clone())
+                    .collect(),
+                release_title: (!track.release_title.trim().is_empty())
+                    .then(|| track.release_title.clone()),
+            },
+        })
     }
 
     pub fn record_playlist_created(&self, playlist_id: i64, title: &str) -> Result<()> {
@@ -1584,6 +1638,9 @@ impl DeviceSync {
                 self.apply_playback_command(target_device_id, command, &op.op_id)?;
                 false
             }
+            SyncOpPayload::ListenRecorded { event } => self
+                .library
+                .apply_listen_event(event, &op.origin_device_id)?,
         };
         Ok(changed)
     }
@@ -3229,6 +3286,7 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
         SyncOpPayload::DeviceTrusted { .. } => "device_trusted",
         SyncOpPayload::DeviceRevoked { .. } => "device_revoked",
         SyncOpPayload::PlaybackCommand { .. } => "playback_command",
+        SyncOpPayload::ListenRecorded { .. } => "listen_recorded",
     }
 }
 
