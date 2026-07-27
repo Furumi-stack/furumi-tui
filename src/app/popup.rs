@@ -196,7 +196,26 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConnectedDevices { cursor } => {
             handle_connected_devices(state, runtime, cursor, key);
         }
+        Popup::ListenHistory { cursor } => handle_listen_history(state, cursor, key),
     }
+}
+
+fn handle_listen_history(state: &mut AppState, cursor: usize, key: KeyEvent) {
+    let len = match state.listen_history.as_ref() {
+        Some(crate::app::state::Loadable::Ready(entries)) => entries.len(),
+        _ => 0,
+    };
+    let cursor = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Up | KeyCode::Char('k') => cursor.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => (cursor + 1).min(len.saturating_sub(1)),
+        KeyCode::PageUp => cursor.saturating_sub(10),
+        KeyCode::PageDown => (cursor + 10).min(len.saturating_sub(1)),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => len.saturating_sub(1),
+        _ => cursor,
+    };
+    state.popup = Some(Popup::ListenHistory { cursor });
 }
 
 fn handle_federation_status_details(

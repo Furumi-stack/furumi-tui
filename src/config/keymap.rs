@@ -596,4 +596,13 @@ mod tests {
             KeyResolution::Action(Action::SeekForward { seconds: 10 })
         );
     }
+
+    #[test]
+    fn default_listening_history_key_resolves() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        assert_eq!(
+            km.resolve(key!(shift - h), KeyContext::Library),
+            KeyResolution::Action(Action::OpenListenHistory)
+        );
+    }
 }

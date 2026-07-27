@@ -82,6 +82,8 @@ pub enum Effect {
     OpenVisualizerEditor {
         path: std::path::PathBuf,
     },
+    /// Load qualified listening history without blocking the UI thread.
+    LoadListenHistory,
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -113,6 +115,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::OpenConnectedDevices => {
             state.popup = Some(super::state::Popup::ConnectedDevices { cursor: 0 });
             None
+        }
+        Action::OpenListenHistory => {
+            state.popup = Some(super::state::Popup::ListenHistory { cursor: 0 });
+            state.listen_history = Some(Loadable::Loading);
+            Some(Effect::LoadListenHistory)
         }
         Action::NextTab => {
             switch_tab(state, state.active_tab.next());

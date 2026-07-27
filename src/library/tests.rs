@@ -526,4 +526,31 @@ fn history_counts_completed_plays() {
     assert!(!lib.apply_listen_event(&event, "device-a").unwrap());
     let track = lib.tracks_by_ids(&[track_id]).unwrap().remove(0);
     assert_eq!(track.play_count, 1);
+    let history = lib.listen_history(20).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].listen_id, "listen-1");
+    assert_eq!(history[0].title, "Song");
+    assert_eq!(history[0].artist, "Artist");
+    assert_eq!(history[0].origin_device_id, "device-a");
+}
+
+#[test]
+fn listen_history_hides_unqualified_events_and_keeps_remote_metadata() {
+    let lib = test_library();
+    let event = music_dht::device_sync::ListenEvent {
+        listen_id: "remote-listen".to_string(),
+        content_id: format!("b3:{}", "a".repeat(64)),
+        started_at_ms: 1_700_000_000_000,
+        listened_ms: 10_000,
+        track_duration_ms: Some(120_000),
+        ended_reason: music_dht::device_sync::ListenEndReason::Skipped,
+        track: music_dht::device_sync::ListenTrackMetadata {
+            title: "Remote song".to_string(),
+            artist_names: vec!["Remote artist".to_string()],
+            featured_artist_names: vec!["Guest".to_string()],
+            release_title: None,
+        },
+    };
+    assert!(lib.apply_listen_event(&event, "remote-device").unwrap());
+    assert!(lib.listen_history(20).unwrap().is_empty());
 }

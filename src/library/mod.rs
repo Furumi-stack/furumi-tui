@@ -26,6 +26,16 @@ use models::{
 pub const LIKES_PLAYLIST_ID: i64 = -1;
 const NETWORK_ARTIST_CACHE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenHistoryEntry {
+    pub listen_id: String,
+    pub content_id: String,
+    pub title: String,
+    pub artist: String,
+    pub origin_device_id: String,
+    pub started_at_ms: i64,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS artists (
     id          INTEGER PRIMARY KEY,
@@ -2275,6 +2285,49 @@ impl Library {
             ],
         )?;
         Ok(inserted > 0)
+    }
+
+    /// Most recent qualified listens, including tracks that are not present
+    /// in this device's local library.
+    pub fn listen_history(&self, limit: usize) -> Result<Vec<ListenHistoryEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT listen_id, content_id, origin_device_id, started_at_ms, metadata_json
+             FROM listen_events
+             WHERE qualified = 1
+             ORDER BY started_at_ms DESC, listen_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(
+                |(listen_id, content_id, origin_device_id, started_at_ms, metadata_json)| {
+                    let metadata: music_dht::device_sync::ListenTrackMetadata =
+                        serde_json::from_str(&metadata_json)
+                            .context("invalid listen history metadata")?;
+                    let mut artists = metadata.artist_names;
+                    artists.extend(metadata.featured_artist_names);
+                    Ok(ListenHistoryEntry {
+                        listen_id,
+                        content_id,
+                        title: metadata.title,
+                        artist: artists.join(", "),
+                        origin_device_id,
+                        started_at_ms,
+                    })
+                },
+            )
+            .collect()
     }
 
     // -----------------------------------------------------------------

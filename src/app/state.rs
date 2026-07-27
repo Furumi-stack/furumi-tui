@@ -732,6 +732,8 @@ pub enum Popup {
     ConfirmDeviceLeave,
     /// Connected playback devices and their current role/status.
     ConnectedDevices { cursor: usize },
+    /// Qualified listening history from every trusted device.
+    ListenHistory { cursor: usize },
     /// Full federation, transport and device status details.
     FederationStatusDetails {
         focus: StatusDetailFocus,
@@ -1280,6 +1282,7 @@ pub struct AppState {
     pub likes_loaded: bool,
     pub local_content_ids_loaded: bool,
     pub local_library_stats: Option<Loadable<crate::library::LocalLibraryStats>>,
+    pub listen_history: Option<Loadable<Vec<crate::library::ListenHistoryEntry>>>,
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
     pub federation: FederationTab,

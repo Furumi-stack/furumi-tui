@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme;
@@ -88,7 +88,118 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         }
         Some(Popup::ConfirmDeviceLeave) => draw_device_leave(frame, state),
         Some(Popup::ConnectedDevices { cursor }) => draw_connected_devices(frame, state, *cursor),
+        Some(Popup::ListenHistory { cursor }) => draw_listen_history(frame, state, *cursor),
         None => {}
+    }
+}
+
+fn draw_listen_history(frame: &mut Frame, state: &AppState, cursor: usize) {
+    let area = centered(
+        frame.area(),
+        100,
+        frame.area().height.saturating_sub(4).clamp(10, 30),
+    );
+    let block = Block::bordered()
+        .title(" Listening history ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    match state.listen_history.as_ref() {
+        Some(Loadable::Loading) | None => {
+            frame.render_widget(
+                Paragraph::new(format!("{} Loading history…", state.spinner()))
+                    .alignment(Alignment::Center),
+                body,
+            );
+        }
+        Some(Loadable::Failed(err)) => {
+            frame.render_widget(
+                Paragraph::new(format!("History unavailable: {err}"))
+                    .style(theme::dim())
+                    .wrap(Wrap { trim: true }),
+                body,
+            );
+        }
+        Some(Loadable::Ready(entries)) if entries.is_empty() => {
+            frame.render_widget(
+                Paragraph::new("No qualified listens yet.")
+                    .style(theme::dim())
+                    .alignment(Alignment::Center),
+                body,
+            );
+        }
+        Some(Loadable::Ready(entries)) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or_default();
+            let rows = entries.iter().map(|entry| {
+                Row::new(vec![
+                    Cell::from(entry.title.clone()),
+                    Cell::from(entry.artist.clone()),
+                    Cell::from(relative_listen_time(entry.started_at_ms, now_ms)),
+                    Cell::from(history_device_name(state, &entry.origin_device_id)),
+                ])
+            });
+            let mut table_state =
+                TableState::default().with_selected(cursor.min(entries.len() - 1));
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(28),
+                    Constraint::Length(12),
+                    Constraint::Percentage(26),
+                ],
+            )
+            .header(Row::new(["Track", "Artist", "When", "Device"]).style(theme::header_for(state)))
+            .row_highlight_style(theme::selection_for(state))
+            .highlight_symbol("› ");
+            frame.render_stateful_widget(table, body, &mut table_state);
+        }
+    }
+    frame.render_widget(
+        Paragraph::new("j/k scroll · pgup/pgdn page · esc close")
+            .style(theme::dim())
+            .alignment(Alignment::Center),
+        footer,
+    );
+}
+
+fn history_device_name(state: &AppState, device_id: &str) -> String {
+    state
+        .federation
+        .devices
+        .as_ref()
+        .and_then(|status| {
+            status
+                .devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+                .map(|device| device.name.clone())
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            if device_id == state.device_playback.self_device_id {
+                state.device_playback.self_device_name.clone()
+            } else {
+                device_id.chars().take(10).collect()
+            }
+        })
+}
+
+fn relative_listen_time(started_at_ms: i64, now_ms: i64) -> String {
+    let elapsed = now_ms.saturating_sub(started_at_ms).max(0) / 1_000;
+    match elapsed {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed / 86_400),
+        _ => format!("{}w ago", elapsed / 604_800),
     }
 }
 

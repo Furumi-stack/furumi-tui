@@ -1332,6 +1332,18 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 }
             });
         }
+        Effect::LoadListenHistory => {
+            let library = Arc::clone(&runtime.library);
+            let devices = Arc::clone(&runtime.devices);
+            let tx = runtime.event_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = library
+                    .listen_history(500)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(AppEvent::ListenHistoryLoaded(result));
+                let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
+            });
+        }
         Effect::ToggleLikes {
             track_ids,
             fed_tracks,
@@ -1685,7 +1697,10 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
             state.player.volume = volume.min(100);
             save_app_settings(state);
         }
-        Effect::SetOptions | Effect::RemoveQueueIndices { .. } | Effect::PlaybackQueueChanged => {}
+        Effect::SetOptions
+        | Effect::RemoveQueueIndices { .. }
+        | Effect::PlaybackQueueChanged
+        | Effect::LoadListenHistory => {}
         _ => {}
     }
     record_control_playback_state(state, runtime, seek);
@@ -2831,6 +2846,12 @@ fn handle_playback_command(
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
     match event {
         AppEvent::StatusMessage(message) => state.status_message = Some(message),
+        AppEvent::ListenHistoryLoaded(result) => {
+            state.listen_history = Some(match result {
+                Ok(entries) => state::Loadable::Ready(entries),
+                Err(err) => state::Loadable::Failed(err),
+            });
+        }
         AppEvent::FederationStatus(status) => {
             state.federation.status = Some(status);
         }

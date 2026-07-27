@@ -198,6 +198,10 @@ key_sequence = "shift-l"
 command = "ToggleVisualizer"
 
 [[keymaps]]
+key_sequence = "shift-h"
+command = "OpenListenHistory"
+
+[[keymaps]]
 key_sequence = "x"
 command = "ToggleLike"
 

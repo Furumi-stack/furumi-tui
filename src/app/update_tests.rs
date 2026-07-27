@@ -16,6 +16,23 @@ fn with_artists(n: usize) -> AppState {
     state
 }
 
+#[test]
+fn listening_history_popup_requests_a_background_load() {
+    let mut state = AppState::default();
+    assert_eq!(
+        update(&mut state, Action::OpenListenHistory),
+        Some(Effect::LoadListenHistory)
+    );
+    assert!(matches!(
+        state.popup,
+        Some(crate::app::state::Popup::ListenHistory { cursor: 0 })
+    ));
+    assert!(matches!(
+        state.listen_history,
+        Some(crate::app::state::Loadable::Loading)
+    ));
+}
+
 fn test_track(id: i64) -> TrackItem {
     TrackItem {
         id,

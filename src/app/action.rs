@@ -43,6 +43,7 @@ pub enum Action {
     RemoveFromQueue,
     ClearQueue,
     OpenConnectedDevices,
+    OpenListenHistory,
     GoToRelease,
     AddToPlaylist,
     NewPlaylist,
@@ -102,7 +103,8 @@ impl Action {
             | Action::ToggleShuffle
             | Action::CycleRepeat
             | Action::ToggleVisualizer
-            | Action::OpenConnectedDevices => Category::Playback,
+            | Action::OpenConnectedDevices
+            | Action::OpenListenHistory => Category::Playback,
             Action::QueueAddNext
             | Action::QueueAddLast
             | Action::DownloadSelected
@@ -152,6 +154,7 @@ impl Action {
             Action::CycleRepeat => Some(":repeat [off|one|all]"),
             Action::ClearQueue => Some(":clear"),
             Action::OpenConnectedDevices => None,
+            Action::OpenListenHistory => None,
             Action::ToggleHelp => Some(":help"),
             Action::OpenSearch => Some("/text"),
             _ => None,
@@ -194,6 +197,7 @@ impl Action {
             Action::RemoveFromQueue => "Queue: remove selected".into(),
             Action::ClearQueue => "Queue: clear".into(),
             Action::OpenConnectedDevices => "Connected devices…".into(),
+            Action::OpenListenHistory => "Listening history…".into(),
             Action::GoToRelease => "Open the track's release".into(),
             Action::AddToPlaylist => "Add track to a playlist…".into(),
             Action::NewPlaylist => "Create a playlist".into(),
