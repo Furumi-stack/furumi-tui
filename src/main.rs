@@ -20,8 +20,29 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
+const HELP: &str = "\
+Furumi — federated terminal music player
+
+Usage:
+  furumi [OPTION]
+
+Options:
+  -h, --help       Show this help
+  -V, --version    Show version
+      --status     Print a one-line now-playing status
+      --status-json
+                   Print now-playing status as JSON
+
+tmux:
+  set -g status-right '#(furumi --status)'
+";
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("furumi {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
