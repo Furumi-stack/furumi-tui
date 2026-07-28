@@ -38,6 +38,7 @@ pub struct Runtime {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub library: Arc<Library>,
     pub devices: Arc<crate::devices::DeviceSync>,
+    pub jam: Arc<crate::jam::JamManager>,
     pub federation: Arc<crate::federation::Federation>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
@@ -249,7 +250,12 @@ pub async fn run(
 
     let devices = crate::devices::DeviceSync::new(Arc::clone(&library))?;
     devices.set_event_tx(event_tx.clone());
-    let federation = crate::federation::Federation::new(Arc::clone(&library), Arc::clone(&devices));
+    let jam = crate::jam::JamManager::new(event_tx.clone());
+    let federation = crate::federation::Federation::new(
+        Arc::clone(&library),
+        Arc::clone(&devices),
+        Arc::clone(&jam),
+    );
     state.federation.settings = federation.settings();
     state.federation.devices = Some(devices.status());
     if let Ok((device_id, device_name)) = devices.identity_summary() {
@@ -263,6 +269,7 @@ pub async fn run(
         event_tx,
         library,
         devices,
+        jam,
         federation,
         fed_status_at: None,
         library_network_refresh_at: None,
@@ -360,7 +367,7 @@ fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
     } else {
         runtime.player.shared.audio_analysis()
     };
-    if state.device_playback.role == state::DevicePlaybackRole::Active {
+    if state.device_playback.is_audio_owner() {
         publish_playback_snapshot(state, runtime);
     }
 }
@@ -474,7 +481,7 @@ fn apply_playback_state_to_ui(
 }
 
 fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
-    if state.device_playback.role != state::DevicePlaybackRole::Active {
+    if !state.device_playback.is_audio_owner() {
         return;
     }
     publish_playback_snapshot_with_active(state, runtime, true);
@@ -503,6 +510,19 @@ fn publish_playback_snapshot_with_active(state: &mut AppState, runtime: &Runtime
         state: playback_state_from_ui(state),
     };
     runtime.devices.publish_playback(snapshot);
+    if state.device_playback.role == state::DevicePlaybackRole::Jam
+        && state.device_playback.jam_host
+    {
+        runtime
+            .jam
+            .publish_host_playback(crate::devices::PlaybackSnapshot {
+                device_id: state.device_playback.self_device_id.clone(),
+                device_name: state.device_playback.self_device_name.clone(),
+                active: true,
+                updated_at_ms: unix_time_ms(),
+                state: playback_state_from_ui(state),
+            });
+    }
 }
 
 fn update_local_idle_since(state: &mut AppState) {
@@ -532,7 +552,7 @@ fn active_idle_lease_expired(snapshot: &crate::devices::PlaybackSnapshot, now: i
 }
 
 fn local_active_lease_protected(state: &mut AppState, now: i64) -> bool {
-    if state.device_playback.role != state::DevicePlaybackRole::Active || !state.player.playing {
+    if !state.device_playback.is_audio_owner() || !state.player.playing {
         return false;
     }
     if !state.player.paused {
@@ -576,7 +596,7 @@ pub(crate) fn become_control_device(
     runtime: &Runtime,
     snapshot: crate::devices::PlaybackSnapshot,
 ) {
-    if state.device_playback.role == state::DevicePlaybackRole::Active {
+    if state.device_playback.is_audio_owner() {
         runtime.player.stop();
         publish_inactive_playback_snapshot(state, runtime);
     }
@@ -596,6 +616,7 @@ pub(crate) fn become_control_device(
 pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, start_audio: bool) {
     let was_control = state.device_playback.role == state::DevicePlaybackRole::Control;
     state.device_playback.role = state::DevicePlaybackRole::Active;
+    state.device_playback.jam_host = false;
     let Ok((device_id, device_name)) = runtime.devices.identity_summary() else {
         return;
     };
@@ -617,7 +638,7 @@ pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, 
 }
 
 pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut Runtime) {
-    if state.device_playback.role == state::DevicePlaybackRole::Active {
+    if state.device_playback.is_audio_owner() {
         publish_playback_snapshot(state, runtime);
         request_urgent_device_sync(runtime);
         return;
@@ -722,6 +743,12 @@ fn record_control_playback_state(state: &mut AppState, runtime: &Runtime, seek: 
         state: playback_state_from_ui(state),
         seek,
     };
+    if state.device_playback.role == state::DevicePlaybackRole::Jam {
+        if let Err(err) = runtime.jam.submit_command(command) {
+            state.status_message = Some(format!("Jam command failed: {err:#}"));
+        }
+        return;
+    }
     record_playback_command_async(runtime, target, command, "device command");
 }
 
@@ -1479,9 +1506,40 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         | Effect::DeviceSetName(_)
         | Effect::DeviceRevoke(_)
         | Effect::DeviceLeaveGroup
+        | Effect::JamCreate
+        | Effect::JamJoin(_)
             if !state.connected_devices_enabled() =>
         {
             state.status_message = Some("enable federation before using connected devices".into());
+        }
+        Effect::JamCreate => {
+            let federation = Arc::clone(&runtime.federation);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let result = federation
+                    .create_jam()
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(AppEvent::JamInvite(result));
+            });
+        }
+        Effect::JamJoin(invite) => {
+            let result = runtime
+                .federation
+                .join_jam(&invite)
+                .map(|()| "joined Jam; waiting for host state".to_string())
+                .map_err(|err| format!("{err:#}"));
+            let _ = runtime.event_tx.send(AppEvent::JamJoined(result));
+            let _ = runtime
+                .event_tx
+                .send(AppEvent::JamStatus(runtime.jam.status()));
+        }
+        Effect::JamLeave => {
+            runtime.jam.leave();
+            state.jam = runtime.jam.status();
+            state.device_playback.role = state::DevicePlaybackRole::Active;
+            state.device_playback.jam_host = false;
+            state.status_message = Some("left Jam".into());
         }
         Effect::DeviceShowInvite => {
             let fed = Arc::clone(&runtime.federation);
@@ -1679,6 +1737,8 @@ fn is_controlled_playback_effect(effect: &Effect) -> bool {
 
 fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
     let mut seek = false;
+    let local_only_volume = state.device_playback.role == state::DevicePlaybackRole::Jam
+        && matches!(effect, Effect::SetVolume(_));
     match effect {
         Effect::PlayCurrent => {
             state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
@@ -1707,6 +1767,9 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
         | Effect::PlaybackQueueChanged
         | Effect::LoadListenHistory => {}
         _ => {}
+    }
+    if local_only_volume {
+        return;
     }
     record_control_playback_state(state, runtime, seek);
 }
@@ -2753,7 +2816,7 @@ fn handle_device_playback_snapshot(
     let already_controls_this_device = state.device_playback.is_control()
         && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str());
     if !lease_expired || already_controls_this_device {
-        let was_active = state.device_playback.role == state::DevicePlaybackRole::Active;
+        let was_active = state.device_playback.is_audio_owner();
         let was_paused = state.player.playing && state.player.paused;
         become_control_device(state, runtime, snapshot.clone());
         if was_active && was_paused {
@@ -2829,7 +2892,7 @@ fn handle_playback_command(
             if active_device_id == state.device_playback.self_device_id {
                 return;
             }
-            let was_active = state.device_playback.role == state::DevicePlaybackRole::Active;
+            let was_active = state.device_playback.is_audio_owner();
             let snapshot = crate::devices::PlaybackSnapshot {
                 device_id: active_device_id,
                 device_name: active_device_name,
@@ -2962,6 +3025,83 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::PlaybackCommand(command) => {
             handle_playback_command(state, runtime, command);
         }
+        AppEvent::JamStatus(status) => {
+            state.jam = status.clone();
+            match status.role {
+                crate::jam::JamRole::Host => {
+                    state.device_playback.role = state::DevicePlaybackRole::Jam;
+                    state.device_playback.jam_host = true;
+                    publish_playback_snapshot(state, runtime);
+                }
+                crate::jam::JamRole::Participant => {
+                    if state.device_playback.is_audio_owner() {
+                        runtime.player.stop();
+                        runtime.player_start_pending = false;
+                    }
+                    state.device_playback.role = state::DevicePlaybackRole::Jam;
+                    state.device_playback.jam_host = false;
+                }
+                crate::jam::JamRole::None => {
+                    if state.device_playback.role == state::DevicePlaybackRole::Jam {
+                        state.device_playback.role = state::DevicePlaybackRole::Active;
+                        state.device_playback.jam_host = false;
+                    }
+                }
+            }
+        }
+        AppEvent::JamPlayback(snapshot) => {
+            let local_volume = state.player.volume;
+            become_control_device(state, runtime, snapshot);
+            state.device_playback.role = state::DevicePlaybackRole::Jam;
+            state.device_playback.jam_host = false;
+            state.player.volume = local_volume;
+            state.status_message = Some(format!(
+                "Jam · controlling {}",
+                state.device_playback.active_label()
+            ));
+        }
+        AppEvent::JamCommand(command) => {
+            let command = match command {
+                crate::devices::PlaybackCommand::SetState {
+                    state: mut wire,
+                    seek,
+                } => {
+                    wire.volume = state.player.volume;
+                    crate::devices::PlaybackCommand::SetState { state: wire, seek }
+                }
+                crate::devices::PlaybackCommand::ActiveChanged { .. } => {
+                    state.status_message =
+                        Some("Jam cannot transfer audio away from its host".into());
+                    return;
+                }
+            };
+            handle_playback_command(state, runtime, command);
+            state.device_playback.role = state::DevicePlaybackRole::Jam;
+            state.device_playback.jam_host = true;
+            publish_playback_snapshot(state, runtime);
+        }
+        AppEvent::JamInvite(result) => match result {
+            Ok(invite) => {
+                if !state.device_playback.is_audio_owner() {
+                    transfer_active_to_this_device(state, runtime);
+                }
+                state.jam = runtime.jam.status();
+                state.device_playback.role = state::DevicePlaybackRole::Jam;
+                state.device_playback.jam_host = true;
+                publish_playback_snapshot(state, runtime);
+                state.popup = Some(state::Popup::FedCopyText {
+                    title: "Jam invite".to_string(),
+                    text: invite,
+                    help: "Copied capability lets federation peers control this host player until restart or regeneration.".to_string(),
+                });
+                state.status_message = Some("Jam started".into());
+            }
+            Err(error) => state.status_message = Some(format!("Jam: {error}")),
+        },
+        AppEvent::JamJoined(result) => match result {
+            Ok(message) => state.status_message = Some(message),
+            Err(error) => state.status_message = Some(format!("Jam: {error}")),
+        },
         AppEvent::FedSearchLoaded { seq, result } => {
             if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {
                 return;

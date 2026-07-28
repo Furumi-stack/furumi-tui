@@ -416,6 +416,7 @@ struct Running {
 pub struct Federation {
     library: Arc<Library>,
     devices: Arc<crate::devices::DeviceSync>,
+    jam: Arc<crate::jam::JamManager>,
     data_dir: PathBuf,
     cache_dir: PathBuf,
     media_dir: PathBuf,
@@ -515,7 +516,11 @@ async fn dht_record_payload_bytes(data_dir: PathBuf, now_ms: u64) -> Result<u64>
 }
 
 impl Federation {
-    pub fn new(library: Arc<Library>, devices: Arc<crate::devices::DeviceSync>) -> Arc<Self> {
+    pub fn new(
+        library: Arc<Library>,
+        devices: Arc<crate::devices::DeviceSync>,
+        jam: Arc<crate::jam::JamManager>,
+    ) -> Arc<Self> {
         let dirs = crate::config::project_dirs();
         let data_dir = dirs
             .as_ref()
@@ -539,6 +544,7 @@ impl Federation {
         Arc::new(Self {
             library,
             devices,
+            jam,
             data_dir,
             cache_dir,
             media_dir,
@@ -553,6 +559,27 @@ impl Federation {
 
     pub fn settings(&self) -> FedSettings {
         lock(&self.settings).clone()
+    }
+
+    pub async fn create_jam(&self) -> Result<String> {
+        let service = {
+            let running = self.running.lock().await;
+            Arc::clone(
+                &running
+                    .as_ref()
+                    .context("enable federation before creating a Jam")?
+                    .service,
+            )
+        };
+        let (device_id, device_name) = self.devices.identity_summary()?;
+        self.jam
+            .create_or_regenerate(service, device_id, device_name)
+            .await
+    }
+
+    pub fn join_jam(&self, invite: &str) -> Result<()> {
+        let (device_id, device_name) = self.devices.identity_summary()?;
+        self.jam.join(invite, device_id, device_name)
     }
 
     fn cached_metadata_snapshot(&self) -> Vec<CachedTrackMetadata> {
@@ -627,6 +654,8 @@ impl Federation {
             .stream_protocol(CATALOG_ALPN)
             // Personal-device sync (likes, playlists, trusted devices).
             .stream_protocol(crate::devices::SYNC_ALPN)
+            // Capability-scoped shared playback control.
+            .stream_protocol(crate::jam::JAM_ALPN)
             .build()
             .map_err(|err| anyhow::anyhow!("invalid federation config: {err}"))?;
         let (service, mut events) = MusicDhtService::start(config)
@@ -690,6 +719,15 @@ impl Federation {
         let device_tick_task = tokio::spawn(async move {
             crate::devices::sync_loop(device_sync, device_service, device_transport).await;
         });
+        let jam_acceptor = service
+            .stream_acceptor(crate::jam::JAM_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take the Jam acceptor: {err}"))?;
+        let jam_serve_task =
+            tokio::spawn(crate::jam::serve_peers(jam_acceptor, Arc::clone(&self.jam)));
+        let jam_poll_task = tokio::spawn(crate::jam::poll_loop(
+            Arc::clone(&self.jam),
+            Arc::clone(&service),
+        ));
 
         *guard = Some(Running {
             service,
@@ -702,6 +740,8 @@ impl Federation {
                 catalog_task,
                 device_sync_task,
                 device_tick_task,
+                jam_serve_task,
+                jam_poll_task,
             ],
         });
         self.set_error(None);

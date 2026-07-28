@@ -440,7 +440,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         display_lines.push(DisplayLine::Row(index));
     }
     let height =
-        (display_lines.len() as u16 + 9).clamp(11, frame.area().height.saturating_sub(2).max(11));
+        (display_lines.len() as u16 + 14).clamp(16, frame.area().height.saturating_sub(2).max(16));
     let area = centered(frame.area(), 76, height);
     let block = Block::bordered()
         .title(" Connected devices ")
@@ -450,9 +450,10 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let [summary_area, this_area, other_area, hint_area] = Layout::vertical([
+    let [summary_area, this_area, jam_area, other_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -479,12 +480,11 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         width: this_area.width,
         height: 1,
     };
-    let action_label =
-        if state.device_playback.role == crate::app::state::DevicePlaybackRole::Active {
-            "This device is active"
-        } else {
-            "Make this device active"
-        };
+    let action_label = if state.device_playback.is_audio_owner() {
+        "This device is active"
+    } else {
+        "Make this device active"
+    };
     let self_name = self_row
         .map(|row| row.name.as_str())
         .unwrap_or(state.device_playback.self_device_name.as_str());
@@ -500,6 +500,60 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         &self_status,
         state,
     );
+
+    render_subtitle(frame, jam_area, state, "Jam");
+    let jam_status = match state.jam.role {
+        crate::jam::JamRole::None => "inactive · h host · J join".to_string(),
+        crate::jam::JamRole::Host => format!(
+            "HOST {} · {} participant(s) · c copy invite · h regenerate · l leave",
+            state
+                .jam
+                .jam_id
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(12)
+                .collect::<String>(),
+            state.jam.participants.len()
+        ),
+        crate::jam::JamRole::Participant => format!(
+            "{} · {} · {} participant(s) · l leave",
+            if state.jam.connected {
+                "CONNECTED"
+            } else {
+                "RECONNECTING"
+            },
+            state.jam.host_name.as_deref().unwrap_or("Jam host"),
+            state.jam.participants.len()
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("  {jam_status}"),
+            if state.jam.role == crate::jam::JamRole::None {
+                theme::dim()
+            } else {
+                theme::accent_for(state)
+            },
+        )),
+        Rect {
+            x: jam_area.x,
+            y: jam_area.y + 1,
+            width: jam_area.width,
+            height: 1,
+        },
+    );
+    if let Some(error) = state.jam.last_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!("  {error}"), theme::dim())),
+            Rect {
+                x: jam_area.x,
+                y: jam_area.y + 2,
+                width: jam_area.width,
+                height: 1,
+            },
+        );
+    }
 
     render_subtitle(frame, other_area, state, "Other devices");
     let list_area = Rect {
@@ -560,7 +614,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "enter: activate selected device / control active selected · esc close",
+            "enter device · h host Jam · J join · c copy · l leave · esc close",
             theme::dim(),
         ))
         .alignment(Alignment::Center),

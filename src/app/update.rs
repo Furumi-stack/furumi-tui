@@ -68,6 +68,12 @@ pub enum Effect {
     DeviceRevoke(String),
     /// Leave the current personal-device group after publishing self-revoke.
     DeviceLeaveGroup,
+    /// Create or regenerate the runtime Jam capability.
+    JamCreate,
+    /// Join a federation Jam by capability.
+    JamJoin(String),
+    /// Leave the current Jam without changing personal-device state.
+    JamLeave,
     /// Assemble the federated artist card (fan-out to the owning peers).
     FedOpenArtist(String),
     /// Download federated tracks into the local library, one by one.

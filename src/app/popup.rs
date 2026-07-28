@@ -82,7 +82,7 @@ pub(crate) fn connected_device_rows(state: &AppState) -> Vec<ConnectedDevicePopu
                 is_self: true,
                 online: true,
                 section: DevicePresenceSection::Online,
-                active: state.device_playback.role == crate::app::state::DevicePlaybackRole::Active,
+                active: state.device_playback.is_audio_owner(),
                 playing: state.player.playing,
                 paused: state.player.paused,
                 queue_len: state.player.queue.len(),
@@ -386,6 +386,32 @@ fn handle_connected_devices(
     let cursor = cursor.min(last);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {}
+        KeyCode::Char('h') => {
+            super::perform_effect(state, runtime, crate::app::update::Effect::JamCreate);
+        }
+        KeyCode::Char('J') => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::JamInvite,
+                input: crate::app::input::LineEdit::default(),
+            });
+        }
+        KeyCode::Char('l') if state.jam.role != crate::jam::JamRole::None => {
+            super::perform_effect(state, runtime, crate::app::update::Effect::JamLeave);
+        }
+        KeyCode::Char('c') => {
+            if let Some(invite) = state.jam.invite.as_deref() {
+                match copy_to_clipboard(invite) {
+                    Ok(()) => state.status_message = Some("Jam invite copied".into()),
+                    Err(error) => {
+                        state.status_message = Some(format!("clipboard: {error}"));
+                        state.popup = Some(Popup::ConnectedDevices { cursor });
+                    }
+                }
+            } else {
+                state.status_message = Some("only the Jam host has an invite".into());
+                state.popup = Some(Popup::ConnectedDevices { cursor });
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             state.popup = Some(Popup::ConnectedDevices {
                 cursor: cursor.saturating_sub(1),
@@ -496,6 +522,17 @@ fn handle_fed_input(
                             state,
                             runtime,
                             crate::app::update::Effect::DeviceConnectInvite(value),
+                        );
+                    }
+                }
+                FedInputField::JamInvite => {
+                    if value.is_empty() {
+                        state.status_message = Some("Jam invite is empty".into());
+                    } else {
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::JamJoin(value),
                         );
                     }
                 }

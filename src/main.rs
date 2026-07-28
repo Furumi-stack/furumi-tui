@@ -3,6 +3,7 @@ mod art;
 mod config;
 mod devices;
 mod federation;
+mod jam;
 mod library;
 mod media;
 mod player;

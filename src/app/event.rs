@@ -166,4 +166,14 @@ pub enum AppEvent {
     DevicePlayback(crate::devices::PlaybackSnapshot),
     /// Playback command addressed to this device.
     PlaybackCommand(crate::devices::PlaybackCommand),
+    /// Current lifecycle/status of the federation Jam.
+    JamStatus(crate::jam::JamStatus),
+    /// Host playback snapshot received by a Jam participant.
+    JamPlayback(crate::devices::PlaybackSnapshot),
+    /// Participant command accepted by this Jam host.
+    JamCommand(crate::devices::PlaybackCommand),
+    /// Result of creating/regenerating a Jam capability.
+    JamInvite(Result<String, String>),
+    /// Result of joining a Jam capability.
+    JamJoined(Result<String, String>),
 }

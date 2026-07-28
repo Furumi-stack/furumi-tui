@@ -4,6 +4,7 @@ use crate::app::state::{AppState, DevicePlaybackRole};
 
 pub const ACCENT: Color = Color::Cyan;
 pub const CONTROL_ACCENT: Color = Color::Yellow;
+pub const JAM_ACCENT: Color = Color::Magenta;
 pub const DIM: Color = Color::DarkGray;
 
 pub fn accent() -> Style {
@@ -38,7 +39,12 @@ pub fn selection() -> Style {
 
 pub fn selection_for(state: &AppState) -> Style {
     if state.device_playback.is_control() {
-        Style::new().fg(Color::White).bg(Color::Rgb(92, 72, 0))
+        let background = if state.device_playback.role == DevicePlaybackRole::Jam {
+            Color::Rgb(80, 24, 96)
+        } else {
+            Color::Rgb(92, 72, 0)
+        };
+        Style::new().fg(Color::White).bg(background)
     } else {
         selection()
     }
@@ -64,6 +70,7 @@ pub fn role_pill(role: DevicePlaybackRole) -> Style {
     let bg = match role {
         DevicePlaybackRole::Active => Color::Green,
         DevicePlaybackRole::Control => CONTROL_ACCENT,
+        DevicePlaybackRole::Jam => JAM_ACCENT,
     };
     Style::new()
         .fg(Color::Black)
@@ -72,7 +79,9 @@ pub fn role_pill(role: DevicePlaybackRole) -> Style {
 }
 
 fn accent_color_for(state: &AppState) -> Color {
-    if state.device_playback.is_control() {
+    if state.device_playback.role == DevicePlaybackRole::Jam {
+        JAM_ACCENT
+    } else if state.device_playback.is_control() {
         CONTROL_ACCENT
     } else {
         ACCENT

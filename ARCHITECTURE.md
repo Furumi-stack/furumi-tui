@@ -89,6 +89,20 @@ joining another user's trusted-device group.
 Keeping these layers separate prevents discovery convenience from silently
 becoming a synchronization trust decision.
 
+### Federation Jam control
+
+Jam is a third, deliberately narrow authority boundary. A host creates an
+opaque `frid://j/...` runtime capability and remains the only node producing
+audio. Other TUI peers use a dedicated Jam ALPN to submit the same portable
+playback commands used by connected-device control and receive the host's
+playback snapshot. They receive queue metadata, not audio.
+
+Jam never exchanges trusted membership, likes, playlists, or listening
+history. Volume remains local. Commands carry unique IDs and are retried until
+the host acknowledges them, while inactive participants expire from the
+runtime session. Regenerating the capability or restarting the host invalidates
+the previous link.
+
 ## Discovery and direct communication
 
 Furumi separates finding content from transferring it.
