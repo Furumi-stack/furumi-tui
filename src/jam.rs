@@ -13,7 +13,7 @@ use crate::app::event::AppEvent;
 use crate::devices::{PlaybackCommand, PlaybackSnapshot};
 
 pub const JAM_ALPN: &[u8] = b"furumi/jam/1";
-const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const MAX_COMMANDS: usize = 128;
 const PARTICIPANT_TTL_MS: i64 = 30 * 60 * 1_000;
@@ -29,7 +29,6 @@ pub enum JamRole {
 #[derive(Debug, Clone)]
 pub struct JamStatus {
     pub role: JamRole,
-    pub jam_id: Option<String>,
     pub host_name: Option<String>,
     pub invite: Option<String>,
     pub participants: Vec<JamParticipant>,
@@ -41,7 +40,6 @@ impl Default for JamStatus {
     fn default() -> Self {
         Self {
             role: JamRole::None,
-            jam_id: None,
             host_name: None,
             invite: None,
             participants: Vec::new(),
@@ -207,7 +205,6 @@ impl JamManager {
         if let Some(joined) = &state.joined {
             return JamStatus {
                 role: JamRole::Participant,
-                jam_id: Some(joined.invite.jam_id.clone()),
                 host_name: Some(joined.invite.host_name.clone()),
                 invite: None,
                 participants: joined.participants.clone(),
@@ -218,7 +215,6 @@ impl JamManager {
         if let Some(invite) = &state.host.invite {
             return JamStatus {
                 role: JamRole::Host,
-                jam_id: Some(invite.jam_id.clone()),
                 host_name: Some(invite.host_name.clone()),
                 invite: state.host.invite_uri.clone(),
                 participants: state.host.participants.values().cloned().collect(),

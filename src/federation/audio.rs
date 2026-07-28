@@ -18,6 +18,8 @@ use crate::library::Library;
 
 /// ALPN of the audio streaming protocol (shared with furumi-fd).
 pub const AUDIO_ALPN: &[u8] = b"furumi-fd/audio/1";
+/// Version of the audio transfer stream protocol.
+pub const AUDIO_PROTOCOL_VERSION: u16 = 1;
 
 /// Maximum size of a JSON protocol line (request or response header).
 const MAX_PROTOCOL_LINE: usize = 4096;

@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
@@ -338,6 +339,20 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+fn protocol_label(id: &str) -> &str {
+    match id {
+        "federation_net" => "Federation transport",
+        "ticket" => "Peer ticket",
+        "rendezvous" => "Rendezvous",
+        "music_dht" => "Music DHT",
+        "catalog" => "Catalog",
+        "audio" => "Audio transfer",
+        "device_sync" => "Device sync",
+        "jam" => "Jam",
+        other => other,
+    }
+}
+
 fn draw_section(frame: &mut Frame, area: Rect, state: &AppState, y: &mut u16, title: &'static str) {
     if *y >= area.y + area.height {
         return;
@@ -485,11 +500,16 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    if area.width >= 60 && area.height >= 15 {
-        let [top_area, _, bottom_area] = Layout::vertical([
+    if area.width >= 60 && area.height >= 20 {
+        let protocols_height =
+            protocol_card_height(state, area.width.saturating_sub(2), area.height);
+        let [top_area, _, bottom_area, _, protocols_area, _] = Layout::vertical([
             Constraint::Length(7),
             Constraint::Length(1),
             Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(protocols_height),
+            Constraint::Min(0),
         ])
         .areas(area);
         let [status_area, _, local_area] = Layout::horizontal([
@@ -532,10 +552,17 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             " Connected Devices ",
             device_summary_lines(state),
         );
+        draw_summary_card(
+            frame,
+            protocols_area,
+            state,
+            " Protocol Versions ",
+            protocol_summary_lines(state, protocols_area.width.saturating_sub(2)),
+        );
         return;
     }
 
-    if area.height < 31 {
+    if area.height < 39 {
         frame.render_widget(
             Paragraph::new(compact_status_lines(state))
                 .wrap(ratatui::widgets::Wrap { trim: false }),
@@ -553,6 +580,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         _,
         local_area,
         _,
+        protocols_area,
+        _,
     ] = Layout::vertical([
         Constraint::Length(7),
         Constraint::Length(1),
@@ -561,6 +590,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         Constraint::Length(7),
         Constraint::Length(1),
         Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Length(protocol_card_height(
+            state,
+            area.width.saturating_sub(2),
+            area.height,
+        )),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -593,6 +628,13 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         " Local Data ",
         local_data_summary_lines(state),
     );
+    draw_summary_card(
+        frame,
+        protocols_area,
+        state,
+        " Protocol Versions ",
+        protocol_summary_lines(state, protocols_area.width.saturating_sub(2)),
+    );
 }
 
 fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
@@ -608,6 +650,9 @@ fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(Line::styled("Connected Devices", theme::header_for(state)));
     lines.extend(device_summary_lines(state).into_iter().take(2));
+    lines.push(Line::default());
+    lines.push(Line::styled("Protocol Versions", theme::header_for(state)));
+    lines.extend(protocol_summary_lines(state, 0).into_iter().take(3));
     lines
 }
 
@@ -635,6 +680,122 @@ fn summary_line(label: &'static str, value: String) -> Line<'static> {
         Span::styled(format!("{label:<10}"), theme::dim()),
         Span::raw(value),
     ])
+}
+
+fn protocol_summary_line(
+    label: &str,
+    value: String,
+    style: Style,
+    label_width: usize,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<label_width$}", protocol_label(label)),
+            theme::dim(),
+        ),
+        Span::styled(value, style),
+    ])
+}
+
+fn protocol_summary_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
+    let Some(status) = state.federation.status.as_ref() else {
+        return vec![protocol_summary_line(
+            "status",
+            "[UNKNOWN]".to_string(),
+            theme::dim(),
+            22,
+        )];
+    };
+    let protocols = &status.protocols;
+    let newer = !protocols.newer.is_empty();
+    let badge = if newer {
+        "[NEWER VERSION SEEN]"
+    } else if status.running && protocols.observed_peers == 0 {
+        "[CURRENT · waiting for peers]"
+    } else {
+        "[CURRENT]"
+    };
+    let badge_style = Style::new()
+        .fg(if newer { Color::LightRed } else { Color::Green })
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![protocol_summary_line(
+        "status",
+        badge.to_string(),
+        badge_style,
+        22,
+    )];
+    let mut entries = Vec::new();
+    for (id, local) in &protocols.local {
+        let observed = protocols.observed.get(id).copied();
+        let value = match observed {
+            Some(remote) if remote > *local => format!("local {local} · network {remote}"),
+            Some(remote) => format!("{local} · seen {remote}"),
+            None => local.to_string(),
+        };
+        let style = if observed.is_some_and(|remote| remote > *local) {
+            Style::new()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        entries.push((id.as_str(), value, style));
+    }
+    if width >= 58 {
+        let cell_width = width as usize / 2;
+        let label_width = 22.min(cell_width.saturating_sub(3));
+        let value_width = cell_width.saturating_sub(label_width + 2);
+        for pair in entries.chunks(2) {
+            let mut spans =
+                protocol_cell_spans(pair[0].0, &pair[0].1, pair[0].2, label_width, value_width);
+            if let Some(second) = pair.get(1) {
+                spans.push(Span::styled("  ", theme::dim()));
+                spans.extend(protocol_cell_spans(
+                    second.0,
+                    &second.1,
+                    second.2,
+                    label_width,
+                    value_width,
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        lines.extend(
+            entries
+                .into_iter()
+                .map(|(id, value, style)| protocol_summary_line(id, value, style, 22)),
+        );
+    }
+    if newer {
+        lines.push(Line::styled(
+            "A newer protocol was observed; update Furumi for compatibility.",
+            Style::new().fg(Color::LightRed),
+        ));
+    }
+    lines
+}
+
+fn protocol_card_height(state: &AppState, width: u16, available: u16) -> u16 {
+    let content = protocol_summary_lines(state, width).len() as u16;
+    content.saturating_add(2).min(available)
+}
+
+fn protocol_cell_spans(
+    label: &str,
+    value: &str,
+    style: Style,
+    label_width: usize,
+    value_width: usize,
+) -> Vec<Span<'static>> {
+    let value = value.chars().take(value_width).collect::<String>();
+    vec![
+        Span::styled(
+            format!("{:<label_width$}", protocol_label(label)),
+            theme::dim(),
+        ),
+        Span::styled(format!("{value:<value_width$}"), style),
+    ]
 }
 
 fn node_summary_lines(state: &AppState) -> Vec<Line<'static>> {

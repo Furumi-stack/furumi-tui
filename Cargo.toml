@@ -21,7 +21,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 lofty = "0.22"
 # P2P federation: library index in a shared DHT + audio streaming between
 # peers (same protocol as furumi-fd).
-music-dht = { git = "https://gt.hexor.cy/ab/frid.git", rev = "8de7d1292708fa0b225e5a4a9d5ab4f0676202d3" }
+music-dht = "0.3"
 ratatui = "0.30.1"
 rhai = { version = "1", features = ["sync"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "symphonia-aac", "symphonia-isomp4", "symphonia-alac"] }
@@ -35,6 +35,11 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2.2"
+
+[patch.crates-io]
+# souvlaki 0.8.3 still depends on the unmaintained block 0.1.6. Keep its API
+# intact while using an opaque inhabited FFI type accepted by current Rust.
+block = { path = "vendor/block" }
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.1"

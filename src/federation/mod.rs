@@ -13,6 +13,7 @@
 //! the network too).
 
 mod audio;
+mod capabilities;
 pub mod catalog;
 
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +37,7 @@ use crate::library::NetworkArtistPreview;
 use crate::library::models::{ArtistRef, TrackItem};
 
 pub use audio::{AUDIO_ALPN, DownloadProgress, StreamingStart, TrackMetadata};
+pub use capabilities::ProtocolVersions;
 pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRelease};
 
 /// How often the published library is re-synchronized with the local index.
@@ -386,6 +388,7 @@ pub struct FedStatus {
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
     pub transport: TransportStatsSnapshot,
+    pub protocols: ProtocolVersions,
 }
 
 /// Outcome of preparing a federated track for playback.
@@ -426,6 +429,7 @@ pub struct Federation {
     last_sync: std::sync::Mutex<Option<String>>,
     last_error: std::sync::Mutex<Option<String>>,
     transport_stats: Arc<TransportStats>,
+    observed_protocols: Arc<capabilities::ObservedVersions>,
 }
 
 #[derive(Debug, Clone)]
@@ -554,6 +558,7 @@ impl Federation {
             last_sync: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(initial_error),
             transport_stats: Arc::new(TransportStats::default()),
+            observed_protocols: Arc::new(capabilities::ObservedVersions::default()),
         })
     }
 
@@ -656,6 +661,8 @@ impl Federation {
             .stream_protocol(crate::devices::SYNC_ALPN)
             // Capability-scoped shared playback control.
             .stream_protocol(crate::jam::JAM_ALPN)
+            // Informational application/protocol versions.
+            .schema_independent_stream_protocol(capabilities::CAPABILITIES_ALPN)
             .build()
             .map_err(|err| anyhow::anyhow!("invalid federation config: {err}"))?;
         let (service, mut events) = MusicDhtService::start(config)
@@ -728,6 +735,14 @@ impl Federation {
             Arc::clone(&self.jam),
             Arc::clone(&service),
         ));
+        let capabilities_acceptor = service
+            .stream_acceptor(capabilities::CAPABILITIES_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take capabilities acceptor: {err}"))?;
+        let capabilities_serve_task = tokio::spawn(capabilities::serve(capabilities_acceptor));
+        let capabilities_probe_task = tokio::spawn(capabilities::probe_loop(
+            Arc::clone(&service),
+            Arc::clone(&self.observed_protocols),
+        ));
 
         *guard = Some(Running {
             service,
@@ -742,6 +757,8 @@ impl Federation {
                 device_tick_task,
                 jam_serve_task,
                 jam_poll_task,
+                capabilities_serve_task,
+                capabilities_probe_task,
             ],
         });
         self.set_error(None);
@@ -880,6 +897,7 @@ impl Federation {
             network: settings.network_id,
             last_sync: lock(&self.last_sync).clone(),
             last_error: lock(&self.last_error).clone(),
+            protocols: ProtocolVersions::snapshot(&self.observed_protocols),
             ..FedStatus::default()
         };
         if let Some(running) = guard.as_ref() {
