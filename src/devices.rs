@@ -1249,8 +1249,7 @@ impl DeviceSync {
         device: &StoredDevice,
         transport_stats: Arc<crate::federation::TransportStats>,
     ) -> Result<()> {
-        let ticket: PeerTicket = device.endpoint_ticket.parse()?;
-        let peer = service.connect(ticket).await?;
+        let peer = resolve_device_peer(&service, device).await?;
         let own_ticket = service.ticket().await?.to_string();
         let identity = self.ensure_identity()?;
         let profile = self.own_profile(&own_ticket)?;
@@ -2380,7 +2379,7 @@ impl DeviceSync {
         let own = self.ensure_identity()?.device_id;
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
-            "SELECT device_id, endpoint_ticket
+            "SELECT device_id, endpoint_id, endpoint_ticket
              FROM sync_devices
              WHERE trusted_at_ms IS NOT NULL
                AND revoked_at_ms IS NULL
@@ -2390,7 +2389,8 @@ impl DeviceSync {
         let rows = stmt.query_map([own], |row| {
             Ok(StoredDevice {
                 device_id: row.get(0)?,
-                endpoint_ticket: row.get(1)?,
+                endpoint_id: row.get(1)?,
+                endpoint_ticket: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2642,7 +2642,27 @@ impl DeviceSync {
 #[derive(Debug)]
 struct StoredDevice {
     device_id: String,
+    endpoint_id: String,
     endpoint_ticket: String,
+}
+
+async fn resolve_device_peer(
+    service: &MusicDhtService,
+    device: &StoredDevice,
+) -> Result<music_dht::EndpointId> {
+    if let Ok(peer) = device.endpoint_id.parse::<music_dht::EndpointId>()
+        && (service.connected_peers().contains(&peer)
+            || service
+                .known_peers()
+                .iter()
+                .any(|contact| contact.peer_id == peer))
+    {
+        // The live DHT contact carries a ticket for the current schema. The
+        // persisted device ticket may predate a schema upgrade.
+        return Ok(peer);
+    }
+    let ticket: PeerTicket = device.endpoint_ticket.parse()?;
+    service.connect(ticket).await.map_err(Into::into)
 }
 
 pub async fn serve_peers(
