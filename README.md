@@ -114,6 +114,29 @@ Import a music directory from Furumi's command line:
 Federation, trusted-device pairing, and key bindings are configured directly
 inside the player.
 
+### Now playing in tmux
+
+While Furumi is running, a second invocation can print a cheap, single-line
+playback snapshot without opening the TUI or library:
+
+```bash
+furumi --status
+# ▶ Artist — Track 1:23/4:05
+```
+
+For example, add this to `.tmux.conf`:
+
+```tmux
+set -g status-interval 1
+set -g status-right '#(furumi --status) | %H:%M'
+```
+
+`furumi --status-json` returns the same snapshot as JSON, including playback
+state, title, artist, album, position, duration, and volume. Both commands
+print nothing when Furumi is stopped or no track is loaded. On Linux, Furumi
+also exposes the existing MPRIS player `cy.hexor.furumi`, which can be queried
+with tools such as `playerctl`.
+
 ## Architecture
 
 Furumi is a Rust application built with:

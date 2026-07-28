@@ -7,6 +7,7 @@ mod library;
 mod media;
 mod player;
 mod share;
+mod status;
 mod streaming;
 mod ui;
 mod visualizer;
@@ -20,9 +21,16 @@ use crossterm::event::{
 };
 
 fn main() -> Result<()> {
-    if std::env::args_os().any(|arg| arg == "--version" || arg == "-V") {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("furumi {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--status" || arg == "--status-json")
+    {
+        return status::print(args.iter().any(|arg| arg == "--status-json"));
     }
 
     let mut startup_warning = None;

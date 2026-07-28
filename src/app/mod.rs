@@ -66,6 +66,7 @@ pub struct Runtime {
     pub player_start_pending: bool,
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
+    pub status_publisher: crate::status::Publisher,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +287,7 @@ pub async fn run(
         player_start_pending: false,
         media_tx,
         last_media_push: None,
+        status_publisher: crate::status::Publisher::spawn(),
     };
     spawn_content_id_backfill(&runtime);
 
@@ -325,6 +327,9 @@ pub async fn run(
                 state.advance_spinner();
                 expire_quit_confirmation(&mut state);
                 sync_player_shared(&mut state, &runtime);
+                runtime
+                    .status_publisher
+                    .publish(crate::status::PlaybackStatus::from_player(&state.player));
                 maybe_prefetch_next(&mut state, &runtime);
                 push_media_update(&state, &mut runtime, false);
             }
