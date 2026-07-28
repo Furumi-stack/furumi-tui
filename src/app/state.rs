@@ -1240,6 +1240,9 @@ pub struct DevicePlaybackState {
     pub remote: BTreeMap<String, crate::devices::PlaybackSnapshot>,
     pub last_remote_snapshot: Option<crate::devices::PlaybackSnapshot>,
     pub jam_host: bool,
+    /// A freshly started TUI owns playback by protocol. The first active
+    /// snapshot discovered during startup is imported and handed off here.
+    pub startup_takeover_pending: bool,
 }
 
 impl DevicePlaybackState {

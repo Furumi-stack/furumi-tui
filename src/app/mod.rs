@@ -263,6 +263,7 @@ pub async fn run(
         state.device_playback.self_device_name = device_name.clone();
         state.device_playback.active_device_id = Some(device_id);
         state.device_playback.active_device_name = Some(device_name);
+        state.device_playback.startup_takeover_pending = true;
     }
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
@@ -2809,6 +2810,18 @@ fn handle_device_playback_snapshot(
         + 1;
 
     if !snapshot.active {
+        return;
+    }
+    // Starting a player is an explicit claim of the active role. Import the
+    // current queue/position from the previously active peer, then announce a
+    // normal handoff so that the old owner becomes a control device. This is
+    // intentionally one-shot: subsequent snapshots use the regular lease and
+    // explicit-transfer rules.
+    if state.device_playback.startup_takeover_pending {
+        state.device_playback.startup_takeover_pending = false;
+        become_control_device(state, runtime, snapshot);
+        transfer_active_to_this_device(state, runtime);
+        state.status_message = Some("playback moved to this newly started player".to_string());
         return;
     }
     if local_active_lease_protected(state, now) {
