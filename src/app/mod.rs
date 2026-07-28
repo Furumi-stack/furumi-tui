@@ -2784,6 +2784,12 @@ fn handle_device_playback_snapshot(
     runtime: &mut Runtime,
     snapshot: crate::devices::PlaybackSnapshot,
 ) {
+    // Personal-device reconciliation must never change Jam ownership. Jam
+    // has its own authority and lifecycle even when the same TUI also belongs
+    // to a trusted-device group.
+    if state.device_playback.role == state::DevicePlaybackRole::Jam {
+        return;
+    }
     if snapshot.device_id == state.device_playback.self_device_id {
         return;
     }
@@ -2813,7 +2819,7 @@ fn handle_device_playback_snapshot(
         return;
     }
     let lease_expired = active_idle_lease_expired(&snapshot, now);
-    let already_controls_this_device = state.device_playback.is_control()
+    let already_controls_this_device = state.device_playback.is_personal_control()
         && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str());
     if !lease_expired || already_controls_this_device {
         let was_active = state.device_playback.is_audio_owner();
@@ -2828,7 +2834,7 @@ fn handle_device_playback_snapshot(
         return;
     }
 
-    if state.device_playback.is_control() {
+    if state.device_playback.is_personal_control() {
         return;
     }
     become_active_device(state, runtime, false);
@@ -2942,7 +2948,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 })
                 .unwrap_or(1)
                 .max(1);
-            let active_revoked = state.device_playback.is_control()
+            let active_revoked = state.device_playback.is_personal_control()
                 && state
                     .device_playback
                     .active_device_id
@@ -2960,7 +2966,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                             })
                             .is_some_and(|device| device.revoked)
                     });
-            let active_missing = state.device_playback.is_control()
+            let active_missing = state.device_playback.is_personal_control()
                 && state
                     .device_playback
                     .active_device_id
@@ -3021,6 +3027,11 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::DevicePlayback(snapshot) => {
             handle_device_playback_snapshot(state, runtime, snapshot);
+        }
+        AppEvent::PlaybackCommand(_)
+            if state.device_playback.role == state::DevicePlaybackRole::Jam =>
+        {
+            tracing::debug!("ignored personal-device playback command while Jam is active");
         }
         AppEvent::PlaybackCommand(command) => {
             handle_playback_command(state, runtime, command);

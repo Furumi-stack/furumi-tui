@@ -38,15 +38,10 @@ pub fn selection() -> Style {
 }
 
 pub fn selection_for(state: &AppState) -> Style {
-    if state.device_playback.is_control() {
-        let background = if state.device_playback.role == DevicePlaybackRole::Jam {
-            Color::Rgb(80, 24, 96)
-        } else {
-            Color::Rgb(92, 72, 0)
-        };
-        Style::new().fg(Color::White).bg(background)
-    } else {
-        selection()
+    match state.device_playback.role {
+        DevicePlaybackRole::Jam => Style::new().fg(Color::White).bg(Color::Rgb(80, 24, 96)),
+        DevicePlaybackRole::Control => Style::new().fg(Color::White).bg(Color::Rgb(92, 72, 0)),
+        DevicePlaybackRole::Active => selection(),
     }
 }
 
@@ -55,10 +50,10 @@ pub fn header_for(state: &AppState) -> Style {
 }
 
 pub fn border_for(state: &AppState) -> Style {
-    if state.device_playback.is_control() {
-        Style::new().fg(CONTROL_ACCENT)
-    } else {
-        dim()
+    match state.device_playback.role {
+        DevicePlaybackRole::Jam => Style::new().fg(JAM_ACCENT),
+        DevicePlaybackRole::Control => Style::new().fg(CONTROL_ACCENT),
+        DevicePlaybackRole::Active => dim(),
     }
 }
 
@@ -79,11 +74,9 @@ pub fn role_pill(role: DevicePlaybackRole) -> Style {
 }
 
 fn accent_color_for(state: &AppState) -> Color {
-    if state.device_playback.role == DevicePlaybackRole::Jam {
-        JAM_ACCENT
-    } else if state.device_playback.is_control() {
-        CONTROL_ACCENT
-    } else {
-        ACCENT
+    match state.device_playback.role {
+        DevicePlaybackRole::Jam => JAM_ACCENT,
+        DevicePlaybackRole::Control => CONTROL_ACCENT,
+        DevicePlaybackRole::Active => ACCENT,
     }
 }

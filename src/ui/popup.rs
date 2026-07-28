@@ -555,7 +555,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
         );
     }
 
-    render_subtitle(frame, other_area, state, "Other devices");
+    render_subtitle(frame, other_area, state, "My devices");
     let list_area = Rect {
         x: other_area.x,
         y: other_area.y + 1,

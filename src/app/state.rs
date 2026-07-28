@@ -1248,6 +1248,10 @@ impl DevicePlaybackState {
             || (self.role == DevicePlaybackRole::Jam && !self.jam_host)
     }
 
+    pub fn is_personal_control(&self) -> bool {
+        self.role == DevicePlaybackRole::Control
+    }
+
     pub fn is_audio_owner(&self) -> bool {
         self.role == DevicePlaybackRole::Active
             || (self.role == DevicePlaybackRole::Jam && self.jam_host)

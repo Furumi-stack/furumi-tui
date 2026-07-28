@@ -423,6 +423,12 @@ fn handle_connected_devices(
             });
         }
         KeyCode::Enter => {
+            if state.device_playback.role == crate::app::state::DevicePlaybackRole::Jam {
+                state.status_message =
+                    Some("leave the current Jam before switching personal devices".into());
+                state.popup = Some(Popup::ConnectedDevices { cursor });
+                return;
+            }
             if cursor == 0 {
                 super::transfer_active_to_this_device(state, runtime);
                 state.status_message = Some("active playback moved to this device".into());
