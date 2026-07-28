@@ -505,15 +505,7 @@ fn draw_connected_devices(frame: &mut Frame, state: &AppState, cursor: usize) {
     let jam_status = match state.jam.role {
         crate::jam::JamRole::None => "inactive · h host · J join".to_string(),
         crate::jam::JamRole::Host => format!(
-            "HOST {} · {} participant(s) · c copy invite · h regenerate · l leave",
-            state
-                .jam
-                .jam_id
-                .as_deref()
-                .unwrap_or_default()
-                .chars()
-                .take(12)
-                .collect::<String>(),
+            "HOST · {} peer(s) · c copy · h new · l leave",
             state.jam.participants.len()
         ),
         crate::jam::JamRole::Participant => format!(
