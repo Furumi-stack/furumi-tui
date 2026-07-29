@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LibrarySourceMode {
-    #[default]
     Local,
     My,
+    #[default]
     Global,
 }
 
@@ -128,6 +128,6 @@ hide_featured_only = true
 
         assert_eq!(settings.volume, 100);
         assert!(settings.library.hide_featured_only);
-        assert_eq!(settings.library.source_mode, LibrarySourceMode::Local);
+        assert_eq!(settings.library.source_mode, LibrarySourceMode::Global);
     }
 }

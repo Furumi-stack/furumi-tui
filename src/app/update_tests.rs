@@ -158,25 +158,25 @@ fn source_mode_cycles_on_library_playlists_and_queue_tabs() {
         update(&mut state, Action::CycleSourceMode),
         Some(Effect::SourceModeChanged)
     );
-    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::My);
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Local);
 
     state.active_tab = Tab::Playlists;
     assert_eq!(
         update(&mut state, Action::CycleSourceMode),
         Some(Effect::SourceModeChanged)
     );
-    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Global);
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::My);
 
     state.active_tab = Tab::Queue;
     assert_eq!(
         update(&mut state, Action::CycleSourceMode),
         Some(Effect::SourceModeChanged)
     );
-    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Local);
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Global);
 
     state.active_tab = Tab::Federation;
     assert_eq!(update(&mut state, Action::CycleSourceMode), None);
-    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Local);
+    assert_eq!(state.global.filters.source_mode, LibrarySourceMode::Global);
 }
 
 #[test]

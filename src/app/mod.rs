@@ -277,7 +277,7 @@ pub async fn run(
         library_network_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         library_network_cursors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         library_network_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        library_network_mode: crate::config::settings::LibrarySourceMode::Local,
+        library_network_mode: state.global.filters.source_mode,
         library_network_art_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         library_network_art_attempted: Arc::new(std::sync::Mutex::new(
             std::collections::HashSet::new(),
