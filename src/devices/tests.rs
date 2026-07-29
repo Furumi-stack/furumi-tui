@@ -229,6 +229,58 @@ fn playback_command_is_targeted_and_deduplicated() {
 }
 
 #[test]
+fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
+    let sync = test_sync();
+    let command = PlaybackCommand::SetState {
+        state: PlaybackStateWire {
+            queue: Vec::new(),
+            queue_pos: 0,
+            playing: false,
+            paused: false,
+            idle_since_ms: None,
+            position_secs: 0.0,
+            volume: 42,
+            shuffle: false,
+            repeat: PlaybackRepeat::Off,
+        },
+        seek: false,
+    };
+    sync.record_playback_command("dev_target", command.clone())
+        .unwrap();
+    sync.record_playback_command("dev_other", command).unwrap();
+
+    let target_ops = sync.ops_for_peer("dev_target").unwrap();
+    assert_eq!(
+        target_ops
+            .iter()
+            .filter(|op| matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        sync.ops_for_peer("dev_unknown")
+            .unwrap()
+            .iter()
+            .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
+    );
+
+    lock(&sync.conn)
+        .execute(
+            "UPDATE sync_ops
+             SET hlc_ms = ?1
+             WHERE kind = 'playback_command'",
+            [now_ms().saturating_sub(PLAYBACK_COMMAND_TTL_MS + 1)],
+        )
+        .unwrap();
+    assert!(
+        sync.ops_for_peer("dev_target")
+            .unwrap()
+            .iter()
+            .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
+    );
+}
+
+#[test]
 fn newer_device_trust_reactivates_revoked_device() {
     let sync = test_sync();
     let device_id = "dev_readd";

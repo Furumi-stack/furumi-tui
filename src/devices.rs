@@ -31,6 +31,9 @@ const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_LINE: usize = 8 * 1024 * 1024;
+/// Playback control is ephemeral. Keeping old full-queue commands in a new
+/// peer's catch-up batch can make the initial pairing frame arbitrarily large.
+const PLAYBACK_COMMAND_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_OPS_PER_BATCH: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2173,25 +2176,39 @@ impl DeviceSync {
              LEFT JOIN sync_peer_acks a
                ON a.peer_device_id = ?1 AND a.origin_device_id = o.origin_device_id
              WHERE o.seq > COALESCE(a.max_seq, 0)
-             ORDER BY o.hlc_ms, o.op_id
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![peer_device_id, MAX_OPS_PER_BATCH as i64], |row| {
-            let payload_json: String = row.get(4)?;
-            Ok(SyncOpWire {
-                op_id: row.get(0)?,
-                origin_device_id: row.get(1)?,
-                seq: row.get(2)?,
-                hlc_ms: row.get(3)?,
-                payload: serde_json::from_str(&payload_json).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
+               AND (
+                    o.kind != 'playback_command'
+                    OR (
+                        o.hlc_ms >= ?2
+                        AND json_extract(o.payload_json, '$.target_device_id') = ?1
                     )
-                })?,
-            })
-        })?;
+               )
+             ORDER BY o.hlc_ms, o.op_id
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                peer_device_id,
+                now_ms().saturating_sub(PLAYBACK_COMMAND_TTL_MS),
+                MAX_OPS_PER_BATCH as i64
+            ],
+            |row| {
+                let payload_json: String = row.get(4)?;
+                Ok(SyncOpWire {
+                    op_id: row.get(0)?,
+                    origin_device_id: row.get(1)?,
+                    seq: row.get(2)?,
+                    hlc_ms: row.get(3)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                })
+            },
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
