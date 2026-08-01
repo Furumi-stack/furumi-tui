@@ -389,6 +389,7 @@ mod tests {
             featured_tracks: Vec::new(),
         };
         let mut state = AppState::default();
+        state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
         state.artist_fed_views.insert(
             detail.id,
             Loadable::Ready(crate::federation::FedArtistCard {
@@ -716,7 +717,16 @@ pub enum Popup {
         title: String,
         text: String,
         help: String,
+        cursor: usize,
     },
+    /// A copy-friendly terminal screen containing exactly one logical line.
+    /// The app loop temporarily leaves the alternate screen while this is
+    /// active so terminal selection does not acquire TUI borders or hard
+    /// line breaks.
+    PlainText { text: String },
+    /// The destination is already write-tested; Enter/y migrates managed
+    /// files, while n changes only the destination for future downloads.
+    ConfirmMusicDirectory { path: std::path::PathBuf },
     /// Incoming trusted-device pairing request.
     DevicePairing {
         request_id: String,
@@ -801,6 +811,7 @@ impl StatusDetailFocus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FedInputField {
+    MusicDirectory,
     NetworkId,
     ConnectTicket,
     DeviceName,
@@ -811,6 +822,7 @@ pub enum FedInputField {
 impl FedInputField {
     pub fn title(self) -> &'static str {
         match self {
+            FedInputField::MusicDirectory => "Music save directory",
             FedInputField::NetworkId => "Network ID",
             FedInputField::ConnectTicket => "Connect to peer (paste ticket)",
             FedInputField::DeviceName => "Device name",
@@ -821,6 +833,9 @@ impl FedInputField {
 
     pub fn help(self) -> &'static str {
         match self {
+            FedInputField::MusicDirectory => {
+                "Federated tracks saved to your library use this directory. The directory is checked for write access before anything changes."
+            }
             FedInputField::NetworkId => {
                 "A unique network id. It must match exactly on every client that should see and connect to the same peers."
             }
@@ -867,6 +882,7 @@ impl FedRow {
 /// the config directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
+    MusicDirectory,
     Federation(FedRow),
     StatusDetails,
     DeviceName,
@@ -1004,7 +1020,7 @@ pub fn device_status_order(state: &AppState) -> Vec<usize> {
 }
 
 pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
-    let mut rows = Vec::new();
+    let mut rows = vec![SettingsRow::MusicDirectory];
     rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
     rows.push(SettingsRow::DeviceName);
     rows.push(SettingsRow::DeviceInvite);
@@ -1064,6 +1080,98 @@ pub struct Cmdline {
     /// A live command (search) applied effects during this session; Esc
     /// undoes them, Enter keeps them.
     pub live: bool,
+    /// Commands committed during this process, oldest first.
+    pub history: Vec<String>,
+    /// Entry currently recalled with Up/Down. `None` is the editable draft
+    /// after the newest history entry.
+    history_index: Option<usize>,
+    history_draft: String,
+}
+
+impl Cmdline {
+    const HISTORY_LIMIT: usize = 100;
+
+    pub fn begin_history_navigation(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    pub fn remember(&mut self, value: &str) {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        if self.history.last().is_none_or(|last| last != value) {
+            self.history.push(value.to_string());
+            if self.history.len() > Self::HISTORY_LIMIT {
+                self.history.remove(0);
+            }
+        }
+        self.begin_history_navigation();
+    }
+
+    pub fn history_previous(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = self.input.as_str().to_string();
+                self.history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.input = LineEdit::new(self.history[index].clone());
+        true
+    }
+
+    pub fn history_next(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            self.input = LineEdit::new(self.history[index + 1].clone());
+        } else {
+            self.history_index = None;
+            self.input = LineEdit::new(std::mem::take(&mut self.history_draft));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod cmdline_history_tests {
+    use super::Cmdline;
+    use crate::app::input::LineEdit;
+
+    #[test]
+    fn history_walks_oldest_and_restores_the_draft() {
+        let mut cmdline = Cmdline::default();
+        cmdline.remember("volume 20");
+        cmdline.remember("/ambient");
+        cmdline.input = LineEdit::new("unfinished");
+
+        assert!(cmdline.history_previous());
+        assert_eq!(cmdline.input.as_str(), "/ambient");
+        assert!(cmdline.history_previous());
+        assert_eq!(cmdline.input.as_str(), "volume 20");
+        assert!(cmdline.history_previous());
+        assert_eq!(cmdline.input.as_str(), "volume 20");
+        assert!(cmdline.history_next());
+        assert_eq!(cmdline.input.as_str(), "/ambient");
+        assert!(cmdline.history_next());
+        assert_eq!(cmdline.input.as_str(), "unfinished");
+    }
+
+    #[test]
+    fn history_deduplicates_consecutive_commands() {
+        let mut cmdline = Cmdline::default();
+        cmdline.remember("q");
+        cmdline.remember(" q ");
+        assert_eq!(cmdline.history, vec!["q"]);
+    }
 }
 
 /// Live search state driven by the `:/query` command.
@@ -1169,6 +1277,9 @@ impl RepeatMode {
 pub struct PlayerBar {
     pub queue: Vec<TrackItem>,
     pub queue_pos: usize,
+    /// Exclusive end of the contiguous "play next" block built by
+    /// sequential `a` actions. New `a` additions are inserted here.
+    pub play_next_end: Option<usize>,
     pub current: Option<TrackItem>,
     /// A track is loaded (playing or paused); false = stopped.
     pub playing: bool,
@@ -1194,6 +1305,7 @@ impl Default for PlayerBar {
         Self {
             queue: Vec::new(),
             queue_pos: 0,
+            play_next_end: None,
             current: None,
             playing: false,
             paused: false,
@@ -1283,6 +1395,9 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub spinner_frame: usize,
     pub settings_cursor: usize,
+    /// Root for music permanently downloaded from federation peers.
+    pub music_dir: std::path::PathBuf,
+    pub music_dir_changing: bool,
     pub player: PlayerBar,
     pub device_playback: DevicePlaybackState,
     pub jam: crate::jam::JamStatus,

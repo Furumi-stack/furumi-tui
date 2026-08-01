@@ -64,6 +64,16 @@ key_sequence = "shift-a"
 command = "QueueAddLast"
 
 [[keymaps]]
+key_sequence = "alt-k"
+command = "MoveQueueUp"
+context = "queue"
+
+[[keymaps]]
+key_sequence = "alt-j"
+command = "MoveQueueDown"
+context = "queue"
+
+[[keymaps]]
 key_sequence = "shift-c"
 command = "OpenConnectedDevices"
 

@@ -422,7 +422,9 @@ pub struct Federation {
     jam: Arc<crate::jam::JamManager>,
     data_dir: PathBuf,
     cache_dir: PathBuf,
-    media_dir: PathBuf,
+    media_dir: std::sync::Mutex<PathBuf>,
+    /// Serializes permanent downloads/card writes with a directory change.
+    media_change: tokio::sync::Mutex<()>,
     metadata_cache: std::sync::Mutex<std::collections::HashMap<String, CachedTrackMetadata>>,
     settings: std::sync::Mutex<FedSettings>,
     running: tokio::sync::Mutex<Option<Running>>,
@@ -524,6 +526,7 @@ impl Federation {
         library: Arc<Library>,
         devices: Arc<crate::devices::DeviceSync>,
         jam: Arc<crate::jam::JamManager>,
+        media_dir: PathBuf,
     ) -> Arc<Self> {
         let dirs = crate::config::project_dirs();
         let data_dir = dirs
@@ -534,10 +537,6 @@ impl Federation {
             .as_ref()
             .map(|d| d.cache_dir().join("fedcache"))
             .unwrap_or_else(|| PathBuf::from("fedcache"));
-        let media_dir = dirs
-            .as_ref()
-            .map(|d| d.data_dir().join("federation-media"))
-            .unwrap_or_else(|| PathBuf::from("federation-media"));
         let initial_error = [&data_dir, &cache_dir, &media_dir]
             .into_iter()
             .find_map(|dir| {
@@ -551,7 +550,8 @@ impl Federation {
             jam,
             data_dir,
             cache_dir,
-            media_dir,
+            media_dir: std::sync::Mutex::new(media_dir),
+            media_change: tokio::sync::Mutex::new(()),
             metadata_cache: std::sync::Mutex::new(Default::default()),
             settings: std::sync::Mutex::new(load_settings()),
             running: tokio::sync::Mutex::new(None),
@@ -564,6 +564,40 @@ impl Federation {
 
     pub fn settings(&self) -> FedSettings {
         lock(&self.settings).clone()
+    }
+
+    pub fn media_dir(&self) -> PathBuf {
+        lock(&self.media_dir).clone()
+    }
+
+    /// Switches the permanent-download root while excluding concurrent
+    /// downloads. Validation runs again here because permissions may have
+    /// changed after the confirmation popup was shown.
+    pub async fn change_media_dir(
+        self: &Arc<Self>,
+        requested: PathBuf,
+        move_existing: bool,
+    ) -> Result<crate::library::MusicRelocationStats> {
+        let _guard = self.media_change.lock().await;
+        let old = self.media_dir();
+        let library = Arc::clone(&self.library);
+        let requested_for_task = requested.clone();
+        let (path, stats) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let path = Library::validate_music_directory(&requested_for_task)?;
+            if path == std::fs::canonicalize(&old).unwrap_or(old.clone()) {
+                return Ok((path, crate::library::MusicRelocationStats::default()));
+            }
+            let stats = if move_existing && old.exists() {
+                library.relocate_managed_music(&old, &path)?
+            } else {
+                crate::library::MusicRelocationStats::default()
+            };
+            Ok((path, stats))
+        })
+        .await
+        .context("music directory task failed")??;
+        *lock(&self.media_dir) = path;
+        Ok(stats)
     }
 
     pub async fn create_jam(&self) -> Result<String> {
@@ -1403,11 +1437,6 @@ impl Federation {
         Ok(peer.to_string())
     }
 
-    /// Directory for streamed (never library-imported) card artwork.
-    fn art_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join("art")
-    }
-
     /// Returns a cached-or-streamed image for the card: the artist image
     /// (`release: None`) or a release cover. Peers are tried in order until
     /// one answers with an image; the result lands in the art cache and its
@@ -1418,14 +1447,11 @@ impl Federation {
         artist: &str,
         release: Option<&str>,
     ) -> Option<String> {
-        let dir = self.art_cache_dir();
+        let _guard = self.media_change.lock().await;
+        let dir = music_art_dir(&self.media_dir(), artist, release);
         let stem = match release {
-            Some(release) => format!(
-                "cover-{}-{}",
-                sanitize_file_stem(artist),
-                sanitize_file_stem(release)
-            ),
-            None => format!("artist-{}", sanitize_file_stem(artist)),
+            Some(_) => "cover".to_string(),
+            None => "artist".to_string(),
         };
         // Reuse a previously streamed copy of any known image type.
         for extension in ["jpg", "png", "webp", "gif", "bmp"] {
@@ -1489,7 +1515,7 @@ impl Federation {
         F: FnMut(DownloadProgress) + Send,
     {
         let save = self.settings().save_on_listen;
-        self.fetch_playable_with_progress(fed, save, false, progress, None)
+        self.fetch_playable_with_progress(fed, save, save, progress, None)
             .await
     }
 
@@ -1504,7 +1530,7 @@ impl Federation {
         S: FnMut(StreamingStart) + Send,
     {
         let save = self.settings().save_on_listen;
-        self.fetch_playable_with_progress(fed, save, false, progress, Some(&mut stream_start))
+        self.fetch_playable_with_progress(fed, save, save, progress, Some(&mut stream_start))
             .await
     }
 
@@ -1558,6 +1584,11 @@ impl Federation {
     where
         F: FnMut(DownloadProgress) + Send,
     {
+        let _media_guard = if save {
+            Some(self.media_change.lock().await)
+        } else {
+            None
+        };
         let mut fed = fed.clone();
         let mut tried_content_lookup = false;
 
@@ -1636,8 +1667,10 @@ impl Federation {
                 }
                 Err(_) => anyhow::bail!("malformed owner id '{}'", fed.owner),
             };
+            let media_dir;
             let dir = if save {
-                &self.media_dir
+                media_dir = music_release_dir(&self.media_dir(), &fed);
+                &media_dir
             } else {
                 &self.cache_dir
             };
@@ -1698,8 +1731,14 @@ impl Federation {
                     }
                     // Same for the cover: the peer's library cover wins over an
                     // embedded picture; embedded art stays as the fallback.
-                    if import_cover.is_some() {
-                        import.cover = import_cover;
+                    if let Some((bytes, extension)) = &import_cover {
+                        match save_release_cover(&import_path, bytes, extension) {
+                            Ok(()) => import.cover = None,
+                            Err(err) => {
+                                tracing::warn!(%err, "saving the release cover beside its music failed");
+                                import.cover = import_cover;
+                            }
+                        }
                     }
                     let (track_id, _) = crate::library::import::upsert_track(&library, &import)?;
                     // A like that referenced the federated track moves onto the
@@ -1711,7 +1750,13 @@ impl Federation {
                     // created (or still image-less) main artist.
                     if let (Some((bytes, extension)), Some(artist_name)) =
                         (&artist_image, import.artists.first())
-                        && let Err(err) = save_artist_image(&library, artist_name, bytes, extension)
+                        && let Err(err) = save_artist_image(
+                            &library,
+                            artist_name,
+                            import_path.parent().and_then(Path::parent),
+                            bytes,
+                            extension,
+                        )
                     {
                         tracing::warn!(%err, "saving the artist image failed");
                     }
@@ -1943,20 +1988,28 @@ impl Federation {
 fn save_artist_image(
     library: &Library,
     artist_name: &str,
+    artist_dir: Option<&Path>,
     bytes: &[u8],
     extension: &str,
 ) -> Result<()> {
-    let covers_dir = library.covers_dir();
-    std::fs::create_dir_all(covers_dir)?;
-    let path = covers_dir.join(format!(
-        "artist-{}.{extension}",
-        sanitize_file_stem(artist_name)
-    ));
+    let artist_dir = artist_dir.context("downloaded track has no artist directory")?;
+    std::fs::create_dir_all(artist_dir)?;
+    let path = artist_dir.join(format!("artist.{extension}"));
     // Write only if the artist actually lacks an image, to avoid litter.
     if library.artist_image_missing(artist_name)? {
         std::fs::write(&path, bytes)?;
         library.set_artist_image_if_missing(artist_name, &path.to_string_lossy())?;
     }
+    Ok(())
+}
+
+fn save_release_cover(audio_path: &Path, bytes: &[u8], extension: &str) -> Result<()> {
+    let directory = audio_path
+        .parent()
+        .context("downloaded track has no release directory")?;
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join(format!("cover.{extension}"));
+    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -2561,6 +2614,37 @@ fn sanitize_file_stem(value: &str) -> String {
         stem.push_str("track");
     }
     stem
+}
+
+fn music_artist_dir(root: &Path, artist: &str) -> PathBuf {
+    let artist = if artist.trim().is_empty() {
+        "Unknown Artist"
+    } else {
+        artist
+    };
+    root.join(sanitize_file_stem(artist))
+}
+
+fn music_art_dir(root: &Path, artist: &str, release: Option<&str>) -> PathBuf {
+    let artist_dir = music_artist_dir(root, artist);
+    match release.filter(|release| !release.trim().is_empty()) {
+        Some(release) => artist_dir.join(sanitize_file_stem(release)),
+        None => artist_dir,
+    }
+}
+
+fn music_release_dir(root: &Path, fed: &FedTrack) -> PathBuf {
+    let artist = fed
+        .artist_names
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Unknown Artist");
+    let release = fed
+        .release_title
+        .as_deref()
+        .filter(|release| !release.trim().is_empty())
+        .unwrap_or("Unknown Release");
+    music_art_dir(root, artist, Some(release))
 }
 
 fn download_stem(fed: &FedTrack) -> String {

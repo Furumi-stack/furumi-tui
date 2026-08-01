@@ -8,6 +8,7 @@ pub mod state;
 pub mod update;
 
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -61,6 +62,8 @@ pub struct Runtime {
     pub art_semaphore: Arc<tokio::sync::Semaphore>,
     /// The terminal screen was externally disturbed and needs a full repaint.
     pub force_redraw: bool,
+    /// The alternate screen is temporarily suspended for copy-friendly text.
+    pub plain_text_mode: bool,
     /// Monotonic sequence for live search; stale responses are dropped.
     pub search_seq: Arc<std::sync::atomic::AtomicU64>,
     pub player: player::Controller,
@@ -103,6 +106,15 @@ fn refresh_local_library_stats(runtime: &Runtime) {
     tokio::task::spawn_blocking(move || {
         let result = library.local_stats().map_err(err_string);
         let _ = tx.send(AppEvent::LocalLibraryStatsLoaded(result));
+    });
+}
+
+pub(super) fn validate_music_directory(state: &mut AppState, runtime: &Runtime, path: PathBuf) {
+    state.status_message = Some("checking music directory write access…".into());
+    let tx = runtime.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = Library::validate_music_directory(&path).map_err(err_string);
+        let _ = tx.send(AppEvent::MusicDirectoryValidated(result));
     });
 }
 
@@ -244,6 +256,7 @@ pub async fn run(
     };
     state.player.volume = settings.volume;
     state.global.filters = settings.library;
+    state.music_dir = settings.music_dir.clone();
     if let Err(err) = state.visualizer.load_library() {
         state.status_message = Some(format!("visualizations disabled: {err:#}"));
     }
@@ -255,6 +268,7 @@ pub async fn run(
         Arc::clone(&library),
         Arc::clone(&devices),
         Arc::clone(&jam),
+        settings.music_dir.clone(),
     );
     state.federation.settings = federation.settings();
     state.federation.devices = Some(devices.status());
@@ -288,6 +302,7 @@ pub async fn run(
         fed_streaming: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         art_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         force_redraw: false,
+        plain_text_mode: false,
         search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         player: player::spawn(move |event| {
             let _ = player_events.send(AppEvent::Player(event));
@@ -318,11 +333,30 @@ pub async fn run(
     visual_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        if runtime.force_redraw {
-            terminal.clear()?;
-            runtime.force_redraw = false;
+        let plain_text = match state.popup.as_ref() {
+            Some(state::Popup::PlainText { text }) => Some(text.as_str()),
+            _ => None,
+        };
+        match (runtime.plain_text_mode, plain_text) {
+            (false, Some(text)) => {
+                enter_plain_text_mode(text)?;
+                runtime.plain_text_mode = true;
+            }
+            (true, None) => {
+                leave_plain_text_mode()?;
+                runtime.plain_text_mode = false;
+                runtime.force_redraw = true;
+            }
+            _ => {}
         }
-        terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
+
+        if !runtime.plain_text_mode {
+            if runtime.force_redraw {
+                terminal.clear()?;
+                runtime.force_redraw = false;
+            }
+            terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
+        }
 
         tokio::select! {
             maybe_event = input.next() => match maybe_event {
@@ -347,6 +381,10 @@ pub async fn run(
         }
 
         if state.should_quit {
+            if runtime.plain_text_mode {
+                leave_plain_text_mode()?;
+                runtime.plain_text_mode = false;
+            }
             state.shutting_down = true;
             terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
             runtime.federation.shutdown().await;
@@ -354,6 +392,32 @@ pub async fn run(
         }
         maintenance(&mut state, &mut runtime);
     }
+}
+
+fn enter_plain_text_mode(text: &str) -> Result<()> {
+    let text: String = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
+        crossterm::style::Print(text)
+    )?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn leave_plain_text_mode() -> Result<()> {
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )?;
+    Ok(())
 }
 
 fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
@@ -453,6 +517,7 @@ fn apply_playback_state_to_ui(
         .filter(|track| update::track_allowed_by_source_mode(state, track))
         .collect();
     state.player.queue_pos = queue_pos.min(state.player.queue.len().saturating_sub(1));
+    state.player.play_next_end = None;
     state.player.playing = wire.playing && !state.player.queue.is_empty();
     state.player.paused = wire.paused;
     state.device_playback.local_idle_since_ms = if state.player.playing && !state.player.paused {
@@ -1331,6 +1396,14 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         }
         Effect::SetOptions => {}
         Effect::PlaybackQueueChanged => {}
+        Effect::QueueOrderChanged { restart_current } => {
+            if restart_current && state.player.playing && state.player.current.is_some() {
+                let paused = state.player.paused;
+                start_current_audio(state, runtime, state.player.position_secs, paused);
+                push_media_metadata(state, runtime);
+                push_media_update(state, runtime, true);
+            }
+        }
         Effect::SourceModeChanged => {
             runtime.library_network_refresh_at = None;
             if let Ok(mut cursors) = runtime.library_network_cursors.lock() {
@@ -1348,6 +1421,30 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             if let Some(effect) = update::apply_library_filter_change(state) {
                 perform_effect(state, runtime, effect);
             }
+        }
+        Effect::ChangeMusicDirectory {
+            path,
+            move_existing,
+        } => {
+            if state.music_dir_changing {
+                state.status_message = Some("music directory change is already running".into());
+                return;
+            }
+            state.music_dir_changing = true;
+            state.status_message = Some(if move_existing {
+                "moving saved music to the new directory…".into()
+            } else {
+                "changing music save directory…".into()
+            });
+            let federation = Arc::clone(&runtime.federation);
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let result = federation
+                    .change_media_dir(path, move_existing)
+                    .await
+                    .map_err(err_string);
+                let _ = tx.send(AppEvent::MusicDirectoryChanged(result));
+            });
         }
         Effect::EnqueueRelease { id, next } => {
             let library = Arc::clone(&runtime.library);
@@ -1733,6 +1830,7 @@ fn is_controlled_playback_effect(effect: &Effect) -> bool {
             | Effect::SetOptions
             | Effect::RemoveQueueIndices { .. }
             | Effect::PlaybackQueueChanged
+            | Effect::QueueOrderChanged { .. }
     )
 }
 
@@ -1766,7 +1864,9 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
         Effect::SetOptions
         | Effect::RemoveQueueIndices { .. }
         | Effect::PlaybackQueueChanged
-        | Effect::LoadListenHistory => {}
+        | Effect::QueueOrderChanged { .. }
+        | Effect::LoadListenHistory
+        | Effect::ChangeMusicDirectory { .. } => {}
         _ => {}
     }
     if local_only_volume {
@@ -2678,6 +2778,7 @@ fn save_app_settings(state: &AppState) {
     let settings = crate::config::settings::AppSettings {
         volume: state.player.volume,
         library: state.global.filters,
+        music_dir: state.music_dir.clone(),
     };
     if let Err(err) = crate::config::settings::save(&settings) {
         tracing::warn!(%err, "saving app settings failed");
@@ -2939,6 +3040,44 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Err(err) => state::Loadable::Failed(err),
             });
         }
+        AppEvent::MusicDirectoryValidated(result) => match result {
+            Ok(path) => {
+                let current = std::fs::canonicalize(&state.music_dir)
+                    .unwrap_or_else(|_| state.music_dir.clone());
+                if path == current {
+                    state.status_message = Some("this is already the music save directory".into());
+                } else {
+                    state.popup = Some(state::Popup::ConfirmMusicDirectory { path });
+                    state.status_message = None;
+                }
+            }
+            Err(message) => {
+                state.status_message = Some(format!(
+                    "music directory is not writable; nothing changed: {message}"
+                ));
+            }
+        },
+        AppEvent::MusicDirectoryChanged(result) => {
+            state.music_dir_changing = false;
+            match result {
+                Ok(stats) => {
+                    state.music_dir = runtime.federation.media_dir();
+                    save_app_settings(state);
+                    state.status_message = Some(format!(
+                        "music directory changed · moved {} track(s), {} image(s)",
+                        stats.tracks, stats.images
+                    ));
+                    let _ = runtime.event_tx.send(AppEvent::LibraryChanged {
+                        message: state.status_message.clone(),
+                    });
+                }
+                Err(message) => {
+                    state.status_message = Some(format!(
+                        "music directory change failed; old library kept: {message}"
+                    ));
+                }
+            }
+        }
         AppEvent::FederationStatus(status) => {
             state.federation.status = Some(status);
         }
@@ -3018,6 +3157,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     title: "Device invite".to_string(),
                     text: invite,
                     help: "Use this invite on another client within 10 minutes to pair it with this device group.".to_string(),
+                    cursor: 0,
                 });
                 state.status_message = Some("device invite generated".to_string());
             }
@@ -3117,6 +3257,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     title: "Jam invite".to_string(),
                     text: invite,
                     help: "Copied capability lets federation peers control this host player until restart or regeneration.".to_string(),
+                    cursor: 0,
                 });
                 state.status_message = Some("Jam started".into());
             }
@@ -3273,6 +3414,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         // Skip the failed track instead of stalling the queue.
                         if state.player.queue_pos + 1 < state.player.queue.len() {
                             state.player.queue_pos += 1;
+                            update::normalize_play_next_block(&mut state.player);
                             start_current_audio(state, runtime, 0.0, state.player.paused);
                             push_media_metadata(state, runtime);
                             push_media_update(state, runtime, true);
@@ -3374,6 +3516,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     text: ticket,
                     help: "Copy this ticket and paste it into Connect to a peer on another client."
                         .to_string(),
+                    cursor: 0,
                 });
             }
             Err(message) => state.status_message = Some(message),
@@ -3516,6 +3659,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     .take()
                     .unwrap_or(state.player.queue_pos + 1);
                 state.player.queue_pos = next_pos.min(state.player.queue.len().saturating_sub(1));
+                update::normalize_play_next_block(&mut state.player);
                 state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
                 state.player.position_secs = 0.0;
                 state.player.track_started_at = Some(now_epoch_seconds());
@@ -3648,9 +3792,13 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::EnqueueTracks { tracks, next } => {
             let previous_len = state.player.queue.len();
-            update::enqueue_tracks(state, tracks, next);
+            let restart_current = update::enqueue_tracks(state, tracks, next);
             let count = state.player.queue.len().saturating_sub(previous_len);
-            record_control_playback_state(state, runtime, false);
+            perform_effect(
+                state,
+                runtime,
+                Effect::QueueOrderChanged { restart_current },
+            );
             state.status_message = Some(if count == 0 {
                 "no tracks available in the current source mode".to_string()
             } else if next {

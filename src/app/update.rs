@@ -48,8 +48,19 @@ pub enum Effect {
     },
     /// Queue/options changed without a direct audio engine action.
     PlaybackQueueChanged,
+    /// Queue order changed. A decoded gapless-next source must be discarded
+    /// by restarting the current source at its current position.
+    QueueOrderChanged {
+        restart_current: bool,
+    },
     /// Persist and apply a Local / My / Global source-mode change.
     SourceModeChanged,
+    /// Switch the permanent federation-download root, optionally relocating
+    /// files managed under the previous root first.
+    ChangeMusicDirectory {
+        path: std::path::PathBuf,
+        move_existing: bool,
+    },
     /// Persist the federation settings and start/stop the node.
     FedApplySettings,
     /// Force an immediate library publish into the DHT.
@@ -180,6 +191,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::ToggleShuffle => {
             state.player.shuffle = !state.player.shuffle;
+            state.player.play_next_end = None;
             // Shuffle physically reorders the unplayed tail, so the Queue
             // tab always shows the real upcoming order; turning it off
             // restores the original ordering.
@@ -275,6 +287,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::OpenCommandLine => {
             state.cmdline.active = true;
             state.cmdline.input.clear();
+            state.cmdline.begin_history_navigation();
             None
         }
         Action::OpenSearch => {
@@ -283,6 +296,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             state.cmdline.active = true;
             state.cmdline.input = crate::app::input::LineEdit::new("/");
             state.cmdline.live = true;
+            state.cmdline.begin_history_navigation();
             state.search = SearchState::default();
             state.active_tab = Tab::Global;
             if !matches!(state.global.stack.last(), Some(GlobalView::Search { .. })) {
@@ -371,6 +385,8 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::RemoveFromQueue => remove_selected_from_queue(state),
         Action::QueueAddNext => queue_add(state, true),
         Action::QueueAddLast => queue_add(state, false),
+        Action::MoveQueueUp => move_selected_queue(state, true),
+        Action::MoveQueueDown => move_selected_queue(state, false),
         Action::GoToRelease => {
             let track = selected_track(state).or_else(|| state.player.current.clone());
             match track {
@@ -418,6 +434,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             let had_tracks = !state.player.queue.is_empty();
             state.player.queue.clear();
             state.player.queue_pos = 0;
+            state.player.play_next_end = None;
             state.player.current = None;
             state.player.playing = false;
             state.player.paused = false;
@@ -1030,6 +1047,68 @@ fn selected_queue_indices(state: &AppState) -> Vec<usize> {
         .unwrap_or_else(|| vec![state.queue_tab.cursor.min(state.player.queue.len() - 1)])
 }
 
+fn move_selected_queue(state: &mut AppState, up: bool) -> Option<Effect> {
+    let indices = selected_queue_indices(state);
+    let Some(&start) = indices.first() else {
+        state.status_message = Some("queue is empty".into());
+        return None;
+    };
+    let end = *indices.last().unwrap_or(&start);
+    let len = state.player.queue.len();
+    if (up && start == 0) || (!up && end + 1 >= len) {
+        state.status_message = Some(if up {
+            "selection is already at the top of the queue".into()
+        } else {
+            "selection is already at the bottom of the queue".into()
+        });
+        return None;
+    }
+
+    let old_current = state.player.queue_pos;
+    let new_current = if up {
+        let displaced = state.player.queue.remove(start - 1);
+        state.player.queue.insert(end, displaced);
+        if old_current == start - 1 {
+            end
+        } else if (start..=end).contains(&old_current) {
+            old_current - 1
+        } else {
+            old_current
+        }
+    } else {
+        let displaced = state.player.queue.remove(end + 1);
+        state.player.queue.insert(start, displaced);
+        if old_current == end + 1 {
+            start
+        } else if (start..=end).contains(&old_current) {
+            old_current + 1
+        } else {
+            old_current
+        }
+    };
+    let delta: isize = if up { -1 } else { 1 };
+    state.player.queue_pos = new_current;
+    state.queue_tab.cursor = (state.queue_tab.cursor as isize + delta) as usize;
+    if state
+        .track_selection
+        .is_active_for(&TrackSelectionScope::Queue)
+    {
+        state.track_selection.anchor = (state.track_selection.anchor as isize + delta) as usize;
+        state.track_selection.cursor = (state.track_selection.cursor as isize + delta) as usize;
+    }
+    // An explicit manual order supersedes both the temporary play-next block
+    // and a saved pre-shuffle order.
+    state.player.play_next_end = None;
+    state.player.original_order = None;
+    let restart_current = state.player.prefetched_pos.take().is_some();
+    state.status_message = Some(format!(
+        "moved {} track(s) {}",
+        indices.len(),
+        if up { "up" } else { "down" }
+    ));
+    Some(Effect::QueueOrderChanged { restart_current })
+}
+
 fn remove_selected_from_queue(state: &mut AppState) -> Option<Effect> {
     let indices = selected_queue_indices(state);
     if indices.is_empty() {
@@ -1081,6 +1160,10 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
         .iter()
         .filter(|index| **index < old_queue_pos)
         .count();
+    if let Some(end) = state.player.play_next_end {
+        let removed_before_end = unique.iter().filter(|index| **index < end).count();
+        state.player.play_next_end = Some(end.saturating_sub(removed_before_end));
+    }
     let was_loaded = state.player.playing;
     let was_paused = state.player.paused;
 
@@ -1107,6 +1190,7 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
         state.player.track_started_at = None;
         state.player.listen_id = None;
         state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+        normalize_play_next_block(&mut state.player);
         return QueueRemovalOutcome {
             restart_paused: was_loaded.then_some(was_paused),
             stop: false,
@@ -1134,6 +1218,7 @@ fn remove_queue_indices(state: &mut AppState, indices: &[usize]) -> QueueRemoval
             .cloned()
     });
     state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+    normalize_play_next_block(&mut state.player);
     QueueRemovalOutcome {
         restart_paused: None,
         stop: false,
@@ -1267,7 +1352,7 @@ fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
     if !tracks.is_empty() {
         let count = tracks.len();
         let title = tracks[0].title.clone();
-        enqueue_tracks(state, tracks, next);
+        let restart_current = enqueue_tracks(state, tracks, next);
         state.track_selection.clear();
         state.status_message = Some(if count == 1 && next {
             format!("queued next: {title}")
@@ -1278,7 +1363,7 @@ fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
         } else {
             format!("queued: {count} tracks")
         });
-        return Some(Effect::PlaybackQueueChanged);
+        return Some(Effect::QueueOrderChanged { restart_current });
     }
     if let Some(id) = selected_release_id(state) {
         return Some(Effect::EnqueueRelease { id, next });
@@ -1372,19 +1457,22 @@ pub(crate) fn track_artist_refs(track: &TrackItem) -> Vec<crate::library::models
     refs
 }
 
-/// Insert tracks after the playing one (`next`) or at the end. Keeps the
-/// gapless prefetch index pointing at the same track if items shift.
-pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) {
+/// Insert tracks into the stable "play next" block (`next`) or at the end.
+/// Returns whether a decoded gapless-next source became stale.
+pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) -> bool {
     let tracks: Vec<_> = tracks
         .into_iter()
         .filter(|track| track_allowed_by_source_mode(state, track))
         .collect();
     let player = &mut state.player;
     if tracks.is_empty() {
-        return;
+        return false;
     }
     let insert_at = if next && !player.queue.is_empty() {
-        (player.queue_pos + 1).min(player.queue.len())
+        player
+            .play_next_end
+            .filter(|end| *end >= player.queue_pos.saturating_add(1) && *end <= player.queue.len())
+            .unwrap_or_else(|| (player.queue_pos + 1).min(player.queue.len()))
     } else if next {
         0
     } else {
@@ -1394,13 +1482,27 @@ pub fn enqueue_tracks(state: &mut AppState, tracks: Vec<TrackItem>, next: bool) 
     for (offset, track) in tracks.into_iter().enumerate() {
         player.queue.insert(insert_at + offset, track);
     }
-    if let Some(prefetched) = &mut player.prefetched_pos
-        && insert_at <= *prefetched
-    {
-        *prefetched += count;
+    let restart_current = player
+        .prefetched_pos
+        .is_some_and(|prefetched| insert_at <= prefetched);
+    if restart_current {
+        player.prefetched_pos = None;
     }
     if insert_at <= player.queue_pos && player.current.is_some() {
         player.queue_pos += count;
+    }
+    if next {
+        player.play_next_end = Some(insert_at + count);
+    }
+    restart_current
+}
+
+pub(super) fn normalize_play_next_block(player: &mut super::state::PlayerBar) {
+    if player
+        .play_next_end
+        .is_some_and(|end| end <= player.queue_pos || end > player.queue.len())
+    {
+        player.play_next_end = None;
     }
 }
 
@@ -1426,6 +1528,7 @@ fn queue_step(state: &mut AppState, direction: isize) -> Option<Effect> {
     } else {
         player.queue_pos = next as usize;
     }
+    normalize_play_next_block(player);
     Some(Effect::PlayCurrent)
 }
 
@@ -1464,9 +1567,11 @@ pub fn advance_after_finish(state: &mut AppState) -> Option<Effect> {
         repeat => {
             if player.queue_pos + 1 < player.queue.len() {
                 player.queue_pos += 1;
+                normalize_play_next_block(player);
                 Some(Effect::PlayCurrent)
             } else if repeat == super::state::RepeatMode::All {
                 player.queue_pos = 0;
+                player.play_next_end = None;
                 Some(Effect::PlayCurrent)
             } else {
                 player.playing = false;
@@ -2076,6 +2181,7 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             return None;
         }
         state.player.queue_pos = state.queue_tab.cursor.min(state.player.queue.len() - 1);
+        normalize_play_next_block(&mut state.player);
         return Some(Effect::PlayCurrent);
     }
     if state.active_tab != Tab::Global {
@@ -2616,6 +2722,19 @@ fn fed_card_featured_artist_names(track: &crate::federation::FedCardTrack) -> Ve
 fn federation_select(state: &mut AppState) -> Option<Effect> {
     use super::state::{FedInputField, FedRow, Popup, SettingsRow};
     match settings_rows(state).get(state.settings_cursor).copied()? {
+        SettingsRow::MusicDirectory => {
+            if state.music_dir_changing {
+                state.status_message = Some("music directory change is already running".into());
+                return None;
+            }
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::MusicDirectory,
+                input: crate::app::input::LineEdit::new(
+                    state.music_dir.to_string_lossy().into_owned(),
+                ),
+            });
+            None
+        }
         SettingsRow::Federation(FedRow::Toggle) => {
             let settings = &mut state.federation.settings;
             if !settings.enabled && settings.network_id.trim().is_empty() {
@@ -2789,6 +2908,7 @@ fn require_connected_devices_enabled(state: &mut AppState) -> bool {
 pub(super) fn on_new_queue(state: &mut AppState) {
     let player = &mut state.player;
     player.original_order = None;
+    player.play_next_end = None;
     if player.shuffle && !player.queue.is_empty() {
         player.original_order = Some(player.queue.iter().map(track_key).collect());
         shuffle_range(player, (player.queue_pos + 1).min(player.queue.len()));

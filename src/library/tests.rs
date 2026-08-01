@@ -60,6 +60,130 @@ fn artist_filters(hide_featured_only: bool) -> crate::config::settings::LibraryF
     }
 }
 
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("furumi-{label}-{}-{unique}", std::process::id()))
+}
+
+#[test]
+fn managed_music_relocation_builds_artist_release_tree_and_updates_paths() {
+    let root = unique_test_dir("music-relocation");
+    let old = root.join("old");
+    let new = root.join("new");
+    let covers = root.join("covers");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&covers).unwrap();
+    let audio = old.join("legacy.flac");
+    let cover = covers.join("release.jpg");
+    let artist_image = covers.join("artist.png");
+    std::fs::write(&audio, b"audio").unwrap();
+    std::fs::write(&cover, b"cover").unwrap();
+    std::fs::write(&artist_image, b"artist").unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    register_norm_function(&conn).unwrap();
+    conn.execute_batch(SCHEMA).unwrap();
+    let library = Library {
+        conn: Mutex::new(conn),
+        db_path: root.join("library.db"),
+        covers_dir: covers,
+    };
+    let track_id = import::upsert_track(
+        &library,
+        &import::TrackImport {
+            file_path: audio.to_string_lossy().into_owned(),
+            title: "Song".into(),
+            artists: vec!["Artist".into()],
+            featured_artists: vec![],
+            album_artists: vec!["Artist".into()],
+            release_title: "Release".into(),
+            release_type: Some("album".into()),
+            year: Some(2026),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_seconds: 1.0,
+            audio_format: Some("flac".into()),
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: Some(5),
+            cover: None,
+        },
+    )
+    .unwrap()
+    .0;
+    let (release_id, artist_id): (i64, i64) = library
+        .lock()
+        .query_row(
+            "SELECT t.release_id, ta.artist_id
+             FROM tracks t JOIN track_artists ta ON ta.track_id = t.id
+             WHERE t.id = ?1 AND ta.role = 'main'",
+            [track_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    library
+        .lock()
+        .execute(
+            "UPDATE releases SET cover_path = ?2 WHERE id = ?1",
+            params![release_id, cover.to_string_lossy()],
+        )
+        .unwrap();
+    library
+        .lock()
+        .execute(
+            "UPDATE artists SET image_path = ?2 WHERE id = ?1",
+            params![artist_id, artist_image.to_string_lossy()],
+        )
+        .unwrap();
+
+    let stats = library.relocate_managed_music(&old, &new).unwrap();
+    assert_eq!(stats.tracks, 1);
+    assert_eq!(stats.images, 2);
+    let track = library.tracks_by_ids(&[track_id]).unwrap().remove(0);
+    assert_eq!(
+        track.file_path,
+        new.join("Artist/Release/legacy.flac").to_string_lossy()
+    );
+    assert_eq!(
+        track.cover_path.as_deref(),
+        Some(
+            new.join("Artist/Release/cover.jpg")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    let image: String = library
+        .lock()
+        .query_row(
+            "SELECT image_path FROM artists WHERE id = ?1",
+            [artist_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(image, new.join("Artist/artist.png").to_string_lossy());
+    assert!(!audio.exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn music_directory_validation_rejects_a_file_without_touching_it() {
+    let root = unique_test_dir("music-validation");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("not-a-directory");
+    std::fs::write(&file, b"keep").unwrap();
+
+    assert!(Library::validate_music_directory(&file).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn local_stats_counts_library_rows_and_audio_bytes() {
     let lib = test_library();

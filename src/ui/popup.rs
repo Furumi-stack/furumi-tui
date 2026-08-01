@@ -42,8 +42,15 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             draw_fed_input(frame, state, field.title(), field.help(), input)
         }
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, state, title, text),
-        Some(Popup::FedCopyText { title, text, help }) => {
-            draw_fed_copy_text(frame, state, title, text, help)
+        Some(Popup::FedCopyText {
+            title,
+            text,
+            help,
+            cursor,
+        }) => draw_fed_copy_text(frame, state, title, text, help, *cursor),
+        Some(Popup::PlainText { .. }) => {}
+        Some(Popup::ConfirmMusicDirectory { path }) => {
+            draw_music_directory_confirmation(frame, state, path)
         }
         Some(Popup::FederationStatusDetails {
             focus,
@@ -91,6 +98,34 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ListenHistory { cursor }) => draw_listen_history(frame, state, *cursor),
         None => {}
     }
+}
+
+fn draw_music_directory_confirmation(frame: &mut Frame, state: &AppState, path: &std::path::Path) {
+    let area = centered(frame.area(), 76, 9);
+    let block = Block::bordered()
+        .title(" Move existing music? ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("The destination is writable:"),
+            Line::styled(
+                path.to_string_lossy().into_owned(),
+                theme::accent_for(state),
+            ),
+            Line::raw(""),
+            Line::raw("Move music and artwork previously saved by Furumi there?"),
+            Line::styled(
+                "enter/y move · n keep existing files where they are · esc cancel",
+                theme::dim(),
+            ),
+        ])
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_listen_history(frame: &mut Frame, state: &AppState, cursor: usize) {
@@ -862,7 +897,14 @@ fn draw_fed_text(frame: &mut Frame, state: &AppState, title: &str, text: &str) {
 }
 
 /// Wrapped text with an explicit copy-and-close action.
-fn draw_fed_copy_text(frame: &mut Frame, state: &AppState, title: &str, text: &str, help: &str) {
+fn draw_fed_copy_text(
+    frame: &mut Frame,
+    state: &AppState,
+    title: &str,
+    text: &str,
+    help: &str,
+    cursor: usize,
+) {
     let width = frame.area().width.saturating_sub(8).clamp(36, 96);
     let text_width = usize::from(width.saturating_sub(2));
     let text_lines = (text.chars().count() / text_width.max(1) + 1) as u16;
@@ -894,17 +936,28 @@ fn draw_fed_copy_text(frame: &mut Frame, state: &AppState, title: &str, text: &s
         Paragraph::new(text.to_string()).wrap(Wrap { trim: false }),
         body_area,
     );
+    let button = |label: &str, selected: bool| {
+        if selected {
+            Span::styled(format!(" {label} "), theme::tab_active_for(state))
+        } else {
+            Span::styled(format!(" {label} "), theme::dim())
+        }
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            " Copy to clipboard and close ",
-            theme::tab_active_for(state),
-        ))
+        Paragraph::new(Line::from(vec![
+            button("Copy to clipboard", cursor == 0),
+            Span::raw("   "),
+            button("Show as plain terminal line", cursor == 1),
+        ]))
         .alignment(Alignment::Center),
         button_area,
     );
     frame.render_widget(
-        Paragraph::new(Line::styled("enter/c copy · esc close", theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(
+            "left/right choose · enter apply · c copy · p plain line · esc close",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
         footer_area,
     );
 }

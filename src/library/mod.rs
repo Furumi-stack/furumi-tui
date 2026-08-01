@@ -11,6 +11,7 @@ pub mod import;
 pub mod models;
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -288,6 +289,12 @@ pub struct LocalLibraryStats {
     pub database_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MusicRelocationStats {
+    pub tracks: usize,
+    pub images: usize,
+}
+
 impl LocalLibraryStats {
     pub fn total_bytes(&self) -> u64 {
         self.audio_bytes
@@ -328,6 +335,258 @@ impl Library {
 
     pub fn covers_dir(&self) -> &Path {
         &self.covers_dir
+    }
+
+    /// Verifies that `path` can actually be used for durable downloads. The
+    /// returned path is absolute/canonical, so the persisted setting does not
+    /// later depend on Furumi's working directory.
+    pub fn validate_music_directory(path: &Path) -> Result<PathBuf> {
+        anyhow::ensure!(!path.as_os_str().is_empty(), "music directory is empty");
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("creating music directory {}", path.display()))?;
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("resolving music directory {}", path.display()))?;
+        anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let probe = path.join(format!(
+            ".furumi-write-test-{}-{unique}",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+                .with_context(|| format!("no write access to {}", path.display()))?;
+            file.write_all(b"furumi")?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&probe);
+        result?;
+        Ok(path)
+    }
+
+    /// Copies Furumi-managed audio and its managed artwork into a portable
+    /// `Artist/Release` tree, atomically switches SQLite paths, then removes
+    /// the old copies. User-imported audio outside `old_root` is untouched.
+    pub fn relocate_managed_music(
+        &self,
+        old_root: &Path,
+        new_root: &Path,
+    ) -> Result<MusicRelocationStats> {
+        let new_root = Self::validate_music_directory(new_root)?;
+        let old_root = std::fs::canonicalize(old_root)
+            .with_context(|| format!("resolving old music directory {}", old_root.display()))?;
+        anyhow::ensure!(
+            old_root != new_root,
+            "the new music directory is the current directory"
+        );
+        anyhow::ensure!(
+            !old_root.starts_with(&new_root) && !new_root.starts_with(&old_root),
+            "choose a directory outside the current music directory"
+        );
+
+        #[derive(Debug)]
+        struct Row {
+            track_id: i64,
+            track_path: String,
+            release_id: i64,
+            release_title: String,
+            cover_path: Option<String>,
+            artist_id: Option<i64>,
+            artist_name: String,
+            image_path: Option<String>,
+        }
+
+        let rows = {
+            let conn = self.lock();
+            let mut statement = conn.prepare(
+                "SELECT t.id, t.file_path, r.id, r.title, r.cover_path,
+                        a.id, COALESCE(a.name, 'Unknown Artist'), a.image_path
+                 FROM tracks t
+                 JOIN releases r ON r.id = t.release_id
+                 LEFT JOIN track_artists ta
+                   ON ta.track_id = t.id AND ta.role = 'main' AND ta.position = 0
+                 LEFT JOIN artists a ON a.id = ta.artist_id
+                 ORDER BY t.id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(Row {
+                        track_id: row.get(0)?,
+                        track_path: row.get(1)?,
+                        release_id: row.get(2)?,
+                        release_title: row.get(3)?,
+                        cover_path: row.get(4)?,
+                        artist_id: row.get(5)?,
+                        artist_name: row.get(6)?,
+                        image_path: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        #[derive(Debug, Clone)]
+        struct CopyOp {
+            source: PathBuf,
+            destination: PathBuf,
+        }
+        let managed_art =
+            |path: &Path| path.starts_with(&old_root) || path.starts_with(&self.covers_dir);
+        let mut reserved = HashSet::<PathBuf>::new();
+        let mut copies = Vec::<CopyOp>::new();
+        let mut track_updates = Vec::<(i64, String, String)>::new();
+        let mut release_updates = HashMap::<i64, (String, String)>::new();
+        let mut artist_updates = HashMap::<i64, (String, String)>::new();
+
+        for row in rows {
+            let source = PathBuf::from(&row.track_path);
+            if !source.is_file() || !source.starts_with(&old_root) {
+                continue;
+            }
+            let artist_dir = new_root.join(storage_name(&row.artist_name, "Unknown Artist"));
+            let release_dir = artist_dir.join(storage_name(&row.release_title, "Unknown Release"));
+            let filename = source
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| std::ffi::OsStr::new("track"));
+            let destination =
+                unique_destination(release_dir.join(filename), row.track_id, &mut reserved);
+            copies.push(CopyOp {
+                source: source.clone(),
+                destination: destination.clone(),
+            });
+            track_updates.push((
+                row.track_id,
+                row.track_path,
+                destination.to_string_lossy().into_owned(),
+            ));
+
+            if let Some(cover) = row.cover_path {
+                let cover_source = PathBuf::from(&cover);
+                if cover_source.is_file()
+                    && managed_art(&cover_source)
+                    && !release_updates.contains_key(&row.release_id)
+                {
+                    let extension = cover_source.extension().unwrap_or_default();
+                    let mut destination = release_dir.join("cover");
+                    destination.set_extension(extension);
+                    let destination =
+                        unique_destination(destination, row.release_id, &mut reserved);
+                    copies.push(CopyOp {
+                        source: cover_source,
+                        destination: destination.clone(),
+                    });
+                    release_updates.insert(
+                        row.release_id,
+                        (cover, destination.to_string_lossy().into_owned()),
+                    );
+                }
+            }
+
+            if let (Some(artist_id), Some(image)) = (row.artist_id, row.image_path) {
+                let image_source = PathBuf::from(&image);
+                if image_source.is_file()
+                    && managed_art(&image_source)
+                    && !artist_updates.contains_key(&artist_id)
+                {
+                    let extension = image_source.extension().unwrap_or_default();
+                    let mut destination = artist_dir.join("artist");
+                    destination.set_extension(extension);
+                    let destination = unique_destination(destination, artist_id, &mut reserved);
+                    copies.push(CopyOp {
+                        source: image_source,
+                        destination: destination.clone(),
+                    });
+                    artist_updates.insert(
+                        artist_id,
+                        (image, destination.to_string_lossy().into_owned()),
+                    );
+                }
+            }
+        }
+
+        let mut created = Vec::<PathBuf>::new();
+        let copy_result = (|| -> Result<()> {
+            for op in &copies {
+                let parent = op
+                    .destination
+                    .parent()
+                    .context("music destination has no parent")?;
+                std::fs::create_dir_all(parent)?;
+                copy_file_exclusive(&op.source, &op.destination)?;
+                created.push(op.destination.clone());
+            }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            for path in created.iter().rev() {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error.context("copying the existing music library"));
+        }
+
+        let database_result = (|| -> Result<()> {
+            let mut conn = self.lock();
+            let transaction = conn.transaction()?;
+            for (id, old, new) in &track_updates {
+                anyhow::ensure!(
+                    transaction.execute(
+                        "UPDATE tracks SET file_path = ?3 WHERE id = ?1 AND file_path = ?2",
+                        params![id, old, new],
+                    )? == 1,
+                    "track {id} changed while the music library was moving"
+                );
+            }
+            for (id, (old, new)) in &release_updates {
+                anyhow::ensure!(
+                    transaction.execute(
+                        "UPDATE releases SET cover_path = ?3 WHERE id = ?1 AND cover_path = ?2",
+                        params![id, old, new],
+                    )? == 1,
+                    "release {id} changed while the music library was moving"
+                );
+            }
+            for (id, (old, new)) in &artist_updates {
+                anyhow::ensure!(
+                    transaction.execute(
+                        "UPDATE artists SET image_path = ?3 WHERE id = ?1 AND image_path = ?2",
+                        params![id, old, new],
+                    )? == 1,
+                    "artist {id} changed while the music library was moving"
+                );
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = database_result {
+            for path in created.iter().rev() {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error.context("updating music paths in the library"));
+        }
+
+        let mut removed = HashSet::new();
+        for op in &copies {
+            if removed.insert(op.source.clone())
+                && let Err(error) = std::fs::remove_file(&op.source)
+            {
+                // The committed destination is authoritative. A failed old
+                // delete only leaves a recoverable duplicate.
+                tracing::warn!(path = %op.source.display(), %error, "old music copy was not removed");
+            }
+        }
+        remove_empty_directories(&old_root);
+
+        Ok(MusicRelocationStats {
+            tracks: track_updates.len(),
+            images: release_updates.len() + artist_updates.len(),
+        })
     }
 
     pub fn local_stats(&self) -> Result<LocalLibraryStats> {
@@ -2496,6 +2755,84 @@ impl Library {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn storage_name(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.');
+    let shortened: String = cleaned.chars().take(120).collect();
+    if shortened.is_empty() {
+        fallback.to_string()
+    } else {
+        shortened
+    }
+}
+
+fn unique_destination(requested: PathBuf, id: i64, reserved: &mut HashSet<PathBuf>) -> PathBuf {
+    if !requested.exists() && reserved.insert(requested.clone()) {
+        return requested;
+    }
+    let stem = requested
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("file"))
+        .to_string_lossy();
+    let extension = requested.extension().map(|value| value.to_os_string());
+    let mut candidate = requested.with_file_name(format!("{stem}-{id}"));
+    if let Some(extension) = extension {
+        candidate.set_extension(extension);
+    }
+    let mut suffix = 2usize;
+    while candidate.exists() || !reserved.insert(candidate.clone()) {
+        candidate = requested.with_file_name(format!("{stem}-{id}-{suffix}"));
+        if let Some(extension) = requested.extension() {
+            candidate.set_extension(extension);
+        }
+        suffix += 1;
+    }
+    candidate
+}
+
+fn copy_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    let mut input =
+        std::fs::File::open(source).with_context(|| format!("opening {}", source.display()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("creating {}", destination.display()))?;
+    let result = std::io::copy(&mut input, &mut output)
+        .with_context(|| format!("copying {}", source.display()))
+        .and_then(|_| {
+            output
+                .sync_all()
+                .with_context(|| format!("syncing {}", destination.display()))
+        });
+    if let Err(error) = result {
+        drop(output);
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_empty_directories(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            remove_empty_directories(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(root);
 }
 
 fn cleanup_empty_releases(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {

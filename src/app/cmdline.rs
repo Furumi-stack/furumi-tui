@@ -17,6 +17,16 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => cancel(state),
         KeyCode::Enter => commit(state, runtime),
+        KeyCode::Up => {
+            if state.cmdline.history_previous() {
+                after_change(state, runtime);
+            }
+        }
+        KeyCode::Down => {
+            if state.cmdline.history_next() {
+                after_change(state, runtime);
+            }
+        }
         // Backspace on an empty line closes it, like vim.
         KeyCode::Backspace if state.cmdline.input.is_empty() => cancel(state),
         _ => {
@@ -162,7 +172,9 @@ pub(super) fn refresh_local_search(state: &mut AppState, runtime: &Runtime) {
 /// Enter: close the line. Live commands already took effect (their view
 /// stays open); one-shot commands execute here.
 fn commit(state: &mut AppState, runtime: &mut Runtime) {
+    let remembered = state.cmdline.input.as_str().to_string();
     let parsed = command::parse(&state.cmdline.input);
+    state.cmdline.remember(&remembered);
     close(state);
     match parsed {
         Parsed::Empty => {}
@@ -272,6 +284,7 @@ fn close(state: &mut AppState) {
     state.cmdline.active = false;
     state.cmdline.input.clear();
     state.cmdline.live = false;
+    state.cmdline.begin_history_navigation();
 }
 
 /// Pop the live search view if this command-line session opened it.

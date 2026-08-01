@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +51,9 @@ pub struct AppSettings {
     pub volume: u8,
     #[serde(default)]
     pub library: LibraryFilters,
+    /// Root used for music materialized from federation peers.
+    #[serde(default = "default_music_dir")]
+    pub music_dir: PathBuf,
 }
 
 impl Default for AppSettings {
@@ -57,6 +61,7 @@ impl Default for AppSettings {
         Self {
             volume: default_volume(),
             library: LibraryFilters::default(),
+            music_dir: default_music_dir(),
         }
     }
 }
@@ -64,12 +69,23 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn normalized(mut self) -> Self {
         self.volume = self.volume.min(100);
+        if self.music_dir.as_os_str().is_empty() {
+            self.music_dir = default_music_dir();
+        }
         self
     }
 }
 
 fn default_volume() -> u8 {
     80
+}
+
+/// The historical permanent-download location, kept as the default for
+/// backward compatibility with existing installations.
+pub fn default_music_dir() -> PathBuf {
+    crate::config::project_dirs()
+        .map(|dirs| dirs.data_dir().join("federation-media"))
+        .unwrap_or_else(|| PathBuf::from("federation-media"))
 }
 
 pub fn load() -> (AppSettings, Option<String>) {
@@ -129,5 +145,6 @@ hide_featured_only = true
         assert_eq!(settings.volume, 100);
         assert!(settings.library.hide_featured_only);
         assert_eq!(settings.library.source_mode, LibrarySourceMode::Global);
+        assert_eq!(settings.music_dir, default_music_dir());
     }
 }

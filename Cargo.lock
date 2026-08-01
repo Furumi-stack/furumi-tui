@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "furumi_tui"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "blake3",

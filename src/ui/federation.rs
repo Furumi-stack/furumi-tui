@@ -69,6 +69,25 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut y = area.y;
     let mut cursor = 0usize;
 
+    draw_section(frame, area, state, &mut y, "Library");
+    draw_row(
+        frame,
+        area,
+        state,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Music save directory",
+        if state.music_dir_changing {
+            format!("{} moving…", state.spinner())
+        } else {
+            state.music_dir.to_string_lossy().into_owned()
+        },
+    );
+    cursor += 1;
+
+    y = y.saturating_add(1);
+
     draw_section(frame, area, state, &mut y, "Federation");
     for row in FedRow::ALL {
         let (label, value) = match row {

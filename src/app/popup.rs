@@ -136,17 +136,52 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::FedText { title, text }),
         },
-        Popup::FedCopyText { title, text, help } => match key.code {
+        Popup::FedCopyText {
+            title,
+            text,
+            help,
+            mut cursor,
+        } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                cursor = usize::from(cursor == 0);
+                state.popup = Some(Popup::FedCopyText {
+                    title,
+                    text,
+                    help,
+                    cursor,
+                });
+            }
+            KeyCode::Enter if cursor == 1 => state.popup = Some(Popup::PlainText { text }),
+            KeyCode::Char('p') => state.popup = Some(Popup::PlainText { text }),
             KeyCode::Enter | KeyCode::Char('c') => match copy_to_clipboard(&text) {
                 Ok(()) => state.status_message = Some("copied to clipboard".to_string()),
                 Err(err) => {
                     state.status_message = Some(format!("copy failed: {err}"));
-                    state.popup = Some(Popup::FedCopyText { title, text, help });
+                    state.popup = Some(Popup::FedCopyText {
+                        title,
+                        text,
+                        help,
+                        cursor,
+                    });
                 }
             },
-            _ => state.popup = Some(Popup::FedCopyText { title, text, help }),
+            _ => {
+                state.popup = Some(Popup::FedCopyText {
+                    title,
+                    text,
+                    help,
+                    cursor,
+                })
+            }
         },
+        Popup::PlainText { text } => match key.code {
+            KeyCode::Esc => {}
+            _ => state.popup = Some(Popup::PlainText { text }),
+        },
+        Popup::ConfirmMusicDirectory { path } => {
+            handle_music_directory_confirmation(state, runtime, path, key)
+        }
         Popup::FederationStatusDetails {
             focus,
             status_cursor,
@@ -502,6 +537,13 @@ fn handle_fed_input(
                         !state.federation.settings.network_id.is_empty();
                     super::fed_apply_settings(state, runtime);
                 }
+                FedInputField::MusicDirectory => {
+                    if value.is_empty() {
+                        state.status_message = Some("music directory is empty".into());
+                    } else {
+                        super::validate_music_directory(state, runtime, value.into());
+                    }
+                }
                 FedInputField::ConnectTicket => {
                     if value.is_empty() {
                         state.status_message = Some("ticket is empty".into());
@@ -549,6 +591,31 @@ fn handle_fed_input(
             state.popup = Some(Popup::FedInput { field, input });
         }
     }
+}
+
+fn handle_music_directory_confirmation(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    path: std::path::PathBuf,
+    key: KeyEvent,
+) {
+    let move_existing = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => true,
+        KeyCode::Char('n') | KeyCode::Char('N') => false,
+        _ => {
+            state.popup = Some(Popup::ConfirmMusicDirectory { path });
+            return;
+        }
+    };
+    super::perform_effect(
+        state,
+        runtime,
+        crate::app::update::Effect::ChangeMusicDirectory {
+            path,
+            move_existing,
+        },
+    );
 }
 
 fn handle_device_pairing(
@@ -934,10 +1001,15 @@ fn handle_track_info(
         KeyCode::Char('c') => {
             if let Some(track) = tracks.get(cursor.min(len.saturating_sub(1))) {
                 match crate::share::track_share_link(track) {
-                    Some(link) => match copy_to_clipboard(&link) {
-                        Ok(()) => state.status_message = Some("frid link copied".into()),
-                        Err(err) => state.status_message = Some(format!("copy failed: {err}")),
-                    },
+                    Some(link) => {
+                        state.popup = Some(Popup::FedCopyText {
+                            title: "Track share link".into(),
+                            text: link,
+                            help: "Copy the link with a clipboard helper, or show it as one clean terminal line for mouse selection.".into(),
+                            cursor: 0,
+                        });
+                        return;
+                    }
                     None => state.status_message = Some("no content id for this track yet".into()),
                 }
             }

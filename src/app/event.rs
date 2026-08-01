@@ -56,6 +56,8 @@ pub enum AppEvent {
     LocalContentIdsLoaded(Result<Vec<String>, String>),
     /// Counts and storage footprint of the local library/database.
     LocalLibraryStatsLoaded(Result<crate::library::LocalLibraryStats, String>),
+    MusicDirectoryValidated(Result<std::path::PathBuf, String>),
+    MusicDirectoryChanged(Result<crate::library::MusicRelocationStats, String>),
     ListenHistoryLoaded(Result<Vec<crate::library::ListenHistoryEntry>, String>),
     /// One content id became available locally while the UI is open.
     LocalContentAvailable {

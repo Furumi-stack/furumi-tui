@@ -457,6 +457,7 @@ fn local_mode_hides_pending_federation_tracks_from_playlists_and_playback() {
         active_tab: Tab::Playlists,
         ..AppState::default()
     };
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
     state.playlists.opened = Some(OpenedPlaylist { id: 7, cursor: 1 });
     state.playlist_views.insert(
         7,
@@ -512,6 +513,7 @@ fn network_modes_show_pending_federation_playlist_tracks() {
 #[test]
 fn local_mode_rejects_async_federation_queue_additions() {
     let mut state = AppState::default();
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
 
     enqueue_tracks(
         &mut state,
@@ -732,11 +734,76 @@ fn artist_top_track_selection_queues_all_selected_tracks() {
     update(&mut state, Action::MoveDown);
     assert_eq!(
         update(&mut state, Action::QueueAddLast),
-        Some(Effect::PlaybackQueueChanged),
+        Some(Effect::QueueOrderChanged {
+            restart_current: false,
+        }),
     );
     let queued: Vec<i64> = state.player.queue.iter().map(|track| track.id).collect();
     assert_eq!(queued, vec![1, 2]);
     assert!(!state.track_selection.is_active());
+}
+
+#[test]
+fn sequential_queue_next_additions_keep_their_order_as_one_block() {
+    let mut state = AppState::default();
+    state.player.queue = (10..=13).map(test_track).collect();
+    state.player.queue_pos = 0;
+    state.player.current = Some(test_track(10));
+
+    assert!(!enqueue_tracks(&mut state, vec![test_track(1)], true));
+    assert!(!enqueue_tracks(&mut state, vec![test_track(2)], true));
+    assert!(!enqueue_tracks(&mut state, vec![test_track(3)], true));
+
+    assert_eq!(
+        state
+            .player
+            .queue
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![10, 1, 2, 3, 11, 12, 13]
+    );
+    assert_eq!(state.player.play_next_end, Some(4));
+}
+
+#[test]
+fn queue_selection_moves_as_a_group_and_preserves_current_track() {
+    let mut state = AppState {
+        active_tab: Tab::Queue,
+        ..AppState::default()
+    };
+    state.player.queue = (1..=5).map(test_track).collect();
+    state.player.queue_pos = 0;
+    state.player.current = Some(test_track(1));
+    state.queue_tab.cursor = 2;
+    state.track_selection.start(TrackSelectionScope::Queue, 2);
+    state
+        .track_selection
+        .set_cursor(TrackSelectionScope::Queue, 3);
+
+    assert_eq!(
+        update(&mut state, Action::MoveQueueUp),
+        Some(Effect::QueueOrderChanged {
+            restart_current: false,
+        })
+    );
+    assert_eq!(
+        state
+            .player
+            .queue
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4, 2, 5]
+    );
+    assert_eq!(state.player.queue_pos, 0);
+    assert_eq!(state.queue_tab.cursor, 1);
+    assert_eq!(
+        state
+            .track_selection
+            .indices(&TrackSelectionScope::Queue, 5),
+        Some(vec![1, 2])
+    );
 }
 
 #[test]

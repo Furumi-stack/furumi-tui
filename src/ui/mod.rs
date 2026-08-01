@@ -258,7 +258,7 @@ fn draw_queue(frame: &mut Frame, area: Rect, state: &AppState) {
     let player = &state.player;
     let block = Block::bordered()
         .title(format!(
-            " Queue — {} tracks · Mode: {} · enter: play · d: remove · shift-v: select · :clear ",
+            " Queue — {} tracks · Mode: {} · enter: play · alt-j/k: move · d: remove · shift-v: select · :clear ",
             player.queue.len(),
             state.global.filters.source_mode.label()
         ))
