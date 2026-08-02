@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let rows_height =
-        (settings_rows(state).len() + 6 + device_presence_sections(state).len()) as u16;
+        (settings_rows(state).len() + 8 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -79,7 +79,7 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         state.settings_cursor,
         "Music save directory",
         if state.music_dir_changing {
-            format!("{} moving…", state.spinner())
+            format!("{} checking/changing…", state.spinner())
         } else {
             state.music_dir.to_string_lossy().into_owned()
         },

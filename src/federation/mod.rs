@@ -544,6 +544,7 @@ impl Federation {
                     .err()
                     .map(|err| format!("cannot create {}: {err}", dir.display()))
             });
+        let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
         Arc::new(Self {
             library,
             devices,
@@ -1439,8 +1440,8 @@ impl Federation {
 
     /// Returns a cached-or-streamed image for the card: the artist image
     /// (`release: None`) or a release cover. Peers are tried in order until
-    /// one answers with an image; the result lands in the art cache and its
-    /// local path is returned.
+    /// one answers with an image; the result is stored beside the artist or
+    /// release in the permanent music tree and its local path is returned.
     pub async fn card_image(
         &self,
         owners: &[String],
@@ -1983,8 +1984,8 @@ impl Federation {
     }
 }
 
-/// Writes a received artist image into the covers directory and attaches it
-/// to the artist unless one is already set.
+/// Writes a received artist image into the artist's music directory and
+/// attaches it to the artist unless one is already set.
 fn save_artist_image(
     library: &Library,
     artist_name: &str,
@@ -2599,36 +2600,19 @@ fn collect_specs(library: &Library) -> Result<Vec<ItemSpec>> {
     Ok(specs)
 }
 
-fn sanitize_file_stem(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.');
-    let mut stem: String = trimmed.chars().take(120).collect();
-    if stem.is_empty() {
-        stem.push_str("track");
-    }
-    stem
-}
-
 fn music_artist_dir(root: &Path, artist: &str) -> PathBuf {
     let artist = if artist.trim().is_empty() {
         "Unknown Artist"
     } else {
         artist
     };
-    root.join(sanitize_file_stem(artist))
+    root.join(crate::library::storage_name(artist, "Unknown Artist"))
 }
 
 fn music_art_dir(root: &Path, artist: &str, release: Option<&str>) -> PathBuf {
     let artist_dir = music_artist_dir(root, artist);
     match release.filter(|release| !release.trim().is_empty()) {
-        Some(release) => artist_dir.join(sanitize_file_stem(release)),
+        Some(release) => artist_dir.join(crate::library::storage_name(release, "Unknown Release")),
         None => artist_dir,
     }
 }
@@ -2650,9 +2634,9 @@ fn music_release_dir(root: &Path, fed: &FedTrack) -> PathBuf {
 fn download_stem(fed: &FedTrack) -> String {
     let artists = fed.artist_line();
     if artists.is_empty() {
-        sanitize_file_stem(&fed.title)
+        crate::library::storage_name(&fed.title, "track")
     } else {
-        sanitize_file_stem(&format!("{artists} - {}", fed.title))
+        crate::library::storage_name(&format!("{artists} - {}", fed.title), "track")
     }
 }
 

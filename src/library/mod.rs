@@ -446,6 +446,7 @@ impl Library {
 
         for row in rows {
             let source = PathBuf::from(&row.track_path);
+            let source = std::fs::canonicalize(&source).unwrap_or(source);
             if !source.is_file() || !source.starts_with(&old_root) {
                 continue;
             }
@@ -469,6 +470,7 @@ impl Library {
 
             if let Some(cover) = row.cover_path {
                 let cover_source = PathBuf::from(&cover);
+                let cover_source = std::fs::canonicalize(&cover_source).unwrap_or(cover_source);
                 if cover_source.is_file()
                     && managed_art(&cover_source)
                     && !release_updates.contains_key(&row.release_id)
@@ -491,6 +493,7 @@ impl Library {
 
             if let (Some(artist_id), Some(image)) = (row.artist_id, row.image_path) {
                 let image_source = PathBuf::from(&image);
+                let image_source = std::fs::canonicalize(&image_source).unwrap_or(image_source);
                 if image_source.is_file()
                     && managed_art(&image_source)
                     && !artist_updates.contains_key(&artist_id)
@@ -2757,7 +2760,7 @@ impl Library {
     }
 }
 
-fn storage_name(value: &str, fallback: &str) -> String {
+pub(crate) fn storage_name(value: &str, fallback: &str) -> String {
     let cleaned: String = value
         .chars()
         .map(|character| match character {
@@ -2767,12 +2770,24 @@ fn storage_name(value: &str, fallback: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim().trim_matches('.');
-    let shortened: String = cleaned.chars().take(120).collect();
+    let mut shortened: String = cleaned.chars().take(120).collect();
     if shortened.is_empty() {
-        fallback.to_string()
-    } else {
-        shortened
+        return fallback.to_string();
     }
+    let windows_base = shortened
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let windows_reserved = matches!(windows_base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || windows_base
+            .strip_prefix("COM")
+            .or_else(|| windows_base.strip_prefix("LPT"))
+            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'));
+    if windows_reserved {
+        shortened.insert(0, '_');
+    }
+    shortened
 }
 
 fn unique_destination(requested: PathBuf, id: i64, reserved: &mut HashSet<PathBuf>) -> PathBuf {

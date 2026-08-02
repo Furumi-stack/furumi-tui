@@ -110,6 +110,11 @@ fn refresh_local_library_stats(runtime: &Runtime) {
 }
 
 pub(super) fn validate_music_directory(state: &mut AppState, runtime: &Runtime, path: PathBuf) {
+    if state.music_dir_changing {
+        state.status_message = Some("music directory change is already running".into());
+        return;
+    }
+    state.music_dir_changing = true;
     state.status_message = Some("checking music directory write access…".into());
     let tx = runtime.event_tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -270,6 +275,7 @@ pub async fn run(
         Arc::clone(&jam),
         settings.music_dir.clone(),
     );
+    state.music_dir = federation.media_dir();
     state.federation.settings = federation.settings();
     state.federation.devices = Some(devices.status());
     if let Ok((device_id, device_name)) = devices.identity_summary() {
@@ -3040,23 +3046,27 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Err(err) => state::Loadable::Failed(err),
             });
         }
-        AppEvent::MusicDirectoryValidated(result) => match result {
-            Ok(path) => {
-                let current = std::fs::canonicalize(&state.music_dir)
-                    .unwrap_or_else(|_| state.music_dir.clone());
-                if path == current {
-                    state.status_message = Some("this is already the music save directory".into());
-                } else {
-                    state.popup = Some(state::Popup::ConfirmMusicDirectory { path });
-                    state.status_message = None;
+        AppEvent::MusicDirectoryValidated(result) => {
+            state.music_dir_changing = false;
+            match result {
+                Ok(path) => {
+                    let current = std::fs::canonicalize(&state.music_dir)
+                        .unwrap_or_else(|_| state.music_dir.clone());
+                    if path == current {
+                        state.status_message =
+                            Some("this is already the music save directory".into());
+                    } else {
+                        state.popup = Some(state::Popup::ConfirmMusicDirectory { path });
+                        state.status_message = None;
+                    }
+                }
+                Err(message) => {
+                    state.status_message = Some(format!(
+                        "music directory is not writable; nothing changed: {message}"
+                    ));
                 }
             }
-            Err(message) => {
-                state.status_message = Some(format!(
-                    "music directory is not writable; nothing changed: {message}"
-                ));
-            }
-        },
+        }
         AppEvent::MusicDirectoryChanged(result) => {
             state.music_dir_changing = false;
             match result {

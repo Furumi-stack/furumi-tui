@@ -99,9 +99,10 @@ fn create_controls() -> Option<MediaControls> {
     #[cfg(not(target_os = "windows"))]
     let hwnd = None;
 
+    let dbus_name = platform_dbus_name();
     let config = PlatformConfig {
         display_name: "Furumi",
-        dbus_name: "cy.hexor.furumi",
+        dbus_name: &dbus_name,
         hwnd,
     };
     match MediaControls::new(config) {
@@ -111,6 +112,41 @@ fn create_controls() -> Option<MediaControls> {
             None
         }
     }
+}
+
+/// MPRIS well-known names must be unique on the session bus. Developers often
+/// run a checkout next to an installed Furumi, and souvlaki 0.8.3 reports a
+/// duplicate name by panicking in its private service thread. Ratatui's global
+/// panic hook then restores the terminal even though the app thread is still
+/// alive, leaving a frozen UI in canonical/echo mode.
+///
+/// Give every Unix MPRIS instance its own valid bus-name component. Other
+/// backends ignore `dbus_name`, so retain the stable application identifier
+/// there.
+fn platform_dbus_name() -> String {
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    {
+        mpris_dbus_name(std::process::id())
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    )))]
+    {
+        "cy.hexor.furumi".to_string()
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+fn mpris_dbus_name(process_id: u32) -> String {
+    format!("cy.hexor.furumi.instance{process_id}")
 }
 
 /// An invisible top-level window owning the SMTC session. Created on the
@@ -217,3 +253,18 @@ fn pump_platform_events() {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn pump_platform_events() {}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn mpris_names_are_distinct_between_processes() {
+        let first = super::mpris_dbus_name(41);
+        let second = super::mpris_dbus_name(42);
+        assert_eq!(first, "cy.hexor.furumi.instance41");
+        assert_ne!(first, second);
+    }
+}

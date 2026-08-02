@@ -185,6 +185,14 @@ fn music_directory_validation_rejects_a_file_without_touching_it() {
 }
 
 #[test]
+fn managed_music_names_are_portable_to_windows() {
+    assert_eq!(storage_name("Artist/Name", "fallback"), "Artist_Name");
+    assert_eq!(storage_name("CON", "fallback"), "_CON");
+    assert_eq!(storage_name("lpt9.live", "fallback"), "_lpt9.live");
+    assert_eq!(storage_name("...", "fallback"), "fallback");
+}
+
+#[test]
 fn local_stats_counts_library_rows_and_audio_bytes() {
     let lib = test_library();
     add_track(&lib, "One", "Artist", "First");
