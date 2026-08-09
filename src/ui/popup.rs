@@ -25,6 +25,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..
         }) => draw_edit(frame, state, title, fields, *focus, error.as_deref()),
         Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, state, label),
+        Some(Popup::SimilarityPrivacyConsent { .. }) => {
+            draw_similarity_privacy_consent(frame, state)
+        }
+        Some(Popup::ConfirmClearEmbeddings) => draw_confirm_clear_embeddings(frame, state),
         Some(Popup::LibraryFilters { cursor }) => draw_library_filters(frame, state, *cursor),
         Some(Popup::TrackInfo {
             tracks,
@@ -98,6 +102,51 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ListenHistory { cursor }) => draw_listen_history(frame, state, *cursor),
         None => {}
     }
+}
+
+fn draw_similarity_privacy_consent(frame: &mut Frame, state: &AppState) {
+    let area = centered(frame.area(), 78, 11);
+    let block = Block::bordered()
+        .title(" Similarity search and federation ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("To find similar music on other peers, Furumi sends them an"),
+            Line::raw("anonymous numeric embedding of the selected track."),
+            Line::raw(""),
+            Line::raw("It contains no account identity, but a peer may technically"),
+            Line::raw("infer what kind of music you are searching from it."),
+            Line::raw(""),
+            Line::styled("enter/y: agree and enable · n/esc: cancel", theme::dim()),
+        ])
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_confirm_clear_embeddings(frame: &mut Frame, state: &AppState) {
+    let area = centered(frame.area(), 70, 8);
+    let block = Block::bordered()
+        .title(" Clear embeddings? ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("All model/profile embeddings will be removed from SQLite."),
+            Line::raw("Audio and library metadata stay untouched."),
+            Line::raw("If enabled, processing starts again automatically."),
+            Line::raw(""),
+            Line::styled("enter/y: clear · n/esc: cancel", theme::dim()),
+        ]),
+        inner,
+    );
 }
 
 fn draw_music_directory_confirmation(frame: &mut Frame, state: &AppState, path: &std::path::Path) {
@@ -873,11 +922,19 @@ fn draw_fed_input(
     );
 }
 
-/// Read-only wrapped text (this peer's federation ticket).
+/// Read-only wrapped text.
 fn draw_fed_text(frame: &mut Frame, state: &AppState, title: &str, text: &str) {
     let width = frame.area().width.saturating_sub(8).clamp(24, 90);
     let text_width = usize::from(width.saturating_sub(2));
-    let lines_needed = (text.chars().count() / text_width.max(1) + 3) as u16;
+    let lines_needed = text
+        .lines()
+        .map(|line| {
+            UnicodeWidthStr::width(line)
+                .max(1)
+                .div_ceil(text_width.max(1))
+        })
+        .sum::<usize>()
+        .saturating_add(2) as u16;
     let area = centered(
         frame.area(),
         width,
@@ -1281,12 +1338,22 @@ fn draw_track_info(
     );
 
     let can_share = crate::share::track_can_share(track);
-    let hint = if tracks.len() > 1 && can_share {
+    let can_similar =
+        state.similarity.settings.enabled && track.id >= 0 && !track.file_path.is_empty();
+    let hint = if tracks.len() > 1 && can_share && can_similar {
+        "j/k scroll · h/left previous · l/right next · a artist · s similar · c copy link · esc"
+    } else if tracks.len() > 1 && can_share {
         "j/k scroll · h/left previous · l/right next · a artist · c copy frid link · esc close"
+    } else if tracks.len() > 1 && can_similar {
+        "j/k scroll · h/left previous · l/right next · a artist · s similar · esc close"
     } else if tracks.len() > 1 {
         "j/k scroll · h/left previous · l/right next · a artist · esc close"
+    } else if can_share && can_similar {
+        "j/k scroll · a artist · s similar · c copy link · esc close"
     } else if can_share {
         "j/k scroll · a artist · c copy frid link · esc close"
+    } else if can_similar {
+        "j/k scroll · a artist · s similar · esc close"
     } else {
         "j/k scroll · a artist · esc close"
     };

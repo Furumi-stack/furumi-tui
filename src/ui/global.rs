@@ -890,7 +890,12 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
 
 fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     let search = &state.search;
-    let mut title = format!(" Search: {} ", search.query);
+    let prefix = if search.similarity_source.is_some() {
+        "Search similar to"
+    } else {
+        "Search"
+    };
+    let mut title = format!(" {prefix}: {} ", search.query);
     if search.loading {
         title.push_str("· searching… ");
     }

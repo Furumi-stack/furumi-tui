@@ -8,6 +8,7 @@ mod library;
 mod media;
 mod player;
 mod share;
+mod similarity;
 mod status;
 mod streaming;
 mod ui;

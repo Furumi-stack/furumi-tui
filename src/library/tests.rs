@@ -686,3 +686,78 @@ fn listen_history_hides_unqualified_events_and_keeps_remote_metadata() {
     assert!(lib.apply_listen_event(&event, "remote-device").unwrap());
     assert!(lib.listen_history(20).unwrap().is_empty());
 }
+
+#[test]
+fn similarity_embeddings_round_trip_and_keep_profiles_separate() {
+    let lib = test_library();
+    let track_id = add_track(&lib, "Song", "Artist", "Album");
+    for profile in ["profile-a", "profile-b"] {
+        lib.ensure_similarity_profile(profile, "model", "1", "sha", "prep", 3)
+            .unwrap();
+    }
+    let track = lib
+        .pending_similarity_tracks("profile-a")
+        .unwrap()
+        .into_iter()
+        .find(|track| track.id == track_id)
+        .unwrap();
+    lib.store_similarity_embedding(&track, "profile-a", &[0.1, 0.2, 0.3])
+        .unwrap();
+    lib.store_similarity_embedding(&track, "profile-b", &[0.3, 0.2, 0.1])
+        .unwrap();
+
+    assert_eq!(
+        lib.similarity_embedding(track_id, "profile-a").unwrap(),
+        Some(vec![0.1, 0.2, 0.3])
+    );
+    assert_eq!(
+        lib.similarity_embedding(track_id, "profile-b").unwrap(),
+        Some(vec![0.3, 0.2, 0.1])
+    );
+    let stats = lib.similarity_storage_stats("profile-a").unwrap();
+    assert_eq!(stats.total_tracks, 1);
+    assert_eq!(stats.embedded_tracks, 1);
+    assert_eq!(stats.stored_vectors, 2);
+    assert_eq!(stats.stored_bytes, 24);
+}
+
+#[test]
+fn changed_content_id_invalidates_only_the_stale_embedding() {
+    let lib = test_library();
+    let track_id = add_track(&lib, "Song", "Artist", "Album");
+    lib.ensure_similarity_profile("profile", "model", "1", "sha", "prep", 2)
+        .unwrap();
+    let track = lib.pending_similarity_tracks("profile").unwrap().remove(0);
+    lib.store_similarity_embedding(&track, "profile", &[0.6, 0.8])
+        .unwrap();
+    lib.lock()
+        .execute(
+            "UPDATE tracks SET content_id = ?2 WHERE id = ?1",
+            params![track_id, format!("b3:{}", "f".repeat(64))],
+        )
+        .unwrap();
+
+    assert_eq!(lib.pending_similarity_tracks("profile").unwrap().len(), 1);
+    assert_eq!(lib.similarity_embedding(track_id, "profile").unwrap(), None);
+    assert!(lib.load_similarity_index("profile").unwrap().is_empty());
+}
+
+#[test]
+fn clearing_embeddings_preserves_the_library() {
+    let lib = test_library();
+    let track_id = add_track(&lib, "Song", "Artist", "Album");
+    lib.ensure_similarity_profile("profile", "model", "1", "sha", "prep", 2)
+        .unwrap();
+    let track = lib.pending_similarity_tracks("profile").unwrap().remove(0);
+    lib.store_similarity_embedding(&track, "profile", &[0.6, 0.8])
+        .unwrap();
+
+    lib.clear_similarity_embeddings().unwrap();
+
+    assert_eq!(lib.tracks_by_ids(&[track_id]).unwrap().len(), 1);
+    assert!(
+        lib.similarity_embedding(track_id, "profile")
+            .unwrap()
+            .is_none()
+    );
+}

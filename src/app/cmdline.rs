@@ -8,6 +8,7 @@ use crate::app::Runtime;
 use crate::app::command::{self, Command, Parsed};
 use crate::app::event::AppEvent;
 use crate::app::state::{AppState, GlobalView, SearchState, Tab};
+use crate::library::models::SearchResults;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const SEARCH_LIMIT: i64 = 12;
@@ -97,6 +98,7 @@ fn set_view_cursor_zero(state: &mut AppState) {
 /// spawned task only queries if it is still the latest after the debounce,
 /// and the receiver drops responses that arrive out of date.
 pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
+    state.search.similarity_source = None;
     let seq = runtime.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let query = state.search.query.clone();
     if query.is_empty() {
@@ -145,6 +147,62 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     }
 }
 
+pub(super) fn schedule_similarity_search(
+    state: &mut AppState,
+    runtime: &Runtime,
+    track: &crate::library::models::TrackItem,
+) {
+    let seq = runtime.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let artist = track.artist_line();
+    state.search.query = if artist.is_empty() {
+        track.title.clone()
+    } else {
+        format!("{} — {artist}", track.title)
+    };
+    state.search.similarity_source = Some(track.id);
+    state.search.loading = true;
+    state.search.results = None;
+    state.search.fed_tracks.clear();
+    state.search.fed_artists.clear();
+    state.search.fed_loading = false;
+    state.active_tab = crate::app::state::Tab::Global;
+    if let Some(crate::app::state::GlobalView::Search { cursor }) = state.global.stack.last_mut() {
+        *cursor = 0;
+    } else {
+        state
+            .global
+            .stack
+            .push(crate::app::state::GlobalView::Search { cursor: 0 });
+    }
+
+    let similarity = Arc::clone(&runtime.similarity);
+    let tx = runtime.event_tx.clone();
+    let track_id = track.id;
+    let source_track = track.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = similarity
+            .search_track(track_id, 49)
+            .map(|(matches, query)| {
+                let mut tracks = Vec::with_capacity(1 + matches.len());
+                tracks.push(source_track);
+                tracks.extend(matches.into_iter().map(|found| found.track));
+                (
+                    SearchResults {
+                        artists: Vec::new(),
+                        releases: Vec::new(),
+                        tracks,
+                    },
+                    query,
+                )
+            });
+        let (result, query) = match result {
+            Ok((results, query)) => (Ok(results), Some(query)),
+            Err(err) => (Err(format!("{err:#}")), None),
+        };
+        let _ = tx.send(AppEvent::SimilaritySearchLoaded { seq, result, query });
+    });
+}
+
 /// Refresh only the local-library half of an already open search.
 ///
 /// Library/device sync notifications can arrive while federated search
@@ -152,6 +210,9 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
 /// federation rows and bump the shared sequence, causing valid network
 /// responses to be dropped or flicker away.
 pub(super) fn refresh_local_search(state: &mut AppState, runtime: &Runtime) {
+    if state.search.similarity_source.is_some() {
+        return;
+    }
     let query = state.search.query.clone();
     if query.is_empty() {
         return;

@@ -69,6 +69,13 @@ library management are included. Visualizations are runtime-loadable Rhai
 scripts executed in a resource-limited sandbox, so they can be added or edited
 without rebuilding the player.
 
+Optional similarity search calculates versioned embeddings for local tracks
+in the background and keeps them in SQLite. It works offline; after a separate
+privacy consent it can also ask a bounded set of federation peers for matches.
+The first selectable model is downloaded on demand and is licensed separately
+by MTG under CC BY-NC-SA 4.0 (a proprietary license is also available from
+MTG); Furumi itself remains WTFPL.
+
 ## Install
 
 ### macOS
@@ -144,6 +151,7 @@ Furumi is a Rust application built with:
 - `ratatui` and `crossterm` for the cross-platform TUI;
 - `rodio` for local audio playback;
 - SQLite for the personal library and synchronization state;
+- tract ONNX inference for optional local music embeddings;
 - a dedicated DHT for decentralized discovery;
 - iroh-based P2P streams for client-to-client communication;
 - an offline-tolerant operation log for trusted-device synchronization;

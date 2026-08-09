@@ -41,6 +41,7 @@ pub struct Runtime {
     pub devices: Arc<crate::devices::DeviceSync>,
     pub jam: Arc<crate::jam::JamManager>,
     pub federation: Arc<crate::federation::Federation>,
+    pub similarity: Arc<crate::similarity::Manager>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
     pub library_network_refresh_at: Option<std::time::Instant>,
@@ -262,6 +263,7 @@ pub async fn run(
     state.player.volume = settings.volume;
     state.global.filters = settings.library;
     state.music_dir = settings.music_dir.clone();
+    state.similarity.settings = settings.similarity.clone();
     if let Err(err) = state.visualizer.load_library() {
         state.status_message = Some(format!("visualizations disabled: {err:#}"));
     }
@@ -269,10 +271,17 @@ pub async fn run(
     let devices = crate::devices::DeviceSync::new(Arc::clone(&library))?;
     devices.set_event_tx(event_tx.clone());
     let jam = crate::jam::JamManager::new(event_tx.clone());
+    let similarity = crate::similarity::Manager::new(
+        Arc::clone(&library),
+        event_tx.clone(),
+        settings.similarity.clone(),
+    );
+    state.similarity.status = similarity.status();
     let federation = crate::federation::Federation::new(
         Arc::clone(&library),
         Arc::clone(&devices),
         Arc::clone(&jam),
+        Arc::clone(&similarity),
         settings.music_dir.clone(),
     );
     state.music_dir = federation.media_dir();
@@ -292,6 +301,7 @@ pub async fn run(
         devices,
         jam,
         federation,
+        similarity,
         fed_status_at: None,
         library_network_refresh_at: None,
         library_network_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -319,6 +329,9 @@ pub async fn run(
         status_publisher: crate::status::Publisher::spawn(),
     };
     spawn_content_id_backfill(&runtime);
+    if state.similarity.settings.enabled {
+        runtime.similarity.start();
+    }
 
     {
         let fed = Arc::clone(&runtime.federation);
@@ -1581,6 +1594,15 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 let _ = tx.send(event);
             });
         }
+        Effect::SimilarityApplySettings => {
+            save_app_settings(state);
+            runtime.similarity.apply(state.similarity.settings.clone());
+            state.similarity.status = runtime.similarity.status();
+        }
+        Effect::SimilarityClear => {
+            state.status_message = Some("clearing stored embeddings…".to_string());
+            runtime.similarity.clear();
+        }
         Effect::FedApplySettings => fed_apply_settings(state, runtime),
         Effect::FedSyncNow => {
             state.federation.publishing = true;
@@ -2785,6 +2807,7 @@ fn save_app_settings(state: &AppState) {
         volume: state.player.volume,
         library: state.global.filters,
         music_dir: state.music_dir.clone(),
+        similarity: state.similarity.settings.clone(),
     };
     if let Err(err) = crate::config::settings::save(&settings) {
         tracing::warn!(%err, "saving app settings failed");
@@ -3632,6 +3655,40 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Err(message) => state.status_message = Some(message),
             }
         }
+        AppEvent::SimilaritySearchLoaded { seq, result, query } => {
+            if seq != runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            state.search.loading = false;
+            match result {
+                Ok(results) => state.search.results = Some(results),
+                Err(message) => {
+                    state.status_message = Some(format!("similarity search failed: {message}"));
+                    return;
+                }
+            }
+            if let Some(query) = query
+                && state.federation.settings.enabled
+                && runtime.similarity.network_allowed()
+            {
+                state.search.fed_loading = true;
+                let federation = Arc::clone(&runtime.federation);
+                let tx = runtime.event_tx.clone();
+                tokio::spawn(async move {
+                    let result = federation
+                        .search_similar(query, 50)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = tx.send(AppEvent::FedSearchLoaded { seq, result });
+                });
+            }
+        }
+        AppEvent::SimilarityStatus(status) => state.similarity.status = status,
+        AppEvent::SimilarityProfileActivated(profile_id) => {
+            state.similarity.settings.active_profile = profile_id;
+            state.similarity.status = runtime.similarity.status();
+            save_app_settings(state);
+        }
         AppEvent::ArtLoaded { key, art } => {
             let entry = match art {
                 Some(image) => state::ArtState::Ready(image),
@@ -3857,6 +3914,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::LibraryChanged { message } => {
             on_library_changed(state, runtime);
+            if state.similarity.settings.enabled {
+                runtime.similarity.start();
+            }
             if let Some(message) = message {
                 state.status_message = Some(message);
             }

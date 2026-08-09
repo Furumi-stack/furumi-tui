@@ -282,6 +282,31 @@ intended role: transforming current audio features into drawing commands. It
 is not a plugin mechanism for accessing the library, network, or player
 controls.
 
+## Music-similarity indexing
+
+Similarity search is an optional local capability and is disabled by default.
+When enabled, a background pipeline downloads a selected ONNX model, verifies
+its pinned SHA-256 digest, decodes durable local tracks, and stores normalized
+embeddings in the library SQLite database. Embeddings are keyed by an exact
+fingerprint of the model artifact and preprocessing profile. Old profile rows
+remain available while a new profile is calculated, and the in-memory exact
+cosine index switches only after the replacement profile is usable.
+
+The SQLite rows are the canonical derived store. The in-memory index can be
+discarded and rebuilt, and neither is required for import, browsing, or
+playback. Remote/cache-only tracks are never scheduled for local embedding.
+
+Federated similarity uses a separate versioned direct-stream protocol. With
+explicit privacy consent, the requester sends only a normalized embedding and
+its profile fingerprint to a bounded set of known peers. It does not publish
+queries to the DHT. Each peer searches its own active local index and returns a
+bounded metadata result with a compact embedding SimHash. The requester uses
+that signature to suppress near-duplicate recordings across peers without
+receiving every result vector. Fan-out, concurrency, message sizes, and
+timeouts are bounded; incompatible profiles are rejected. This direct
+peer-selection layer can later be replaced by DHT routing without changing
+local storage or ranking.
+
 ## Persistence boundaries
 
 Furumi stores different kinds of state according to their lifetime:
@@ -290,6 +315,7 @@ Furumi stores different kinds of state according to their lifetime:
 | --- | --- | --- |
 | Library, playlists, likes, history | SQLite | Durable local source of truth |
 | Device operation log and replicas | SQLite | Offline synchronization |
+| Versioned track embeddings | SQLite | Durable, locally rebuildable similarity data |
 | Federation catalog cache | SQLite/cache | Faster network browsing |
 | Audio and artwork cache | Filesystem cache | Reusable fetched data |
 | Settings, keymap, identity | Platform config/data dirs | Node configuration |
@@ -321,6 +347,8 @@ The source tree follows the architectural responsibilities:
 
 - `library/` owns the local catalog and import pipeline;
 - `player/` owns audio playback and analysis;
+- `similarity.rs` owns model acquisition, preprocessing, background indexing,
+  and the replaceable exact in-memory index;
 - `federation/` owns DHT-facing search, peer catalogs, and audio exchange;
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;

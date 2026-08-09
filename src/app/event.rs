@@ -32,6 +32,16 @@ pub enum AppEvent {
         seq: u64,
         result: Result<SearchResults, String>,
     },
+    /// Local similar-track search completed. It uses the same sequence as
+    /// text search so stale pages cannot overwrite a newer request.
+    SimilaritySearchLoaded {
+        seq: u64,
+        result: Result<SearchResults, String>,
+        query: Option<crate::similarity::QueryVector>,
+    },
+    SimilarityStatus(crate::similarity::SimilarityStatus),
+    /// `None` is emitted after clearing every stored embedding.
+    SimilarityProfileActivated(Option<String>),
     /// Artwork loaded and decoded for the shared art cache.
     ArtLoaded {
         key: String,

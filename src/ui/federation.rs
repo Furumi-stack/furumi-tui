@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::theme;
-use crate::app::state::{AppState, DevicePresenceSection, FedRow, settings_rows};
+use crate::app::state::{AppState, DevicePresenceSection, FedRow, SimilarityRow, settings_rows};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::bordered()
@@ -28,12 +28,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
         .areas(inner);
 
         draw_settings_rows(frame, rows_area, state);
-        draw_status(frame, status_area, state);
+        draw_status_column(frame, status_area, state);
         return;
     }
 
     let rows_height =
-        (settings_rows(state).len() + 8 + device_presence_sections(state).len()) as u16;
+        (settings_rows(state).len() + 10 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     .areas(inner);
 
     draw_settings_rows(frame, rows_area, state);
-    draw_status(frame, status_area, state);
+    draw_status_column(frame, status_area, state);
 }
 
 fn device_presence_sections(state: &AppState) -> Vec<DevicePresenceSection> {
@@ -85,6 +85,39 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         },
     );
     cursor += 1;
+
+    y = y.saturating_add(1);
+
+    draw_section(frame, area, state, &mut y, "Similarity Search");
+    let similarity = &state.similarity.settings;
+    for row in SimilarityRow::ALL {
+        let (label, value) = match row {
+            SimilarityRow::Toggle => ("Similarity search", on_off(similarity.enabled).to_string()),
+            SimilarityRow::Model => (
+                "Embedding model",
+                crate::similarity::model_by_id(&similarity.model)
+                    .map(|model| format!("{} · {}", model.id, model.license))
+                    .unwrap_or_else(|| similarity.model.clone()),
+            ),
+            SimilarityRow::Profile => (
+                "Preprocessing profile",
+                format!("{} (enter for details)", similarity.profile),
+            ),
+            SimilarityRow::Workers => ("Background workers", similarity.workers.to_string()),
+            SimilarityRow::Clear => ("Clear all stored embeddings", "↵".to_string()),
+        };
+        draw_row(
+            frame,
+            area,
+            state,
+            &mut y,
+            cursor,
+            state.settings_cursor,
+            label,
+            value,
+        );
+        cursor += 1;
+    }
 
     y = y.saturating_add(1);
 
@@ -366,6 +399,7 @@ fn protocol_label(id: &str) -> &str {
         "music_dht" => "Music DHT",
         "catalog" => "Catalog",
         "audio" => "Audio transfer",
+        "similarity" => "Similarity search",
         "device_sync" => "Device sync",
         "jam" => "Jam",
         other => other,
@@ -503,6 +537,68 @@ fn rtt_label(ms: Option<u64>) -> String {
 
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect::<String>() + "…"
+}
+
+fn draw_status_column(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height < 12 {
+        draw_status(frame, area, state);
+        return;
+    }
+    let [similarity_area, _, federation_area] = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    draw_similarity_status(frame, similarity_area, state);
+    draw_status(frame, federation_area, state);
+}
+
+fn draw_similarity_status(frame: &mut Frame, area: Rect, state: &AppState) {
+    let status = &state.similarity.status;
+    let progress = if status.total_tracks == 0 {
+        "0 / 0".to_string()
+    } else {
+        format!("{} / {}", status.completed_tracks, status.total_tracks)
+    };
+    let active = status
+        .active_profile
+        .as_deref()
+        .map(short_id)
+        .unwrap_or_else(|| "not ready".to_string());
+    let target = status
+        .target_profile
+        .as_deref()
+        .map(short_id)
+        .unwrap_or_else(|| "—".to_string());
+    draw_summary_card(
+        frame,
+        area,
+        state,
+        " Similarity Processing ",
+        vec![
+            status_line("State", status.phase.label().to_string()),
+            status_line("Progress", progress),
+            status_line("Active", active),
+            status_line("Processing", target),
+            status_line(
+                "Stored",
+                format!(
+                    "{} vectors / {}",
+                    status.stored_vectors,
+                    short_bytes_label(status.stored_bytes)
+                ),
+            ),
+            status_line(
+                "Current / errors",
+                status
+                    .current_track
+                    .clone()
+                    .or_else(|| status.last_error.clone())
+                    .unwrap_or_else(|| format!("{} errors", status.failed_tracks)),
+            ),
+        ],
+    );
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {

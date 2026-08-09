@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional offline music-similarity search for local tracks, backed by
+  versioned SQLite embeddings and a replaceable exact in-memory cosine index.
+- Automatic SHA-256-verified download and local inference for the first ONNX
+  embedding model, with retained model/profile generations and background
+  backfilling of existing library tracks.
+- Similarity settings for enablement, model/profile information, numeric worker
+  count, derived-data cleanup, processing progress, and federation privacy
+  consent.
+- Track-seeded similarity search from the track-information popup, including
+  bounded federated queries to compatible known peers.
+- The `furumi-fd/similarity/1` protocol in the visible protocol-version status.
+
+### Changed
+
+- Similarity wire types, bounds, validation, and stream framing now come from
+  the shared `music-dht 0.3.1` API so native, web, and future clients can
+  interoperate without sharing an embedding implementation.
+- A similarity result page keeps the source track first as query context while
+  excluding it from the actual nearest-neighbor ranking, labels the mode as
+  `Search similar to`, and suppresses near-identical embeddings across releases
+  and federated peer responses.
+- Preprocessing profiles now open a read-only details window describing their
+  audio selection, resampling, spectrogram, patching, and aggregation contract.
+
 ## [0.2.5] - 2026-08-02
 
 ### Added

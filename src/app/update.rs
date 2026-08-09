@@ -63,6 +63,9 @@ pub enum Effect {
     },
     /// Persist the federation settings and start/stop the node.
     FedApplySettings,
+    /// Persist/apply embedding model, profile, worker or enable changes.
+    SimilarityApplySettings,
+    SimilarityClear,
     /// Force an immediate library publish into the DHT.
     FedSyncNow,
     /// Fetch this peer's ticket and show it in a popup.
@@ -2720,7 +2723,7 @@ fn fed_card_featured_artist_names(track: &crate::federation::FedCardTrack) -> Ve
 /// Enter on Settings: toggle switches, open text inputs, run
 /// one-shot operations. The heavy lifting happens in perform_effect().
 fn federation_select(state: &mut AppState) -> Option<Effect> {
-    use super::state::{FedInputField, FedRow, Popup, SettingsRow};
+    use super::state::{FedInputField, FedRow, Popup, SettingsRow, SimilarityRow};
     match settings_rows(state).get(state.settings_cursor).copied()? {
         SettingsRow::MusicDirectory => {
             if state.music_dir_changing {
@@ -2735,6 +2738,52 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             });
             None
         }
+        SettingsRow::Similarity(SimilarityRow::Toggle) => {
+            if !state.similarity.settings.enabled
+                && state.federation.settings.enabled
+                && !state.similarity.settings.federation_consent
+            {
+                state.popup = Some(Popup::SimilarityPrivacyConsent {
+                    enable_federation: false,
+                });
+                return None;
+            }
+            state.similarity.settings.enabled = !state.similarity.settings.enabled;
+            Some(Effect::SimilarityApplySettings)
+        }
+        SettingsRow::Similarity(SimilarityRow::Model) => {
+            let models = crate::similarity::MODELS;
+            let current = models
+                .iter()
+                .position(|model| model.id == state.similarity.settings.model)
+                .unwrap_or(0);
+            state.similarity.settings.model = models[(current + 1) % models.len()].id.to_string();
+            Some(Effect::SimilarityApplySettings)
+        }
+        SettingsRow::Similarity(SimilarityRow::Profile) => {
+            let profile = state.similarity.settings.profile.clone();
+            let text =
+                crate::similarity::profile_details(&profile, &state.similarity.settings.model)
+                    .unwrap_or_else(|| format!("Unknown preprocessing profile: {profile}"));
+            state.popup = Some(Popup::FedText {
+                title: format!("Preprocessing profile: {profile}"),
+                text,
+            });
+            None
+        }
+        SettingsRow::Similarity(SimilarityRow::Workers) => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::SimilarityWorkers,
+                input: crate::app::input::LineEdit::new(
+                    state.similarity.settings.workers.to_string(),
+                ),
+            });
+            None
+        }
+        SettingsRow::Similarity(SimilarityRow::Clear) => {
+            state.popup = Some(Popup::ConfirmClearEmbeddings);
+            None
+        }
         SettingsRow::Federation(FedRow::Toggle) => {
             let settings = &mut state.federation.settings;
             if !settings.enabled && settings.network_id.trim().is_empty() {
@@ -2744,7 +2793,17 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
                 });
                 return None;
             }
-            settings.enabled = !settings.enabled;
+            let enabling = !settings.enabled;
+            settings.enabled = enabling;
+            if enabling
+                && state.similarity.settings.enabled
+                && !state.similarity.settings.federation_consent
+            {
+                state.popup = Some(Popup::SimilarityPrivacyConsent {
+                    enable_federation: true,
+                });
+                return None;
+            }
             Some(Effect::FedApplySettings)
         }
         SettingsRow::Federation(FedRow::NetworkId) => {

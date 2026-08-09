@@ -193,6 +193,26 @@ CREATE INDEX IF NOT EXISTS idx_network_artist_cache_kind
     ON network_artist_cache(source_kind, seen_at_ms);
 CREATE INDEX IF NOT EXISTS idx_network_artist_cache_artist
     ON network_artist_cache(artist_key);
+CREATE TABLE IF NOT EXISTS similarity_profiles (
+    profile_id       TEXT PRIMARY KEY,
+    model_id         TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    model_sha256     TEXT NOT NULL,
+    preprocessing    TEXT NOT NULL,
+    dimensions       INTEGER NOT NULL,
+    created_at_ms    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS track_embeddings (
+    track_id          INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    profile_id        TEXT NOT NULL REFERENCES similarity_profiles(profile_id) ON DELETE CASCADE,
+    dimensions        INTEGER NOT NULL,
+    vector            BLOB NOT NULL,
+    source_content_id TEXT,
+    computed_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (track_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_track_embeddings_profile
+    ON track_embeddings(profile_id, track_id);
 ";
 
 /// The SELECT column list every TrackItem row is built from; artist lists
@@ -269,6 +289,32 @@ pub struct NetworkArtistImageRequest {
     pub source_id: String,
     pub artist_key: String,
     pub name: String,
+}
+
+/// Minimal durable-track row used by the background embedding pipeline.
+#[derive(Debug, Clone)]
+pub struct SimilarityTrack {
+    pub id: i64,
+    pub title: String,
+    pub file_path: String,
+    pub content_id: Option<String>,
+    pub duration_seconds: f64,
+}
+
+/// One validated vector loaded from SQLite for the in-memory exact index.
+#[derive(Debug, Clone)]
+pub struct StoredEmbedding {
+    pub track_id: i64,
+    pub vector: Vec<f32>,
+    pub artist_key: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SimilarityStorageStats {
+    pub total_tracks: usize,
+    pub embedded_tracks: usize,
+    pub stored_vectors: usize,
+    pub stored_bytes: u64,
 }
 
 pub struct Library {
@@ -1431,6 +1477,192 @@ impl Library {
             params![content_id],
         )?;
         Ok(tracks.pop())
+    }
+
+    // -----------------------------------------------------------------
+    // Similarity embeddings. SQLite is the canonical store; callers build
+    // replaceable in-memory indexes from these rows.
+    // -----------------------------------------------------------------
+
+    pub fn ensure_similarity_profile(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        model_version: &str,
+        model_sha256: &str,
+        preprocessing: &str,
+        dimensions: usize,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO similarity_profiles (
+                 profile_id, model_id, model_version, model_sha256,
+                 preprocessing, dimensions, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(profile_id) DO NOTHING",
+            params![
+                profile_id,
+                model_id,
+                model_version,
+                model_sha256,
+                preprocessing,
+                dimensions as i64,
+                now_ms_i64(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_similarity_tracks(&self, profile_id: &str) -> Result<Vec<SimilarityTrack>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT t.id, t.title, t.file_path, t.content_id, t.duration_seconds
+             FROM tracks t
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM track_embeddings e
+                 WHERE e.track_id = t.id
+                   AND e.profile_id = ?1
+                   AND e.source_content_id IS t.content_id
+             )
+             ORDER BY t.id",
+        )?;
+        Ok(statement
+            .query_map([profile_id], |row| {
+                Ok(SimilarityTrack {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    file_path: row.get(2)?,
+                    content_id: row.get(3)?,
+                    duration_seconds: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn store_similarity_embedding(
+        &self,
+        track: &SimilarityTrack,
+        profile_id: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        anyhow::ensure!(!vector.is_empty(), "embedding vector is empty");
+        anyhow::ensure!(
+            vector.iter().all(|value| value.is_finite()),
+            "embedding contains a non-finite value"
+        );
+        let bytes = embedding_to_bytes(vector);
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO track_embeddings (
+                 track_id, profile_id, dimensions, vector,
+                 source_content_id, computed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(track_id, profile_id) DO UPDATE SET
+                 dimensions = excluded.dimensions,
+                 vector = excluded.vector,
+                 source_content_id = excluded.source_content_id,
+                 computed_at_ms = excluded.computed_at_ms",
+            params![
+                track.id,
+                profile_id,
+                vector.len() as i64,
+                bytes,
+                track.content_id.as_deref(),
+                now_ms_i64(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn similarity_embedding(
+        &self,
+        track_id: i64,
+        profile_id: &str,
+    ) -> Result<Option<Vec<f32>>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT e.dimensions, e.vector
+                 FROM track_embeddings e
+                 JOIN tracks t ON t.id = e.track_id
+                 WHERE e.track_id = ?1
+                   AND e.profile_id = ?2
+                   AND e.source_content_id IS t.content_id",
+                params![track_id, profile_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        row.map(|(dimensions, bytes)| embedding_from_bytes(dimensions, &bytes))
+            .transpose()
+    }
+
+    pub fn load_similarity_index(&self, profile_id: &str) -> Result<Vec<StoredEmbedding>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT e.track_id, e.dimensions, e.vector,
+                    COALESCE((
+                        SELECT norm(a.name)
+                        FROM track_artists ta
+                        JOIN artists a ON a.id = ta.artist_id
+                        WHERE ta.track_id = e.track_id AND ta.role = 'main'
+                        ORDER BY ta.position LIMIT 1
+                    ), '')
+             FROM track_embeddings e
+             JOIN tracks t ON t.id = e.track_id
+             WHERE e.profile_id = ?1
+               AND e.source_content_id IS t.content_id
+             ORDER BY e.track_id",
+        )?;
+        let rows = statement.query_map([profile_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut embeddings = Vec::new();
+        for row in rows {
+            let (track_id, dimensions, bytes, artist_key) = row?;
+            embeddings.push(StoredEmbedding {
+                track_id,
+                vector: embedding_from_bytes(dimensions, &bytes)?,
+                artist_key,
+            });
+        }
+        Ok(embeddings)
+    }
+
+    pub fn similarity_storage_stats(&self, profile_id: &str) -> Result<SimilarityStorageStats> {
+        let conn = self.lock();
+        let total_tracks = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let embedded_tracks = conn.query_row(
+            "SELECT COUNT(*)
+             FROM track_embeddings e JOIN tracks t ON t.id = e.track_id
+             WHERE e.profile_id = ?1 AND e.source_content_id IS t.content_id",
+            [profile_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let (stored_vectors, stored_bytes) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(vector)), 0) FROM track_embeddings",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok(SimilarityStorageStats {
+            total_tracks: total_tracks.max(0) as usize,
+            embedded_tracks: embedded_tracks.max(0) as usize,
+            stored_vectors: stored_vectors.max(0) as usize,
+            stored_bytes: stored_bytes.max(0) as u64,
+        })
+    }
+
+    pub fn clear_similarity_embeddings(&self) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM track_embeddings", [])?;
+        conn.execute("DELETE FROM similarity_profiles", [])?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -3129,6 +3361,32 @@ fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn embedding_to_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn embedding_from_bytes(dimensions: i64, bytes: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(dimensions > 0, "stored embedding has invalid dimensions");
+    let dimensions = dimensions as usize;
+    anyhow::ensure!(
+        bytes.len() == dimensions * std::mem::size_of::<f32>(),
+        "stored embedding byte length does not match its dimensions"
+    );
+    let vector: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    anyhow::ensure!(
+        vector.iter().all(|value| value.is_finite()),
+        "stored embedding contains a non-finite value"
+    );
+    Ok(vector)
 }
 
 fn remote_artist_id(artist_key: &str) -> i64 {

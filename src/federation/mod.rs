@@ -15,6 +15,7 @@
 mod audio;
 mod capabilities;
 pub mod catalog;
+mod similarity;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ use crate::library::models::{ArtistRef, TrackItem};
 pub use audio::{AUDIO_ALPN, DownloadProgress, StreamingStart, TrackMetadata};
 pub use capabilities::ProtocolVersions;
 pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRelease};
+pub use similarity::SIMILARITY_ALPN;
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -420,6 +422,7 @@ pub struct Federation {
     library: Arc<Library>,
     devices: Arc<crate::devices::DeviceSync>,
     jam: Arc<crate::jam::JamManager>,
+    similarity: Arc<crate::similarity::Manager>,
     data_dir: PathBuf,
     cache_dir: PathBuf,
     media_dir: std::sync::Mutex<PathBuf>,
@@ -526,6 +529,7 @@ impl Federation {
         library: Arc<Library>,
         devices: Arc<crate::devices::DeviceSync>,
         jam: Arc<crate::jam::JamManager>,
+        similarity: Arc<crate::similarity::Manager>,
         media_dir: PathBuf,
     ) -> Arc<Self> {
         let dirs = crate::config::project_dirs();
@@ -549,6 +553,7 @@ impl Federation {
             library,
             devices,
             jam,
+            similarity,
             data_dir,
             cache_dir,
             media_dir: std::sync::Mutex::new(media_dir),
@@ -692,6 +697,8 @@ impl Federation {
             .stream_protocol(AUDIO_ALPN)
             // ...and browse each other's per-artist catalogs over this one.
             .stream_protocol(CATALOG_ALPN)
+            // Anonymous, bounded direct embedding queries.
+            .stream_protocol(SIMILARITY_ALPN)
             // Personal-device sync (likes, playlists, trusted devices).
             .stream_protocol(crate::devices::SYNC_ALPN)
             // Capability-scoped shared playback control.
@@ -746,6 +753,15 @@ impl Federation {
             service.endpoint_id(),
             Arc::clone(&self.transport_stats),
         ));
+        let similarity_acceptor = service
+            .stream_acceptor(SIMILARITY_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take the similarity acceptor: {err}"))?;
+        let similarity_task = tokio::spawn(similarity::serve_peers(
+            similarity_acceptor,
+            Arc::clone(&self.similarity),
+            service.endpoint_id(),
+            Arc::clone(&self.transport_stats),
+        ));
         let sync_acceptor = service
             .stream_acceptor(crate::devices::SYNC_ALPN)
             .map_err(|err| anyhow::anyhow!("failed to take the device-sync acceptor: {err}"))?;
@@ -788,6 +804,7 @@ impl Federation {
                 sync_task,
                 audio_task,
                 catalog_task,
+                similarity_task,
                 device_sync_task,
                 device_tick_task,
                 jam_serve_task,
@@ -1145,6 +1162,21 @@ impl Federation {
         rank_fed_search_results(&mut artists, &mut tracks, &normalized);
 
         Ok(FedSearchResults { artists, tracks })
+    }
+
+    /// Bounded fan-out to known peers using the exact model/profile
+    /// fingerprint carried with the query. No DHT records are written.
+    pub async fn search_similar(
+        &self,
+        query: crate::similarity::QueryVector,
+        limit: usize,
+    ) -> Result<FedSearchResults> {
+        anyhow::ensure!(
+            self.similarity.network_allowed(),
+            "similarity federation has no consent"
+        );
+        let service = self.service().await?;
+        similarity::search(service, query, limit, Arc::clone(&self.transport_stats)).await
     }
 
     /// Resolves a share-link content id to one playable federated track.

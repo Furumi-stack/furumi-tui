@@ -687,6 +687,10 @@ pub enum Popup {
     },
     /// Delete confirmation; Enter/y deletes, Esc/n cancels.
     ConfirmDelete { target: DeleteTarget, label: String },
+    /// Enabling network similarity reveals an embedding query to peers.
+    SimilarityPrivacyConsent { enable_federation: bool },
+    /// Derived data is safe to recreate but potentially expensive.
+    ConfirmClearEmbeddings,
     /// Library-home filters. Cursor is kept for the next filters added here.
     LibraryFilters { cursor: usize },
     /// Track metadata viewer; left/right switch between selected tracks.
@@ -812,6 +816,7 @@ impl StatusDetailFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FedInputField {
     MusicDirectory,
+    SimilarityWorkers,
     NetworkId,
     ConnectTicket,
     DeviceName,
@@ -823,6 +828,7 @@ impl FedInputField {
     pub fn title(self) -> &'static str {
         match self {
             FedInputField::MusicDirectory => "Music save directory",
+            FedInputField::SimilarityWorkers => "Similarity background workers",
             FedInputField::NetworkId => "Network ID",
             FedInputField::ConnectTicket => "Connect to peer (paste ticket)",
             FedInputField::DeviceName => "Device name",
@@ -835,6 +841,9 @@ impl FedInputField {
         match self {
             FedInputField::MusicDirectory => {
                 "Federated tracks saved to your library use this directory. The directory is checked for write access before anything changes."
+            }
+            FedInputField::SimilarityWorkers => {
+                "Enter the maximum number of tracks processed in parallel, from 1 to 16. The change takes effect immediately."
             }
             FedInputField::NetworkId => {
                 "A unique network id. It must match exactly on every client that should see and connect to the same peers."
@@ -866,6 +875,25 @@ pub enum FedRow {
     Connect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityRow {
+    Toggle,
+    Model,
+    Profile,
+    Workers,
+    Clear,
+}
+
+impl SimilarityRow {
+    pub const ALL: [SimilarityRow; 5] = [
+        SimilarityRow::Toggle,
+        SimilarityRow::Model,
+        SimilarityRow::Profile,
+        SimilarityRow::Workers,
+        SimilarityRow::Clear,
+    ];
+}
+
 impl FedRow {
     pub const ALL: [FedRow; 6] = [
         FedRow::Toggle,
@@ -883,6 +911,7 @@ impl FedRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     MusicDirectory,
+    Similarity(SimilarityRow),
     Federation(FedRow),
     StatusDetails,
     DeviceName,
@@ -1021,6 +1050,7 @@ pub fn device_status_order(state: &AppState) -> Vec<usize> {
 
 pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = vec![SettingsRow::MusicDirectory];
+    rows.extend(SimilarityRow::ALL.into_iter().map(SettingsRow::Similarity));
     rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
     rows.push(SettingsRow::DeviceName);
     rows.push(SettingsRow::DeviceInvite);
@@ -1057,6 +1087,12 @@ pub struct FederationTab {
     pub devices: Option<crate::devices::DeviceSyncStatus>,
     pub publishing: bool,
     pub device_syncing: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct SimilarityTab {
+    pub settings: crate::config::settings::SimilaritySettings,
+    pub status: crate::similarity::SimilarityStatus,
 }
 
 /// Playlists eligible as add-targets (the virtual Likes playlist is managed
@@ -1187,6 +1223,9 @@ pub struct SearchState {
     /// from the artist names of matching tracks.
     pub fed_artists: Vec<crate::federation::FedArtistHit>,
     pub fed_loading: bool,
+    /// Present only for a track-seeded search; text-search refreshes must not
+    /// replace this page with a title query.
+    pub similarity_source: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1423,6 +1462,7 @@ pub struct AppState {
     pub logs: LogsTab,
     pub queue_tab: QueueTab,
     pub federation: FederationTab,
+    pub similarity: SimilarityTab,
     /// The one federated artist card being viewed (name + loading state);
     /// opening another card replaces it.
     pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,

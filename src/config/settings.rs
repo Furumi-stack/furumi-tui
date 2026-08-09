@@ -46,6 +46,40 @@ pub struct LibraryFilters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimilaritySettings {
+    /// Local embedding/search master switch. Network participation follows
+    /// federation and additionally requires the explicit privacy consent.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_similarity_model")]
+    pub model: String,
+    #[serde(default = "default_similarity_profile")]
+    pub profile: String,
+    #[serde(default = "default_similarity_workers")]
+    pub workers: usize,
+    #[serde(default)]
+    pub federation_consent: bool,
+    /// Exact fingerprint of the last fully usable profile. Keeping this
+    /// separate from the selected target lets an old index serve searches
+    /// while a newly selected model/profile is being calculated.
+    #[serde(default)]
+    pub active_profile: Option<String>,
+}
+
+impl Default for SimilaritySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_similarity_model(),
+            profile: default_similarity_profile(),
+            workers: default_similarity_workers(),
+            federation_consent: false,
+            active_profile: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_volume")]
     pub volume: u8,
@@ -54,6 +88,8 @@ pub struct AppSettings {
     /// Root used for music materialized from federation peers.
     #[serde(default = "default_music_dir")]
     pub music_dir: PathBuf,
+    #[serde(default)]
+    pub similarity: SimilaritySettings,
 }
 
 impl Default for AppSettings {
@@ -62,6 +98,7 @@ impl Default for AppSettings {
             volume: default_volume(),
             library: LibraryFilters::default(),
             music_dir: default_music_dir(),
+            similarity: SimilaritySettings::default(),
         }
     }
 }
@@ -72,12 +109,33 @@ impl AppSettings {
         if self.music_dir.as_os_str().is_empty() {
             self.music_dir = default_music_dir();
         }
+        if self.similarity.model.trim().is_empty() {
+            self.similarity.model = default_similarity_model();
+        }
+        if self.similarity.profile.trim().is_empty() {
+            self.similarity.profile = default_similarity_profile();
+        }
+        self.similarity.workers = self.similarity.workers.clamp(1, 16);
         self
     }
 }
 
 fn default_volume() -> u8 {
     80
+}
+
+fn default_similarity_model() -> String {
+    "discogs-effnet-bsdynamic-1".to_string()
+}
+
+fn default_similarity_profile() -> String {
+    "furumi-full-track-v1".to_string()
+}
+
+fn default_similarity_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| (count.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
 }
 
 /// The historical permanent-download location, kept as the default for

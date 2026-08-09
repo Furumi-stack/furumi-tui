@@ -115,6 +115,39 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConfirmDelete { target, label } => {
             handle_confirm_delete(state, runtime, target, label, key);
         }
+        Popup::SimilarityPrivacyConsent { enable_federation } => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                state.similarity.settings.federation_consent = true;
+                state.similarity.settings.enabled = true;
+                super::perform_effect(
+                    state,
+                    runtime,
+                    crate::app::update::Effect::SimilarityApplySettings,
+                );
+                if enable_federation {
+                    super::perform_effect(
+                        state,
+                        runtime,
+                        crate::app::update::Effect::FedApplySettings,
+                    );
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                if enable_federation {
+                    state.federation.settings.enabled = false;
+                }
+            }
+            _ => {
+                state.popup = Some(Popup::SimilarityPrivacyConsent { enable_federation });
+            }
+        },
+        Popup::ConfirmClearEmbeddings => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                super::perform_effect(state, runtime, crate::app::update::Effect::SimilarityClear)
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+            _ => state.popup = Some(Popup::ConfirmClearEmbeddings),
+        },
         Popup::LibraryFilters { cursor } => handle_library_filters(state, runtime, cursor, key),
         Popup::TrackInfo {
             tracks,
@@ -544,6 +577,21 @@ fn handle_fed_input(
                         super::validate_music_directory(state, runtime, value.into());
                     }
                 }
+                FedInputField::SimilarityWorkers => match value.parse::<usize>() {
+                    Ok(workers @ 1..=16) => {
+                        state.similarity.settings.workers = workers;
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::SimilarityApplySettings,
+                        );
+                    }
+                    _ => {
+                        state.status_message =
+                            Some("similarity workers must be a number from 1 to 16".into());
+                        state.popup = Some(Popup::FedInput { field, input });
+                    }
+                },
                 FedInputField::ConnectTicket => {
                     if value.is_empty() {
                         state.status_message = Some("ticket is empty".into());
@@ -1018,6 +1066,28 @@ fn handle_track_info(
                 cursor: cursor.min(len.saturating_sub(1)),
                 scroll,
             });
+        }
+        KeyCode::Char('s') => {
+            let Some(track) = tracks.get(cursor.min(len.saturating_sub(1))) else {
+                return;
+            };
+            if !state.similarity.settings.enabled {
+                state.status_message = Some("enable Similarity search in Settings first".into());
+                state.popup = Some(Popup::TrackInfo {
+                    tracks,
+                    cursor,
+                    scroll,
+                });
+            } else if track.id < 0 || track.file_path.is_empty() {
+                state.status_message = Some("similarity search starts from a local track".into());
+                state.popup = Some(Popup::TrackInfo {
+                    tracks,
+                    cursor,
+                    scroll,
+                });
+            } else {
+                super::cmdline::schedule_similarity_search(state, runtime, track);
+            }
         }
         _ => {
             state.popup = Some(Popup::TrackInfo {
