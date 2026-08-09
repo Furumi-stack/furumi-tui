@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preprocessing profiles now open a read-only details window describing their
   audio selection, resampling, spectrogram, patching, and aggregation contract.
 
+### Fixed
+
+- Current-track information (`Shift+I`) now uses the enriched queue entry, so
+  it shows the same complete metadata and similarity action as `I` on that
+  track in the queue.
+
 ## [0.2.5] - 2026-08-02
 
 ### Added

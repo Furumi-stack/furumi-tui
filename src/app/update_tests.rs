@@ -571,9 +571,15 @@ fn current_track_info_uses_now_playing_track() {
         active_tab: Tab::Queue,
         ..AppState::default()
     };
-    state.player.queue = vec![test_track(1), test_track(2)];
+    let mut complete = test_track(2);
+    complete.audio_format = Some("flac".into());
+    complete.audio_bitrate = Some(921);
+    state.player.queue = vec![test_track(1), complete];
+    state.player.queue_pos = 1;
     state.queue_tab.cursor = 0;
-    state.player.current = Some(test_track(2));
+    let mut lightweight = test_track(2);
+    lightweight.file_path.clear();
+    state.player.current = Some(lightweight);
 
     assert_eq!(update(&mut state, Action::OpenCurrentTrackInfo), None);
     match &state.popup {
@@ -582,6 +588,9 @@ fn current_track_info_uses_now_playing_track() {
                 tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
                 vec![2]
             );
+            assert_eq!(tracks[0].file_path, "/s/2");
+            assert_eq!(tracks[0].audio_format.as_deref(), Some("flac"));
+            assert_eq!(tracks[0].audio_bitrate, Some(921));
         }
         other => panic!("expected track info popup, got {other:?}"),
     }

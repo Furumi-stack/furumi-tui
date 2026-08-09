@@ -382,7 +382,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             open_track_info(state, tracks, "no track selected")
         }
         Action::OpenCurrentTrackInfo => {
-            let tracks = state.player.current.clone().into_iter().collect();
+            let tracks = current_track_for_info(state).into_iter().collect();
             open_track_info(state, tracks, "nothing playing")
         }
         Action::RemoveFromQueue => remove_selected_from_queue(state),
@@ -458,6 +458,31 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::DeleteSelected => delete_selected(state),
     }
+}
+
+/// Prefer the queue's current entry because it may have been enriched or
+/// replaced with a durable local track after streaming started. The player
+/// keeps its original lightweight entry while that stream is active.
+fn current_track_for_info(state: &AppState) -> Option<TrackItem> {
+    let current = state.player.current.as_ref()?;
+    let current_key = super::state::track_key(current);
+    let queued_at_position = state.player.queue.get(state.player.queue_pos);
+
+    queued_at_position
+        .filter(|queued| {
+            super::state::track_key(queued) == current_key
+                || queued.id == current.id
+                || current.is_fed_pending()
+        })
+        .or_else(|| {
+            state
+                .player
+                .queue
+                .iter()
+                .find(|queued| super::state::track_key(queued) == current_key)
+        })
+        .cloned()
+        .or_else(|| Some(current.clone()))
 }
 
 fn track_info_needs_fed_metadata(track: &TrackItem) -> bool {
