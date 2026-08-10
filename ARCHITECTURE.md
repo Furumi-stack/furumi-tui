@@ -123,6 +123,22 @@ The DHT is the distributed index. Nodes publish compact searchable
 descriptions of their local library and query the network without contacting a
 central search service.
 
+Similarity discovery uses a separate schema-independent DHT overlay. A node
+derives a deterministic 256-bit routing signature from every local embedding,
+groups them into fixed two-level LSH buckets, and publishes compact summaries
+containing only fine-bucket representatives, its peer identity, and the ticket
+needed to dial a previously unknown owner. The owner signs every summary with
+its existing transport key, so storage peers can relay and cache it but cannot
+impersonate or modify it. Summaries expire with the ordinary library-record TTL
+and are replaceable federation cache, never local library authority.
+
+A similarity search first performs bounded multi-probe LSH lookups to rank
+likely owners, then sends the existing normalized-vector request directly to
+at most 16 peers initially and 48 on fallback. Known peers remain a rollout
+fallback. The model, preprocessing, durable embeddings, exact cosine search,
+and consent policy remain client-owned; `music-dht` owns only compatible
+routing math, signed records, replication, and wire bounds.
+
 Once a peer is known, communication moves to direct P2P streams provided by
 iroh through `music-dht`. Furumi defines separate application protocols for
 catalog requests, audio transfer, and trusted-device synchronization. This

@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS track_embeddings (
     profile_id        TEXT NOT NULL REFERENCES similarity_profiles(profile_id) ON DELETE CASCADE,
     dimensions        INTEGER NOT NULL,
     vector            BLOB NOT NULL,
+    routing_signature BLOB,
     source_content_id TEXT,
     computed_at_ms    INTEGER NOT NULL,
     PRIMARY KEY (track_id, profile_id)
@@ -1551,15 +1552,17 @@ impl Library {
             "embedding contains a non-finite value"
         );
         let bytes = embedding_to_bytes(vector);
+        let routing_signature = music_dht::similarity_lsh::routing_signature(vector)?;
         let conn = self.lock();
         conn.execute(
             "INSERT INTO track_embeddings (
-                 track_id, profile_id, dimensions, vector,
+                 track_id, profile_id, dimensions, vector, routing_signature,
                  source_content_id, computed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(track_id, profile_id) DO UPDATE SET
                  dimensions = excluded.dimensions,
                  vector = excluded.vector,
+                 routing_signature = excluded.routing_signature,
                  source_content_id = excluded.source_content_id,
                  computed_at_ms = excluded.computed_at_ms",
             params![
@@ -1567,6 +1570,7 @@ impl Library {
                 profile_id,
                 vector.len() as i64,
                 bytes,
+                routing_signature.as_slice(),
                 track.content_id.as_deref(),
                 now_ms_i64(),
             ],
@@ -1631,6 +1635,65 @@ impl Library {
             });
         }
         Ok(embeddings)
+    }
+
+    /// Loads the compact DHT-routing signatures for every current local
+    /// embedding. Rows created before similarity routing existed are
+    /// backfilled in place from their durable vectors.
+    pub fn similarity_routing_signatures(&self, profile_id: &str) -> Result<Vec<[u8; 32]>> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        let missing = {
+            let mut statement = transaction.prepare(
+                "SELECT e.track_id, e.dimensions, e.vector
+             FROM track_embeddings e
+             JOIN tracks t ON t.id = e.track_id
+             WHERE e.profile_id = ?1
+               AND e.source_content_id IS t.content_id
+               AND (e.routing_signature IS NULL OR length(e.routing_signature) != 32)
+             ORDER BY e.track_id",
+            )?;
+            statement
+                .query_map([profile_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (track_id, dimensions, vector_bytes) in missing {
+            let vector = embedding_from_bytes(dimensions, &vector_bytes)?;
+            let signature = music_dht::similarity_lsh::routing_signature(&vector)?;
+            transaction.execute(
+                "UPDATE track_embeddings
+                 SET routing_signature = ?3
+                 WHERE track_id = ?1 AND profile_id = ?2",
+                params![track_id, profile_id, signature.as_slice()],
+            )?;
+        }
+        transaction.commit()?;
+
+        let mut statement = conn.prepare(
+            "SELECT e.routing_signature
+             FROM track_embeddings e
+             JOIN tracks t ON t.id = e.track_id
+             WHERE e.profile_id = ?1
+               AND e.source_content_id IS t.content_id
+             ORDER BY e.track_id",
+        )?;
+        let stored = statement
+            .query_map([profile_id], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let signatures = stored
+            .into_iter()
+            .map(|signature| {
+                <[u8; 32]>::try_from(signature)
+                    .map_err(|_| anyhow::anyhow!("invalid similarity routing signature length"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(signatures)
     }
 
     pub fn similarity_storage_stats(&self, profile_id: &str) -> Result<SimilarityStorageStats> {
@@ -3441,6 +3504,16 @@ fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     {
         conn.execute(
             "ALTER TABLE network_artist_cache ADD COLUMN remote_image_hint TEXT",
+            [],
+        )?;
+    }
+    let embedding_columns = table_columns(conn, "track_embeddings")?;
+    if !embedding_columns
+        .iter()
+        .any(|column| column == "routing_signature")
+    {
+        conn.execute(
+            "ALTER TABLE track_embeddings ADD COLUMN routing_signature BLOB",
             [],
         )?;
     }

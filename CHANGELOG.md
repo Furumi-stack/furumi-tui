@@ -20,12 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Track-seeded similarity search from the track-information popup, including
   bounded federated queries to compatible known peers.
 - The `furumi-fd/similarity/1` protocol in the visible protocol-version status.
+- Decentralized `similarity_dht` routing with signed anonymous two-level LSH
+  summaries, multi-probe lookup beyond the locally known peer set, and known-
+  peer fallback during gradual network upgrades.
 
 ### Changed
 
 - Similarity wire types, bounds, validation, and stream framing now come from
-  the shared `music-dht 0.3.1` API so native, web, and future clients can
+  the shared `music-dht 0.4.0` API so native, web, and future clients can
   interoperate without sharing an embedding implementation.
+- Existing SQLite embeddings are backfilled once with compact 256-bit routing
+  signatures; new embeddings store them immediately without changing exact
+  local cosine search.
 - A similarity result page keeps the source track first as query context while
   excluding it from the actual nearest-neighbor ranking, labels the mode as
   `Search similar to`, and suppresses near-identical embeddings across releases

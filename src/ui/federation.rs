@@ -400,6 +400,7 @@ fn protocol_label(id: &str) -> &str {
         "catalog" => "Catalog",
         "audio" => "Audio transfer",
         "similarity" => "Similarity search",
+        "similarity_dht" => "Similarity DHT",
         "device_sync" => "Device sync",
         "jam" => "Jam",
         other => other,

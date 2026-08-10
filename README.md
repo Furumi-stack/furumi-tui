@@ -72,6 +72,9 @@ without rebuilding the player.
 Optional similarity search calculates versioned embeddings for local tracks
 in the background and keeps them in SQLite. It works offline; after a separate
 privacy consent it can also ask a bounded set of federation peers for matches.
+Compatible peers are selected through signed, anonymous LSH summaries in a
+decentralized DHT; no central recommendation index or shared calibration file
+is required.
 The first selectable model is downloaded on demand and is licensed separately
 by MTG under CC BY-NC-SA 4.0 (a proprietary license is also available from
 MTG); Furumi itself remains WTFPL.

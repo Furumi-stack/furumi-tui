@@ -1520,7 +1520,9 @@ dependencies = [
 
 [[package]]
 name = "federation-net"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e690b370c505d153bef214b21a8f2aa55d667367ac1e16bde8bc0de88963c2"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1647,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "furumi_tui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3138,7 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "music-dht"
-version = "0.3.1"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c5b429b90a8f1b0980b3a35a6fa5445d7a275c737eb04db18db4d7f14c81478"
 dependencies = [
  "async-trait",
  "blake3",

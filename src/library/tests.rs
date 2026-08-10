@@ -701,24 +701,47 @@ fn similarity_embeddings_round_trip_and_keep_profiles_separate() {
         .into_iter()
         .find(|track| track.id == track_id)
         .unwrap();
-    lib.store_similarity_embedding(&track, "profile-a", &[0.1, 0.2, 0.3])
+    let first = [0.26726124, 0.5345225, 0.8017837];
+    let second = [0.8017837, 0.5345225, 0.26726124];
+    lib.store_similarity_embedding(&track, "profile-a", &first)
         .unwrap();
-    lib.store_similarity_embedding(&track, "profile-b", &[0.3, 0.2, 0.1])
+    lib.store_similarity_embedding(&track, "profile-b", &second)
         .unwrap();
 
     assert_eq!(
         lib.similarity_embedding(track_id, "profile-a").unwrap(),
-        Some(vec![0.1, 0.2, 0.3])
+        Some(first.to_vec())
     );
     assert_eq!(
         lib.similarity_embedding(track_id, "profile-b").unwrap(),
-        Some(vec![0.3, 0.2, 0.1])
+        Some(second.to_vec())
     );
     let stats = lib.similarity_storage_stats("profile-a").unwrap();
     assert_eq!(stats.total_tracks, 1);
     assert_eq!(stats.embedded_tracks, 1);
     assert_eq!(stats.stored_vectors, 2);
     assert_eq!(stats.stored_bytes, 24);
+    lib.lock()
+        .execute(
+            "UPDATE track_embeddings SET routing_signature = NULL WHERE profile_id = 'profile-a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        lib.similarity_routing_signatures("profile-a")
+            .unwrap()
+            .len(),
+        1
+    );
+    let stored_signature_bytes: i64 = lib
+        .lock()
+        .query_row(
+            "SELECT length(routing_signature) FROM track_embeddings WHERE profile_id = 'profile-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_signature_bytes, 32);
 }
 
 #[test]

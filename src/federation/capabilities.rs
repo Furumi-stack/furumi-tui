@@ -171,6 +171,7 @@ mod tests {
             "catalog",
             "audio",
             "similarity",
+            "similarity_dht",
             "device_sync",
             "jam",
         ] {

@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use music_dht::similarity_dht::SimilarityDht;
+use music_dht::similarity_lsh::SIMILARITY_DHT_ALPN;
 use music_dht::{
     ByteStream, ByteStreamConnectionStats, EndpointId, ItemKind, ItemSpec, LibraryItem,
     MusicDhtConfig, MusicDhtService, NetworkId, PeerTicket, PublishStats, RendezvousConfig,
@@ -413,6 +415,7 @@ pub struct NetworkLibrarySource {
 
 struct Running {
     service: Arc<MusicDhtService>,
+    similarity_dht: Arc<SimilarityDht>,
     network_name: String,
     network_id: NetworkId,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -697,12 +700,15 @@ impl Federation {
             .stream_protocol(AUDIO_ALPN)
             // ...and browse each other's per-artist catalogs over this one.
             .stream_protocol(CATALOG_ALPN)
-            // Anonymous, bounded direct embedding queries.
-            .stream_protocol(SIMILARITY_ALPN)
+            // Anonymous, bounded direct embedding queries have their own
+            // versioned contract and survive catalog-schema upgrades.
+            .schema_independent_stream_protocol(SIMILARITY_ALPN)
             // Personal-device sync (likes, playlists, trusted devices).
             .stream_protocol(crate::devices::SYNC_ALPN)
             // Capability-scoped shared playback control.
             .stream_protocol(crate::jam::JAM_ALPN)
+            // Signed LSH summaries form their own upgrade-safe DHT overlay.
+            .schema_independent_stream_protocol(SIMILARITY_DHT_ALPN)
             // Informational application/protocol versions.
             .schema_independent_stream_protocol(capabilities::CAPABILITIES_ALPN)
             .build()
@@ -716,6 +722,25 @@ impl Federation {
             network = %network_name,
             "federation started"
         );
+
+        let similarity_dht = SimilarityDht::open(
+            Arc::clone(&service),
+            self.data_dir.join("similarity-routing.sqlite3"),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to start the similarity DHT: {err}"))?;
+        let similarity_dht_acceptor = service
+            .stream_acceptor(SIMILARITY_DHT_ALPN)
+            .map_err(|err| anyhow::anyhow!("failed to take similarity DHT acceptor: {err}"))?;
+        let similarity_dht_serve_task =
+            tokio::spawn(Arc::clone(&similarity_dht).serve(similarity_dht_acceptor));
+        let similarity_dht_maintenance_task =
+            tokio::spawn(Arc::clone(&similarity_dht).maintenance());
+        let similarity_dht_sync_task = tokio::spawn(similarity_route_sync_loop(
+            Arc::clone(&similarity_dht),
+            Arc::clone(&self.similarity),
+            Arc::clone(&self.library),
+        ));
 
         // Drain DHT events into the log; the channel is bounded.
         let event_task = tokio::spawn(async move {
@@ -797,6 +822,7 @@ impl Federation {
 
         *guard = Some(Running {
             service,
+            similarity_dht,
             network_name,
             network_id,
             tasks: vec![
@@ -811,6 +837,9 @@ impl Federation {
                 jam_poll_task,
                 capabilities_serve_task,
                 capabilities_probe_task,
+                similarity_dht_serve_task,
+                similarity_dht_maintenance_task,
+                similarity_dht_sync_task,
             ],
         });
         self.set_error(None);
@@ -832,6 +861,20 @@ impl Federation {
             .await
             .as_ref()
             .map(|running| Arc::clone(&running.service))
+            .context("federation is not running")
+    }
+
+    async fn similarity_services(&self) -> Result<(Arc<MusicDhtService>, Arc<SimilarityDht>)> {
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .map(|running| {
+                (
+                    Arc::clone(&running.service),
+                    Arc::clone(&running.similarity_dht),
+                )
+            })
             .context("federation is not running")
     }
 
@@ -1175,8 +1218,15 @@ impl Federation {
             self.similarity.network_allowed(),
             "similarity federation has no consent"
         );
-        let service = self.service().await?;
-        similarity::search(service, query, limit, Arc::clone(&self.transport_stats)).await
+        let (service, similarity_dht) = self.similarity_services().await?;
+        similarity::search(
+            service,
+            similarity_dht,
+            query,
+            limit,
+            Arc::clone(&self.transport_stats),
+        )
+        .await
     }
 
     /// Resolves a share-link content id to one playable federated track.
@@ -2563,6 +2613,77 @@ fn sort_fed_appearances(appearances: &mut [FedAppearsOn]) {
             })
             .then_with(|| a.track.title.cmp(&b.track.title))
     });
+}
+
+async fn similarity_route_sync_loop(
+    routing: Arc<SimilarityDht>,
+    similarity: Arc<crate::similarity::Manager>,
+    library: Arc<Library>,
+) {
+    let mut interval = tokio::time::interval(SYNC_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut published_marker: Option<(String, blake3::Hash)> = None;
+    loop {
+        interval.tick().await;
+        if !similarity.network_allowed() {
+            if published_marker.take().is_some() {
+                routing.clear_local_signatures();
+                tracing::info!("local similarity DHT publication disabled");
+            }
+            continue;
+        }
+        let status = similarity.status();
+        let Some(profile_id) = status.active_profile else {
+            continue;
+        };
+        if status.phase != crate::similarity::Phase::Ready {
+            continue;
+        }
+        let library = Arc::clone(&library);
+        let profile_for_task = profile_id.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let signatures = library.similarity_routing_signatures(&profile_for_task)?;
+            let mut hasher = blake3::Hasher::new();
+            for signature in &signatures {
+                hasher.update(signature);
+            }
+            Ok::<_, anyhow::Error>((signatures, hasher.finalize()))
+        })
+        .await;
+        let (signatures, fingerprint) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %profile_id, "similarity routing signatures unavailable");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "similarity routing signature task failed");
+                continue;
+            }
+        };
+        let marker = (profile_id.clone(), fingerprint);
+        if published_marker.as_ref() == Some(&marker) {
+            continue;
+        }
+        match routing
+            .sync_local_signatures(profile_id.clone(), signatures)
+            .await
+        {
+            Ok(stats) => {
+                tracing::info!(
+                    profile = %profile_id,
+                    records = stats.records,
+                    keys = stats.keys,
+                    remote_nodes = stats.remote_nodes,
+                    "local similarity DHT index synchronized"
+                );
+                published_marker = Some(marker);
+            }
+            Err(error) => {
+                tracing::warn!(%error, %profile_id, "similarity DHT synchronization failed");
+            }
+        }
+    }
 }
 
 async fn stop_running(running: Option<Running>) {
