@@ -338,6 +338,27 @@ pub struct FedSearchResults {
     pub tracks: Vec<FedTrack>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ScoredFedTrack {
+    pub track: FedTrack,
+    pub score: f32,
+    pub embedding_signature: Option<[u8; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES]>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimilaritySearchStats {
+    pub tracks: usize,
+    pub artists: usize,
+    pub peers_queried: usize,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FedSimilaritySearchResults {
+    pub tracks: Vec<ScoredFedTrack>,
+    pub stats: SimilaritySearchStats,
+}
+
 /// A track found through federated search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FedTrack {
@@ -1213,17 +1234,19 @@ impl Federation {
         &self,
         query: crate::similarity::QueryVector,
         limit: usize,
-    ) -> Result<FedSearchResults> {
+    ) -> Result<FedSimilaritySearchResults> {
         anyhow::ensure!(
             self.similarity.network_allowed(),
             "similarity federation has no consent"
         );
         let (service, similarity_dht) = self.similarity_services().await?;
+        let settings = self.similarity.settings();
         similarity::search(
             service,
             similarity_dht,
             query,
             limit,
+            settings.minimum_score,
             Arc::clone(&self.transport_stats),
         )
         .await

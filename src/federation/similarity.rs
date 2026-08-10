@@ -4,9 +4,9 @@
 //! module owns application policy: consent, peer fan-out, local index access,
 //! result conversion, deduplication, and ranking limits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use futures_util::stream::{self, StreamExt as _};
@@ -16,7 +16,9 @@ use music_dht::{
     ByteStream, EndpointId, ItemId, ItemKind, MusicDhtService, PeerTicket, StreamAcceptor,
 };
 
-use crate::federation::{FedSearchResults, FedTrack, TransportStats};
+use crate::federation::{
+    FedSimilaritySearchResults, FedTrack, ScoredFedTrack, SimilaritySearchStats, TransportStats,
+};
 use crate::similarity::{Manager, QueryVector};
 
 pub use music_dht::similarity::SIMILARITY_ALPN;
@@ -26,7 +28,6 @@ const MAX_QUERY_PEERS: usize = 48;
 const QUERY_CONCURRENCY: usize = 8;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTING_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_PER_ARTIST: usize = 3;
 const MAX_NEAR_DUPLICATE_SIGNATURE_DISTANCE: u32 = 8;
 
 pub async fn serve_peers(
@@ -62,7 +63,7 @@ async fn serve_one(
         let vector = request.vector;
         let limit = request.limit;
         let matches = tokio::task::spawn_blocking(move || {
-            similarity.search_vector(&profile, &vector, None, None, limit)
+            similarity.search_vector_for_peer(&profile, &vector, limit)
         })
         .await
         .context("local similarity task failed")
@@ -130,8 +131,10 @@ pub async fn search(
     routing: Arc<SimilarityDht>,
     query: QueryVector,
     limit: usize,
+    minimum_score: f32,
     transport: Arc<TransportStats>,
-) -> Result<FedSearchResults> {
+) -> Result<FedSimilaritySearchResults> {
+    let started = Instant::now();
     let own = service.endpoint_id();
     let routed = match tokio::time::timeout(
         ROUTING_TIMEOUT,
@@ -192,6 +195,7 @@ pub async fn search(
     )
     .await;
     let mut successful = 0usize;
+    let mut peers_queried = initial;
     for response in responses {
         match response {
             Ok(peer_hits) => {
@@ -202,6 +206,7 @@ pub async fn search(
         }
     }
     if initial < peers.len() && (hits.len() < limit || successful < initial.min(4)) {
+        peers_queried = peers.len();
         for response in query_peers(
             Arc::clone(&service),
             &peers[initial..],
@@ -219,9 +224,11 @@ pub async fn search(
     hits.sort_by(|left, right| right.1.total_cmp(&left.1));
     let mut dedup = HashSet::new();
     let mut embedding_signatures = vec![query_signature];
-    let mut artist_counts: HashMap<String, usize> = HashMap::new();
     let mut tracks = Vec::new();
-    for (track, _, embedding_signature) in hits {
+    for (track, score, embedding_signature) in hits {
+        if score < minimum_score {
+            break;
+        }
         if query
             .source_content_id
             .as_deref()
@@ -244,26 +251,33 @@ pub async fn search(
         }) {
             continue;
         }
-        let artist = track
-            .artist_names
-            .first()
-            .map(|name| music_dht::normalize_name(name))
-            .unwrap_or_default();
-        let count = artist_counts.entry(artist.clone()).or_default();
-        if !artist.is_empty() && *count >= MAX_PER_ARTIST {
-            continue;
-        }
-        *count += 1;
         if let Some(signature) = embedding_signature {
             embedding_signatures.push(signature);
         }
-        tracks.push(track);
+        tracks.push(ScoredFedTrack {
+            track,
+            score,
+            embedding_signature,
+        });
         if tracks.len() >= limit.min(wire::MAX_SIMILARITY_RESULTS) {
             break;
         }
     }
-    Ok(FedSearchResults {
-        artists: Vec::new(),
+    let artists = tracks
+        .iter()
+        .filter_map(|hit| hit.track.artist_names.first())
+        .map(|name| music_dht::normalize_name(name))
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>()
+        .len();
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(FedSimilaritySearchResults {
+        stats: SimilaritySearchStats {
+            tracks: tracks.len(),
+            artists,
+            peers_queried,
+            elapsed_ms,
+        },
         tracks,
     })
 }

@@ -509,6 +509,8 @@ pub enum TrackSelectionScope {
     Release(i64),
     Playlist(i64),
     Queue,
+    /// The unified local + federated similar-track result list.
+    SimilaritySearch,
     /// The federated section of the search results (its tracks).
     FedSearch,
     /// The tracklist of the open federated release view.
@@ -817,6 +819,8 @@ impl StatusDetailFocus {
 pub enum FedInputField {
     MusicDirectory,
     SimilarityWorkers,
+    SimilarityMinimumScore,
+    SimilarityMaxTracksPerArtist,
     NetworkId,
     ConnectTicket,
     DeviceName,
@@ -829,6 +833,8 @@ impl FedInputField {
         match self {
             FedInputField::MusicDirectory => "Music save directory",
             FedInputField::SimilarityWorkers => "Similarity background workers",
+            FedInputField::SimilarityMinimumScore => "Minimum similarity score",
+            FedInputField::SimilarityMaxTracksPerArtist => "Tracks per artist",
             FedInputField::NetworkId => "Network ID",
             FedInputField::ConnectTicket => "Connect to peer (paste ticket)",
             FedInputField::DeviceName => "Device name",
@@ -844,6 +850,12 @@ impl FedInputField {
             }
             FedInputField::SimilarityWorkers => {
                 "Enter the maximum number of tracks processed in parallel, from 1 to 16. The change takes effect immediately."
+            }
+            FedInputField::SimilarityMinimumScore => {
+                "Enter the minimum cosine similarity from 0.00 to 1.00. Lower values show broader matches; higher values hide weak matches. Embeddings are not recalculated."
+            }
+            FedInputField::SimilarityMaxTracksPerArtist => {
+                "Enter how many tracks by one primary artist may appear in similarity results, from 1 to 50. Embeddings are not recalculated."
             }
             FedInputField::NetworkId => {
                 "A unique network id. It must match exactly on every client that should see and connect to the same peers."
@@ -880,15 +892,19 @@ pub enum SimilarityRow {
     Toggle,
     Model,
     Profile,
+    MinimumScore,
+    MaxTracksPerArtist,
     Workers,
     Clear,
 }
 
 impl SimilarityRow {
-    pub const ALL: [SimilarityRow; 5] = [
+    pub const ALL: [SimilarityRow; 7] = [
         SimilarityRow::Toggle,
         SimilarityRow::Model,
         SimilarityRow::Profile,
+        SimilarityRow::MinimumScore,
+        SimilarityRow::MaxTracksPerArtist,
         SimilarityRow::Workers,
         SimilarityRow::Clear,
     ];
@@ -1211,6 +1227,85 @@ mod cmdline_history_tests {
 }
 
 /// Live search state driven by the `:/query` command.
+#[derive(Debug, Clone)]
+pub enum SimilaritySearchHit {
+    Local {
+        track: TrackItem,
+        score: f32,
+        embedding_signature: [u8; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES],
+    },
+    Federated {
+        track: crate::federation::FedTrack,
+        score: f32,
+        embedding_signature: Option<[u8; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES]>,
+    },
+}
+
+impl SimilaritySearchHit {
+    pub fn score(&self) -> f32 {
+        match self {
+            Self::Local { score, .. } | Self::Federated { score, .. } => *score,
+        }
+    }
+
+    pub fn embedding_signature(
+        &self,
+    ) -> Option<[u8; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES]> {
+        match self {
+            Self::Local {
+                embedding_signature,
+                ..
+            } => Some(*embedding_signature),
+            Self::Federated {
+                embedding_signature,
+                ..
+            } => *embedding_signature,
+        }
+    }
+
+    pub fn track_item(&self) -> TrackItem {
+        match self {
+            Self::Local { track, .. } => track.clone(),
+            Self::Federated { track, .. } => crate::federation::pending_track(track),
+        }
+    }
+
+    pub fn federated_track(&self) -> Option<&crate::federation::FedTrack> {
+        match self {
+            Self::Federated { track, .. } => Some(track),
+            Self::Local { .. } => None,
+        }
+    }
+
+    pub fn primary_artist_key(&self) -> String {
+        match self {
+            Self::Local { track, .. } => track
+                .artists
+                .first()
+                .map(|artist| music_dht::normalize_name(&artist.name))
+                .unwrap_or_default(),
+            Self::Federated { track, .. } => track
+                .artist_names
+                .first()
+                .map(|artist| music_dht::normalize_name(artist))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn content_key(&self) -> String {
+        match self {
+            Self::Local { track, .. } => track
+                .content_id
+                .clone()
+                .unwrap_or_else(|| format!("local:{}", track.id)),
+            Self::Federated { track, .. } => track
+                .content_id
+                .clone()
+                .unwrap_or_else(|| format!("remote:{}:{}", track.owner, track.item_id)),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SearchState {
     pub query: String,
@@ -1226,6 +1321,59 @@ pub struct SearchState {
     /// Present only for a track-seeded search; text-search refreshes must not
     /// replace this page with a title query.
     pub similarity_source: Option<i64>,
+    /// The source is pinned at row zero; candidates below it are globally
+    /// ranked across the local library and federation.
+    pub similarity_source_track: Option<TrackItem>,
+    pub similarity_tracks: Vec<SimilaritySearchHit>,
+    pub similarity_stats: Option<crate::federation::SimilaritySearchStats>,
+    pub similarity_error: Option<String>,
+}
+
+impl SearchState {
+    pub fn similarity_len(&self) -> usize {
+        usize::from(self.similarity_source_track.is_some()) + self.similarity_tracks.len()
+    }
+
+    pub fn similarity_track(&self, index: usize) -> Option<TrackItem> {
+        if index == 0 {
+            return self.similarity_source_track.clone();
+        }
+        self.similarity_tracks
+            .get(index.checked_sub(1)?)
+            .map(SimilaritySearchHit::track_item)
+    }
+
+    pub fn similarity_fed_track(&self, index: usize) -> Option<&crate::federation::FedTrack> {
+        self.similarity_tracks
+            .get(index.checked_sub(1)?)?
+            .federated_track()
+    }
+
+    pub fn similarity_key(&self, index: usize) -> Option<String> {
+        if index == 0 {
+            return self
+                .similarity_source_track
+                .as_ref()
+                .map(|track| format!("source:{}", track.id));
+        }
+        self.similarity_tracks
+            .get(index.checked_sub(1)?)
+            .map(SimilaritySearchHit::content_key)
+    }
+
+    pub fn similarity_index_for_key(&self, key: &str) -> Option<usize> {
+        if self
+            .similarity_source_track
+            .as_ref()
+            .is_some_and(|track| key == format!("source:{}", track.id))
+        {
+            return Some(0);
+        }
+        self.similarity_tracks
+            .iter()
+            .position(|hit| hit.content_key() == key)
+            .map(|index| index + 1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

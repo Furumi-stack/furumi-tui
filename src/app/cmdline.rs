@@ -8,7 +8,6 @@ use crate::app::Runtime;
 use crate::app::command::{self, Command, Parsed};
 use crate::app::event::AppEvent;
 use crate::app::state::{AppState, GlobalView, SearchState, Tab};
-use crate::library::models::SearchResults;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const SEARCH_LIMIT: i64 = 12;
@@ -99,6 +98,10 @@ fn set_view_cursor_zero(state: &mut AppState) {
 /// and the receiver drops responses that arrive out of date.
 pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     state.search.similarity_source = None;
+    state.search.similarity_source_track = None;
+    state.search.similarity_tracks.clear();
+    state.search.similarity_stats = None;
+    state.search.similarity_error = None;
     let seq = runtime.search_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let query = state.search.query.clone();
     if query.is_empty() {
@@ -160,6 +163,10 @@ pub(super) fn schedule_similarity_search(
         format!("{} — {artist}", track.title)
     };
     state.search.similarity_source = Some(track.id);
+    state.search.similarity_source_track = Some(track.clone());
+    state.search.similarity_tracks.clear();
+    state.search.similarity_stats = None;
+    state.search.similarity_error = None;
     state.search.loading = true;
     state.search.results = None;
     state.search.fed_tracks.clear();
@@ -178,23 +185,10 @@ pub(super) fn schedule_similarity_search(
     let similarity = Arc::clone(&runtime.similarity);
     let tx = runtime.event_tx.clone();
     let track_id = track.id;
-    let source_track = track.clone();
     tokio::task::spawn_blocking(move || {
         let result = similarity
             .search_track(track_id, 49)
-            .map(|(matches, query)| {
-                let mut tracks = Vec::with_capacity(1 + matches.len());
-                tracks.push(source_track);
-                tracks.extend(matches.into_iter().map(|found| found.track));
-                (
-                    SearchResults {
-                        artists: Vec::new(),
-                        releases: Vec::new(),
-                        tracks,
-                    },
-                    query,
-                )
-            });
+            .map(|(matches, query)| (matches, query));
         let (result, query) = match result {
             Ok((results, query)) => (Ok(results), Some(query)),
             Err(err) => (Err(format!("{err:#}")), None),

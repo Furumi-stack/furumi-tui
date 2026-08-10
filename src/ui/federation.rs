@@ -103,6 +103,14 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
                 "Preprocessing profile",
                 format!("{} (enter for details)", similarity.profile),
             ),
+            SimilarityRow::MinimumScore => (
+                "Minimum similarity",
+                format!("{:.2}", similarity.minimum_score),
+            ),
+            SimilarityRow::MaxTracksPerArtist => (
+                "Tracks per artist",
+                similarity.max_tracks_per_artist.to_string(),
+            ),
             SimilarityRow::Workers => ("Background workers", similarity.workers.to_string()),
             SimilarityRow::Clear => ("Clear all stored embeddings", "↵".to_string()),
         };

@@ -900,6 +900,9 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         title.push_str("· searching… ");
     }
     let inner = bordered(frame, area, state, title);
+    if search.similarity_source.is_some() {
+        return draw_similarity_search(frame, inner, state, cursor);
+    }
 
     let empty_results = SearchResults::default();
     let results = match &search.results {
@@ -1092,6 +1095,156 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         };
         if let Some(row_index) = row_cursor
             && fed_selected.contains(&row_index)
+            && row_index != cursor
+        {
+            frame
+                .buffer_mut()
+                .set_style(rect, theme::selection_for(state));
+        }
+        draw_row(frame, rect, state, line, right, row_cursor == Some(cursor));
+    }
+}
+
+fn draw_similarity_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
+    let search = &state.search;
+    let status = if search.fed_loading {
+        super::loading_line(state, "searching federation…")
+    } else if let Some(stats) = &search.similarity_stats {
+        let elapsed = if stats.elapsed_ms < 1_000 {
+            format!("{} ms", stats.elapsed_ms)
+        } else {
+            format!("{:.2} s", stats.elapsed_ms as f64 / 1_000.0)
+        };
+        Line::from(vec![
+            Span::styled("Federation · ", theme::accent_for(state)),
+            Span::styled(
+                format!(
+                    "{} tracks · {} artists · {} peers queried · {elapsed}",
+                    stats.tracks, stats.artists, stats.peers_queried
+                ),
+                theme::dim(),
+            ),
+        ])
+    } else if search.similarity_error.is_some() {
+        Line::styled(
+            "Federation search failed · showing local results",
+            error_style(),
+        )
+    } else if search.loading {
+        super::loading_line(state, "preparing local similarity search…")
+    } else {
+        Line::styled("Federation disabled · showing local results", theme::dim())
+    };
+    let [status_area, content] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(Paragraph::new(status), status_area);
+
+    let mut rows: Vec<(Line, Option<String>, Option<usize>)> = Vec::new();
+    rows.push((Line::styled("Tracks", theme::header_for(state)), None, None));
+    if let Some(track) = &search.similarity_source_track {
+        let heart = if state.track_liked(track) {
+            Span::styled("♥ ", theme::accent_for(state))
+        } else {
+            Span::raw("  ")
+        };
+        rows.push((
+            Line::from(vec![
+                heart,
+                Span::raw(track.title.clone()),
+                Span::styled(
+                    format!("  {} · {}", track.artist_line(), track.release_title),
+                    theme::dim(),
+                ),
+            ]),
+            Some(super::track_meta_suffix(track, true)),
+            Some(0),
+        ));
+    }
+    for (offset, hit) in search.similarity_tracks.iter().enumerate() {
+        let index = offset + 1;
+        match hit {
+            crate::app::state::SimilaritySearchHit::Local { track, .. } => {
+                let heart = if state.track_liked(track) {
+                    Span::styled("♥ ", theme::accent_for(state))
+                } else {
+                    Span::raw("  ")
+                };
+                rows.push((
+                    Line::from(vec![
+                        heart,
+                        Span::raw(track.title.clone()),
+                        Span::styled(
+                            format!("  {} · {}", track.artist_line(), track.release_title),
+                            theme::dim(),
+                        ),
+                    ]),
+                    Some(super::track_meta_suffix(track, true)),
+                    Some(index),
+                ));
+            }
+            crate::app::state::SimilaritySearchHit::Federated { track, .. } => {
+                let heart = if state.fed_track_liked(track) {
+                    Span::styled("♥ ", theme::accent_for(state))
+                } else {
+                    Span::raw("  ")
+                };
+                let origin = if track.own {
+                    "your library".to_string()
+                } else {
+                    format!("peer {}…", track.owner_short())
+                };
+                let mut meta = track.duration_label();
+                if let Some(year) = track.year {
+                    if !meta.is_empty() {
+                        meta.push_str(" · ");
+                    }
+                    meta.push_str(&year.to_string());
+                }
+                rows.push((
+                    Line::from(vec![
+                        heart,
+                        fed_track_availability_prefix(state, track),
+                        Span::raw(track.title.clone()),
+                        Span::styled(
+                            format!("  {} · {origin}", track.artist_line()),
+                            theme::dim(),
+                        ),
+                    ]),
+                    Some(meta),
+                    Some(index),
+                ));
+            }
+        }
+    }
+
+    let scope = crate::app::state::TrackSelectionScope::SimilaritySearch;
+    let mut selected = std::collections::HashSet::new();
+    if state.track_selection.is_active_for(&scope)
+        && let Some(indices) = state
+            .track_selection
+            .indices(&scope, search.similarity_len())
+    {
+        selected.extend(indices);
+    }
+    let cursor_row = rows
+        .iter()
+        .position(|(_, _, row_cursor)| *row_cursor == Some(cursor))
+        .unwrap_or(0);
+    let visible = usize::from(content.height.max(1));
+    let first = cursor_row
+        .saturating_sub(visible / 2)
+        .min(rows.len().saturating_sub(visible));
+    for (offset, (line, right, row_cursor)) in
+        rows.into_iter().enumerate().skip(first).take(visible)
+    {
+        let rect = Rect {
+            x: content.x,
+            y: content.y + (offset - first) as u16,
+            width: content.width,
+            height: 1,
+        };
+        if let Some(row_index) = row_cursor
+            && selected.contains(&row_index)
             && row_index != cursor
         {
             frame

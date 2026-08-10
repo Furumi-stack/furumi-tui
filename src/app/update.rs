@@ -905,6 +905,9 @@ fn set_track_scope_cursor(state: &mut AppState, scope: &TrackSelectionScope, val
         TrackSelectionScope::Queue => {
             state.queue_tab.cursor = value;
         }
+        TrackSelectionScope::SimilaritySearch => {
+            set_view_cursor(state, value);
+        }
         TrackSelectionScope::FedSearch => {
             let base = state.search.results.as_ref().map_or(0, |r| r.len())
                 + state.search.fed_artists.len();
@@ -952,6 +955,14 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
                 _ => None,
             },
             GlobalView::Search { cursor } => {
+                if state.search.similarity_source.is_some() {
+                    let len = state.search.similarity_len();
+                    return (*cursor < len).then_some((
+                        TrackSelectionScope::SimilaritySearch,
+                        *cursor,
+                        len,
+                    ));
+                }
                 // Only the federated tracks section is selectable here.
                 let base = state.search.results.as_ref().map_or(0, |r| r.len())
                     + state.search.fed_artists.len();
@@ -1044,6 +1055,20 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
 }
 
 pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
+    if state.active_tab == Tab::Global
+        && state.search.similarity_source.is_some()
+        && let Some(GlobalView::Search { cursor }) = state.global.stack.last()
+    {
+        let len = state.search.similarity_len();
+        let indices = state
+            .track_selection
+            .indices(&TrackSelectionScope::SimilaritySearch, len)
+            .unwrap_or_else(|| vec![(*cursor).min(len.saturating_sub(1))]);
+        return indices
+            .into_iter()
+            .filter_map(|index| state.search.similarity_track(index))
+            .collect();
+    }
     // Federated contexts produce queueable placeholders that behave like
     // regular tracks (queue, info, playback-on-demand).
     {
@@ -1276,6 +1301,9 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 _ => None,
             },
             GlobalView::Search { cursor } => {
+                if state.search.similarity_source.is_some() {
+                    return state.search.similarity_track(*cursor);
+                }
                 let results = state.search.results.as_ref()?;
                 let offset = cursor.checked_sub(results.artists.len() + results.releases.len())?;
                 match results.tracks.get(offset) {
@@ -1877,10 +1905,13 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             refresh_track_selection_cursor(state);
         }
         Some(GlobalView::Search { cursor }) => {
-            // Local results plus the federated section below them.
-            let total = (state.search.results.as_ref().map_or(0, |r| r.len())
-                + state.search.fed_artists.len()
-                + state.search.fed_tracks.len()) as isize;
+            let total = if state.search.similarity_source.is_some() {
+                state.search.similarity_len()
+            } else {
+                state.search.results.as_ref().map_or(0, |r| r.len())
+                    + state.search.fed_artists.len()
+                    + state.search.fed_tracks.len()
+            } as isize;
             if total == 0 {
                 return;
             }
@@ -2000,9 +2031,13 @@ fn current_view_len(state: &AppState) -> usize {
             _ => 0,
         },
         Some(GlobalView::Search { .. }) => {
-            state.search.results.as_ref().map_or(0, |r| r.len())
-                + state.search.fed_artists.len()
-                + state.search.fed_tracks.len()
+            if state.search.similarity_source.is_some() {
+                state.search.similarity_len()
+            } else {
+                state.search.results.as_ref().map_or(0, |r| r.len())
+                    + state.search.fed_artists.len()
+                    + state.search.fed_tracks.len()
+            }
         }
         Some(GlobalView::FedArtist { .. }) => fed_card_len(state),
         Some(GlobalView::FedRelease { index, .. }) => fed_card_release(state, *index)
@@ -2292,31 +2327,47 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             },
             _ => Outcome::Nothing,
         },
-        Some(GlobalView::Search { cursor }) => match &state.search.results {
-            Some(results) => {
-                let artists = results.artists.len();
-                let releases = results.releases.len();
-                if cursor < artists {
-                    Outcome::Push(GlobalView::Artist {
-                        id: results.artists[cursor].id,
-                        cursor: 0,
-                    })
-                } else if cursor < artists + releases {
-                    Outcome::Push(GlobalView::Release {
-                        id: results.releases[cursor - artists].id,
-                        cursor: 0,
-                    })
-                } else if results.tracks.get(cursor - artists - releases).is_some() {
-                    Outcome::Play {
-                        tracks: results.tracks.clone(),
-                        start: cursor - artists - releases,
-                    }
+        Some(GlobalView::Search { cursor }) => {
+            if state.search.similarity_source.is_some() {
+                let tracks = (0..state.search.similarity_len())
+                    .filter_map(|index| state.search.similarity_track(index))
+                    .collect::<Vec<_>>();
+                if tracks.is_empty() {
+                    Outcome::Nothing
                 } else {
-                    fed_outcome(state, cursor - artists - releases - results.tracks.len())
+                    Outcome::Play {
+                        start: cursor.min(tracks.len() - 1),
+                        tracks,
+                    }
+                }
+            } else {
+                match &state.search.results {
+                    Some(results) => {
+                        let artists = results.artists.len();
+                        let releases = results.releases.len();
+                        if cursor < artists {
+                            Outcome::Push(GlobalView::Artist {
+                                id: results.artists[cursor].id,
+                                cursor: 0,
+                            })
+                        } else if cursor < artists + releases {
+                            Outcome::Push(GlobalView::Release {
+                                id: results.releases[cursor - artists].id,
+                                cursor: 0,
+                            })
+                        } else if results.tracks.get(cursor - artists - releases).is_some() {
+                            Outcome::Play {
+                                tracks: results.tracks.clone(),
+                                start: cursor - artists - releases,
+                            }
+                        } else {
+                            fed_outcome(state, cursor - artists - releases - results.tracks.len())
+                        }
+                    }
+                    None => fed_outcome(state, cursor),
                 }
             }
-            None => fed_outcome(state, cursor),
-        },
+        }
         Some(GlobalView::FedArtist { cursor }) => match &state.fed_artist_view {
             Some((_, Loadable::Ready(card))) => {
                 let release_indices = fed_artist_visible_release_indices(state, card);
@@ -2491,6 +2542,20 @@ pub(crate) fn selected_fed_tracks(state: &AppState) -> Vec<crate::federation::Fe
     // selection (e.g. `i` on a queue or playlist track).
     if state.active_tab != Tab::Global {
         return Vec::new();
+    }
+    if state.search.similarity_source.is_some()
+        && let Some(GlobalView::Search { cursor }) = state.global.stack.last()
+    {
+        let scope = TrackSelectionScope::SimilaritySearch;
+        let len = state.search.similarity_len();
+        let indices = state
+            .track_selection
+            .indices(&scope, len)
+            .unwrap_or_else(|| vec![(*cursor).min(len.saturating_sub(1))]);
+        return indices
+            .into_iter()
+            .filter_map(|index| state.search.similarity_fed_track(index).cloned())
+            .collect();
     }
     // An active Shift-V range in a federated scope.
     if let Some(scope) = state.track_selection.scope.clone() {
@@ -2793,6 +2858,25 @@ fn federation_select(state: &mut AppState) -> Option<Effect> {
             state.popup = Some(Popup::FedText {
                 title: format!("Preprocessing profile: {profile}"),
                 text,
+            });
+            None
+        }
+        SettingsRow::Similarity(SimilarityRow::MinimumScore) => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::SimilarityMinimumScore,
+                input: crate::app::input::LineEdit::new(format!(
+                    "{:.2}",
+                    state.similarity.settings.minimum_score
+                )),
+            });
+            None
+        }
+        SettingsRow::Similarity(SimilarityRow::MaxTracksPerArtist) => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::SimilarityMaxTracksPerArtist,
+                input: crate::app::input::LineEdit::new(
+                    state.similarity.settings.max_tracks_per_artist.to_string(),
+                ),
             });
             None
         }

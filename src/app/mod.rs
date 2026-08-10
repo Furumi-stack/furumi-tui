@@ -3348,6 +3348,39 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Err(message) => tracing::warn!(%message, "federated search failed"),
             }
         }
+        AppEvent::FedSimilaritySearchLoaded { seq, result } => {
+            if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {
+                return;
+            }
+            state.search.fed_loading = false;
+            let selected_key = state.global.stack.last().and_then(|view| match view {
+                state::GlobalView::Search { cursor } => state.search.similarity_key(*cursor),
+                _ => None,
+            });
+            match result {
+                Ok(results) => {
+                    let remote = results.tracks.into_iter().map(|hit| {
+                        state::SimilaritySearchHit::Federated {
+                            track: hit.track,
+                            score: hit.score,
+                            embedding_signature: hit.embedding_signature,
+                        }
+                    });
+                    state.search.similarity_tracks.extend(remote);
+                    rank_similarity_search_tracks(
+                        &mut state.search.similarity_tracks,
+                        state.similarity.settings.max_tracks_per_artist,
+                    );
+                    state.search.similarity_stats = Some(results.stats);
+                    state.search.similarity_error = None;
+                }
+                Err(message) => {
+                    tracing::warn!(%message, "federated similarity search failed");
+                    state.search.similarity_error = Some(message);
+                }
+            }
+            restore_similarity_cursor(state, selected_key.as_deref());
+        }
         AppEvent::FedTrackResolved {
             placeholder_id,
             resolve_key,
@@ -3696,7 +3729,20 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
             state.search.loading = false;
             match result {
-                Ok(results) => state.search.results = Some(results),
+                Ok(results) => {
+                    state.search.similarity_tracks = results
+                        .into_iter()
+                        .map(|hit| state::SimilaritySearchHit::Local {
+                            track: hit.track,
+                            score: hit.score,
+                            embedding_signature: hit.embedding_signature,
+                        })
+                        .collect();
+                    rank_similarity_search_tracks(
+                        &mut state.search.similarity_tracks,
+                        state.similarity.settings.max_tracks_per_artist,
+                    );
+                }
                 Err(message) => {
                     state.status_message = Some(format!("similarity search failed: {message}"));
                     return;
@@ -3714,7 +3760,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                         .search_similar(query, 50)
                         .await
                         .map_err(|err| format!("{err:#}"));
-                    let _ = tx.send(AppEvent::FedSearchLoaded { seq, result });
+                    let _ = tx.send(AppEvent::FedSimilaritySearchLoaded { seq, result });
                 });
             }
         }
@@ -4004,6 +4050,135 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 perform_effect(state, runtime, effect);
             }
         }
+    }
+}
+
+fn rank_similarity_search_tracks(
+    tracks: &mut Vec<state::SimilaritySearchHit>,
+    max_tracks_per_artist: usize,
+) {
+    const RESULT_LIMIT: usize = 49;
+    const MAX_NEAR_DUPLICATE_SIGNATURE_DISTANCE: u32 = 8;
+
+    tracks.sort_by(|left, right| right.score().total_cmp(&left.score()));
+    let candidates = std::mem::take(tracks);
+    let mut content = std::collections::HashSet::new();
+    let mut signatures = Vec::new();
+    let mut artist_counts: std::collections::HashMap<String, usize> = Default::default();
+    for hit in candidates {
+        if !content.insert(hit.content_key()) {
+            continue;
+        }
+        if hit.embedding_signature().is_some_and(|candidate| {
+            signatures.iter().any(|existing| {
+                music_dht::similarity::signature_distance(&candidate, existing)
+                    <= MAX_NEAR_DUPLICATE_SIGNATURE_DISTANCE
+            })
+        }) {
+            continue;
+        }
+        let artist = hit.primary_artist_key();
+        let count = artist_counts.entry(artist.clone()).or_default();
+        if !artist.is_empty() && *count >= max_tracks_per_artist.clamp(1, RESULT_LIMIT) {
+            continue;
+        }
+        *count += 1;
+        if let Some(signature) = hit.embedding_signature() {
+            signatures.push(signature);
+        }
+        tracks.push(hit);
+        if tracks.len() >= RESULT_LIMIT {
+            break;
+        }
+    }
+}
+
+fn restore_similarity_cursor(state: &mut AppState, selected_key: Option<&str>) {
+    let selected_index = selected_key.and_then(|key| state.search.similarity_index_for_key(key));
+    let len = state.search.similarity_len();
+    if let Some(state::GlobalView::Search { cursor }) = state.global.stack.last_mut() {
+        *cursor = selected_index.unwrap_or(*cursor).min(len.saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod similarity_search_tests {
+    use super::*;
+    use crate::library::models::{ArtistRef, TrackItem};
+
+    fn local_hit(id: i64, artist: &str, score: f32, signature: u8) -> state::SimilaritySearchHit {
+        state::SimilaritySearchHit::Local {
+            track: TrackItem {
+                id,
+                title: format!("local {id}"),
+                track_number: None,
+                disc_number: None,
+                duration_seconds: 1.0,
+                artists: vec![ArtistRef {
+                    id,
+                    name: artist.to_string(),
+                }],
+                featured_artists: Vec::new(),
+                release_id: id,
+                release_title: "release".to_string(),
+                release_year: None,
+                file_path: format!("/music/{id}"),
+                content_id: Some(format!("local-{id}")),
+                cover_path: None,
+                audio_format: None,
+                audio_bitrate: None,
+                audio_sample_rate: None,
+                audio_bit_depth: None,
+                file_size_bytes: None,
+                play_count: 0,
+                fed: None,
+            },
+            score,
+            embedding_signature: [signature; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES],
+        }
+    }
+
+    fn remote_hit(artist: &str, score: f32, signature: u8) -> state::SimilaritySearchHit {
+        state::SimilaritySearchHit::Federated {
+            track: crate::federation::FedTrack {
+                item_id: format!("remote-{signature}"),
+                owner: "peer".to_string(),
+                own: false,
+                title: format!("remote {signature}"),
+                artist_names: vec![artist.to_string()],
+                featured_artist_names: Vec::new(),
+                year: None,
+                duration_seconds: Some(1),
+                content_id: Some(format!("remote-{signature}")),
+                release_title: None,
+                track_number: None,
+                disc_number: None,
+            },
+            score,
+            embedding_signature: Some(
+                [signature; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES],
+            ),
+        }
+    }
+
+    #[test]
+    fn similarity_results_rank_local_and_remote_together_with_one_artist_cap() {
+        let mut tracks = vec![
+            local_hit(1, "same artist", 0.70, 1),
+            remote_hit("other artist", 0.90, 2),
+            remote_hit("same artist", 0.80, 3),
+            local_hit(2, "same artist", 0.60, 4),
+        ];
+
+        rank_similarity_search_tracks(&mut tracks, 1);
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].score(), 0.90);
+        assert_eq!(tracks[1].score(), 0.80);
+        assert!(matches!(
+            tracks[0],
+            state::SimilaritySearchHit::Federated { .. }
+        ));
     }
 }
 

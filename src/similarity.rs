@@ -36,7 +36,7 @@ const EMBEDDING_DIMENSIONS: usize = 1280;
 const MODEL_BATCH: usize = 8;
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 const RESULT_LIMIT: usize = 50;
-const MAX_PER_ARTIST: usize = 3;
+const PEER_CANDIDATE_MAX_PER_ARTIST: usize = 10;
 const NEAR_DUPLICATE_COSINE: f32 = 0.995;
 const FULL_TRACK_MAX_SECONDS: u32 = 5 * 60;
 const LONG_TRACK_WINDOW_SECONDS: u32 = 60;
@@ -369,6 +369,52 @@ impl Manager {
         exclude_content_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SimilarTrack>> {
+        let settings = lock(&self.settings);
+        let minimum_score = settings.minimum_score;
+        let max_tracks_per_artist = settings.max_tracks_per_artist;
+        drop(settings);
+        self.search_vector_with_policy(
+            profile_id,
+            vector,
+            exclude_track_id,
+            exclude_content_id,
+            limit,
+            minimum_score,
+            max_tracks_per_artist,
+        )
+    }
+
+    /// Returns a wider, policy-neutral candidate set to a remote requester.
+    /// The requester applies its own score threshold and artist diversity
+    /// limit; neither value is part of embedding compatibility.
+    pub(crate) fn search_vector_for_peer(
+        &self,
+        profile_id: &str,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SimilarTrack>> {
+        self.search_vector_with_policy(
+            profile_id,
+            vector,
+            None,
+            None,
+            limit,
+            -1.0,
+            PEER_CANDIDATE_MAX_PER_ARTIST,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_vector_with_policy(
+        &self,
+        profile_id: &str,
+        vector: &[f32],
+        exclude_track_id: Option<i64>,
+        exclude_content_id: Option<&str>,
+        limit: usize,
+        minimum_score: f32,
+        max_tracks_per_artist: usize,
+    ) -> Result<Vec<SimilarTrack>> {
         anyhow::ensure!(
             !vector.is_empty() && vector.len() <= 4096,
             "wrong embedding dimensions"
@@ -396,7 +442,7 @@ impl Manager {
                     entry.vector.as_slice(),
                 )
             })
-            .filter(|(_, score, _, _)| score.is_finite())
+            .filter(|(_, score, _, _)| score.is_finite() && *score >= minimum_score)
             .collect();
         scores.sort_by(|left, right| right.1.total_cmp(&left.1));
 
@@ -410,7 +456,7 @@ impl Manager {
                 continue;
             }
             let count = artist_counts.entry(artist.to_string()).or_default();
-            if !artist.is_empty() && *count >= MAX_PER_ARTIST {
+            if !artist.is_empty() && *count >= max_tracks_per_artist {
                 continue;
             }
             *count += 1;

@@ -45,7 +45,7 @@ pub struct LibraryFilters {
     pub source_mode: LibrarySourceMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimilaritySettings {
     /// Local embedding/search master switch. Network participation follows
     /// federation and additionally requires the explicit privacy consent.
@@ -57,6 +57,14 @@ pub struct SimilaritySettings {
     pub profile: String,
     #[serde(default = "default_similarity_workers")]
     pub workers: usize,
+    /// Requester-side cosine score floor. This is search policy, not part of
+    /// the embedding profile, so changing it never invalidates vectors.
+    #[serde(default = "default_similarity_minimum_score")]
+    pub minimum_score: f32,
+    /// Requester-side diversity cap applied independently to local and
+    /// federated candidates.
+    #[serde(default = "default_similarity_max_tracks_per_artist")]
+    pub max_tracks_per_artist: usize,
     #[serde(default)]
     pub federation_consent: bool,
     /// Exact fingerprint of the last fully usable profile. Keeping this
@@ -73,13 +81,15 @@ impl Default for SimilaritySettings {
             model: default_similarity_model(),
             profile: default_similarity_profile(),
             workers: default_similarity_workers(),
+            minimum_score: default_similarity_minimum_score(),
+            max_tracks_per_artist: default_similarity_max_tracks_per_artist(),
             federation_consent: false,
             active_profile: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_volume")]
     pub volume: u8,
@@ -116,6 +126,11 @@ impl AppSettings {
             self.similarity.profile = default_similarity_profile();
         }
         self.similarity.workers = self.similarity.workers.clamp(1, 16);
+        if !self.similarity.minimum_score.is_finite() {
+            self.similarity.minimum_score = default_similarity_minimum_score();
+        }
+        self.similarity.minimum_score = self.similarity.minimum_score.clamp(0.0, 1.0);
+        self.similarity.max_tracks_per_artist = self.similarity.max_tracks_per_artist.clamp(1, 50);
         self
     }
 }
@@ -136,6 +151,14 @@ fn default_similarity_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| (count.get() / 2).clamp(1, 4))
         .unwrap_or(1)
+}
+
+fn default_similarity_minimum_score() -> f32 {
+    0.70
+}
+
+fn default_similarity_max_tracks_per_artist() -> usize {
+    5
 }
 
 /// The historical permanent-download location, kept as the default for
@@ -204,5 +227,21 @@ hide_featured_only = true
         assert!(settings.library.hide_featured_only);
         assert_eq!(settings.library.source_mode, LibrarySourceMode::Global);
         assert_eq!(settings.music_dir, default_music_dir());
+        assert_eq!(settings.similarity.minimum_score, 0.70);
+        assert_eq!(settings.similarity.max_tracks_per_artist, 5);
+    }
+
+    #[test]
+    fn similarity_search_policy_is_normalized_without_changing_the_profile() {
+        let mut settings = AppSettings::default();
+        let profile = settings.similarity.profile.clone();
+        settings.similarity.minimum_score = f32::NAN;
+        settings.similarity.max_tracks_per_artist = 0;
+
+        let settings = settings.normalized();
+
+        assert_eq!(settings.similarity.minimum_score, 0.70);
+        assert_eq!(settings.similarity.max_tracks_per_artist, 1);
+        assert_eq!(settings.similarity.profile, profile);
     }
 }

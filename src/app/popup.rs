@@ -592,6 +592,36 @@ fn handle_fed_input(
                         state.popup = Some(Popup::FedInput { field, input });
                     }
                 },
+                FedInputField::SimilarityMinimumScore => match value.parse::<f32>() {
+                    Ok(score) if score.is_finite() && (0.0..=1.0).contains(&score) => {
+                        state.similarity.settings.minimum_score = score;
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::SimilarityApplySettings,
+                        );
+                    }
+                    _ => {
+                        state.status_message =
+                            Some("minimum similarity must be a number from 0.00 to 1.00".into());
+                        state.popup = Some(Popup::FedInput { field, input });
+                    }
+                },
+                FedInputField::SimilarityMaxTracksPerArtist => match value.parse::<usize>() {
+                    Ok(limit @ 1..=50) => {
+                        state.similarity.settings.max_tracks_per_artist = limit;
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::SimilarityApplySettings,
+                        );
+                    }
+                    _ => {
+                        state.status_message =
+                            Some("tracks per artist must be a number from 1 to 50".into());
+                        state.popup = Some(Popup::FedInput { field, input });
+                    }
+                },
                 FedInputField::ConnectTicket => {
                     if value.is_empty() {
                         state.status_message = Some("ticket is empty".into());

@@ -36,8 +36,13 @@ pub enum AppEvent {
     /// text search so stale pages cannot overwrite a newer request.
     SimilaritySearchLoaded {
         seq: u64,
-        result: Result<SearchResults, String>,
+        result: Result<Vec<crate::similarity::SimilarTrack>, String>,
         query: Option<crate::similarity::QueryVector>,
+    },
+    /// Federated candidates and diagnostics for a track-seeded search.
+    FedSimilaritySearchLoaded {
+        seq: u64,
+        result: Result<crate::federation::FedSimilaritySearchResults, String>,
     },
     SimilarityStatus(crate::similarity::SimilarityStatus),
     /// `None` is emitted after clearing every stored embedding.
