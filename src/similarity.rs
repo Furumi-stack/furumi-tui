@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -101,7 +101,7 @@ impl Phase {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SimilarityStatus {
     pub phase: Phase,
     pub active_profile: Option<String>,
@@ -144,6 +144,8 @@ pub struct Manager {
     settings: Mutex<SimilaritySettings>,
     workers: AtomicUsize,
     generation: AtomicU64,
+    pipeline_running: AtomicBool,
+    rescan_requested: AtomicBool,
     status: Mutex<SimilarityStatus>,
     index: RwLock<Index>,
     model: Mutex<Option<(String, RunnableModel)>>,
@@ -169,13 +171,20 @@ impl Manager {
                 Err(err) => tracing::warn!(%err, "similarity index restore failed"),
             }
         }
+        let target_profile = model_by_id(&settings.model)
+            .filter(|_| profile_by_id(&settings.profile).is_some())
+            .map(|model| profile_fingerprint(model, &settings.profile));
+        let restored_profile_is_current = index.profile_id == target_profile;
         let status = SimilarityStatus {
-            phase: if settings.enabled {
-                Phase::Loading
-            } else {
+            phase: if !settings.enabled {
                 Phase::Disabled
+            } else if restored_profile_is_current {
+                Phase::Ready
+            } else {
+                Phase::Loading
             },
             active_profile: index.profile_id.clone(),
+            target_profile,
             model: settings.model.clone(),
             ..SimilarityStatus::default()
         };
@@ -184,6 +193,8 @@ impl Manager {
             event_tx,
             workers: AtomicUsize::new(settings.workers.clamp(1, 16)),
             generation: AtomicU64::new(0),
+            pipeline_running: AtomicBool::new(false),
+            rescan_requested: AtomicBool::new(false),
             settings: Mutex::new(settings),
             status: Mutex::new(status),
             index: RwLock::new(index),
@@ -223,23 +234,51 @@ impl Manager {
             || previous.model != settings.model
             || previous.profile != settings.profile
         {
+            self.generation.fetch_add(1, Ordering::AcqRel);
             self.start();
         }
     }
 
+    /// Requests a scan without cancelling useful work already in progress.
+    /// Bursts of library-change notifications collapse into one follow-up
+    /// pass, so metadata refreshes cannot repeatedly restart the model.
     pub fn start(self: &Arc<Self>) {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.rescan_requested.store(true, Ordering::Release);
+        if self.pipeline_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(err) = this.run_pipeline(generation).await
-                && this.generation.load(Ordering::Acquire) == generation
-            {
-                tracing::error!(%err, "similarity pipeline failed");
-                this.update_status(|status| {
-                    status.phase = Phase::Error;
-                    status.current_track = None;
-                    status.last_error = Some(format!("{err:#}"));
-                });
+            loop {
+                // This pass covers every notification received before it
+                // starts. A notification during the pass requests one more.
+                this.rescan_requested.store(false, Ordering::Release);
+                let generation = this.generation.load(Ordering::Acquire);
+                if let Err(err) = this.run_pipeline(generation).await
+                    && this.generation.load(Ordering::Acquire) == generation
+                {
+                    tracing::error!(%err, "similarity pipeline failed");
+                    this.update_status(|status| {
+                        status.phase = Phase::Error;
+                        status.current_track = None;
+                        status.last_error = Some(format!("{err:#}"));
+                    });
+                }
+
+                if this.rescan_requested.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                this.pipeline_running.store(false, Ordering::Release);
+                // Close the small race between checking the request flag and
+                // releasing ownership of the worker. If another worker has
+                // already claimed it, that worker owns the pending pass.
+                if this.rescan_requested.swap(false, Ordering::AcqRel)
+                    && !this.pipeline_running.swap(true, Ordering::AcqRel)
+                {
+                    continue;
+                }
+                break;
             }
         });
     }
@@ -431,7 +470,6 @@ impl Manager {
         )?;
         let stats = self.library.similarity_storage_stats(&profile_id)?;
         self.update_status(|status| {
-            status.phase = Phase::Downloading;
             status.target_profile = Some(profile_id.clone());
             status.model = spec.id.to_string();
             status.total_tracks = stats.total_tracks;
@@ -442,21 +480,18 @@ impl Manager {
             status.current_track = None;
             status.last_error = None;
         });
-        let model_path = self.ensure_model(spec, generation).await?;
-        self.ensure_generation(generation)?;
-        self.update_status(|status| status.phase = Phase::Loading);
-        let model = self.load_model(&profile_id, &model_path).await?;
-        self.ensure_generation(generation)?;
 
         let mut pending: VecDeque<_> = self.library.pending_similarity_tracks(&profile_id)?.into();
-        let pending_total = pending.len();
-        self.update_status(|status| {
-            status.phase = if pending_total == 0 {
-                Phase::Loading
-            } else {
-                Phase::Processing
-            };
-        });
+        if pending.is_empty() {
+            self.ensure_generation(generation)?;
+            return self.activate_profile(profile_id);
+        }
+
+        let model_path = self.ensure_model(spec, generation).await?;
+        self.ensure_generation(generation)?;
+        let model = self.load_model(&profile_id, &model_path).await?;
+        self.ensure_generation(generation)?;
+        self.update_status(|status| status.phase = Phase::Processing);
 
         let mut jobs = tokio::task::JoinSet::new();
         while !pending.is_empty() || !jobs.is_empty() {
@@ -506,6 +541,10 @@ impl Manager {
             }
         }
         self.ensure_generation(generation)?;
+        self.activate_profile(profile_id)
+    }
+
+    fn activate_profile(&self, profile_id: String) -> Result<()> {
         let entries = self.library.load_similarity_index(&profile_id)?;
         let total_tracks = self
             .library
@@ -519,7 +558,12 @@ impl Manager {
             profile_id: Some(profile_id.clone()),
             entries,
         };
-        lock(&self.settings).active_profile = Some(profile_id.clone());
+        let profile_changed = {
+            let mut settings = lock(&self.settings);
+            let changed = settings.active_profile.as_deref() != Some(&profile_id);
+            settings.active_profile = Some(profile_id.clone());
+            changed
+        };
         let stats = self.library.similarity_storage_stats(&profile_id)?;
         self.update_status(|status| {
             status.phase = Phase::Ready;
@@ -531,9 +575,11 @@ impl Manager {
             status.stored_bytes = stats.stored_bytes;
             status.current_track = None;
         });
-        let _ = self
-            .event_tx
-            .send(AppEvent::SimilarityProfileActivated(Some(profile_id)));
+        if profile_changed {
+            let _ = self
+                .event_tx
+                .send(AppEvent::SimilarityProfileActivated(Some(profile_id)));
+        }
         Ok(())
     }
 
@@ -561,6 +607,7 @@ impl Manager {
             tokio::fs::remove_file(&path).await?;
         }
 
+        self.update_status(|status| status.phase = Phase::Downloading);
         let response = reqwest::get(spec.url).await?.error_for_status()?;
         let tmp = path.with_extension(format!("part-{}-{generation}", std::process::id()));
         let mut file = tokio::fs::File::create(&tmp).await?;
@@ -603,6 +650,7 @@ impl Manager {
         {
             return Ok(Arc::clone(model));
         }
+        self.update_status(|status| status.phase = Phase::Loading);
         let path = path.to_path_buf();
         let model = tokio::task::spawn_blocking(move || load_onnx(&path))
             .await
@@ -614,10 +662,13 @@ impl Manager {
     fn update_status(&self, update: impl FnOnce(&mut SimilarityStatus)) {
         let snapshot = {
             let mut status = lock(&self.status);
+            let previous = status.clone();
             update(&mut status);
-            status.clone()
+            (*status != previous).then(|| status.clone())
         };
-        let _ = self.event_tx.send(AppEvent::SimilarityStatus(snapshot));
+        if let Some(snapshot) = snapshot {
+            let _ = self.event_tx.send(AppEvent::SimilarityStatus(snapshot));
+        }
     }
 }
 
@@ -977,6 +1028,14 @@ fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("furumi-{label}-{}-{unique}", std::process::id()))
+    }
+
     #[test]
     fn profile_fingerprint_changes_with_contract() {
         let model = &MODELS[0];
@@ -1008,6 +1067,43 @@ mod tests {
         let distinct = [0.0, 1.0, 0.0];
         assert!(is_near_duplicate(&near_duplicate, &[&query]));
         assert!(!is_near_duplicate(&distinct, &[&query]));
+    }
+
+    #[tokio::test]
+    async fn repeated_rescans_keep_an_up_to_date_profile_ready() {
+        let directory = unique_test_dir("similarity-stable-status");
+        let library = Arc::new(Library::open(&directory.join("library.db")).unwrap());
+        let profile_id = profile_fingerprint(&MODELS[0], DEFAULT_PROFILE_ID);
+        let settings = SimilaritySettings {
+            enabled: true,
+            active_profile: Some(profile_id),
+            ..SimilaritySettings::default()
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager = Manager::new(Arc::clone(&library), event_tx, settings);
+
+        assert_eq!(manager.status().phase, Phase::Ready);
+        for _ in 0..32 {
+            manager.start();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while manager.pipeline_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(manager.status().phase, Phase::Ready);
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::SimilarityStatus(status) = event {
+                assert_eq!(status.phase, Phase::Ready);
+            }
+        }
+
+        drop(manager);
+        drop(library);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

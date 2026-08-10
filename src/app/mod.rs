@@ -44,6 +44,10 @@ pub struct Runtime {
     pub similarity: Arc<crate::similarity::Manager>,
     /// When the last Federation-tab status snapshot was requested.
     pub fed_status_at: Option<std::time::Instant>,
+    /// Keeps the last successful local-data snapshot visible while a newer
+    /// one is calculated and collapses bursts of library-change events.
+    pub local_library_stats_refreshing: Arc<std::sync::atomic::AtomicBool>,
+    pub local_library_stats_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
     pub library_network_refresh_at: Option<std::time::Instant>,
     pub library_network_refreshing: Arc<std::sync::atomic::AtomicBool>,
     pub library_network_cursors:
@@ -102,11 +106,35 @@ fn refresh_local_content_ids(runtime: &Runtime) {
 }
 
 fn refresh_local_library_stats(runtime: &Runtime) {
+    runtime
+        .local_library_stats_refresh_requested
+        .store(true, std::sync::atomic::Ordering::Release);
+    if runtime
+        .local_library_stats_refreshing
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
     let library = Arc::clone(&runtime.library);
     let tx = runtime.event_tx.clone();
+    let refreshing = Arc::clone(&runtime.local_library_stats_refreshing);
+    let requested = Arc::clone(&runtime.local_library_stats_refresh_requested);
     tokio::task::spawn_blocking(move || {
-        let result = library.local_stats().map_err(err_string);
-        let _ = tx.send(AppEvent::LocalLibraryStatsLoaded(result));
+        loop {
+            requested.store(false, std::sync::atomic::Ordering::Release);
+            let result = library.local_stats().map_err(err_string);
+            let _ = tx.send(AppEvent::LocalLibraryStatsLoaded(result));
+            if requested.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            refreshing.store(false, std::sync::atomic::Ordering::Release);
+            if requested.swap(false, std::sync::atomic::Ordering::AcqRel)
+                && !refreshing.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                continue;
+            }
+            break;
+        }
     });
 }
 
@@ -303,6 +331,8 @@ pub async fn run(
         federation,
         similarity,
         fed_status_at: None,
+        local_library_stats_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        local_library_stats_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         library_network_refresh_at: None,
         library_network_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         library_network_cursors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -2746,7 +2776,12 @@ fn on_library_changed(state: &mut AppState, runtime: &mut Runtime) {
     // until then.
     state.likes_loaded = false;
     state.local_content_ids_loaded = false;
-    state.local_library_stats = None;
+    // Refresh in place: status cards keep the last successful snapshot
+    // instead of flashing `loading` for every background library event.
+    if state.local_library_stats.is_none() {
+        state.local_library_stats = Some(state::Loadable::Loading);
+    }
+    refresh_local_library_stats(runtime);
 
     // Fresh copies of whatever sits in the queue. Federated placeholders
     // and ephemeral tracks (negative ids) are not library rows and keep
@@ -3792,15 +3827,17 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 tracing::warn!(%message, "local content id load failed");
             }
         },
-        AppEvent::LocalLibraryStatsLoaded(result) => {
-            state.local_library_stats = Some(match result {
-                Ok(stats) => state::Loadable::Ready(stats),
-                Err(message) => {
-                    tracing::warn!(%message, "local library stats load failed");
-                    state::Loadable::Failed(message)
+        AppEvent::LocalLibraryStatsLoaded(result) => match result {
+            Ok(stats) => {
+                state.local_library_stats = Some(state::Loadable::Ready(stats));
+            }
+            Err(message) => {
+                tracing::warn!(%message, "local library stats load failed");
+                if !matches!(state.local_library_stats, Some(state::Loadable::Ready(_))) {
+                    state.local_library_stats = Some(state::Loadable::Failed(message));
                 }
-            });
-        }
+            }
+        },
         AppEvent::LocalContentAvailable { content_id } => {
             if let Some(content_id) = music_dht::normalize_content_id(&content_id) {
                 state.local_content_ids.insert(content_id);

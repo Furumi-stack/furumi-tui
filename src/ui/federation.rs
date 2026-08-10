@@ -541,21 +541,20 @@ fn short_id(id: &str) -> String {
 }
 
 fn draw_status_column(frame: &mut Frame, area: Rect, state: &AppState) {
-    if area.height < 12 {
-        draw_status(frame, area, state);
-        return;
-    }
-    let [similarity_area, _, federation_area] = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    draw_similarity_status(frame, similarity_area, state);
-    draw_status(frame, federation_area, state);
+    draw_status(frame, area, state);
 }
 
 fn draw_similarity_status(frame: &mut Frame, area: Rect, state: &AppState) {
+    draw_summary_card(
+        frame,
+        area,
+        state,
+        " Similarity Processing ",
+        similarity_summary_lines(state),
+    );
+}
+
+fn similarity_summary_lines(state: &AppState) -> Vec<Line<'static>> {
     let status = &state.similarity.status;
     let progress = if status.total_tracks == 0 {
         "0 / 0".to_string()
@@ -572,34 +571,28 @@ fn draw_similarity_status(frame: &mut Frame, area: Rect, state: &AppState) {
         .as_deref()
         .map(short_id)
         .unwrap_or_else(|| "—".to_string());
-    draw_summary_card(
-        frame,
-        area,
-        state,
-        " Similarity Processing ",
-        vec![
-            status_line("State", status.phase.label().to_string()),
-            status_line("Progress", progress),
-            status_line("Active", active),
-            status_line("Processing", target),
-            status_line(
-                "Stored",
-                format!(
-                    "{} vectors / {}",
-                    status.stored_vectors,
-                    short_bytes_label(status.stored_bytes)
-                ),
+    vec![
+        summary_line("State", status.phase.label().to_string()),
+        summary_line("Progress", progress),
+        summary_line("Active", active),
+        summary_line("Processing", target),
+        summary_line(
+            "Stored",
+            format!(
+                "{} vectors / {}",
+                status.stored_vectors,
+                short_bytes_label(status.stored_bytes)
             ),
-            status_line(
-                "Current / errors",
-                status
-                    .current_track
-                    .clone()
-                    .or_else(|| status.last_error.clone())
-                    .unwrap_or_else(|| format!("{} errors", status.failed_tracks)),
-            ),
-        ],
-    );
+        ),
+        summary_line(
+            "Current",
+            status
+                .current_track
+                .clone()
+                .or_else(|| status.last_error.clone())
+                .unwrap_or_else(|| format!("{} errors", status.failed_tracks)),
+        ),
+    ]
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -616,69 +609,81 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    if area.width >= 60 && area.height >= 20 {
-        let protocols_height =
-            protocol_card_height(state, area.width.saturating_sub(2), area.height);
-        let [top_area, _, bottom_area, _, protocols_area, _] = Layout::vertical([
-            Constraint::Length(7),
-            Constraint::Length(1),
-            Constraint::Length(7),
-            Constraint::Length(1),
-            Constraint::Length(protocols_height),
-            Constraint::Min(0),
-        ])
-        .areas(area);
-        let [status_area, _, local_area] = Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Length(1),
-            Constraint::Percentage(50),
-        ])
-        .areas(top_area);
-        let [transport_area, _, devices_area] = Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Length(1),
-            Constraint::Percentage(50),
-        ])
-        .areas(bottom_area);
-        draw_summary_card(
-            frame,
-            status_area,
-            state,
-            " Status ",
-            node_summary_lines(state),
-        );
-        draw_summary_card(
-            frame,
-            local_area,
-            state,
-            " Local Data ",
-            local_data_summary_lines(state),
-        );
-        draw_summary_card(
-            frame,
-            transport_area,
-            state,
-            " Iroh Transport ",
-            transport_summary_lines(state),
-        );
-        draw_summary_card(
-            frame,
-            devices_area,
-            state,
-            " Connected Devices ",
-            device_summary_lines(state),
-        );
-        draw_summary_card(
-            frame,
-            protocols_area,
-            state,
-            " Protocol Versions ",
-            protocol_summary_lines(state, protocols_area.width.saturating_sub(2)),
-        );
-        return;
+    if area.width >= 60 {
+        let paired_width = area.width.saturating_sub(1) / 2;
+        let paired_height =
+            protocol_card_height(state, paired_width.saturating_sub(2), area.height).max(8);
+        if area.height >= 16 + paired_height {
+            let [top_area, _, middle_area, _, paired_area, _] = Layout::vertical([
+                Constraint::Length(7),
+                Constraint::Length(1),
+                Constraint::Length(7),
+                Constraint::Length(1),
+                Constraint::Length(paired_height),
+                Constraint::Min(0),
+            ])
+            .areas(area);
+            let [status_area, _, local_area] = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .areas(top_area);
+            let [transport_area, _, devices_area] = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .areas(middle_area);
+            let [similarity_area, _, protocols_area] = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .areas(paired_area);
+            draw_summary_card(
+                frame,
+                status_area,
+                state,
+                " Status ",
+                node_summary_lines(state),
+            );
+            draw_summary_card(
+                frame,
+                local_area,
+                state,
+                " Local Data ",
+                local_data_summary_lines(state),
+            );
+            draw_summary_card(
+                frame,
+                transport_area,
+                state,
+                " Iroh Transport ",
+                transport_summary_lines(state),
+            );
+            draw_summary_card(
+                frame,
+                devices_area,
+                state,
+                " Connected Devices ",
+                device_summary_lines(state),
+            );
+            draw_similarity_status(frame, similarity_area, state);
+            draw_summary_card(
+                frame,
+                protocols_area,
+                state,
+                " Protocol Versions ",
+                protocol_summary_lines(state, protocols_area.width.saturating_sub(2)),
+            );
+            return;
+        }
     }
 
-    if area.height < 39 {
+    let protocols_height = protocol_card_height(state, area.width.saturating_sub(2), area.height);
+    let required_vertical_height = 41u16.saturating_add(protocols_height);
+    if area.height < required_vertical_height {
         frame.render_widget(
             Paragraph::new(compact_status_lines(state))
                 .wrap(ratatui::widgets::Wrap { trim: false }),
@@ -696,6 +701,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         _,
         local_area,
         _,
+        similarity_area,
+        _,
         protocols_area,
         _,
     ] = Layout::vertical([
@@ -707,11 +714,9 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         Constraint::Length(1),
         Constraint::Length(7),
         Constraint::Length(1),
-        Constraint::Length(protocol_card_height(
-            state,
-            area.width.saturating_sub(2),
-            area.height,
-        )),
+        Constraint::Length(8),
+        Constraint::Length(1),
+        Constraint::Length(protocols_height),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -744,6 +749,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         " Local Data ",
         local_data_summary_lines(state),
     );
+    draw_similarity_status(frame, similarity_area, state);
     draw_summary_card(
         frame,
         protocols_area,
@@ -766,6 +772,12 @@ fn compact_status_lines(state: &AppState) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(Line::styled("Connected Devices", theme::header_for(state)));
     lines.extend(device_summary_lines(state).into_iter().take(2));
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Similarity Processing",
+        theme::header_for(state),
+    ));
+    lines.extend(similarity_summary_lines(state).into_iter().take(3));
     lines.push(Line::default());
     lines.push(Line::styled("Protocol Versions", theme::header_for(state)));
     lines.extend(protocol_summary_lines(state, 0).into_iter().take(3));
