@@ -1648,6 +1648,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "furumi-library"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f15ab98c65d89ea18e55ed8852abd2f029f63876d357270c4647d73601d0a2"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "directories",
+ "lofty",
+ "music-dht",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "furumi_tui"
 version = "0.2.6"
 dependencies = [
@@ -1657,6 +1674,7 @@ dependencies = [
  "crokey",
  "crossterm",
  "directories",
+ "furumi-library",
  "futures-util",
  "image",
  "libc",

@@ -17,6 +17,7 @@ crokey = "1.4.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6.0.0"
 futures-util = "0.3.32"
+furumi-library = "0.1.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 lofty = "0.22"
 # P2P federation: library index in a shared DHT + audio streaming between

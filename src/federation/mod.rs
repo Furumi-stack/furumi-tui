@@ -360,43 +360,7 @@ pub struct FedSimilaritySearchResults {
 }
 
 /// A track found through federated search.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FedTrack {
-    /// Hex item id in the DHT (the key audio is requested by).
-    pub item_id: String,
-    /// Hex endpoint id of the owning peer.
-    pub owner: String,
-    /// The item is published by this very instance.
-    pub own: bool,
-    pub title: String,
-    pub artist_names: Vec<String>,
-    pub featured_artist_names: Vec<String>,
-    pub year: Option<i32>,
-    pub duration_seconds: Option<i64>,
-    /// Stable audio content id (`b3:<64 hex>`) when the owner published it.
-    pub content_id: Option<String>,
-    /// Release context, known when the track came from an artist card.
-    pub release_title: Option<String>,
-    pub track_number: Option<i32>,
-    pub disc_number: Option<i32>,
-}
-
-impl FedTrack {
-    pub fn artist_line(&self) -> String {
-        artist_line(&self.artist_names, &self.featured_artist_names)
-    }
-
-    pub fn owner_short(&self) -> String {
-        self.owner.chars().take(10).collect()
-    }
-
-    pub fn duration_label(&self) -> String {
-        match self.duration_seconds {
-            Some(total) => format!("{}:{:02}", total / 60, total % 60),
-            None => String::new(),
-        }
-    }
-}
+pub use furumi_library::FederatedTrack as FedTrack;
 
 /// Live status snapshot rendered on the Federation tab.
 #[derive(Debug, Clone, Default)]
@@ -2598,28 +2562,6 @@ fn push_artist_once(names: &mut Vec<String>, name: &str) {
         return;
     }
     names.push(name.to_string());
-}
-
-fn artist_line(artists: &[String], featured_artists: &[String]) -> String {
-    let mut main = Vec::new();
-    for artist in artists {
-        push_artist_once(&mut main, artist);
-    }
-    let mut featured = Vec::new();
-    for artist in featured_artists {
-        if !main
-            .iter()
-            .any(|name| music_dht::normalize_name(name) == music_dht::normalize_name(artist))
-        {
-            push_artist_once(&mut featured, artist);
-        }
-    }
-    match (main.is_empty(), featured.is_empty()) {
-        (false, false) => format!("{} feat. {}", main.join(", "), featured.join(", ")),
-        (false, true) => main.join(", "),
-        (true, false) => format!("feat. {}", featured.join(", ")),
-        (true, true) => String::new(),
-    }
 }
 
 fn sort_fed_appearances(appearances: &mut [FedAppearsOn]) {

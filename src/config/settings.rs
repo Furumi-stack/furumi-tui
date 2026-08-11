@@ -2,48 +2,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LibrarySourceMode {
-    Local,
-    My,
-    #[default]
-    Global,
-}
-
-impl LibrarySourceMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            LibrarySourceMode::Local => "Local",
-            LibrarySourceMode::My => "My",
-            LibrarySourceMode::Global => "Global",
-        }
-    }
-
-    pub fn includes_network(self) -> bool {
-        !matches!(self, LibrarySourceMode::Local)
-    }
-
-    pub fn includes_global_peers(self) -> bool {
-        matches!(self, LibrarySourceMode::Global)
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            LibrarySourceMode::Local => LibrarySourceMode::My,
-            LibrarySourceMode::My => LibrarySourceMode::Global,
-            LibrarySourceMode::Global => LibrarySourceMode::Local,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LibraryFilters {
-    #[serde(default)]
-    pub hide_featured_only: bool,
-    #[serde(default)]
-    pub source_mode: LibrarySourceMode,
-}
+pub use furumi_library::{LibraryFilters, LibrarySourceMode};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimilaritySettings {

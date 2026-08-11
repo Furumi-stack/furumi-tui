@@ -927,7 +927,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             return centered_line(frame, inner, line);
         }
     };
-    if results.len() == 0
+    if results.is_empty()
         && state.search.fed_tracks.is_empty()
         && state.search.fed_artists.is_empty()
         && !state.search.fed_loading
