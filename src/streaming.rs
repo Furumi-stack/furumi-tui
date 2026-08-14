@@ -101,11 +101,30 @@ impl Read for GrowingFileReader {
 }
 
 impl Seek for GrowingFileReader {
-    fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "streaming playback is not seekable yet",
-        ))
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        // Random access beyond the downloaded prefix is intentionally not
+        // exposed, but decoders may inspect and rewind the available header.
+        let available = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .available;
+        let target = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(available) + i128::from(offset),
+        };
+        if target < 0 || target > i128::from(available) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot seek outside the downloaded audio prefix",
+            ));
+        }
+        let target = target as u64;
+        self.file.seek(SeekFrom::Start(target))?;
+        self.pos = target;
+        Ok(target)
     }
 }
 
@@ -128,6 +147,12 @@ mod tests {
         let mut first = [0u8; 3];
         reader.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"fur");
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut rewind = [0u8; 3];
+        reader.read_exact(&mut rewind).unwrap();
+        assert_eq!(&rewind, b"fur");
+        assert!(reader.seek(SeekFrom::Start(4)).is_err());
 
         output.write_all(b"umi").unwrap();
         writer.add_available(3);

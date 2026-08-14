@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use futures_util::StreamExt as _;
-use rodio::{Decoder, Source as _};
+use rodio::Source as _;
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 use sha2::{Digest as _, Sha256};
@@ -847,8 +847,15 @@ fn decode_mono_window(
     length_seconds: Option<f64>,
 ) -> Result<Vec<f32>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut decoder =
-        Decoder::try_from(file).with_context(|| format!("decoding {}", path.display()))?;
+    let byte_len = file.metadata().ok().map(|metadata| metadata.len());
+    let mut decoder = crate::player::decode_source(
+        Box::new(std::io::BufReader::new(file)),
+        byte_len,
+        None,
+        true,
+    )
+    .map_err(anyhow::Error::msg)
+    .with_context(|| format!("decoding {}", path.display()))?;
     let channels = decoder.channels().get() as usize;
     let source_rate = decoder.sample_rate().get() as usize;
     if start_seconds > 0.0 {

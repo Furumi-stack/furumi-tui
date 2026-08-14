@@ -5,13 +5,14 @@
 //! the UI or app state.
 
 mod analyzer;
+mod opus;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, Player, stream::MixerDeviceSink};
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source, stream::MixerDeviceSink};
 
 pub use analyzer::AudioAnalysisSnapshot;
 
@@ -226,23 +227,13 @@ fn handle(
             }
             let out = output.as_ref().expect("output opened above");
 
-            let mut builder = Decoder::builder()
-                .with_data(reader)
-                .with_seekable(seekable)
-                .with_gapless(true);
-            if let Some(len) = byte_len {
-                builder = builder.with_byte_len(len);
-            }
-            if let Some(mime_type) = mime_type.as_deref() {
-                builder = builder.with_mime_type(mime_type);
-            }
-            match builder.build() {
-                Ok(decoder) => {
+            match decode_source(reader, byte_len, mime_type.as_deref(), seekable) {
+                Ok(source) => {
                     shared.analysis.clear();
                     out.player.stop();
                     out.player.set_volume(volume);
                     out.player.append(analyzer::AnalyzedSource::new(
-                        decoder,
+                        source,
                         Arc::clone(&shared.analysis),
                     ));
                     out.player.play();
@@ -258,16 +249,9 @@ fn handle(
             let Some(out) = output.as_ref() else {
                 return;
             };
-            let mut builder = Decoder::builder()
-                .with_data(reader)
-                .with_seekable(true)
-                .with_gapless(true);
-            if let Some(len) = byte_len {
-                builder = builder.with_byte_len(len);
-            }
-            match builder.build() {
-                Ok(decoder) => out.player.append(analyzer::AnalyzedSource::new(
-                    decoder,
+            match decode_source(reader, byte_len, None, true) {
+                Ok(source) => out.player.append(analyzer::AnalyzedSource::new(
+                    source,
                     Arc::clone(&shared.analysis),
                 )),
                 Err(err) => {
@@ -308,4 +292,39 @@ fn handle(
             }
         }
     }
+}
+
+pub(crate) type DecodedSource = Box<dyn Source + Send>;
+
+pub(crate) fn decode_source(
+    mut reader: TrackReader,
+    byte_len: Option<u64>,
+    mime_type: Option<&str>,
+    seekable: bool,
+) -> Result<DecodedSource, String> {
+    let mime_is_opus = mime_type.is_some_and(|mime| {
+        let mime = mime.to_ascii_lowercase();
+        mime == "audio/opus" || mime.contains("codecs=opus") || mime.contains("codecs=\"opus\"")
+    });
+    let ogg_is_opus = opus::is_ogg_opus(&mut reader)
+        .map_err(|error| format!("cannot inspect audio stream: {error}"))?;
+    if mime_is_opus || ogg_is_opus {
+        return opus::OggOpusSource::new(reader, byte_len, seekable)
+            .map(|source| Box::new(source) as DecodedSource);
+    }
+
+    let mut builder = Decoder::builder()
+        .with_data(reader)
+        .with_seekable(seekable)
+        .with_gapless(true);
+    if let Some(len) = byte_len {
+        builder = builder.with_byte_len(len);
+    }
+    if let Some(mime_type) = mime_type {
+        builder = builder.with_mime_type(mime_type);
+    }
+    builder
+        .build()
+        .map(|decoder| Box::new(decoder) as DecodedSource)
+        .map_err(|error| error.to_string())
 }

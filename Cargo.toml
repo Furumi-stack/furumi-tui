@@ -1,6 +1,6 @@
 [package]
 name = "furumi_tui"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.97"
 description = "A federated P2P player for personal music libraries"
@@ -27,12 +27,14 @@ ratatui = "0.30.1"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 rhai = { version = "1", features = ["sync"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "symphonia-aac", "symphonia-isomp4", "symphonia-alac"] }
+rusty-opus = "0.9.1"
 rustfft = "6.4.1"
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["ogg"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 toml = "1.1.2"
@@ -54,3 +56,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.186"
+
+[dev-dependencies]
+base64 = "0.22.1"
