@@ -21,8 +21,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use music_dht::similarity_dht::SimilarityDht;
@@ -46,6 +46,11 @@ pub use similarity::SIMILARITY_ALPN;
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the application checks whether the shared transport needs a
+/// full restart so all application-owned protocol acceptors are recreated.
+const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(15);
+/// Prevents repeated restarts during a prolonged external network outage.
+const RECOVERY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// How many times a share-link content lookup is retried before the label
 /// fallback kicks in.
@@ -370,6 +375,12 @@ pub struct FedStatus {
     pub endpoint_id: String,
     pub dht_node_id: String,
     pub connected_peers: Vec<String>,
+    pub network_health: String,
+    pub rendezvous_failures: u32,
+    pub peer_dial_failures: u32,
+    pub rendezvous_restarts: u64,
+    pub recovery_count: u64,
+    pub last_rendezvous_error: Option<String>,
     pub known_contacts: usize,
     pub stored_dht_records: Option<usize>,
     pub stored_dht_bytes: Option<u64>,
@@ -419,6 +430,10 @@ pub struct Federation {
     metadata_cache: std::sync::Mutex<std::collections::HashMap<String, CachedTrackMetadata>>,
     settings: std::sync::Mutex<FedSettings>,
     running: tokio::sync::Mutex<Option<Running>>,
+    supervisor_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    supervisor_shutdown: tokio::sync::Notify,
+    shutting_down: AtomicBool,
+    recovery_count: AtomicU64,
     last_sync: std::sync::Mutex<Option<String>>,
     last_error: std::sync::Mutex<Option<String>>,
     transport_stats: Arc<TransportStats>,
@@ -549,6 +564,10 @@ impl Federation {
             metadata_cache: std::sync::Mutex::new(Default::default()),
             settings: std::sync::Mutex::new(load_settings()),
             running: tokio::sync::Mutex::new(None),
+            supervisor_task: std::sync::Mutex::new(None),
+            supervisor_shutdown: tokio::sync::Notify::new(),
+            shutting_down: AtomicBool::new(false),
+            recovery_count: AtomicU64::new(0),
             last_sync: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(initial_error),
             transport_stats: Arc::new(TransportStats::default()),
@@ -558,6 +577,18 @@ impl Federation {
 
     pub fn settings(&self) -> FedSettings {
         lock(&self.settings).clone()
+    }
+
+    /// Starts the application-level federation supervisor once.
+    pub fn start_supervisor(self: &Arc<Self>) {
+        let mut task = lock(&self.supervisor_task);
+        if task.is_some() || self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let federation = Arc::clone(self);
+        *task = Some(tokio::spawn(async move {
+            federation.supervisor_loop().await;
+        }));
     }
 
     pub fn media_dir(&self) -> PathBuf {
@@ -665,12 +696,43 @@ impl Federation {
         network_id: NetworkId,
         network_name: String,
     ) -> Result<()> {
+        self.start_with_network_id_mode(network_id, network_name, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn start_with_network_id_mode(
+        self: &Arc<Self>,
+        network_id: NetworkId,
+        network_name: String,
+        recovery_only: bool,
+    ) -> Result<bool> {
         let mut guard = self.running.lock().await;
+        if recovery_only {
+            let current = self.settings();
+            if !current.enabled
+                || current.network_id.trim() != network_name
+                || NetworkId::from_name(current.network_id.trim()) != network_id
+            {
+                return Ok(false);
+            }
+        }
         if let Some(running) = guard.as_ref() {
             if running.network_id == network_id {
-                return Ok(());
+                if !recovery_only || !running.service.network_health().restart_recommended {
+                    return Ok(false);
+                }
+                tracing::warn!(
+                    network = %network_name,
+                    health = %running.service.network_health().state,
+                    "restarting degraded federation service"
+                );
+            } else if recovery_only {
+                return Ok(false);
             }
             stop_running(guard.take()).await;
+        } else if recovery_only {
+            tracing::warn!(network = %network_name, "retrying stopped federation service");
         }
         std::fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("creating {}", self.data_dir.display()))?;
@@ -828,7 +890,7 @@ impl Federation {
             ],
         });
         self.set_error(None);
-        Ok(())
+        Ok(true)
     }
 
     async fn stop(&self) {
@@ -837,7 +899,55 @@ impl Federation {
     }
 
     pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.supervisor_shutdown.notify_one();
+        let supervisor = lock(&self.supervisor_task).take();
+        if let Some(supervisor) = supervisor {
+            let _ = supervisor.await;
+        }
         self.stop().await;
+    }
+
+    async fn supervisor_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(SUPERVISOR_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut last_attempt = None;
+        loop {
+            tokio::select! {
+                _ = self.supervisor_shutdown.notified() => return,
+                _ = interval.tick() => {}
+            }
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            if last_attempt.is_some_and(|attempt: Instant| attempt.elapsed() < RECOVERY_COOLDOWN) {
+                continue;
+            }
+            match self.recover_if_needed().await {
+                Ok(false) => {}
+                Ok(true) => {
+                    last_attempt = Some(Instant::now());
+                    self.recovery_count.fetch_add(1, Ordering::Relaxed);
+                    self.spawn_sync_soon().await;
+                }
+                Err(err) => {
+                    last_attempt = Some(Instant::now());
+                    tracing::error!(error = %err, "federation recovery failed");
+                    self.set_error(Some(format!("network recovery failed: {err}")));
+                }
+            }
+        }
+    }
+
+    async fn recover_if_needed(self: &Arc<Self>) -> Result<bool> {
+        let settings = self.settings();
+        if !settings.enabled || settings.network_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let network_name = settings.network_id.trim().to_string();
+        self.start_with_network_id_mode(NetworkId::from_name(&network_name), network_name, true)
+            .await
     }
 
     async fn service(&self) -> Result<Arc<MusicDhtService>> {
@@ -975,6 +1085,7 @@ impl Federation {
         let guard = self.running.lock().await;
         let mut status = FedStatus {
             network: settings.network_id,
+            recovery_count: self.recovery_count.load(Ordering::Relaxed),
             last_sync: lock(&self.last_sync).clone(),
             last_error: lock(&self.last_error).clone(),
             protocols: ProtocolVersions::snapshot(&self.observed_protocols),
@@ -982,6 +1093,7 @@ impl Federation {
         };
         if let Some(running) = guard.as_ref() {
             let service = &running.service;
+            let health = service.network_health();
             status.running = true;
             status.network = running.network_name.clone();
             status.endpoint_id = service.endpoint_id().to_string();
@@ -991,6 +1103,11 @@ impl Federation {
                 .iter()
                 .map(|p| p.to_string())
                 .collect();
+            status.network_health = health.state.to_string();
+            status.rendezvous_failures = health.consecutive_rendezvous_failures;
+            status.peer_dial_failures = health.consecutive_peer_dial_failures;
+            status.rendezvous_restarts = health.rendezvous_restarts;
+            status.last_rendezvous_error = health.last_rendezvous_error;
             status.known_contacts = service.known_peers().len();
             status.stored_dht_records = service.dht_record_count().await.ok();
             status.stored_dht_bytes =

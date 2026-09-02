@@ -961,7 +961,10 @@ fn node_summary_lines(state: &AppState) -> Vec<Line<'static>> {
             ]
         }
         Some(status) => vec![
-            summary_line("Node", format!("running on {}", status.network)),
+            summary_line(
+                "Node",
+                format!("running on {} · {}", status.network, status.network_health),
+            ),
             summary_line(
                 "Peers",
                 format!(
@@ -1215,6 +1218,17 @@ fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Lin
                     status.known_contacts
                 ),
             ));
+            lines.push(status_line(
+                "Discovery",
+                format!(
+                    "{} · {} DHT / {} dial failures · {} rebuilds · {} full recoveries",
+                    status.network_health,
+                    status.rendezvous_failures,
+                    status.peer_dial_failures,
+                    status.rendezvous_restarts,
+                    status.recovery_count
+                ),
+            ));
             if !status.connected_peers.is_empty() {
                 let mut peers: Vec<String> = status
                     .connected_peers
@@ -1259,6 +1273,9 @@ fn status_detail_status_lines(state: &AppState, status_cursor: usize) -> Vec<Lin
             ));
             if let Some(error) = &status.last_error {
                 lines.push(status_line("Error", first_line(error)));
+            }
+            if let Some(error) = &status.last_rendezvous_error {
+                lines.push(status_line("Discovery error", first_line(error)));
             }
             push_transport_summary_status(&mut lines, state, status);
         }

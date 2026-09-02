@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-09-02
+
 ### Added
 
 - Optional offline music-similarity search for local tracks, backed by
@@ -27,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Similarity wire types, bounds, validation, and stream framing now come from
-  the shared `music-dht 0.4.0` API so native, web, and future clients can
+  the shared `music-dht 0.4` API so native, web, and future clients can
   interoperate without sharing an embedding implementation.
 - Existing SQLite embeddings are backfilled once with compact 256-bit routing
   signatures; new embeddings store them immediately without changing exact
@@ -41,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Federation now recovers automatically after sleep, prolonged idle, or a
+  degraded rendezvous transport while preserving local playback and state.
 - Current-track information (`Shift+I`) now uses the enriched queue entry, so
   it shows the same complete metadata and similarity action as `I` on that
   track in the queue.
@@ -74,5 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Music-directory validation and migration now reject overlapping changes,
   resolve canonical paths, and produce Windows-portable managed filenames.
 
-[Unreleased]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.5...HEAD
+[Unreleased]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.8...HEAD
+[0.2.8]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.7...v0.2.8
 [0.2.5]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.4...v0.2.5

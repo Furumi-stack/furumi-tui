@@ -312,6 +312,7 @@ pub async fn run(
         Arc::clone(&similarity),
         settings.music_dir.clone(),
     );
+    federation.start_supervisor();
     state.music_dir = federation.media_dir();
     state.federation.settings = federation.settings();
     state.federation.devices = Some(devices.status());
