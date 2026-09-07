@@ -431,6 +431,13 @@ pub async fn run(
         }
 
         if state.should_quit {
+            // A replacement must finish before the runtime/process is torn down.
+            if state.updater.busy {
+                state.should_quit = false;
+                state.status_message =
+                    Some("Please wait for the update operation to finish".into());
+                continue;
+            }
             if runtime.plain_text_mode {
                 leave_plain_text_mode()?;
                 runtime.plain_text_mode = false;
@@ -1415,6 +1422,31 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         return;
     }
     match effect {
+        Effect::CheckUpdate => {
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(crate::updater::check)
+                    .await
+                    .map_err(|err| format!("update worker failed: {err}"))
+                    .and_then(|result| result.map_err(|err| format!("{err:#}")));
+                let _ = tx.send(AppEvent::UpdateChecked(result));
+            });
+        }
+        Effect::InstallUpdate(update) => {
+            let tx = runtime.event_tx.clone();
+            tokio::spawn(async move {
+                let progress_tx = tx.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::updater::install(&update, |message| {
+                        let _ = progress_tx.send(AppEvent::UpdateProgress(message));
+                    })
+                })
+                .await
+                .map_err(|err| format!("update worker failed: {err}"))
+                .and_then(|result| result.map_err(|err| format!("{err:#}")));
+                let _ = tx.send(AppEvent::UpdateInstalled(result));
+            });
+        }
         Effect::PlayCurrent => {
             play_current(state, runtime);
             push_media_metadata(state, runtime);
@@ -3098,6 +3130,37 @@ fn handle_playback_command(
 
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
     match event {
+        AppEvent::UpdateChecked(result) => {
+            state.updater.busy = false;
+            state.updater.message = match result {
+                Ok(Some(update)) => {
+                    let message = format!("v{} available", update.version);
+                    state.updater.available = Some(update);
+                    message
+                }
+                Ok(None) => "No newer stable release".into(),
+                Err(error) => format!("Check failed: {error}"),
+            };
+            state.status_message = Some(state.updater.message.clone());
+        }
+        AppEvent::UpdateProgress(message) => state.updater.message = message,
+        AppEvent::UpdateInstalled(result) => {
+            state.updater.busy = false;
+            state.updater.message = match result {
+                Ok(()) => {
+                    state.updater.installed = true;
+                    let version = state
+                        .updater
+                        .available
+                        .as_ref()
+                        .map(|u| u.version.as_str())
+                        .unwrap_or("new version");
+                    format!("Installed {version}; restart furumi")
+                }
+                Err(error) => format!("Update failed: {error}"),
+            };
+            state.status_message = Some(state.updater.message.clone());
+        }
         AppEvent::StatusMessage(message) => state.status_message = Some(message),
         AppEvent::ListenHistoryLoaded(result) => {
             state.listen_history = Some(match result {

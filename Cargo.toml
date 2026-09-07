@@ -1,6 +1,6 @@
 [package]
 name = "furumi_tui"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 rust-version = "1.97"
 description = "A federated P2P player for personal music libraries"
@@ -11,6 +11,16 @@ name = "furumi"
 path = "src/main.rs"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+semver = "1"
+self-replace = "1.5"
+tempfile = "3"
+fs2 = "0.4"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
+
 anyhow = "1.0.102"
 blake3 = "1"
 crokey = "1.4.0"
@@ -24,7 +34,7 @@ lofty = "0.22"
 # peers (same protocol as furumi-fd).
 music-dht = "0.4.1"
 ratatui = "0.30.1"
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 rhai = { version = "1", features = ["sync"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "symphonia-aac", "symphonia-isomp4", "symphonia-alac"] }
 rusty-opus = "0.9.1"

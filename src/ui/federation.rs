@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::theme;
 use crate::app::state::{AppState, DevicePresenceSection, FedRow, SimilarityRow, settings_rows};
@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let rows_height =
-        (settings_rows(state).len() + 10 + device_presence_sections(state).len()) as u16;
+        (settings_rows(state).len() + 15 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -86,6 +86,48 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     cursor += 1;
 
+    y = y.saturating_add(1);
+
+    draw_section(frame, area, state, &mut y, "Updates");
+    draw_row_enabled(
+        frame,
+        area,
+        state,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Check for updates",
+        format!("v{} | enter", env!("CARGO_PKG_VERSION")),
+        !state.updater.busy && !state.updater.installed,
+    );
+    cursor += 1;
+    draw_row_enabled(
+        frame,
+        area,
+        state,
+        &mut y,
+        cursor,
+        state.settings_cursor,
+        "Install update",
+        state
+            .updater
+            .available
+            .as_ref()
+            .map(|update| format!("v{} | enter", update.version))
+            .unwrap_or_else(|| "check for updates first".into()),
+        state.updater.available.is_some() && !state.updater.busy && !state.updater.installed,
+    );
+    cursor += 1;
+    if y < area.bottom() {
+        let height = 3.min(area.bottom() - y);
+        frame.render_widget(
+            Paragraph::new(state.updater.message.as_str())
+                .style(theme::dim())
+                .wrap(Wrap { trim: true }),
+            Rect::new(area.x, y, area.width, height),
+        );
+        y += height;
+    }
     y = y.saturating_add(1);
 
     draw_section(frame, area, state, &mut y, "Similarity Search");
@@ -1576,5 +1618,43 @@ fn relative_time_label(value_ms: Option<i64>, now_ms: i64) -> String {
         format!("{}h ago", seconds / 60 / 60)
     } else {
         format!("{}d ago", seconds / 60 / 60 / 24)
+    }
+}
+
+#[cfg(test)]
+mod update_ui_tests {
+    use super::*;
+
+    #[test]
+    fn update_controls_and_existing_sections_render_in_both_layouts() {
+        for width in [80, 160] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 55)).unwrap();
+            let mut state = AppState::default();
+            state.updater.message = "No newer stable release".into();
+            terminal
+                .draw(|frame| draw(frame, frame.area(), &state))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            for expected in [
+                "Music save directory",
+                "Check for updates",
+                "Install update",
+                "No newer stable release",
+                "Similarity Search",
+                "Federation",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected} at width {width}"
+                );
+            }
+        }
     }
 }

@@ -10,6 +10,9 @@ use crate::library::models::{
 /// the playback engine, imports). Tasks never touch AppState directly.
 #[derive(Debug)]
 pub enum AppEvent {
+    UpdateChecked(Result<Option<crate::updater::Update>, String>),
+    UpdateProgress(String),
+    UpdateInstalled(Result<(), String>),
     StatusMessage(String),
     /// A page of the artists list arrived (or failed).
     ArtistsLoaded(Result<ArtistsPage, String>),

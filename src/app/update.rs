@@ -18,6 +18,8 @@ pub const QUIT_CONFIRM_HINT: &str = "press quit again to exit";
 /// owns the Runtime (audio controller, API client). Keeps update() pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
+    CheckUpdate,
+    InstallUpdate(crate::updater::Update),
     /// (Re)start playback of `queue[queue_pos]`.
     PlayCurrent,
     TogglePause,
@@ -2815,6 +2817,24 @@ fn fed_card_featured_artist_names(track: &crate::federation::FedCardTrack) -> Ve
 fn federation_select(state: &mut AppState) -> Option<Effect> {
     use super::state::{FedInputField, FedRow, Popup, SettingsRow, SimilarityRow};
     match settings_rows(state).get(state.settings_cursor).copied()? {
+        SettingsRow::CheckUpdate => {
+            if state.updater.busy || state.updater.installed {
+                return None;
+            }
+            state.updater.busy = true;
+            state.updater.available = None;
+            state.updater.message = "Checking GitHub Releases...".into();
+            Some(Effect::CheckUpdate)
+        }
+        SettingsRow::InstallUpdate => {
+            if state.updater.busy || state.updater.installed {
+                return None;
+            }
+            let update = state.updater.available.clone()?;
+            state.updater.busy = true;
+            state.updater.message = "Downloading update...".into();
+            Some(Effect::InstallUpdate(update))
+        }
         SettingsRow::MusicDirectory => {
             if state.music_dir_changing {
                 state.status_message = Some("music directory change is already running".into());

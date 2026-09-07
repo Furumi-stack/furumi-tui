@@ -98,7 +98,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh release create "$RELEASE_TAG" artifacts/*/* \
+          # Hash archive bytes; manifest entries use the release asset basenames.
+          for archive in artifacts/*/*; do
+            (cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")")
+          done > SHA256SUMS
+
+          gh release create "$RELEASE_TAG" artifacts/*/* SHA256SUMS \
             --title "furumi ${RELEASE_TAG}" \
             --notes "Release ${RELEASE_TAG}" \
             --verify-tag

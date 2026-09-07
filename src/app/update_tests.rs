@@ -1,6 +1,27 @@
 use super::*;
 use crate::library::models::{ArtistCard, ArtistDetail, TrackItem};
 
+#[test]
+fn manual_update_check_is_single_flight_and_disabled_after_install() {
+    let mut state = AppState::default();
+    state.settings_cursor = settings_rows(&state)
+        .iter()
+        .position(|row| *row == crate::app::state::SettingsRow::CheckUpdate)
+        .unwrap();
+    assert_eq!(federation_select(&mut state), Some(Effect::CheckUpdate));
+    assert!(state.updater.busy);
+    assert_eq!(federation_select(&mut state), None);
+    state.updater.busy = false;
+    state.updater.installed = true;
+    assert_eq!(federation_select(&mut state), None);
+    state.updater.installed = false;
+    state.settings_cursor = settings_rows(&state)
+        .iter()
+        .position(|row| *row == crate::app::state::SettingsRow::InstallUpdate)
+        .unwrap();
+    assert_eq!(federation_select(&mut state), None);
+}
+
 fn with_artists(n: usize) -> AppState {
     let mut state = AppState::default();
     state.global.artists = (0..n)

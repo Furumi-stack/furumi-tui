@@ -12,6 +12,7 @@ mod similarity;
 mod status;
 mod streaming;
 mod ui;
+mod updater;
 mod visualizer;
 
 use std::io;

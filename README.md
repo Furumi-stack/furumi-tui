@@ -124,6 +124,24 @@ Import a music directory from Furumi's command line:
 Federation, trusted-device pairing, and key bindings are configured directly
 inside the player.
 
+### Manual updates
+
+In **Settings → Updates**, select **Check for updates**, then **Install update**
+when a newer stable GitHub release is available. Downloads run in the background.
+After installation, restart `furumi` to use the new version; playback is not
+restarted automatically. Wait for an active update operation to finish before
+quitting.
+
+Updates replace the running executable in its installation directory, which
+must be writable by your user. Release archives must include a matching entry
+in the release's `SHA256SUMS` asset. Older releases without it cannot be installed
+through this feature. The updater checks SHA-256 and the executable's format
+and architecture before replacing it. Checksums provide integrity checking,
+not publisher signatures. Settings and the local library are preserved.
+
+There are no automatic startup checks. Only the existing release asset naming
+scheme is supported; missing or incompatible platform builds are rejected.
+
 ### Now playing in tmux
 
 While Furumi is running, a second invocation can print a cheap, single-line

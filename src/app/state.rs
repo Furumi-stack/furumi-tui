@@ -926,6 +926,8 @@ impl FedRow {
 /// the config directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
+    CheckUpdate,
+    InstallUpdate,
     MusicDirectory,
     Similarity(SimilarityRow),
     Federation(FedRow),
@@ -1065,7 +1067,11 @@ pub fn device_status_order(state: &AppState) -> Vec<usize> {
 }
 
 pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
-    let mut rows = vec![SettingsRow::MusicDirectory];
+    let mut rows = vec![
+        SettingsRow::MusicDirectory,
+        SettingsRow::CheckUpdate,
+        SettingsRow::InstallUpdate,
+    ];
     rows.extend(SimilarityRow::ALL.into_iter().map(SettingsRow::Similarity));
     rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
     rows.push(SettingsRow::DeviceName);
@@ -1571,6 +1577,7 @@ impl DevicePlaybackState {
 /// event handlers in the main loop; views render from `&AppState`.
 #[derive(Debug, Default)]
 pub struct AppState {
+    pub updater: crate::updater::State,
     pub active_tab: Tab,
     pub should_quit: bool,
     pub shutting_down: bool,
