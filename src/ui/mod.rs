@@ -1,3 +1,4 @@
+mod additional_settings;
 pub mod art;
 mod federation;
 mod global;
@@ -74,6 +75,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Logs => logs::draw(frame, main_area, state),
     }
     draw_status(frame, status_area, state);
+
+    if state.additional_settings_open {
+        additional_settings::draw(frame, state);
+    }
 
     if state.help_visible {
         draw_help(frame, keymap, state);

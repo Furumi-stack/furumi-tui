@@ -1967,6 +1967,11 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
 }
 
 fn clamp_settings_cursor(state: &mut AppState) {
+    state.additional_settings_cursor = state.additional_settings_cursor.min(
+        state::additional_settings_rows(state)
+            .len()
+            .saturating_sub(1),
+    );
     let last = state::settings_rows(state).len().saturating_sub(1);
     state.settings_cursor = state.settings_cursor.min(last);
 }

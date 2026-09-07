@@ -126,7 +126,7 @@ inside the player.
 
 ### Manual updates
 
-In **Settings → Updates**, select **Check for updates**, then **Install update**
+In **Settings → Additional settings → Updates**, select **Check for updates**, then **Install update**
 when a newer stable GitHub release is available. Downloads run in the background.
 After installation, restart `furumi` to use the new version; playback is not
 restarted automatically. Wait for an active update operation to finish before
@@ -141,6 +141,10 @@ not publisher signatures. Settings and the local library are preserved.
 
 There are no automatic startup checks. Only the existing release asset naming
 scheme is supported; missing or incompatible platform builds are rejected.
+
+The **Additional settings** window also contains the music save directory and
+visualization controls. Use Up/Down (or j/k) to navigate, Enter to select, and
+Esc to return to Settings. Long lists scroll with the selection.
 
 ### Now playing in tmux
 

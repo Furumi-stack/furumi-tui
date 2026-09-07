@@ -926,6 +926,7 @@ impl FedRow {
 /// the config directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
+    AdditionalSettings,
     CheckUpdate,
     InstallUpdate,
     MusicDirectory,
@@ -1066,24 +1067,13 @@ pub fn device_status_order(state: &AppState) -> Vec<usize> {
     indices
 }
 
-pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
+/// Secondary settings share actions but have independent navigation.
+pub fn additional_settings_rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = vec![
         SettingsRow::MusicDirectory,
         SettingsRow::CheckUpdate,
         SettingsRow::InstallUpdate,
     ];
-    rows.extend(SimilarityRow::ALL.into_iter().map(SettingsRow::Similarity));
-    rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
-    rows.push(SettingsRow::DeviceName);
-    rows.push(SettingsRow::DeviceInvite);
-    rows.push(SettingsRow::DeviceConnect);
-    rows.push(SettingsRow::DeviceSyncNow);
-    rows.push(SettingsRow::DeviceLeaveGroup);
-    rows.extend(
-        device_status_order(state)
-            .into_iter()
-            .map(SettingsRow::Device),
-    );
     rows.push(SettingsRow::VisualizationClock);
     rows.extend(
         state
@@ -1097,7 +1087,23 @@ pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
     if !state.visualizer.scripts.is_empty() {
         rows.push(SettingsRow::VisualizationEdit);
     }
-    rows.push(SettingsRow::StatusDetails);
+    rows
+}
+
+pub fn settings_rows(state: &AppState) -> Vec<SettingsRow> {
+    let mut rows = vec![SettingsRow::AdditionalSettings, SettingsRow::StatusDetails];
+    rows.extend(FedRow::ALL.into_iter().map(SettingsRow::Federation));
+    rows.push(SettingsRow::DeviceName);
+    rows.push(SettingsRow::DeviceInvite);
+    rows.push(SettingsRow::DeviceConnect);
+    rows.push(SettingsRow::DeviceSyncNow);
+    rows.push(SettingsRow::DeviceLeaveGroup);
+    rows.extend(
+        device_status_order(state)
+            .into_iter()
+            .map(SettingsRow::Device),
+    );
+    rows.extend(SimilarityRow::ALL.into_iter().map(SettingsRow::Similarity));
     rows
 }
 
@@ -1589,6 +1595,9 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub spinner_frame: usize,
     pub settings_cursor: usize,
+    /// Kept open underneath child dialogs and asynchronous confirmations.
+    pub additional_settings_open: bool,
+    pub additional_settings_cursor: usize,
     /// Root for music permanently downloaded from federation peers.
     pub music_dir: std::path::PathBuf,
     pub music_dir_changing: bool,

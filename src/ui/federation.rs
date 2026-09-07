@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::theme;
 use crate::app::state::{AppState, DevicePresenceSection, FedRow, SimilarityRow, settings_rows};
@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let rows_height =
-        (settings_rows(state).len() + 15 + device_presence_sections(state).len()) as u16;
+        (settings_rows(state).len() + 6 + device_presence_sections(state).len()) as u16;
     let [rows_area, _, status_area] = Layout::vertical([
         Constraint::Length(rows_height.min(inner.height)),
         Constraint::Length(1),
@@ -69,7 +69,6 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut y = area.y;
     let mut cursor = 0usize;
 
-    draw_section(frame, area, state, &mut y, "Library");
     draw_row(
         frame,
         area,
@@ -77,98 +76,22 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
         &mut y,
         cursor,
         state.settings_cursor,
-        "Music save directory",
-        if state.music_dir_changing {
-            format!("{} checking/changing…", state.spinner())
-        } else {
-            state.music_dir.to_string_lossy().into_owned()
-        },
+        "Additional settings",
+        "enter".into(),
     );
     cursor += 1;
-
-    y = y.saturating_add(1);
-
-    draw_section(frame, area, state, &mut y, "Updates");
-    draw_row_enabled(
+    draw_row(
         frame,
         area,
         state,
         &mut y,
         cursor,
         state.settings_cursor,
-        "Check for updates",
-        format!("v{} | enter", env!("CARGO_PKG_VERSION")),
-        !state.updater.busy && !state.updater.installed,
+        "Full status details",
+        "enter".to_string(),
     );
-    cursor += 1;
-    draw_row_enabled(
-        frame,
-        area,
-        state,
-        &mut y,
-        cursor,
-        state.settings_cursor,
-        "Install update",
-        state
-            .updater
-            .available
-            .as_ref()
-            .map(|update| format!("v{} | enter", update.version))
-            .unwrap_or_else(|| "check for updates first".into()),
-        state.updater.available.is_some() && !state.updater.busy && !state.updater.installed,
-    );
-    cursor += 1;
-    if y < area.bottom() {
-        let height = 3.min(area.bottom() - y);
-        frame.render_widget(
-            Paragraph::new(state.updater.message.as_str())
-                .style(theme::dim())
-                .wrap(Wrap { trim: true }),
-            Rect::new(area.x, y, area.width, height),
-        );
-        y += height;
-    }
-    y = y.saturating_add(1);
 
-    draw_section(frame, area, state, &mut y, "Similarity Search");
-    let similarity = &state.similarity.settings;
-    for row in SimilarityRow::ALL {
-        let (label, value) = match row {
-            SimilarityRow::Toggle => ("Similarity search", on_off(similarity.enabled).to_string()),
-            SimilarityRow::Model => (
-                "Embedding model",
-                crate::similarity::model_by_id(&similarity.model)
-                    .map(|model| format!("{} · {}", model.id, model.license))
-                    .unwrap_or_else(|| similarity.model.clone()),
-            ),
-            SimilarityRow::Profile => (
-                "Preprocessing profile",
-                format!("{} (enter for details)", similarity.profile),
-            ),
-            SimilarityRow::MinimumScore => (
-                "Minimum similarity",
-                format!("{:.2}", similarity.minimum_score),
-            ),
-            SimilarityRow::MaxTracksPerArtist => (
-                "Tracks per artist",
-                similarity.max_tracks_per_artist.to_string(),
-            ),
-            SimilarityRow::Workers => ("Background workers", similarity.workers.to_string()),
-            SimilarityRow::Clear => ("Clear all stored embeddings", "↵".to_string()),
-        };
-        draw_row(
-            frame,
-            area,
-            state,
-            &mut y,
-            cursor,
-            state.settings_cursor,
-            label,
-            value,
-        );
-        cursor += 1;
-    }
-
+    cursor += 1;
     y = y.saturating_add(1);
 
     draw_section(frame, area, state, &mut y, "Federation");
@@ -356,39 +279,32 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     y = y.saturating_add(1);
-    draw_section(frame, area, state, &mut y, "Visualizations");
-    draw_row(
-        frame,
-        area,
-        state,
-        &mut y,
-        cursor,
-        state.settings_cursor,
-        "Show clock",
-        if state.visualizer.config.show_clock {
-            "[x]".to_string()
-        } else {
-            "[ ]".to_string()
-        },
-    );
-    cursor += 1;
-
-    for (index, script) in state.visualizer.scripts.iter().enumerate() {
-        let selected_script = state
-            .visualizer
-            .selected_script_index()
-            .is_some_and(|selected| selected == index);
-        let label = if selected_script {
-            format!("* {}", script.name)
-        } else {
-            format!("  {}", script.name)
+    draw_section(frame, area, state, &mut y, "Similarity Search");
+    let similarity = &state.similarity.settings;
+    for row in SimilarityRow::ALL {
+        let (label, value) = match row {
+            SimilarityRow::Toggle => ("Similarity search", on_off(similarity.enabled).to_string()),
+            SimilarityRow::Model => (
+                "Embedding model",
+                crate::similarity::model_by_id(&similarity.model)
+                    .map(|model| format!("{} · {}", model.id, model.license))
+                    .unwrap_or_else(|| similarity.model.clone()),
+            ),
+            SimilarityRow::Profile => (
+                "Preprocessing profile",
+                format!("{} (enter for details)", similarity.profile),
+            ),
+            SimilarityRow::MinimumScore => (
+                "Minimum similarity",
+                format!("{:.2}", similarity.minimum_score),
+            ),
+            SimilarityRow::MaxTracksPerArtist => (
+                "Tracks per artist",
+                similarity.max_tracks_per_artist.to_string(),
+            ),
+            SimilarityRow::Workers => ("Background workers", similarity.workers.to_string()),
+            SimilarityRow::Clear => ("Clear all stored embeddings", "↵".to_string()),
         };
-        let value = script
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_string();
         draw_row(
             frame,
             area,
@@ -396,49 +312,11 @@ fn draw_settings_rows(frame: &mut Frame, area: Rect, state: &AppState) {
             &mut y,
             cursor,
             state.settings_cursor,
-            &label,
+            label,
             value,
         );
         cursor += 1;
     }
-
-    draw_row(
-        frame,
-        area,
-        state,
-        &mut y,
-        cursor,
-        state.settings_cursor,
-        "+ New visualization script",
-        "↵".to_string(),
-    );
-    cursor += 1;
-
-    if state.visualizer.selected_script().is_some() {
-        draw_row(
-            frame,
-            area,
-            state,
-            &mut y,
-            cursor,
-            state.settings_cursor,
-            "Edit selected visualization",
-            "↵".to_string(),
-        );
-        cursor += 1;
-    }
-
-    y = y.saturating_add(1);
-    draw_row(
-        frame,
-        area,
-        state,
-        &mut y,
-        cursor,
-        state.settings_cursor,
-        "Full status details",
-        "enter".to_string(),
-    );
 }
 
 fn protocol_label(id: &str) -> &str {
@@ -1642,18 +1520,21 @@ mod update_ui_tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
+            let mut previous = 0;
             for expected in [
-                "Music save directory",
-                "Check for updates",
-                "Install update",
-                "No newer stable release",
-                "Similarity Search",
+                "Additional settings",
+                "Full status details",
                 "Federation",
+                "Connected Devices",
+                "Similarity Search",
             ] {
                 assert!(
                     text.contains(expected),
                     "missing {expected} at width {width}"
                 );
+                let position = text.find(expected).unwrap();
+                assert!(position >= previous, "incorrect order for {expected}");
+                previous = position;
             }
         }
     }

@@ -2,24 +2,76 @@ use super::*;
 use crate::library::models::{ArtistCard, ArtistDetail, TrackItem};
 
 #[test]
+fn additional_settings_preserve_main_navigation_and_child_dialog_parent() {
+    use crate::app::state::{FedInputField, Popup, SettingsRow, additional_settings_rows};
+    let mut state = AppState {
+        active_tab: Tab::Federation,
+        ..AppState::default()
+    };
+    let main_rows = settings_rows(&state);
+    assert!(!main_rows.contains(&SettingsRow::MusicDirectory));
+    assert!(!main_rows.contains(&SettingsRow::CheckUpdate));
+    assert!(!main_rows.contains(&SettingsRow::VisualizationClock));
+    state.settings_cursor = main_rows
+        .iter()
+        .position(|r| *r == SettingsRow::AdditionalSettings)
+        .unwrap();
+    let main_cursor = state.settings_cursor;
+    update(&mut state, Action::Select);
+    assert!(state.additional_settings_open);
+    update(&mut state, Action::Select);
+    assert!(matches!(
+        state.popup,
+        Some(Popup::FedInput {
+            field: FedInputField::MusicDirectory,
+            ..
+        })
+    ));
+    // Child dialogs own their input; closing one leaves the parent window intact.
+    state.popup = None;
+    assert!(state.additional_settings_open);
+    update(&mut state, Action::SelectLast);
+    assert_eq!(
+        state.additional_settings_cursor,
+        additional_settings_rows(&state).len() - 1
+    );
+    update(&mut state, Action::MoveDown);
+    assert_eq!(
+        state.additional_settings_cursor,
+        additional_settings_rows(&state).len() - 1
+    );
+    update(&mut state, Action::ToggleHelp);
+    update(&mut state, Action::Back);
+    assert!(!state.help_visible);
+    assert!(state.additional_settings_open);
+    update(&mut state, Action::Back);
+    assert!(!state.additional_settings_open);
+    assert!(!state.should_quit);
+    assert_eq!(state.settings_cursor, main_cursor);
+}
+
+#[test]
 fn manual_update_check_is_single_flight_and_disabled_after_install() {
     let mut state = AppState::default();
-    state.settings_cursor = settings_rows(&state)
+    state.additional_settings_cursor = crate::app::state::additional_settings_rows(&state)
         .iter()
         .position(|row| *row == crate::app::state::SettingsRow::CheckUpdate)
         .unwrap();
-    assert_eq!(federation_select(&mut state), Some(Effect::CheckUpdate));
+    assert_eq!(
+        update_additional_settings(&mut state, Action::Select),
+        Some(Effect::CheckUpdate)
+    );
     assert!(state.updater.busy);
-    assert_eq!(federation_select(&mut state), None);
+    assert_eq!(update_additional_settings(&mut state, Action::Select), None);
     state.updater.busy = false;
     state.updater.installed = true;
-    assert_eq!(federation_select(&mut state), None);
+    assert_eq!(update_additional_settings(&mut state, Action::Select), None);
     state.updater.installed = false;
-    state.settings_cursor = settings_rows(&state)
+    state.additional_settings_cursor = crate::app::state::additional_settings_rows(&state)
         .iter()
         .position(|row| *row == crate::app::state::SettingsRow::InstallUpdate)
         .unwrap();
-    assert_eq!(federation_select(&mut state), None);
+    assert_eq!(update_additional_settings(&mut state, Action::Select), None);
 }
 
 fn with_artists(n: usize) -> AppState {

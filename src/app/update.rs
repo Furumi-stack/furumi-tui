@@ -115,6 +115,22 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         .take()
         .is_some_and(|deadline| Instant::now() <= deadline);
     state.status_message = None;
+    if state.additional_settings_open
+        && !matches!(
+            action,
+            Action::PlayPause
+                | Action::NextTrack
+                | Action::PrevTrack
+                | Action::SeekForward { .. }
+                | Action::SeekBackward { .. }
+                | Action::VolumeUp
+                | Action::VolumeDown
+                | Action::ToggleShuffle
+                | Action::CycleRepeat
+        )
+    {
+        return update_additional_settings(state, action);
+    }
     match action {
         // While the help window is open, quit/back just close it.
         Action::Quit | Action::Back if state.help_visible => {
@@ -2814,9 +2830,48 @@ fn fed_card_featured_artist_names(track: &crate::federation::FedCardTrack) -> Ve
 
 /// Enter on Settings: toggle switches, open text inputs, run
 /// one-shot operations. The heavy lifting happens in perform_effect().
+fn update_additional_settings(state: &mut AppState, action: Action) -> Option<Effect> {
+    if state.help_visible {
+        if matches!(action, Action::Back | Action::Quit | Action::ToggleHelp) {
+            state.help_visible = false;
+        }
+        return None;
+    }
+    let rows = super::state::additional_settings_rows(state);
+    let last = rows.len().saturating_sub(1);
+    let cursor = state.additional_settings_cursor.min(last);
+    state.additional_settings_cursor = match action {
+        Action::Back | Action::Quit => {
+            state.additional_settings_open = false;
+            return None;
+        }
+        Action::MoveUp | Action::PrevTab => cursor.saturating_sub(1),
+        Action::MoveDown | Action::NextTab => (cursor + 1).min(last),
+        Action::PageUp => cursor.saturating_sub(5),
+        Action::PageDown => (cursor + 5).min(last),
+        Action::SelectFirst => 0,
+        Action::SelectLast => last,
+        Action::Select => return select_settings_row(state, *rows.get(cursor)?),
+        Action::ToggleHelp => {
+            state.help_visible = true;
+            cursor
+        }
+        _ => cursor,
+    };
+    None
+}
+
 fn federation_select(state: &mut AppState) -> Option<Effect> {
+    select_settings_row(state, *settings_rows(state).get(state.settings_cursor)?)
+}
+
+fn select_settings_row(state: &mut AppState, row: super::state::SettingsRow) -> Option<Effect> {
     use super::state::{FedInputField, FedRow, Popup, SettingsRow, SimilarityRow};
-    match settings_rows(state).get(state.settings_cursor).copied()? {
+    match row {
+        SettingsRow::AdditionalSettings => {
+            state.additional_settings_open = true;
+            None
+        }
         SettingsRow::CheckUpdate => {
             if state.updater.busy || state.updater.installed {
                 return None;
