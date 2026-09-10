@@ -668,6 +668,7 @@ mod tests {
             repeat: crate::devices::PlaybackRepeat::Off,
         };
         host.publish_host_playback(PlaybackSnapshot {
+            coordination: None,
             device_id: "dev_host".into(),
             device_name: "Host".into(),
             active: true,

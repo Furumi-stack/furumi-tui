@@ -32,7 +32,6 @@ use update::{Effect, update};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const VISUALIZER_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const ACTIVE_IDLE_LEASE_MS: i64 = 5 * 60 * 1000;
 
 /// Handles shared by background tasks; AppState stays pure UI data.
 pub struct Runtime {
@@ -297,6 +296,8 @@ pub async fn run(
     }
 
     let devices = crate::devices::DeviceSync::new(Arc::clone(&library))?;
+    devices.configure_playback(settings.playback.clone())?;
+    state.device_playback.config = settings.playback.clone();
     devices.set_event_tx(event_tx.clone());
     let jam = crate::jam::JamManager::new(event_tx.clone());
     let similarity = crate::similarity::Manager::new(
@@ -321,7 +322,6 @@ pub async fn run(
         state.device_playback.self_device_name = device_name.clone();
         state.device_playback.active_device_id = Some(device_id);
         state.device_playback.active_device_name = Some(device_name);
-        state.device_playback.startup_takeover_pending = true;
     }
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
@@ -416,6 +416,7 @@ pub async fn run(
             },
             Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
             _ = tick.tick() => {
+                reconcile_personal_playback(&mut state, &mut runtime);
                 state.advance_spinner();
                 expire_quit_confirmation(&mut state);
                 sync_player_shared(&mut state, &runtime);
@@ -626,6 +627,7 @@ fn publish_playback_snapshot_with_active(state: &mut AppState, runtime: &Runtime
         state.device_playback.active_device_name = Some(device_name.clone());
     }
     let snapshot = crate::devices::PlaybackSnapshot {
+        coordination: None,
         device_id,
         device_name,
         active,
@@ -639,6 +641,7 @@ fn publish_playback_snapshot_with_active(state: &mut AppState, runtime: &Runtime
         runtime
             .jam
             .publish_host_playback(crate::devices::PlaybackSnapshot {
+                coordination: None,
                 device_id: state.device_playback.self_device_id.clone(),
                 device_name: state.device_playback.self_device_name.clone(),
                 active: true,
@@ -656,36 +659,6 @@ fn update_local_idle_since(state: &mut AppState) {
     } else {
         state.device_playback.local_idle_since_ms = None;
     }
-}
-
-fn active_snapshot_idle_since(snapshot: &crate::devices::PlaybackSnapshot) -> Option<i64> {
-    if snapshot.state.playing && !snapshot.state.paused {
-        None
-    } else {
-        snapshot
-            .state
-            .idle_since_ms
-            .or(Some(snapshot.updated_at_ms))
-    }
-}
-
-fn active_idle_lease_expired(snapshot: &crate::devices::PlaybackSnapshot, now: i64) -> bool {
-    active_snapshot_idle_since(snapshot)
-        .is_some_and(|idle_since| now.saturating_sub(idle_since) >= ACTIVE_IDLE_LEASE_MS)
-}
-
-fn local_active_lease_protected(state: &mut AppState, now: i64) -> bool {
-    if !state.device_playback.is_audio_owner() || !state.player.playing {
-        return false;
-    }
-    if !state.player.paused {
-        return true;
-    }
-    update_local_idle_since(state);
-    state
-        .device_playback
-        .local_idle_since_ms
-        .is_some_and(|idle_since| now.saturating_sub(idle_since) < ACTIVE_IDLE_LEASE_MS)
 }
 
 fn extrapolate_control_position(state: &mut AppState) {
@@ -719,6 +692,7 @@ pub(crate) fn become_control_device(
     runtime: &Runtime,
     snapshot: crate::devices::PlaybackSnapshot,
 ) {
+    runtime.player.set_playback_allowed(false);
     if state.device_playback.is_audio_owner() {
         runtime.player.stop();
         publish_inactive_playback_snapshot(state, runtime);
@@ -737,6 +711,7 @@ pub(crate) fn become_control_device(
 }
 
 pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, start_audio: bool) {
+    runtime.player.set_playback_allowed(true);
     let was_control = state.device_playback.role == state::DevicePlaybackRole::Control;
     state.device_playback.role = state::DevicePlaybackRole::Active;
     state.device_playback.jam_host = false;
@@ -761,6 +736,13 @@ pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, 
 }
 
 pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut Runtime) {
+    if let Err(error) = runtime
+        .devices
+        .claim_playback(&state.device_playback.self_device_id)
+    {
+        state.status_message = Some(format!("device handoff: {error}"));
+        return;
+    }
     if state.device_playback.is_audio_owner() {
         publish_playback_snapshot(state, runtime);
         request_urgent_device_sync(runtime);
@@ -800,6 +782,10 @@ pub(crate) fn transfer_active_to_remote_device(
         transfer_active_to_this_device(state, runtime);
         return;
     }
+    if let Err(error) = runtime.devices.claim_playback(&target_device_id) {
+        state.status_message = Some(format!("device handoff: {error}"));
+        return;
+    }
     extrapolate_control_position(state);
     let previous_active_id = state.device_playback.active_device_id.clone();
     if state.player.current.is_none() && !state.player.queue.is_empty() {
@@ -824,6 +810,7 @@ pub(crate) fn transfer_active_to_remote_device(
         record_playback_command_async(runtime, previous, command.clone(), "device handoff");
     }
     let snapshot = crate::devices::PlaybackSnapshot {
+        coordination: None,
         device_id: target_device_id.clone(),
         device_name: target_device_name.clone(),
         active: true,
@@ -2877,6 +2864,7 @@ fn refresh_artists(state: &mut AppState, runtime: &Runtime) {
 
 fn save_app_settings(state: &AppState) {
     let settings = crate::config::settings::AppSettings {
+        playback: state.device_playback.config.clone(),
         volume: state.player.volume,
         library: state.global.filters,
         music_dir: state.music_dir.clone(),
@@ -2983,81 +2971,67 @@ fn apply_queue_refresh(
     }
 }
 
+fn reconcile_personal_playback(state: &mut AppState, runtime: &mut Runtime) {
+    if state.device_playback.role == state::DevicePlaybackRole::Jam {
+        runtime
+            .player
+            .set_playback_allowed(state.device_playback.is_audio_owner());
+        let _ = runtime.devices.playback_tick(false, false);
+        return;
+    }
+    let playing =
+        state.device_playback.is_audio_owner() && state.player.playing && !state.player.paused;
+    let owner = match runtime.devices.playback_tick(true, playing) {
+        Ok(owner) => owner,
+        Err(error) => {
+            runtime.player.set_playback_allowed(false);
+            runtime.player.stop();
+            state.status_message = Some(format!("playback coordination: {error}"));
+            return;
+        }
+    };
+    let Some(owner) = owner else {
+        runtime.player.set_playback_allowed(false);
+        runtime.player.stop();
+        runtime.player_start_pending = false;
+        state.device_playback.role = state::DevicePlaybackRole::Control;
+        state.device_playback.active_device_id = None;
+        return;
+    };
+    if owner == state.device_playback.self_device_id {
+        runtime.player.set_playback_allowed(true);
+        if !state.device_playback.is_audio_owner() {
+            become_active_device(state, runtime, true);
+        }
+    } else if let Some(snapshot) = state.device_playback.remote.get(&owner).cloned() {
+        if state.device_playback.last_remote_snapshot.as_ref() != Some(&snapshot)
+            || state.device_playback.is_audio_owner()
+        {
+            become_control_device(state, runtime, snapshot);
+        }
+    } else {
+        runtime.player.set_playback_allowed(false);
+        runtime.player.stop();
+        runtime.player_start_pending = false;
+        state.device_playback.role = state::DevicePlaybackRole::Control;
+        state.device_playback.active_device_id = Some(owner);
+    }
+    publish_playback_snapshot_with_active(state, runtime, state.device_playback.is_audio_owner());
+}
+
 fn handle_device_playback_snapshot(
     state: &mut AppState,
     runtime: &mut Runtime,
     snapshot: crate::devices::PlaybackSnapshot,
 ) {
-    // Personal-device reconciliation must never change Jam ownership. Jam
-    // has its own authority and lifecycle even when the same TUI also belongs
-    // to a trusted-device group.
-    if state.device_playback.role == state::DevicePlaybackRole::Jam {
-        return;
-    }
     if snapshot.device_id == state.device_playback.self_device_id {
         return;
     }
     state
         .device_playback
         .remote
-        .insert(snapshot.device_id.clone(), snapshot.clone());
-    let now = unix_time_ms();
-    state.device_playback.online_devices = state
-        .device_playback
-        .remote
-        .values()
-        .filter(|snapshot| {
-            now.saturating_sub(snapshot.updated_at_ms) <= state::DEVICE_ONLINE_TTL_MS
-        })
-        .count()
-        + 1;
-
-    if !snapshot.active {
-        return;
-    }
-    // Starting a player is an explicit claim of the active role. Import the
-    // current queue/position from the previously active peer, then announce a
-    // normal handoff so that the old owner becomes a control device. This is
-    // intentionally one-shot: subsequent snapshots use the regular lease and
-    // explicit-transfer rules.
-    if state.device_playback.startup_takeover_pending {
-        state.device_playback.startup_takeover_pending = false;
-        become_control_device(state, runtime, snapshot);
-        transfer_active_to_this_device(state, runtime);
-        state.status_message = Some("playback moved to this newly started player".to_string());
-        return;
-    }
-    if local_active_lease_protected(state, now) {
-        tracing::debug!(
-            remote = %snapshot.device_id,
-            "ignored remote active snapshot while local active playback is protected"
-        );
-        return;
-    }
-    let lease_expired = active_idle_lease_expired(&snapshot, now);
-    let already_controls_this_device = state.device_playback.is_personal_control()
-        && state.device_playback.active_device_id.as_deref() == Some(snapshot.device_id.as_str());
-    if !lease_expired || already_controls_this_device {
-        let was_active = state.device_playback.is_audio_owner();
-        let was_paused = state.player.playing && state.player.paused;
-        become_control_device(state, runtime, snapshot.clone());
-        if was_active && was_paused {
-            state.popup = Some(state::Popup::FedText {
-                title: "Active device moved".to_string(),
-                text: format!("Playback is now controlled by {}.", snapshot.device_name),
-            });
-        }
-        return;
-    }
-
-    if state.device_playback.is_personal_control() {
-        return;
-    }
-    become_active_device(state, runtime, false);
-    state.status_message = Some(format!(
-        "active playback moved here; {} was idle for 5m",
-        snapshot.device_name
-    ));
+        .insert(snapshot.device_id.clone(), snapshot);
+    reconcile_personal_playback(state, runtime);
 }
 
 fn handle_playback_command(
@@ -3112,10 +3086,19 @@ fn handle_playback_command(
             state: wire,
         } => {
             if active_device_id == state.device_playback.self_device_id {
+                handle_playback_command(
+                    state,
+                    runtime,
+                    crate::devices::PlaybackCommand::SetState {
+                        state: wire,
+                        seek: true,
+                    },
+                );
                 return;
             }
             let was_active = state.device_playback.is_audio_owner();
             let snapshot = crate::devices::PlaybackSnapshot {
+                coordination: None,
                 device_id: active_device_id,
                 device_name: active_device_name,
                 active: true,
@@ -3237,47 +3220,6 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 })
                 .unwrap_or(1)
                 .max(1);
-            let active_revoked = state.device_playback.is_personal_control()
-                && state
-                    .device_playback
-                    .active_device_id
-                    .as_ref()
-                    .is_some_and(|active| {
-                        state
-                            .federation
-                            .devices
-                            .as_ref()
-                            .and_then(|status| {
-                                status
-                                    .devices
-                                    .iter()
-                                    .find(|device| device.device_id == *active)
-                            })
-                            .is_some_and(|device| device.revoked)
-                    });
-            let active_missing = state.device_playback.is_personal_control()
-                && state
-                    .device_playback
-                    .active_device_id
-                    .as_ref()
-                    .is_some_and(|active| {
-                        active != &state.device_playback.self_device_id
-                            && !state.federation.devices.as_ref().is_some_and(|status| {
-                                status
-                                    .devices
-                                    .iter()
-                                    .any(|device| device.device_id == *active)
-                            })
-                    });
-            if active_revoked || active_missing {
-                runtime.player.stop();
-                state.player.playing = false;
-                state.player.current = None;
-                state.player.paused = false;
-                state.player.position_secs = 0.0;
-                become_active_device(state, runtime, false);
-                state.status_message = Some("active playback moved to this device".into());
-            }
             clamp_settings_cursor(state);
         }
         AppEvent::FedSyncFinished(message) => {
@@ -3318,18 +3260,28 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         AppEvent::DevicePlayback(snapshot) => {
             handle_device_playback_snapshot(state, runtime, snapshot);
         }
-        AppEvent::PlaybackCommand(_)
+        AppEvent::PlaybackCommand { .. }
             if state.device_playback.role == state::DevicePlaybackRole::Jam =>
         {
             tracing::debug!("ignored personal-device playback command while Jam is active");
         }
-        AppEvent::PlaybackCommand(command) => {
-            handle_playback_command(state, runtime, command);
+        AppEvent::PlaybackCommand {
+            command,
+            authority,
+            origin,
+        } => {
+            if runtime
+                .devices
+                .playback_command_is_current(&origin, &authority)
+            {
+                handle_playback_command(state, runtime, command);
+            }
         }
         AppEvent::JamStatus(status) => {
             state.jam = status.clone();
             match status.role {
                 crate::jam::JamRole::Host => {
+                    runtime.player.set_playback_allowed(true);
                     state.device_playback.role = state::DevicePlaybackRole::Jam;
                     state.device_playback.jam_host = true;
                     publish_playback_snapshot(state, runtime);
@@ -3848,6 +3800,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::Player(event) if state.device_playback.is_control() => {
             runtime.player_start_pending = false;
+            // A background decoder may finish after ownership was handed off.
+            // Ignoring Started alone would leave its obsolete audio playing.
+            runtime.player.stop();
             tracing::debug!(
                 ?event,
                 "ignored local player event while controlling remote playback"

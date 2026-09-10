@@ -90,9 +90,18 @@ impl Shared {
 pub struct Controller {
     tx: Sender<Command>,
     pub shared: Arc<Shared>,
+    playback_allowed: Arc<AtomicBool>,
 }
 
 impl Controller {
+    /// Revoke the output at the audio thread boundary, including work queued
+    /// by background decoders before an ownership transfer.
+    pub fn set_playback_allowed(&self, allowed: bool) {
+        if self.playback_allowed.swap(allowed, Ordering::AcqRel) && !allowed {
+            self.stop();
+        }
+    }
+
     pub fn play(&self, reader: TrackReader, byte_len: Option<u64>, volume: f32) {
         let _ = self.tx.send(Command::Play {
             reader,
@@ -142,11 +151,17 @@ pub fn spawn(on_event: impl Fn(PlayerEvent) + Send + 'static) -> Controller {
     let (tx, rx) = std::sync::mpsc::channel();
     let shared = Arc::new(Shared::default());
     let thread_shared = Arc::clone(&shared);
+    let playback_allowed = Arc::new(AtomicBool::new(true));
+    let thread_allowed = Arc::clone(&playback_allowed);
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, thread_shared, on_event))
+        .spawn(move || run(rx, thread_shared, thread_allowed, on_event))
         .expect("spawning the audio thread cannot fail");
-    Controller { tx, shared }
+    Controller {
+        tx,
+        shared,
+        playback_allowed,
+    }
 }
 
 struct Output {
@@ -155,7 +170,12 @@ struct Output {
     player: Player,
 }
 
-fn run(rx: Receiver<Command>, shared: Arc<Shared>, on_event: impl Fn(PlayerEvent)) {
+fn run(
+    rx: Receiver<Command>,
+    shared: Arc<Shared>,
+    playback_allowed: Arc<AtomicBool>,
+    on_event: impl Fn(PlayerEvent),
+) {
     let mut output: Option<Output> = None;
     let mut track_loaded = false;
     let mut last_len = 0usize;
@@ -163,6 +183,14 @@ fn run(rx: Receiver<Command>, shared: Arc<Shared>, on_event: impl Fn(PlayerEvent
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(command) => {
+                if !playback_allowed.load(Ordering::Acquire)
+                    && matches!(
+                        command,
+                        Command::Play { .. } | Command::Enqueue { .. } | Command::Resume
+                    )
+                {
+                    continue;
+                }
                 // Commands change the source queue legitimately; resync the
                 // length so the next tick doesn't read it as a track ending.
                 handle(command, &shared, &mut output, &mut track_loaded, &on_event);

@@ -50,6 +50,8 @@ impl Default for SimilaritySettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default)]
+    pub playback: music_dht::playback::Config,
     #[serde(default = "default_volume")]
     pub volume: u8,
     #[serde(default)]
@@ -64,6 +66,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            playback: music_dht::playback::Config::default(),
             volume: default_volume(),
             library: LibraryFilters::default(),
             music_dir: default_music_dir(),

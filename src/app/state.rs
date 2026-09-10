@@ -1541,6 +1541,7 @@ impl DevicePlaybackRole {
 
 #[derive(Debug, Default)]
 pub struct DevicePlaybackState {
+    pub config: music_dht::playback::Config,
     pub role: DevicePlaybackRole,
     pub self_device_id: String,
     pub self_device_name: String,
@@ -1551,19 +1552,12 @@ pub struct DevicePlaybackState {
     pub remote: BTreeMap<String, crate::devices::PlaybackSnapshot>,
     pub last_remote_snapshot: Option<crate::devices::PlaybackSnapshot>,
     pub jam_host: bool,
-    /// A freshly started TUI owns playback by protocol. The first active
-    /// snapshot discovered during startup is imported and handed off here.
-    pub startup_takeover_pending: bool,
 }
 
 impl DevicePlaybackState {
     pub fn is_control(&self) -> bool {
         self.role == DevicePlaybackRole::Control
             || (self.role == DevicePlaybackRole::Jam && !self.jam_host)
-    }
-
-    pub fn is_personal_control(&self) -> bool {
-        self.role == DevicePlaybackRole::Control
     }
 
     pub fn is_audio_owner(&self) -> bool {

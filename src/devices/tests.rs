@@ -1,5 +1,111 @@
 use super::*;
 
+fn empty_playback_state() -> PlaybackStateWire {
+    PlaybackStateWire {
+        queue: vec![],
+        queue_pos: 0,
+        playing: false,
+        paused: false,
+        idle_since_ms: None,
+        position_secs: 0.0,
+        volume: 80,
+        shuffle: false,
+        repeat: PlaybackRepeat::Off,
+    }
+}
+
+#[test]
+fn coordination_ignores_legacy_commands_and_wrong_snapshot_sender() {
+    let sync = test_sync();
+    let identity = sync.ensure_identity().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sync.set_event_tx(tx);
+    let command = PlaybackCommand::SetState {
+        state: empty_playback_state(),
+        seek: false,
+    };
+    sync.apply_playback_command(&identity.device_id, &command, None, "remote", "legacy")
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+    let mut remote = Engine::new(
+        "remote".into(),
+        PlaybackConfig::default(),
+        Default::default(),
+        0,
+    );
+    remote.transfer("remote", 0);
+    remote.set_output(true, true);
+    remote.heartbeat(1);
+    let snapshot = PlaybackSnapshot {
+        device_id: "remote".into(),
+        device_name: "Remote".into(),
+        active: true,
+        updated_at_ms: now_ms(),
+        state: empty_playback_state(),
+        coordination: Some(remote.announcement()),
+    };
+    sync.apply_playback_snapshot("different-sender", snapshot.clone())
+        .unwrap();
+    assert!(
+        sync.with_playback_engine(|engine| engine.owner().is_none())
+            .unwrap()
+    );
+    sync.apply_playback_snapshot("remote", snapshot).unwrap();
+    assert_eq!(
+        sync.playback_tick(true, false).unwrap().as_deref(),
+        Some("remote")
+    );
+    sync.publish_playback(PlaybackSnapshot {
+        device_id: identity.device_id,
+        device_name: identity.name,
+        active: false,
+        updated_at_ms: now_ms(),
+        state: empty_playback_state(),
+        coordination: None,
+    });
+    let gossip = sync
+        .local_playback_snapshot()
+        .unwrap()
+        .coordination
+        .unwrap();
+    assert_eq!(gossip.claim.unwrap().owner, "remote");
+}
+
+#[test]
+fn checkpoint_is_not_reused_after_changing_trusted_group() {
+    let sync = test_sync();
+    sync.claim_playback("old-group-owner").unwrap();
+    sync.set_group_id("new-test-group").unwrap();
+    assert!(
+        sync.with_playback_engine(|engine| engine.owner().is_none())
+            .unwrap()
+    );
+}
+
+#[test]
+fn queued_command_loses_its_fence_when_another_owner_wins() {
+    let sync = test_sync();
+    let identity = sync.ensure_identity().unwrap();
+    sync.claim_playback(&identity.device_id).unwrap();
+    let stamp = sync
+        .with_playback_engine(|engine| engine.stamp().unwrap())
+        .unwrap();
+    sync.apply_playback_command(
+        &identity.device_id,
+        &PlaybackCommand::SetState {
+            state: empty_playback_state(),
+            seek: false,
+        },
+        Some(&stamp),
+        &identity.device_id,
+        "queued",
+    )
+    .unwrap();
+    assert!(sync.playback_command_is_current(&identity.device_id, &stamp));
+    sync.claim_playback("new-owner").unwrap();
+    assert!(!sync.playback_command_is_current(&identity.device_id, &stamp));
+}
+
 static NEXT_TEST_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn test_sync() -> DeviceSync {
@@ -212,19 +318,41 @@ fn playback_command_is_targeted_and_deduplicated() {
         seek: false,
     };
 
-    sync.apply_playback_command("dev_other", &command, "op_other")
+    sync.claim_playback(&identity.device_id).unwrap();
+    let stamp = sync
+        .with_playback_engine(|engine| engine.stamp().unwrap())
         .unwrap();
+    sync.apply_playback_command(
+        "dev_other",
+        &command,
+        Some(&stamp),
+        &identity.device_id,
+        "op_other",
+    )
+    .unwrap();
     assert!(rx.try_recv().is_err());
 
-    sync.apply_playback_command(&identity.device_id, &command, "op_1")
-        .unwrap();
+    sync.apply_playback_command(
+        &identity.device_id,
+        &command,
+        Some(&stamp),
+        &identity.device_id,
+        "op_1",
+    )
+    .unwrap();
     assert!(matches!(
         rx.try_recv().unwrap(),
-        crate::app::event::AppEvent::PlaybackCommand(_)
+        crate::app::event::AppEvent::PlaybackCommand { .. }
     ));
 
-    sync.apply_playback_command(&identity.device_id, &command, "op_1")
-        .unwrap();
+    sync.apply_playback_command(
+        &identity.device_id,
+        &command,
+        Some(&stamp),
+        &identity.device_id,
+        "op_1",
+    )
+    .unwrap();
     assert!(rx.try_recv().is_err());
 }
 
@@ -245,6 +373,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         },
         seek: false,
     };
+    sync.claim_playback("dev_target").unwrap();
     sync.record_playback_command("dev_target", command.clone())
         .unwrap();
     sync.record_playback_command("dev_other", command).unwrap();

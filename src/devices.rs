@@ -5,6 +5,7 @@
 //! materialized tables, so offline clients can merge likes, playlists and
 //! membership changes deterministically.
 
+use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -24,7 +25,7 @@ use crate::library::models::{ArtistRef, TrackItem};
 
 pub const SYNC_ALPN: &[u8] = b"furumi/sync/2";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
 const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -245,32 +246,13 @@ pub struct PlaybackStateWire {
     pub repeat: PlaybackRepeat,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackSnapshot {
-    pub device_id: String,
-    pub device_name: String,
-    pub active: bool,
-    pub updated_at_ms: i64,
-    pub state: PlaybackStateWire,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlaybackCommand {
-    SetState {
-        state: PlaybackStateWire,
-        #[serde(default)]
-        seek: bool,
-    },
-    ActiveChanged {
-        active_device_id: String,
-        active_device_name: String,
-        state: PlaybackStateWire,
-    },
-}
+pub type PlaybackSnapshot = music_dht::playback::Snapshot<PlaybackStateWire>;
+pub type PlaybackCommand = music_dht::playback::Command<PlaybackStateWire>;
 
 #[derive(Debug, Clone, Default)]
 struct PlaybackShared {
+    engine: Option<Engine>,
+    engine_group: String,
     local: Option<PlaybackSnapshot>,
     remote: BTreeMap<String, PlaybackSnapshot>,
 }
@@ -369,6 +351,8 @@ pub enum SyncOpPayload {
     PlaybackCommand {
         target_device_id: String,
         command: PlaybackCommand,
+        #[serde(default)]
+        authority: Option<CommandStamp>,
     },
     ListenRecorded {
         event: ListenEvent,
@@ -648,10 +632,92 @@ impl DeviceSync {
         format!("{}-{}", now_ms(), random_hex(12))
     }
 
+    pub fn configure_playback(&self, config: PlaybackConfig) -> Result<()> {
+        set_meta(
+            &lock(&self.conn),
+            "playback_config_v1",
+            &serde_json::to_string(&config)?,
+        )?;
+        lock(&self.playback).engine = None;
+        Ok(())
+    }
+
+    fn with_playback_engine<R>(&self, f: impl FnOnce(&mut Engine) -> R) -> Result<R> {
+        let identity = self.ensure_identity()?;
+        let mut shared = lock(&self.playback);
+        if shared.engine.is_none() || shared.engine_group != identity.group_id {
+            shared.engine_group = identity.group_id.clone();
+            let conn = lock(&self.conn);
+            let durable = get_meta(&conn, "playback_coordination_v1")?
+                .map(|json| serde_json::from_str::<Checkpoint>(&json))
+                .transpose()?
+                .filter(|checkpoint| checkpoint.scope == identity.group_id)
+                .map(|checkpoint| checkpoint.state)
+                .unwrap_or_default();
+            let config = get_meta(&conn, "playback_config_v1")?
+                .map(|json| serde_json::from_str::<PlaybackConfig>(&json))
+                .transpose()?
+                .unwrap_or_default();
+            shared.engine = Some(Engine::new(
+                identity.device_id,
+                config,
+                durable,
+                playback_clock(),
+            ));
+        }
+        let engine = shared.engine.as_mut().expect("initialized playback engine");
+        let previous = engine.clone();
+        let result = f(engine);
+        if previous.durable() != engine.durable() {
+            let saved = set_meta(
+                &lock(&self.conn),
+                "playback_coordination_v1",
+                &serde_json::to_string(&Checkpoint {
+                    scope: identity.group_id,
+                    state: engine.durable().clone(),
+                })?,
+            );
+            if let Err(error) = saved {
+                *engine = previous;
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Evaluate shared ownership independently of the UI's online-device list.
+    pub fn playback_tick(&self, available: bool, playing: bool) -> Result<Option<String>> {
+        self.with_playback_engine(|engine| {
+            engine.set_output(available, playing);
+            engine.heartbeat(playback_clock());
+            engine.tick(playback_clock());
+            engine.owner().map(str::to_string)
+        })
+    }
+
+    pub fn playback_command_is_current(&self, origin: &str, stamp: &CommandStamp) -> bool {
+        self.with_playback_engine(|engine| engine.command_is_current(origin, stamp))
+            .unwrap_or(false)
+    }
+
+    pub fn claim_playback(&self, target: &str) -> Result<()> {
+        self.with_playback_engine(|engine| engine.transfer(target, playback_clock()))?
+            .then_some(())
+            .context("cannot allocate playback ownership term")
+    }
+
     pub fn publish_playback(&self, mut snapshot: PlaybackSnapshot) {
         if snapshot.updated_at_ms <= 0 {
             snapshot.updated_at_ms = now_ms();
         }
+        let Ok(coordination) = self.with_playback_engine(|engine| engine.announcement()) else {
+            return;
+        };
+        snapshot.active = coordination
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.owner == snapshot.device_id);
+        snapshot.coordination = Some(coordination);
         lock(&self.playback).local = Some(snapshot);
     }
 
@@ -663,9 +729,22 @@ impl DeviceSync {
         if target_device_id.trim().is_empty() {
             return Ok(());
         }
+        let authority = self
+            .with_playback_engine(|engine| {
+                if let PlaybackCommand::ActiveChanged {
+                    active_device_id, ..
+                } = &command
+                    && engine.owner() != Some(active_device_id.as_str())
+                {
+                    engine.transfer(active_device_id, playback_clock());
+                }
+                engine.stamp()
+            })?
+            .context("no playback owner; wait for discovery or select an output")?;
         self.record_local_op(SyncOpPayload::PlaybackCommand {
             target_device_id: target_device_id.to_string(),
             command,
+            authority: Some(authority),
         })
     }
 
@@ -845,7 +924,7 @@ impl DeviceSync {
                 if let Some(profile) = profile {
                     self.apply_device_profile(&profile, true)?;
                     if let Some(playback) = playback {
-                        self.apply_playback_snapshot(playback)?;
+                        self.apply_playback_snapshot(&profile.device_id, playback)?;
                     }
                 }
                 self.apply_device_profiles(&devices)?;
@@ -1305,7 +1384,7 @@ impl DeviceSync {
             } => {
                 self.apply_device_profiles(&devices)?;
                 if let Some(playback) = playback {
-                    self.apply_playback_snapshot(playback)?;
+                    self.apply_playback_snapshot(&device.device_id, playback)?;
                 }
                 self.apply_snapshot(snapshot)?;
                 self.apply_ops(ops)?;
@@ -1636,8 +1715,15 @@ impl DeviceSync {
             SyncOpPayload::PlaybackCommand {
                 target_device_id,
                 command,
+                authority,
             } => {
-                self.apply_playback_command(target_device_id, command, &op.op_id)?;
+                self.apply_playback_command(
+                    target_device_id,
+                    command,
+                    authority.as_ref(),
+                    &op.origin_device_id,
+                    &op.op_id,
+                )?;
                 false
             }
             SyncOpPayload::ListenRecorded { event } => self
@@ -1651,10 +1737,32 @@ impl DeviceSync {
         &self,
         target_device_id: &str,
         command: &PlaybackCommand,
+        authority: Option<&CommandStamp>,
+        origin: &str,
         op_id: &str,
     ) -> Result<()> {
         let identity = self.ensure_identity()?;
-        if target_device_id != identity.device_id {
+        // Legacy commands still replicate with the library log, but cannot
+        // override the versioned personal-playback protocol.
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        let handoff = matches!(command, PlaybackCommand::ActiveChanged { .. });
+        if !handoff && target_device_id != identity.device_id {
+            return Ok(());
+        }
+        if let PlaybackCommand::ActiveChanged {
+            active_device_id, ..
+        } = command
+            && active_device_id != &authority.claim.owner
+        {
+            return Ok(());
+        }
+        let accepted = self.with_playback_engine(|engine| {
+            engine.accept_command(origin, authority, handoff, playback_clock())
+                && (handoff || engine.is_owner())
+        })?;
+        if !accepted || target_device_id != identity.device_id {
             return Ok(());
         }
         let inserted = {
@@ -1669,7 +1777,11 @@ impl DeviceSync {
             return Ok(());
         }
         if let Some(tx) = lock(&self.event_tx).as_ref() {
-            let _ = tx.send(AppEvent::PlaybackCommand(command.clone()));
+            let _ = tx.send(AppEvent::PlaybackCommand {
+                command: command.clone(),
+                authority: authority.clone(),
+                origin: origin.to_string(),
+            });
         }
         Ok(())
     }
@@ -2595,19 +2707,29 @@ impl DeviceSync {
         lock(&self.playback).local.clone()
     }
 
-    fn apply_playback_snapshot(&self, snapshot: PlaybackSnapshot) -> Result<()> {
+    fn apply_playback_snapshot(&self, sender: &str, snapshot: PlaybackSnapshot) -> Result<()> {
         let identity = self.ensure_identity()?;
-        if snapshot.device_id == identity.device_id {
+        if snapshot.device_id != sender || snapshot.device_id == identity.device_id {
+            return Ok(());
+        }
+        let Some(coordination) = &snapshot.coordination else {
+            return Ok(());
+        };
+        if !self.with_playback_engine(|engine| {
+            engine.observe(&snapshot.device_id, coordination, playback_clock())
+        })? {
             return Ok(());
         }
         let should_send = {
-            let mut playback = lock(&self.playback);
-            let changed = playback
-                .remote
-                .get(&snapshot.device_id)
-                .is_none_or(|current| snapshot.updated_at_ms > current.updated_at_ms);
+            let mut shared = lock(&self.playback);
+            let changed = shared.remote.get(&snapshot.device_id).is_none_or(|old| {
+                old.coordination.as_ref().is_none_or(|c| {
+                    coordination.claim > c.claim
+                        || (coordination.claim == c.claim && coordination.heartbeat > c.heartbeat)
+                })
+            });
             if changed {
-                playback
+                shared
                     .remote
                     .insert(snapshot.device_id.clone(), snapshot.clone());
             }
@@ -2936,7 +3058,7 @@ async fn handle_pair_request(
     }
     sync.apply_device_profile(&profile, true)?;
     if let Some(playback) = playback {
-        sync.apply_playback_snapshot(playback)?;
+        sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
     sync.apply_snapshot(snapshot)?;
     sync.apply_ops(ops)?;
@@ -3026,7 +3148,7 @@ async fn handle_hello(
     sync.apply_device_profile(&profile, false)?;
     sync.apply_device_profiles(&devices)?;
     if let Some(playback) = playback {
-        sync.apply_playback_snapshot(playback)?;
+        sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
     sync.apply_snapshot(snapshot)?;
     sync.apply_ops(ops)?;
@@ -3635,3 +3757,11 @@ fn base64url_decode(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 #[path = "devices/tests.rs"]
 mod tests;
+
+fn playback_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}

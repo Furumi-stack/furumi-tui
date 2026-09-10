@@ -1,6 +1,6 @@
 [package]
 name = "furumi_tui"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A federated P2P player for personal music libraries"
@@ -27,12 +27,12 @@ crokey = "1.4.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6.0.0"
 futures-util = "0.3.32"
-furumi-library = "0.1.0"
+furumi-library = "0.2.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 lofty = "0.22"
 # P2P federation: library index in a shared DHT + audio streaming between
 # peers (same protocol as furumi-fd).
-music-dht = "0.4.1"
+music-dht = "0.5.0"
 ratatui = "0.30.1"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 rhai = { version = "1", features = ["sync"] }

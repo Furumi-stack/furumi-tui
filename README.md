@@ -195,6 +195,31 @@ cargo check --all-targets
 cargo test --all-targets
 ```
 
+## Playback coordination
+
+Connected Devices uses the shared `music_dht::playback` engine from frid.
+Newly started players take an idle/paused output after discovery and become
+controllers when another device is playing. Missing output reports trigger
+automatic failover; concurrent claims converge to one owner. The web gateway
+uses a passive server profile and reports actual browser activity.
+
+The existing device menu handles manual transfers. Advanced policy can be set
+in `settings.toml` without changing the UI:
+
+```toml
+[playback]
+claim_on_startup = true
+automatic_failover = true
+take_paused_on_startup = true
+discovery_ms = 3000
+owner_timeout_ms = 120000
+```
+
+All clients must support the new coordination envelope for eventual single
+output ownership. frid's `PLAYBACK_PROTOCOL.md` describes the protocol, adapter
+contract and rollout. Local Cargo patches are only for development; publish
+frid and bump the client dependency versions before releasing these changes.
+
 ## License
 
 Furumi is released under the

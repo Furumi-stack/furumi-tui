@@ -1698,9 +1698,9 @@ dependencies = [
 
 [[package]]
 name = "furumi-library"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6f15ab98c65d89ea18e55ed8852abd2f029f63876d357270c4647d73601d0a2"
+checksum = "f78466b6345cb90d7bb37db5d9dd67476ab6c2c3b2202876d24f448c314a9a08"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "furumi_tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3239,9 +3239,9 @@ dependencies = [
 
 [[package]]
 name = "music-dht"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bfe5cee89fa891b00e84738f947c924c6845fd84fedb4697cb073e3fe63bb81"
+checksum = "4c3f75d49d3a742a6777a1c4cc53f397399dfc9ddb70034c57aeb44d75d2ee4f"
 dependencies = [
  "async-trait",
  "blake3",

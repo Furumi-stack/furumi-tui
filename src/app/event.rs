@@ -185,7 +185,11 @@ pub enum AppEvent {
     /// Trusted device playback state, delivered by personal-device sync.
     DevicePlayback(crate::devices::PlaybackSnapshot),
     /// Playback command addressed to this device.
-    PlaybackCommand(crate::devices::PlaybackCommand),
+    PlaybackCommand {
+        command: crate::devices::PlaybackCommand,
+        authority: music_dht::playback::CommandStamp,
+        origin: String,
+    },
     /// Current lifecycle/status of the federation Jam.
     JamStatus(crate::jam::JamStatus),
     /// Host playback snapshot received by a Jam participant.
