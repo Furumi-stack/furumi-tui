@@ -61,7 +61,9 @@ fn main() -> Result<()> {
     if let Err(err) = config::logging::init() {
         startup_warning = Some(format!("logging disabled: {err:#}"));
     }
-    capture_stderr();
+    // Restore stderr before main returns: Rust prints a returned error only
+    // after local guards have been dropped and the terminal has been restored.
+    let _stderr_capture = capture_stderr();
     let (keymap, keymap_warning) = config::keymap::Keymap::load();
     let startup_warning = keymap_warning.or(startup_warning);
 
@@ -132,25 +134,46 @@ fn run_app(
 /// every line into tracing — it lands in the Logs tab and the log file
 /// instead of the screen.
 #[cfg(unix)]
-fn capture_stderr() {
+struct StderrCapture {
+    original: std::os::fd::RawFd,
+}
+
+#[cfg(unix)]
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        // SAFETY: original is our owned duplicate, kept open for this scope.
+        unsafe {
+            libc::dup2(self.original, libc::STDERR_FILENO);
+            libc::close(self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn capture_stderr() -> Option<StderrCapture> {
     use std::io::BufRead as _;
     use std::os::fd::FromRawFd as _;
 
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe/dup2 syscalls on freshly created fds.
     unsafe {
+        let original = libc::dup(libc::STDERR_FILENO);
+        if original == -1 {
+            return None;
+        }
+        let capture = StderrCapture { original };
         if libc::pipe(fds.as_mut_ptr()) != 0 {
-            return;
+            return None;
         }
         let [read_fd, write_fd] = fds;
         if libc::dup2(write_fd, libc::STDERR_FILENO) == -1 {
             libc::close(read_fd);
             libc::close(write_fd);
-            return;
+            return None;
         }
         libc::close(write_fd);
         let reader = std::fs::File::from_raw_fd(read_fd);
-        std::thread::Builder::new()
+        let reader_thread = std::thread::Builder::new()
             .name("stderr".to_string())
             .spawn(move || {
                 for line in std::io::BufReader::new(reader).lines() {
@@ -159,33 +182,65 @@ fn capture_stderr() {
                         tracing::warn!(target: "stderr", "{line}");
                     }
                 }
-            })
-            .ok();
+            });
+        if reader_thread.is_err() {
+            return None;
+        }
+        Some(capture)
     }
 }
 
 #[cfg(windows)]
-fn capture_stderr() {
+struct StderrCapture {
+    original: windows_sys::Win32::Foundation::HANDLE,
+    writer: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        // SAFETY: original is borrowed from the process; writer is owned by
+        // this guard. Restoring the original also preserves shell redirection.
+        unsafe {
+            windows_sys::Win32::System::Console::SetStdHandle(
+                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                self.original,
+            );
+            windows_sys::Win32::Foundation::CloseHandle(self.writer);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn capture_stderr() -> Option<StderrCapture> {
     use std::io::BufRead as _;
     use std::os::windows::io::FromRawHandle as _;
 
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
     unsafe {
+        let original = GetStdHandle(STD_ERROR_HANDLE);
+        if original.is_null() || original == INVALID_HANDLE_VALUE {
+            return None;
+        }
         let mut read = core::ptr::null_mut();
         let mut write = core::ptr::null_mut();
         if CreatePipe(&mut read, &mut write, core::ptr::null(), 0) == 0 {
-            return;
+            return None;
         }
         if SetStdHandle(STD_ERROR_HANDLE, write) == 0 {
             CloseHandle(read);
             CloseHandle(write);
-            return;
+            return None;
         }
+        let capture = StderrCapture {
+            original,
+            writer: write,
+        };
         let reader = std::fs::File::from_raw_handle(read);
-        std::thread::Builder::new()
+        let reader_thread = std::thread::Builder::new()
             .name("stderr".to_string())
             .spawn(move || {
                 for line in std::io::BufReader::new(reader).lines() {
@@ -194,13 +249,49 @@ fn capture_stderr() {
                         tracing::warn!(target: "stderr", "{line}");
                     }
                 }
-            })
-            .ok();
+            });
+        if reader_thread.is_err() {
+            return None;
+        }
+        Some(capture)
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn capture_stderr() {}
+fn capture_stderr() -> Option<()> {
+    None
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    #[test]
+    fn error_output_is_restored_after_capture() {
+        const CHILD: &str = "FURUMI_STDERR_CAPTURE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            {
+                let _capture = super::capture_stderr().expect("capture stderr");
+            }
+            eprintln!("furumi-test: visible error after terminal shutdown");
+            return;
+        }
+        // Run in another process: redirecting global stderr inside a parallel
+        // test suite would interfere with unrelated tests and panic reporting.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stderr_tests::error_output_is_restored_after_capture",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("furumi-test: visible error after terminal shutdown")
+        );
+    }
+}
 
 /// Kitty keyboard protocol, where supported, disambiguates Esc from alt-keys
 /// and modifier combos. The flags are popped on exit and on panic — leaving
