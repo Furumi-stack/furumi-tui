@@ -1,5 +1,223 @@
 use super::*;
 
+/// Exercises the production stream handlers and SQLite adapter, not just the
+/// ownership reducer. Each peer has a fresh identity and an isolated library.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn localhost_devices_exchange_state_and_handoff() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let network = NetworkId::from_name(&format!("device-test-{}", random_hex(16)));
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+        let mut receivers = Vec::new();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join("network")).unwrap();
+            let config = music_dht::MusicDhtConfig::builder()
+                .data_dir(dir.path().join("network"))
+                .network_id(network)
+                .stream_protocol(SYNC_ALPN)
+                .build()
+                .unwrap();
+            let (service, events) = MusicDhtService::start(config).await.unwrap();
+            let service = Arc::new(service);
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            let sync = Arc::new(DeviceSync {
+                _identity_lock: Some(Arc::new(
+                    acquire_identity_lock(&dir.path().join("sync.sqlite3")).unwrap(),
+                )),
+                conn: Arc::new(std::sync::Mutex::new(conn)),
+                library: Arc::new(Library::open(&dir.path().join("library.sqlite3")).unwrap()),
+                event_tx: Default::default(),
+                playback: Default::default(),
+            });
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            sync.set_event_tx(tx);
+            let stats = Arc::new(crate::federation::TransportStats::default());
+            servers.push(tokio::spawn(serve_peers(
+                service.stream_acceptor(SYNC_ALPN).unwrap(),
+                sync.clone(),
+                service.clone(),
+                stats.clone(),
+            )));
+            receivers.push(rx);
+            peers.push((sync, service, stats, events));
+        }
+        let (a, service_a, stats_a, _) = &peers[0];
+        let (b, service_b, stats_b, _) = &peers[1];
+        b.ensure_identity().unwrap();
+        b.set_group_id(&a.ensure_identity().unwrap().group_id)
+            .unwrap();
+        let profile_a = a
+            .own_profile(&service_a.ticket().await.unwrap().to_string())
+            .unwrap();
+        let profile_b = b
+            .own_profile(&service_b.ticket().await.unwrap().to_string())
+            .unwrap();
+        a.apply_device_profile(&profile_b, true).unwrap();
+        b.apply_device_profile(&profile_a, true).unwrap();
+        a.claim_playback(&profile_a.device_id).unwrap();
+        a.playback_tick(true, true).unwrap();
+        let mut state = empty_playback_state();
+        state.playing = true;
+        state.position_secs = 42.5;
+        a.publish_playback(PlaybackSnapshot {
+            device_id: profile_a.device_id.clone(),
+            device_name: "TUI".into(),
+            active: true,
+            updated_at_ms: now_ms(),
+            state: state.clone(),
+            coordination: None,
+        });
+        a.sync_device(
+            service_a.clone(),
+            &a.active_remote_devices().unwrap()[0],
+            stats_a.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            b.with_playback_engine(|e| e.owner().map(str::to_owned))
+                .unwrap(),
+            Some(profile_a.device_id.clone())
+        );
+        assert_eq!(lock(&b.playback).remote[&profile_a.device_id].state, state);
+        assert!(
+            b.status()
+                .devices
+                .iter()
+                .any(|d| d.device_id == profile_a.device_id && d.last_seen_ms.is_some())
+        );
+
+        a.record_playback_command(
+            &profile_b.device_id,
+            PlaybackCommand::ActiveChanged {
+                active_device_id: profile_b.device_id.clone(),
+                active_device_name: "Second player".into(),
+                state: state.clone(),
+            },
+        )
+        .unwrap();
+        a.sync_device(
+            service_a.clone(),
+            &a.active_remote_devices().unwrap()[0],
+            stats_a.clone(),
+        )
+        .await
+        .unwrap();
+        let mut transferred = false;
+        while let Ok(event) = receivers[1].try_recv() {
+            if let AppEvent::PlaybackCommand {
+                command:
+                    PlaybackCommand::ActiveChanged {
+                        state: received, ..
+                    },
+                authority,
+                origin,
+            } = event
+            {
+                assert_eq!(received, state);
+                assert!(b.playback_command_is_current(&origin, &authority));
+                transferred = true;
+            }
+        }
+        assert!(transferred, "handoff must reach the player's event loop");
+        assert_eq!(
+            b.playback_tick(true, true).unwrap(),
+            Some(profile_b.device_id.clone())
+        );
+        b.publish_playback(PlaybackSnapshot {
+            device_id: profile_b.device_id.clone(),
+            device_name: "Second player".into(),
+            active: true,
+            updated_at_ms: now_ms(),
+            state,
+            coordination: None,
+        });
+        b.sync_device(
+            service_b.clone(),
+            &b.active_remote_devices().unwrap()[0],
+            stats_b.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            a.playback_tick(true, false).unwrap(),
+            Some(profile_b.device_id)
+        );
+        // A paired peer that accepts a connection but never answers must not
+        // serialize or stop subsequent polls to the responsive peer.
+        let silent_dir = tempfile::tempdir().unwrap();
+        let (silent, _events) = MusicDhtService::start(
+            music_dht::MusicDhtConfig::builder()
+                .data_dir(silent_dir.path())
+                .network_id(network)
+                .stream_protocol(SYNC_ALPN)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let _silent_acceptor = silent.stream_acceptor(SYNC_ALPN).unwrap();
+        let mut silent_profile = profile_a.clone();
+        silent_profile.device_id = "silent-peer".into();
+        silent_profile.endpoint_id = silent.endpoint_id().to_string();
+        silent_profile.endpoint_ticket = silent.ticket().await.unwrap().to_string();
+        a.apply_device_profile(&silent_profile, true).unwrap();
+        lock(&a.conn)
+            .execute(
+                "UPDATE sync_devices SET last_seen_ms = ?1 WHERE device_id = 'silent-peer'",
+                [now_ms() + 1_000],
+            )
+            .unwrap();
+        assert_eq!(
+            a.active_remote_devices().unwrap()[0].device_id,
+            "silent-peer"
+        );
+        a.claim_playback(&profile_a.device_id).unwrap();
+        let poller = tokio::spawn(sync_loop(a.clone(), service_a.clone(), stats_a.clone()));
+        for position in [99.0, 100.0] {
+            a.playback_tick(true, true).unwrap();
+            let mut next = empty_playback_state();
+            next.playing = true;
+            next.position_secs = position;
+            a.publish_playback(PlaybackSnapshot {
+                device_id: profile_a.device_id.clone(),
+                device_name: "TUI".into(),
+                active: true,
+                updated_at_ms: now_ms(),
+                state: next,
+                coordination: None,
+            });
+            tokio::time::timeout(Duration::from_secs(6), async {
+                loop {
+                    if lock(&b.playback)
+                        .remote
+                        .get(&profile_a.device_id)
+                        .is_some_and(|snapshot| snapshot.state.position_secs == position)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("a stalled peer must not delay live playback polls");
+        }
+        poller.abort();
+        let _ = poller.await;
+        silent.shutdown().await.unwrap();
+        for server in servers {
+            server.abort();
+        }
+        for (_, service, _, _) in &peers {
+            service.shutdown().await.unwrap();
+        }
+    })
+    .await
+    .expect("localhost sync must complete within 30 seconds");
+}
+
 fn empty_playback_state() -> PlaybackStateWire {
     PlaybackStateWire {
         queue: vec![],
@@ -119,6 +337,7 @@ fn test_sync() -> DeviceSync {
         unique
     ));
     let sync = DeviceSync {
+        _identity_lock: None,
         conn: Arc::new(std::sync::Mutex::new(conn)),
         library: Arc::new(Library::open(&library_path).unwrap()),
         event_tx: Arc::new(std::sync::Mutex::new(None)),
@@ -126,6 +345,38 @@ fn test_sync() -> DeviceSync {
     };
     sync.ensure_identity().unwrap();
     sync
+}
+
+#[test]
+fn device_identity_has_one_coordinator_across_installation_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.sqlite3");
+    let first = acquire_identity_lock(&path).unwrap();
+    assert!(acquire_identity_lock(&path).is_err());
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "devices::tests::identity_lock_child_process",
+            "--nocapture",
+        ])
+        .env("FURUMI_IDENTITY_LOCK_TEST_PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    drop(first);
+    // Reopening a leftover lock file after shutdown must succeed.
+    assert!(acquire_identity_lock(&path).is_ok());
+}
+
+#[test]
+fn identity_lock_child_process() {
+    if let Some(path) = std::env::var_os("FURUMI_IDENTITY_LOCK_TEST_PATH") {
+        assert!(acquire_identity_lock(std::path::Path::new(&path)).is_err());
+    }
 }
 
 fn device_revoked(sync: &DeviceSync, device_id: &str) -> bool {

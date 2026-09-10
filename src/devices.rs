@@ -82,6 +82,10 @@ pub struct DeviceSyncStatus {
 
 #[derive(Clone)]
 pub struct DeviceSync {
+    // A device identity has exactly one coordinator, including across binaries
+    // launched from different installation directories. The OS releases this
+    // lock on crashes; the file itself is deliberately never removed.
+    _identity_lock: Option<Arc<std::fs::File>>,
     conn: Arc<std::sync::Mutex<Connection>>,
     library: Arc<Library>,
     event_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
@@ -599,16 +603,33 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("devices").join("sync.sqlite3"))
 }
 
+fn acquire_identity_lock(database: &std::path::Path) -> Result<std::fs::File> {
+    let path = database.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening device identity lock {}", path.display()))?;
+    file.try_lock().with_context(|| format!(
+        "Cannot acquire device identity lock {}. Another Furumi instance may already be using this device. Close it before launching another binary; two players must not share one device identity.", path.display()
+    ))?;
+    Ok(file)
+}
+
 impl DeviceSync {
     pub fn new(library: Arc<Library>) -> Result<Arc<Self>> {
         let path = default_db_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let identity_lock = acquire_identity_lock(&path)?;
         let conn =
             Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         init_schema(&conn)?;
         let sync = Arc::new(Self {
+            _identity_lock: Some(Arc::new(identity_lock)),
             conn: Arc::new(std::sync::Mutex::new(conn)),
             library,
             event_tx: Arc::new(std::sync::Mutex::new(None)),
@@ -2829,13 +2850,45 @@ pub async fn sync_loop(
     transport_stats: Arc<crate::federation::TransportStats>,
 ) {
     let mut interval = tokio::time::interval(SYNC_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Independent polls: an offline device must not hold up live outputs.
+    // JoinSet aborts outstanding IO when federation stops or restarts.
+    let mut polls = tokio::task::JoinSet::new();
+    let mut active = std::collections::HashMap::new();
     loop {
-        interval.tick().await;
-        if let Err(err) = sync
-            .sync_once(Arc::clone(&service), Arc::clone(&transport_stats))
-            .await
-        {
-            tracing::debug!("personal sync tick failed: {err:#}");
+        tokio::select! {
+            _ = interval.tick() => {
+                match sync.active_remote_devices() {
+                    Ok(devices) => for device in devices {
+                        if device.endpoint_ticket.trim().is_empty()
+                            || active.values().any(|id| id == &device.device_id) { continue; }
+                        let device_id = device.device_id.clone();
+                        let sync = Arc::clone(&sync);
+                        let service = Arc::clone(&service);
+                        let stats = Arc::clone(&transport_stats);
+                        let handle = polls.spawn(async move {
+                            tokio::time::timeout(Duration::from_secs(30), sync.sync_device(service, &device, stats))
+                                .await.context("device sync exchange timed out")?
+                        });
+                        active.insert(handle.id(), device_id);
+                    },
+                    Err(err) => { let _ = sync.set_last_error(Some(format!("{err:#}"))); }
+                }
+                if let Err(err) = sync.gc_tombstones() {
+                    tracing::debug!("personal sync cleanup failed: {err:#}");
+                }
+            }
+            Some(completed) = polls.join_next_with_id(), if !polls.is_empty() => {
+                let (task, result) = match completed {
+                    Ok((task, result)) => (task, result),
+                    Err(error) => (error.id(), Err(anyhow::Error::from(error))),
+                };
+                if let Some(device_id) = active.remove(&task)
+                    && let Err(err) = result {
+                        tracing::debug!(device = %device_id, "device sync failed: {err:#}");
+                        let _ = sync.set_last_error(Some(format!("{}: {err:#}", short_id(&device_id))));
+                    }
+            }
         }
         if let Some(tx) = lock(&sync.event_tx).as_ref() {
             let _ = tx.send(AppEvent::DeviceSyncStatus(sync.status()));
@@ -3757,6 +3810,9 @@ fn base64url_decode(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 #[path = "devices/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod interop_tests;
 
 fn playback_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

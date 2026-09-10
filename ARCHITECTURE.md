@@ -190,6 +190,13 @@ must propagate and converge, not an ephemeral server-side session flag.
 
 ## Playback across devices
 
+A persisted device identity has exactly one live coordinator. The TUI holds
+an OS file lock beside its device-sync database for the entire runtime; two
+installations using the same user data directory cannot open it concurrently.
+Network polling is independent per trusted peer, with one in-flight exchange
+per peer and a bounded deadline. A stalled peer must not delay the next poll
+of a healthy output. Poll tasks are cancelled when federation shuts down.
+
 Playback has one logical state but remains physically local to the device
 producing audio.
 

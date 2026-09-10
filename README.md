@@ -203,6 +203,15 @@ controllers when another device is playing. Missing output reports trigger
 automatic failover; concurrent claims converge to one owner. The web gateway
 uses a passive server profile and reports actual browser activity.
 
+Only one TUI process may use a device identity. Installed and locally built
+binaries use the same user data directory: close the installed player before
+starting a development build. An OS file lock prevents duplicate coordinators
+and is released automatically on exit or a crash. Older builds do not take
+this lock, so close those explicitly when upgrading.
+
+Connected-device polling runs independently per peer, so an offline or stalled
+device does not postpone updates to live players.
+
 The existing device menu handles manual transfers. Advanced policy can be set
 in `settings.toml` without changing the UI:
 
@@ -219,6 +228,21 @@ All clients must support the new coordination envelope for eventual single
 output ownership. frid's `PLAYBACK_PROTOCOL.md` describes the protocol, adapter
 contract and rollout. Local Cargo patches are only for development; publish
 frid and bump the client dependency versions before releasing these changes.
+
+Run the local protocol checks from the TUI repository:
+
+```bash
+cargo test localhost_devices_exchange_state_and_handoff
+python scripts/test_device_interop.py ../furumusic
+```
+
+The first test uses real iroh streams, isolated SQLite databases, ownership
+handoff, and a stalled peer. The second builds both player test binaries and
+exchanges their actual JSON messages over `127.0.0.1`: queue metadata,
+bidirectional handoff, pause/seek and duplicate command fencing. It exercises
+the TUI command adapter and web player hub, but does not start a browser or
+PostgreSQL and does not cover web database migrations. Both tests use temporary
+identities and data; no running player or user library is used.
 
 ## License
 
