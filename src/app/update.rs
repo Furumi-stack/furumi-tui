@@ -965,11 +965,10 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
                 _ => None,
             },
             GlobalView::Release { id, cursor } => match state.release_views.get(id)? {
-                Loadable::Ready(detail) => Some((
-                    TrackSelectionScope::Release(*id),
-                    *cursor,
-                    detail.tracks.len(),
-                )),
+                Loadable::Ready(detail) => {
+                    let tracks = crate::app::state::release_tracks(state, *id, detail);
+                    Some((TrackSelectionScope::Release(*id), *cursor, tracks.len()))
+                }
                 _ => None,
             },
             GlobalView::Search { cursor } => {
@@ -1021,7 +1020,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
     }
 }
 
-fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, Vec<&TrackItem>)> {
+fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, Vec<TrackItem>)> {
     match state.active_tab {
         Tab::Global => match state.global.stack.last()? {
             GlobalView::Artist { id, cursor } => match state.artist_views.get(id)? {
@@ -1032,14 +1031,14 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
                         Some((
                             TrackSelectionScope::ArtistTop(*id),
                             *cursor,
-                            detail.top_tracks.iter().collect(),
+                            detail.top_tracks.clone(),
                         ))
                     } else {
                         let featured = cursor.checked_sub(tracks + releases)?;
                         (featured < detail.featured_tracks.len()).then_some((
                             TrackSelectionScope::ArtistFeatured(*id),
                             featured,
-                            detail.featured_tracks.iter().collect(),
+                            detail.featured_tracks.clone(),
                         ))
                     }
                 }
@@ -1049,7 +1048,7 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
                 Loadable::Ready(detail) => Some((
                     TrackSelectionScope::Release(*id),
                     *cursor,
-                    detail.tracks.iter().collect(),
+                    crate::app::state::release_tracks(state, *id, detail),
                 )),
                 _ => None,
             },
@@ -1060,13 +1059,16 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
             Some((
                 TrackSelectionScope::Playlist(opened.id),
                 opened.cursor,
-                playlist_tracks(state, opened.id)?,
+                playlist_tracks(state, opened.id)?
+                    .into_iter()
+                    .cloned()
+                    .collect(),
             ))
         }
         Tab::Queue => Some((
             TrackSelectionScope::Queue,
             state.queue_tab.cursor,
-            state.player.queue.iter().collect(),
+            state.player.queue.clone(),
         )),
         Tab::Federation | Tab::Logs => None,
     }
@@ -1104,7 +1106,7 @@ pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
         .unwrap_or_else(|| vec![cursor.min(tracks.len().saturating_sub(1))]);
     indices
         .into_iter()
-        .filter_map(|index| tracks.get(index).map(|track| (*track).clone()))
+        .filter_map(|index| tracks.get(index).cloned())
         .collect()
 }
 
@@ -1315,7 +1317,9 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 _ => None,
             },
             GlobalView::Release { id, cursor } => match state.release_views.get(id)? {
-                Loadable::Ready(detail) => detail.tracks.get(*cursor).cloned(),
+                Loadable::Ready(detail) => crate::app::state::release_tracks(state, *id, detail)
+                    .get(*cursor)
+                    .cloned(),
                 _ => None,
             },
             GlobalView::Search { cursor } => {
@@ -1456,11 +1460,12 @@ fn open_release_for_track(state: &mut AppState, track: &TrackItem) {
     }
     let release_id = track.release_id;
     let cursor = match state.release_views.get(&release_id) {
-        Some(Loadable::Ready(detail)) => detail
-            .tracks
-            .iter()
-            .position(|t| t.id == track.id)
-            .unwrap_or(0),
+        Some(Loadable::Ready(detail)) => {
+            crate::app::state::release_tracks(state, release_id, detail)
+                .iter()
+                .position(|t| t.id == track.id)
+                .unwrap_or(0)
+        }
         _ => {
             state.pending_release_focus = Some((release_id, track.id));
             0
@@ -1914,7 +1919,7 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             let Some(Loadable::Ready(detail)) = state.release_views.get(&id) else {
                 return;
             };
-            let total = detail.tracks.len() as isize;
+            let total = crate::app::state::release_tracks(state, id, detail).len() as isize;
             if total == 0 {
                 return;
             }
@@ -2045,7 +2050,7 @@ fn current_view_len(state: &AppState) -> usize {
             _ => 0,
         },
         Some(GlobalView::Release { id, .. }) => match state.release_views.get(id) {
-            Some(Loadable::Ready(d)) => d.tracks.len(),
+            Some(Loadable::Ready(d)) => crate::app::state::release_tracks(state, *id, d).len(),
             _ => 0,
         },
         Some(GlobalView::Search { .. }) => {
@@ -2339,10 +2344,17 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             _ => Outcome::Nothing,
         },
         Some(GlobalView::Release { id, cursor }) => match state.release_views.get(&id) {
-            Some(Loadable::Ready(detail)) if !detail.tracks.is_empty() => Outcome::Play {
-                tracks: detail.tracks.clone(),
-                start: cursor.min(detail.tracks.len() - 1),
-            },
+            Some(Loadable::Ready(detail)) => {
+                let tracks = crate::app::state::release_tracks(state, id, detail);
+                if tracks.is_empty() {
+                    Outcome::Nothing
+                } else {
+                    Outcome::Play {
+                        start: cursor.min(tracks.len() - 1),
+                        tracks,
+                    }
+                }
+            }
             _ => Outcome::Nothing,
         },
         Some(GlobalView::Search { cursor }) => {

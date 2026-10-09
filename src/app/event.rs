@@ -30,6 +30,11 @@ pub enum AppEvent {
         id: i64,
         result: Result<ReleaseDetail, String>,
     },
+    /// Federated tracks that complete an already-open local release view.
+    ReleaseFederationLoaded {
+        id: i64,
+        result: Result<Option<crate::federation::FedRelease>, String>,
+    },
     /// Live search results; `seq` drops responses that are already stale.
     SearchLoaded {
         seq: u64,

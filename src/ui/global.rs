@@ -837,29 +837,47 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
 
     let artists: Vec<&str> = detail.artists.iter().map(|a| a.name.as_str()).collect();
     let year = detail.year.map(|y| format!(" · {y}")).unwrap_or_default();
-    let info = vec![
+    let tracks = crate::app::state::release_tracks(state, id, detail);
+    let federation_line = match state.release_fed_views.get(&id) {
+        Some(Loadable::Loading) => Some(super::loading_line(state, "searching peers…")),
+        Some(Loadable::Ready(release)) if !release.tracks.is_empty() => Some(Line::styled(
+            format!("federation: +{} tracks", release.tracks.len()),
+            theme::dim(),
+        )),
+        Some(Loadable::Ready(_)) => Some(Line::styled(
+            "federation: no additional tracks",
+            theme::dim(),
+        )),
+        Some(Loadable::Failed(_)) => Some(Line::styled("federation: unavailable", theme::dim())),
+        _ if state.federation.settings.enabled
+            && state.global.filters.source_mode.includes_network() =>
+        {
+            Some(Line::styled("federation: pending", theme::dim()))
+        }
+        _ => None,
+    };
+    let mut info = vec![
         Line::default(),
         Line::styled(detail.title.clone(), theme::header_for(state)),
         Line::raw(artists.join(", ")),
         Line::default(),
         Line::styled(
-            format!(
-                "{}{year} · {} tracks",
-                detail.release_type,
-                detail.tracks.len()
-            ),
+            format!("{}{year} · {} tracks", detail.release_type, tracks.len()),
             theme::dim(),
         ),
     ];
+    if let Some(line) = federation_line {
+        info.push(line);
+    }
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Track list with centered scrolling.
     let visible = usize::from(tracks_area.height.max(1));
-    let total = detail.tracks.len();
+    let total = tracks.len();
     let first = cursor
         .saturating_sub(visible / 2)
         .min(total.saturating_sub(visible));
-    for (offset, track) in detail.tracks.iter().enumerate().skip(first).take(visible) {
+    for (offset, track) in tracks.iter().enumerate().skip(first).take(visible) {
         let rect = Rect {
             x: tracks_area.x,
             y: tracks_area.y + (offset - first) as u16,

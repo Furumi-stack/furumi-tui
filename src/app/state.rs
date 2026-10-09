@@ -304,6 +304,79 @@ mod tests {
     }
 
     #[test]
+    fn release_tracks_adds_remote_rows_without_duplicating_local_content() {
+        let local_content =
+            "b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let detail = ReleaseDetail {
+            id: 7,
+            title: "Album".to_string(),
+            release_type: "album".to_string(),
+            year: Some(2024),
+            cover_path: None,
+            artists: vec![crate::library::models::ArtistRef {
+                id: 3,
+                name: "Artist".to_string(),
+            }],
+            tracks: vec![TrackItem {
+                id: 1,
+                title: "Local".to_string(),
+                track_number: Some(1),
+                disc_number: None,
+                duration_seconds: 120.0,
+                artists: Vec::new(),
+                featured_artists: Vec::new(),
+                release_id: 7,
+                release_title: "Album".to_string(),
+                release_year: Some(2024),
+                file_path: "/music/local.mp3".to_string(),
+                content_id: Some(local_content.clone()),
+                cover_path: None,
+                audio_format: Some("mp3".to_string()),
+                audio_bitrate: Some(320),
+                audio_sample_rate: None,
+                audio_bit_depth: None,
+                file_size_bytes: None,
+                play_count: 0,
+                fed: None,
+            }],
+        };
+        let mut state = AppState::default();
+        state.release_fed_views.insert(
+            detail.id,
+            Loadable::Ready(crate::federation::FedRelease {
+                title: "Album".to_string(),
+                tracks: vec![
+                    crate::federation::FedCardTrack {
+                        title: "Local".to_string(),
+                        track_number: Some(1),
+                        content_id: Some(local_content),
+                        sources: vec![("peer".to_string(), "local-item".to_string())],
+                        ..Default::default()
+                    },
+                    crate::federation::FedCardTrack {
+                        title: "Remote".to_string(),
+                        track_number: Some(3),
+                        sources: vec![("peer".to_string(), "remote-item".to_string())],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        );
+
+        let tracks = release_tracks(&state, detail.id, &detail);
+
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Local", "Remote"]
+        );
+        assert!(tracks[1].is_fed_pending());
+    }
+
+    #[test]
     fn artist_merged_releases_marks_partially_local_federated_release() {
         let local_id = "b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let remote_id = "b3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1604,6 +1677,8 @@ pub struct AppState {
     /// Federated card data that enriches a local artist page in-place.
     pub artist_fed_views: HashMap<i64, Loadable<crate::federation::FedArtistCard>>,
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,
+    /// Federated tracks that enrich an already-open local release view.
+    pub release_fed_views: HashMap<i64, Loadable<crate::federation::FedRelease>>,
     pub playlists: PlaylistsTab,
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
     /// Liked local-library content ids, for the ♥ markers everywhere tracks are shown.
@@ -1719,6 +1794,75 @@ pub fn artist_fed_card(state: &AppState, id: i64) -> Option<&crate::federation::
         Some(Loadable::Ready(card)) => Some(card),
         _ => None,
     }
+}
+
+/// The tracklist rendered and played by an opened release. When federation
+/// has supplied a matching release, local rows remain authoritative and only
+/// tracks that are not already present locally are appended.
+pub fn release_tracks(state: &AppState, id: i64, detail: &ReleaseDetail) -> Vec<TrackItem> {
+    let mut tracks = detail.tracks.clone();
+    if !state.global.filters.source_mode.includes_network() {
+        return tracks;
+    }
+    let Some(Loadable::Ready(fed_release)) = state.release_fed_views.get(&id) else {
+        return tracks;
+    };
+    for fed in &fed_release.tracks {
+        let Some((owner, item_id)) = fed.sources.first().cloned() else {
+            continue;
+        };
+        let fed_content_id = fed
+            .content_id
+            .as_deref()
+            .and_then(music_dht::normalize_content_id);
+        let already_local = tracks.iter().any(|local| {
+            let same_content = fed_content_id.is_some()
+                && track_content_id(local).as_deref() == fed_content_id.as_deref();
+            let same_position = local.track_number == fed.track_number
+                || local.track_number.is_none()
+                || fed.track_number.is_none();
+            same_content
+                || (music_dht::normalize_name(&local.title)
+                    == music_dht::normalize_name(&fed.title)
+                    && same_position)
+        });
+        if already_local {
+            continue;
+        }
+        let names = if fed.artists.is_empty() {
+            detail
+                .artists
+                .iter()
+                .map(|artist| artist.name.clone())
+                .collect()
+        } else {
+            fed.artists.clone()
+        };
+        let featured_artists = fed.featured_artists.clone();
+        tracks.push(crate::federation::pending_track(
+            &crate::federation::FedTrack {
+                item_id,
+                owner,
+                own: false,
+                title: fed.title.clone(),
+                artist_names: names,
+                featured_artist_names: featured_artists,
+                year: fed_release.year.or(detail.year),
+                duration_seconds: fed.duration_seconds.map(|seconds| seconds.round() as i64),
+                content_id: fed.content_id.clone(),
+                release_title: Some(detail.title.clone()),
+                track_number: fed.track_number,
+                disc_number: fed.disc_number,
+            },
+        ));
+    }
+    tracks.sort_by_key(|track| {
+        (
+            track.disc_number.unwrap_or(1),
+            track.track_number.unwrap_or(i32::MAX),
+        )
+    });
+    tracks
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

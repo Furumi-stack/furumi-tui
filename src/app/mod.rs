@@ -189,6 +189,126 @@ fn spawn_artist_federation_enrichment(runtime: &Runtime, id: i64, name: String) 
     });
 }
 
+fn merge_release_federation_results(
+    title: &str,
+    releases: impl IntoIterator<Item = crate::federation::FedRelease>,
+) -> Option<crate::federation::FedRelease> {
+    let key = music_dht::normalize_name(title);
+    let mut merged = None;
+    for release in releases {
+        if music_dht::normalize_name(&release.title) != key {
+            continue;
+        }
+        let target = merged.get_or_insert_with(|| crate::federation::FedRelease {
+            title: release.title.clone(),
+            release_type: release.release_type.clone(),
+            year: release.year,
+            owners: Vec::new(),
+            cover_path: release.cover_path.clone(),
+            tracks: Vec::new(),
+        });
+        if target.release_type.is_empty() {
+            target.release_type = release.release_type.clone();
+        }
+        if target.year.is_none() {
+            target.year = release.year;
+        }
+        if target.cover_path.is_none() {
+            target.cover_path = release.cover_path.clone();
+        }
+        for owner in release.owners {
+            if !target.owners.contains(&owner) {
+                target.owners.push(owner);
+            }
+        }
+        for track in release.tracks {
+            let existing = target.tracks.iter_mut().find(|existing| {
+                music_dht::normalize_name(&existing.title)
+                    == music_dht::normalize_name(&track.title)
+                    && (existing.track_number == track.track_number
+                        || existing.track_number.is_none()
+                        || track.track_number.is_none())
+            });
+            match existing {
+                Some(existing) => {
+                    if existing.artists.is_empty() {
+                        existing.artists = track.artists;
+                    }
+                    if existing.featured_artists.is_empty() {
+                        existing.featured_artists = track.featured_artists;
+                    }
+                    if existing.track_number.is_none() {
+                        existing.track_number = track.track_number;
+                    }
+                    if existing.disc_number.is_none() {
+                        existing.disc_number = track.disc_number;
+                    }
+                    if existing.duration_seconds.is_none() {
+                        existing.duration_seconds = track.duration_seconds;
+                    }
+                    if existing.content_id.is_none() {
+                        existing.content_id = track.content_id;
+                    }
+                    for source in track.sources {
+                        if !existing.sources.contains(&source) {
+                            existing.sources.push(source);
+                        }
+                    }
+                }
+                None => target.tracks.push(track),
+            }
+        }
+    }
+    merged
+}
+
+fn spawn_release_federation_enrichment(
+    runtime: &Runtime,
+    id: i64,
+    title: String,
+    artists: Vec<String>,
+) {
+    let fed = Arc::clone(&runtime.federation);
+    let tx = runtime.event_tx.clone();
+    tokio::spawn(async move {
+        let requests = artists.into_iter().map(|artist| {
+            let fed = Arc::clone(&fed);
+            async move { fed.artist_card(&artist).await }
+        });
+        let mut cards = Vec::new();
+        let mut errors = Vec::new();
+        for result in futures_util::future::join_all(requests).await {
+            match result {
+                Ok(card) => {
+                    let own_owner = card.own_owner.clone();
+                    for mut release in card.releases {
+                        // The local catalog is included in artist cards. This
+                        // view only needs the missing network tracks; local
+                        // rows are already supplied by the release query.
+                        if let Some(own_owner) = own_owner.as_deref() {
+                            release.owners.retain(|owner| owner != own_owner);
+                            for track in &mut release.tracks {
+                                track.sources.retain(|(owner, _)| owner != own_owner);
+                            }
+                            release.tracks.retain(|track| !track.sources.is_empty());
+                        }
+                        cards.push(release);
+                    }
+                }
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        let result = if let Some(release) = merge_release_federation_results(&title, cards) {
+            Ok(Some(release))
+        } else if !errors.is_empty() {
+            Err(errors.join("; "))
+        } else {
+            Ok(None)
+        };
+        let _ = tx.send(AppEvent::ReleaseFederationLoaded { id, result });
+    });
+}
+
 fn maybe_enrich_open_artist(state: &mut AppState, runtime: &Runtime) {
     if !state.federation.settings.enabled || state.active_tab != state::Tab::Global {
         return;
@@ -205,6 +325,38 @@ fn maybe_enrich_open_artist(state: &mut AppState, runtime: &Runtime) {
     let name = detail.name.clone();
     state.artist_fed_views.insert(id, state::Loadable::Loading);
     spawn_artist_federation_enrichment(runtime, id, name);
+}
+
+fn maybe_enrich_open_release(state: &mut AppState, runtime: &Runtime) {
+    if !state.federation.settings.enabled
+        || !state.global.filters.source_mode.includes_network()
+        || state.active_tab != state::Tab::Global
+    {
+        return;
+    }
+    let Some(state::GlobalView::Release { id, .. }) = state.global.stack.last().copied() else {
+        return;
+    };
+    if state.release_fed_views.contains_key(&id) {
+        return;
+    }
+    let Some(state::Loadable::Ready(detail)) = state.release_views.get(&id) else {
+        return;
+    };
+    let mut artists = Vec::new();
+    for artist in &detail.artists {
+        if !artists.iter().any(|name: &String| {
+            music_dht::normalize_name(name) == music_dht::normalize_name(&artist.name)
+        }) {
+            artists.push(artist.name.clone());
+        }
+    }
+    if artists.is_empty() {
+        return;
+    }
+    let title = detail.title.clone();
+    state.release_fed_views.insert(id, state::Loadable::Loading);
+    spawn_release_federation_enrichment(runtime, id, title, artists);
 }
 
 fn spawn_content_id_backfill(runtime: &Runtime) {
@@ -1011,6 +1163,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
     maybe_refresh_network_library(state, runtime);
     maybe_fetch_network_artist_images(state, runtime);
     maybe_enrich_open_artist(state, runtime);
+    maybe_enrich_open_release(state, runtime);
 
     // Liked ids load once per session — markers are shown everywhere.
     if !state.likes_loaded {
@@ -3591,6 +3744,17 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             state.artist_fed_views.insert(id, entry);
             state::restore_artist_cursor_anchor(state, id, cursor_anchor);
         }
+        AppEvent::ReleaseFederationLoaded { id, result } => {
+            let entry = match result {
+                Ok(Some(release)) => state::Loadable::Ready(release),
+                Ok(None) => state::Loadable::Ready(crate::federation::FedRelease::default()),
+                Err(message) => {
+                    tracing::debug!(release = id, %message, "release federation enrichment failed");
+                    state::Loadable::Failed(message)
+                }
+            };
+            state.release_fed_views.insert(id, entry);
+        }
         AppEvent::NetworkArtistCacheUpdated { source_id, count } => {
             tracing::debug!(source = %source_id, count, "network artist cache updated");
             if state.active_tab == state::Tab::Global && state.global.stack.is_empty() {
@@ -3714,6 +3878,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             };
             state.release_views.insert(id, entry);
+            maybe_enrich_open_release(state, runtime);
             // A Shift-J jump was waiting for this release: focus its track.
             if let Some((release_id, track_id)) = state.pending_release_focus
                 && release_id == id
