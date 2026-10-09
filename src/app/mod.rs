@@ -3041,6 +3041,24 @@ fn reset_artist_pagination(state: &mut AppState) {
     global.reloading = false;
 }
 
+/// Preserve the queue position while refreshing library-backed entries.
+///
+/// A playback key identifies a track, not a queue occurrence: the same track
+/// may intentionally appear more than once. Only entries removed before the
+/// current position can therefore move the current occurrence.
+fn queue_position_after_refresh(
+    queue: &[crate::library::models::TrackItem],
+    queue_pos: usize,
+    refreshed_ids: &std::collections::HashSet<i64>,
+) -> usize {
+    let removed_before_current = queue
+        .iter()
+        .take(queue_pos)
+        .filter(|track| track.id >= 0 && !refreshed_ids.contains(&track.id))
+        .count();
+    queue_pos.saturating_sub(removed_before_current)
+}
+
 /// Swap queue entries for their fresh library copies; tracks that were
 /// deleted leave the queue.
 fn apply_queue_refresh(
@@ -3050,6 +3068,9 @@ fn apply_queue_refresh(
 ) {
     let by_id: std::collections::HashMap<i64, _> =
         tracks.into_iter().map(|track| (track.id, track)).collect();
+    let refreshed_ids: std::collections::HashSet<i64> = by_id.keys().copied().collect();
+    let refreshed_queue_pos =
+        queue_position_after_refresh(&state.player.queue, state.player.queue_pos, &refreshed_ids);
     let by_key: std::collections::HashMap<String, _> = by_id
         .values()
         .cloned()
@@ -3085,26 +3106,38 @@ fn apply_queue_refresh(
         state.queue_tab.cursor = 0;
         return;
     }
+    state.player.queue_pos = refreshed_queue_pos.min(state.player.queue.len() - 1);
     state.queue_tab.cursor = state.queue_tab.cursor.min(state.player.queue.len() - 1);
     match (current_id, current_key) {
         (Some(id), _) if id < 0 => {
             // The current source can be an ephemeral federated stream while
             // the queue is refreshed after save-on-listen. It is not a
             // deleted library row, so keep playback untouched.
-            state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
+            state.player.queue_pos = refreshed_queue_pos.min(state.player.queue.len() - 1);
         }
         (Some(id), Some(key)) if by_id.contains_key(&id) || by_key.contains_key(&key) => {
-            if let Some(position) = state
+            // Keep the occurrence at the old position. Searching by key here
+            // would jump to the first copy when a track is queued repeatedly.
+            let position_matches_current = state
                 .player
                 .queue
-                .iter()
-                .position(|track| track_playback_key(track) == key)
+                .get(state.player.queue_pos)
+                .is_some_and(|track| track.id == id || track_playback_key(track) == key);
+            if !position_matches_current
+                && let Some(position) = state
+                    .player
+                    .queue
+                    .iter()
+                    .position(|track| track.id == id || track_playback_key(track) == key)
             {
                 state.player.queue_pos = position;
             }
-            state.player.current = by_id
-                .get(&id)
+            state.player.current = state
+                .player
+                .queue
+                .get(state.player.queue_pos)
                 .cloned()
+                .or_else(|| by_id.get(&id).cloned())
                 .or_else(|| by_key.get(&key).cloned());
             push_media_metadata(state, runtime);
         }
@@ -3112,14 +3145,14 @@ fn apply_queue_refresh(
             // The playing track was deleted from the library.
             runtime.player_start_pending = false;
             runtime.player.stop();
-            state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
+            state.player.queue_pos = refreshed_queue_pos.min(state.player.queue.len() - 1);
             state.player.current = None;
             state.player.playing = false;
             state.player.paused = false;
             push_media_update(state, runtime, true);
         }
         (None, _) => {
-            state.player.queue_pos = state.player.queue_pos.min(state.player.queue.len() - 1);
+            state.player.queue_pos = refreshed_queue_pos.min(state.player.queue.len() - 1);
         }
     }
 }
@@ -4368,6 +4401,57 @@ mod similarity_search_tests {
             tracks[0],
             state::SimilaritySearchHit::Federated { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod queue_refresh_tests {
+    use super::*;
+    use crate::library::models::TrackItem;
+
+    fn track(id: i64) -> TrackItem {
+        TrackItem {
+            id,
+            title: "duplicate".into(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 1.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id: 1,
+            release_title: "release".into(),
+            release_year: None,
+            cover_path: None,
+            file_path: format!("/music/{id}"),
+            content_id: None,
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+        }
+    }
+
+    #[test]
+    fn queue_refresh_keeps_the_selected_duplicate_occurrence() {
+        let queue = vec![track(7), track(7), track(7)];
+        let refreshed_ids = std::collections::HashSet::from([7]);
+
+        assert_eq!(
+            queue_position_after_refresh(&queue, 2, &refreshed_ids),
+            2,
+            "refreshing duplicate queue entries must not select the first one"
+        );
+    }
+
+    #[test]
+    fn queue_refresh_shifts_position_only_for_removed_entries_before_it() {
+        let queue = vec![track(8), track(7), track(7)];
+        let refreshed_ids = std::collections::HashSet::from([7]);
+
+        assert_eq!(queue_position_after_refresh(&queue, 2, &refreshed_ids), 1);
     }
 }
 
