@@ -75,6 +75,7 @@ pub struct Runtime {
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
     pub status_publisher: crate::status::Publisher,
+    pub status_visualizer: crate::visualizer::status::Renderer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -510,6 +511,7 @@ pub async fn run(
         media_tx,
         last_media_push: None,
         status_publisher: crate::status::Publisher::spawn(),
+        status_visualizer: crate::visualizer::status::Renderer::default(),
     };
     spawn_content_id_backfill(&runtime);
     if state.similarity.settings.enabled {
@@ -533,6 +535,7 @@ pub async fn run(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut visual_tick = tokio::time::interval(VISUALIZER_TICK_INTERVAL);
     visual_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut redraw = true;
 
     loop {
         let plain_text = match state.popup.as_ref() {
@@ -552,7 +555,8 @@ pub async fn run(
             _ => {}
         }
 
-        if !runtime.plain_text_mode {
+        sync_status_visualizer_target(&mut state, terminal.get_frame().area());
+        if !runtime.plain_text_mode && (redraw || runtime.force_redraw) {
             if runtime.force_redraw {
                 terminal.clear()?;
                 runtime.force_redraw = false;
@@ -560,6 +564,7 @@ pub async fn run(
             terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
         }
 
+        redraw = true;
         tokio::select! {
             maybe_event = input.next() => match maybe_event {
                 Some(Ok(event)) => handle_terminal_event(&mut state, &mut keymap, &mut runtime, event),
@@ -578,8 +583,21 @@ pub async fn run(
                 maybe_prefetch_next(&mut state, &runtime);
                 push_media_update(&state, &mut runtime, false);
             }
-            _ = visual_tick.tick(), if state.visualizer.active => {
-                sync_player_shared(&mut state, &runtime);
+            _ = visual_tick.tick(), if state.visualizer.active || crate::visualizer::status::playing(&state) => {
+                if state.visualizer.active {
+                    sync_player_shared(&mut state, &runtime);
+                } else {
+                    // The embedded meter only needs the atomic audio snapshot;
+                    // keep device publication on the ordinary player tick.
+                    state.player.audio_analysis = runtime.player.shared.audio_analysis();
+                    // The ready event will repaint. Avoid rendering the old
+                    // meter once here and the new meter again on completion.
+                    redraw = false;
+                }
+                sync_status_visualizer_target(&mut state, terminal.get_frame().area());
+                if !runtime.plain_text_mode {
+                    runtime.status_visualizer.request(&state, runtime.event_tx.clone());
+                }
             }
         }
 
@@ -628,6 +646,21 @@ fn leave_plain_text_mode() -> Result<()> {
         crossterm::event::EnableBracketedPaste
     )?;
     Ok(())
+}
+
+fn sync_status_visualizer_target(state: &mut AppState, screen: ratatui::layout::Rect) {
+    let area = ui::status_visualizer_area(screen, state);
+    let target = if crate::visualizer::status::visible(state) && !area.is_empty() {
+        state
+            .player
+            .current
+            .as_ref()
+            .map(|track| (area.width, track_playback_key(track)))
+    } else {
+        None
+    };
+    state.status_visualizer.set_target(target);
+    state.status_visualizer.set_paused(state.player.paused);
 }
 
 fn sync_player_shared(state: &mut AppState, runtime: &Runtime) {
@@ -3304,6 +3337,10 @@ fn handle_playback_command(
 
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
     match event {
+        AppEvent::StatusVisualizationReady(ready) => {
+            runtime.status_visualizer.busy = false;
+            state.status_visualizer.apply(ready);
+        }
         AppEvent::UpdateChecked(result) => {
             state.updater.busy = false;
             state.updater.message = match result {

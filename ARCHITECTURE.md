@@ -293,6 +293,17 @@ created or edited while Furumi is running without rebuilding or restarting the
 application. Bundled scripts use the same path and contract as user scripts,
 so built-in and custom visualizations exercise the same runtime.
 
+The v2 primitives are sufficient for small perspective wireframes without a
+native 3D engine. The bundled morphing cube transforms eight vertices in Rhai
+and batches its twelve edges into trace/vertical-line commands. Perspective,
+audio-driven deformation, and depth cues stay in the user-editable script;
+Rust rasterizes the resulting 2D commands. This deliberately avoids per-cell
+script command maps and does not provide filled meshes or a depth buffer.
+The richer cube preset adds bounded particle, ring, inner-cage, and echo
+layers. Echo poses are reconstructed from earlier times with current audio
+features, rather than retaining previous frames; particles have deterministic
+lifetimes. Small terminals omit expensive layers and reduce particle counts.
+
 The Rhai engine is configured as a sandboxed computation environment. Module
 loading through `import` and `export` is disabled, no filesystem or network API
 is exposed to scripts, and execution is bounded by limits on operations, call
@@ -304,6 +315,34 @@ The sandbox protects responsiveness and keeps visualization code in its
 intended role: transforming current audio features into drawing commands. It
 is not a plugin mechanism for accessing the library, network, or player
 controls.
+
+Fullscreen execution currently happens synchronously during UI drawing, with a fresh
+Rhai scope for each frame; scripts should derive motion from time and the
+already-smoothed audio features rather than rely on retained mutable state.
+The 50 ms animation timer gives a nominal 20 FPS cadence (other events can
+also trigger redraws). Operation limits are not wall-clock deadlines. The
+host also checks the script modification time during drawing, so slow script
+storage or expensive custom scripts can still delay input. Benchmark script
+evaluation and buffer drawing separately from real terminal throughput before
+increasing scene complexity or the refresh rate.
+
+The embedded status surface uses the same Rhai engine, input map, command
+decoder, and clipped buffer rasterizer with a one-row viewport. It has an
+independent AST cache and a fixed user-editable script in
+`visualizations/status/braille.rhai`, installed if absent. Exact copies of the
+previous bundled default can be atomically upgraded; edited files are preserved. It is not a
+fullscreen preset. During local playback the visual timer samples the audio
+analyzer without increasing trusted-device publication frequency. At most
+one blocking render job is in flight; excess ticks are dropped. File access,
+compilation, evaluation, and buffer preparation happen on that worker.
+An `AppEvent` delivers a prepared row to `AppState`; UI drawing only copies
+cells. Its audio input comes from the decoded-source analyzer before output
+volume scaling; the volume field remains informational. Pause suspends jobs
+and retains the last frame, even when the row needs resizing. Generation
+checks discard results invalidated by track changes, resize, pause/resume,
+or stop. Script errors are confined to the row and retried so
+editing the file repairs the display. Status scripts have a smaller operation
+budget, bounded source/output sizes, and cannot draw outside their viewport.
 
 ## Music-similarity indexing
 

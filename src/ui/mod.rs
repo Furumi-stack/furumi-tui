@@ -5,6 +5,8 @@ mod global;
 mod logs;
 mod playlists;
 mod popup;
+#[cfg(test)]
+mod status_tests;
 pub mod theme;
 
 use ratatui::Frame;
@@ -334,7 +336,7 @@ fn format_secs(secs: f64) -> String {
 
 /// Playback time, progress bar, queue position, volume and mode flags.
 /// Wider consoles get a longer bar and full flags; narrow ones drop pieces.
-fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
+fn player_right_line(state: &AppState, width: u16) -> (Line<'static>, u16) {
     let player = &state.player;
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(track) = &player.current
@@ -364,6 +366,7 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
             ));
         }
     }
+    let volume_offset = spans.iter().map(Span::width).sum::<usize>() + 2;
     if width >= 80 {
         let volume_cells = usize::from(player.volume / 10);
         spans.extend([
@@ -404,18 +407,69 @@ fn player_right_line(state: &AppState, width: u16) -> Line<'static> {
     }
     // Keep a gap between the flags and the username block to the right.
     spans.push(Span::raw("  "));
-    Line::from(spans)
+    (
+        Line::from(spans),
+        volume_offset.min(usize::from(u16::MAX)) as u16,
+    )
+}
+
+/// Shared geometry for rendering and background visualization requests.
+fn footer_areas(area: Rect, state: &AppState) -> [Rect; 3] {
+    let [player_row, message_row] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let (line, volume_offset) = player_right_line(state, area.width);
+    let right_width = line.width().min(usize::from(area.width)) as u16;
+    let [_, right] =
+        Layout::horizontal([Constraint::Min(8), Constraint::Length(right_width)]).areas(player_row);
+    let version_width = (env!("CARGO_PKG_VERSION").len() as u16 + 1).min(message_row.width);
+    let version = Rect::new(
+        message_row.x + message_row.width.saturating_sub(version_width) / 2,
+        message_row.y,
+        version_width,
+        message_row.height,
+    );
+    let message = Rect::new(
+        message_row.x,
+        message_row.y,
+        version.x.saturating_sub(message_row.x).saturating_sub(1),
+        message_row.height,
+    );
+    // On wide terminals align exactly with "vol". On narrow ones keep the
+    // centered version readable, shrinking the histogram into the remainder.
+    let start = right
+        .x
+        .saturating_add(volume_offset)
+        .max(version.right().saturating_add(1))
+        .min(message_row.right());
+    let visual = Rect::new(
+        start,
+        message_row.y,
+        message_row.right().saturating_sub(start),
+        message_row.height,
+    );
+    [message, version, visual]
+}
+
+pub(crate) fn status_visualizer_area(screen: Rect, state: &AppState) -> Rect {
+    let [_, _, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(2),
+    ])
+    .areas(screen);
+    footer_areas(status, state)[2]
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
-    let [player_row, message_row] =
+    let [player_row, _] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let [message_row, version_area, visual_area] = footer_areas(area, state);
 
     let player = &state.player;
     // Layout: track title left, time/progress/flags on the right. The
     // right block is built first and gets a fixed width; the title
     // truncates into whatever is left.
-    let center = player_right_line(state, area.width);
+    let (center, _) = player_right_line(state, area.width);
     let center_width = (center.width() as u16).min(area.width);
     let [title_area, right_area] =
         Layout::horizontal([Constraint::Min(8), Constraint::Length(center_width)])
@@ -444,6 +498,10 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), title_area);
     frame.render_widget(Paragraph::new(center), right_area);
+    draw_version(frame, version_area);
+    if crate::visualizer::status::visible(state) {
+        state.status_visualizer.draw(frame, visual_area);
+    }
 
     if state.cmdline.active {
         // Vim-style command line takes over the message row.
@@ -453,7 +511,6 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             usize::from(message_row.width.saturating_sub(2)),
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), message_row);
-        draw_version(frame, message_row);
         return;
     }
 
@@ -475,7 +532,6 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         },
     };
     frame.render_widget(Paragraph::new(message), message_row);
-    draw_version(frame, message_row);
 
     if let Some(pending) = &state.pending_keys {
         let pending = Paragraph::new(Line::styled(
@@ -507,7 +563,7 @@ fn active_artist_peer_search(state: &AppState) -> Option<String> {
 fn draw_version(frame: &mut Frame, area: Rect) {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     frame.render_widget(
-        Paragraph::new(Line::styled(version, theme::dim())).alignment(Alignment::Right),
+        Paragraph::new(Line::styled(version, theme::dim())).alignment(Alignment::Center),
         area,
     );
 }
