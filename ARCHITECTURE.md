@@ -369,6 +369,25 @@ timeouts are bounded; incompatible profiles are rejected. This direct
 peer-selection layer can later be replaced by DHT routing without changing
 local storage or ranking.
 
+## Podcasts
+
+Podcasts are a separate local source beside the music library. A dedicated
+SQLite store holds subscriptions and episode metadata keyed by
+`(podcast, RSS GUID)`. A feed refresh upserts episodes and never deletes
+ones that dropped out of the feed. Refreshes use conditional HTTP requests
+and run in the background with bounded concurrency. The store is
+independent of `furumi-library`, so podcast data cannot affect the music
+catalog, its migrations or federation publishing.
+
+Episodes enter the queue as ordinary `TrackItem`s whose `file_path` is the
+remote audio URL and whose ids sit in a reserved negative range. Playback
+opens an HTTP range-request reader on the blocking pool. The reader buffers a
+bounded window ahead of the decoder, and rodio uses coarse, byte-based
+seeking for it, so a seek far into an episode fetches only the bytes it
+needs. A sequence number discards a stream that finishes connecting after a
+newer playback request. Episodes have no content id: listening history,
+likes, playlists and cross-device handoff skip them.
+
 ## Persistence boundaries
 
 Furumi stores different kinds of state according to their lifetime:
@@ -379,6 +398,8 @@ Furumi stores different kinds of state according to their lifetime:
 | Device operation log and replicas | SQLite | Offline synchronization |
 | Versioned track embeddings | SQLite | Durable, locally rebuildable similarity data |
 | Federation catalog cache | SQLite/cache | Faster network browsing |
+| Podcast subscriptions and episode metadata | SQLite (`podcasts.sqlite3`) | Durable local podcast catalog; refetchable from feeds |
+| Podcast covers | Filesystem cache | Replaceable artwork |
 | Audio and artwork cache | Filesystem cache | Reusable fetched data |
 | Settings, keymap, identity | Platform config/data dirs | Node configuration |
 | Queue and playback snapshots | Application/device sync state | Continuity and handoff |
@@ -415,6 +436,8 @@ The source tree follows the architectural responsibilities:
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;
 - `ui/` renders the TUI;
+- `podcasts/` owns RSS parsing, the podcast store, feed fetching and the
+  HTTP range-request stream reader;
 - `media.rs` integrates platform media controls;
 - `visualizer.rs` hosts programmable Rhai visualizations.
 

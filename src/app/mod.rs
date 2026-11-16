@@ -3,6 +3,7 @@ mod cmdline;
 pub mod command;
 pub mod event;
 pub mod input;
+mod podcast_runtime;
 pub(crate) mod popup;
 pub mod state;
 pub mod update;
@@ -72,9 +73,17 @@ pub struct Runtime {
     pub search_seq: Arc<std::sync::atomic::AtomicU64>,
     pub player: player::Controller,
     pub player_start_pending: bool,
+    /// Pause or seek requested while a start was pending; those commands
+    /// reached a stopped output and are re-applied once audio starts.
+    pub start_intent_changed: bool,
     pub media_tx: std::sync::mpsc::Sender<crate::media::MediaUpdate>,
     pub last_media_push: Option<std::time::Instant>,
     pub status_publisher: crate::status::Publisher,
+    /// Podcast store and feed client; `None` when the store cannot open.
+    pub podcasts: Option<podcast_runtime::PodcastRuntime>,
+    /// Bumped by every playback start or stop, so a remote stream that
+    /// finishes connecting late does not start over a newer request.
+    pub playback_seq: Arc<std::sync::atomic::AtomicU64>,
     pub status_visualizer: crate::visualizer::status::Renderer,
 }
 
@@ -476,6 +485,16 @@ pub async fn run(
         state.device_playback.active_device_id = Some(device_id);
         state.device_playback.active_device_name = Some(device_name);
     }
+    let podcasts = match podcast_runtime::open().await {
+        Ok(podcasts) => Some(podcasts),
+        Err(err) => {
+            tracing::warn!(%err, "podcast storage unavailable");
+            state.podcasts.list = Some(state::Loadable::Failed(format!(
+                "podcast storage is unavailable: {err}"
+            )));
+            None
+        }
+    };
     let player_events = event_tx.clone();
     let mut runtime = Runtime {
         event_tx,
@@ -508,11 +527,18 @@ pub async fn run(
             let _ = player_events.send(AppEvent::Player(event));
         }),
         player_start_pending: false,
+        start_intent_changed: false,
         media_tx,
         last_media_push: None,
         status_publisher: crate::status::Publisher::spawn(),
+        podcasts,
+        playback_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_visualizer: crate::visualizer::status::Renderer::default(),
     };
+    if runtime.podcasts.is_some() {
+        podcast_runtime::load_list(&runtime);
+        podcast_runtime::spawn_auto_refresh_timer(runtime.event_tx.clone());
+    }
     spawn_content_id_backfill(&runtime);
     if state.similarity.settings.enabled {
         runtime.similarity.start();
@@ -736,6 +762,32 @@ fn playback_track_to_ui(
     wire.to_track_item()
 }
 
+/// Stop local audio and invalidate any playback start still in flight (a
+/// podcast or federated stream that is connecting), so it cannot begin
+/// after this stop.
+fn stop_player(runtime: &Runtime) {
+    runtime
+        .playback_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    runtime.player.stop();
+}
+
+/// Jam participants are not trusted devices: they may echo the host's own
+/// podcast episodes back, but must not make the host fetch arbitrary URLs.
+fn sanitize_jam_stream_urls(state: &AppState, wire: &mut crate::devices::PlaybackStateWire) {
+    for track in &mut wire.queue {
+        if crate::podcasts::is_remote_url(&track.file_path)
+            && !state
+                .player
+                .queue
+                .iter()
+                .any(|queued| queued.file_path == track.file_path)
+        {
+            track.file_path.clear();
+        }
+    }
+}
+
 fn track_playback_key(track: &crate::library::models::TrackItem) -> String {
     state::track_key(track)
 }
@@ -879,7 +931,7 @@ pub(crate) fn become_control_device(
 ) {
     runtime.player.set_playback_allowed(false);
     if state.device_playback.is_audio_owner() {
-        runtime.player.stop();
+        stop_player(runtime);
         publish_inactive_playback_snapshot(state, runtime);
     }
     state.device_playback.role = state::DevicePlaybackRole::Control;
@@ -1345,6 +1397,14 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
             }
         }
     }
+    if state.active_tab == state::Tab::Podcasts
+        && let Some(path) = state
+            .podcasts
+            .current_podcast()
+            .and_then(|podcast| podcast.cover_path.clone())
+    {
+        wanted.push((path, header.0, header.1));
+    }
     for (path, width, height) in wanted {
         let key = crate::art::cache_key(&path, width, height);
         if state.art.contains_key(&key) {
@@ -1626,6 +1686,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             push_media_update(state, runtime, true);
         }
         Effect::TogglePause => {
+            runtime.start_intent_changed |= runtime.player_start_pending;
             if state.player.paused {
                 runtime.player.pause();
             } else {
@@ -1635,10 +1696,11 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         }
         Effect::StopPlayback => {
             runtime.player_start_pending = false;
-            runtime.player.stop();
+            stop_player(runtime);
             push_media_update(state, runtime, true);
         }
         Effect::SeekBy(delta) => {
+            runtime.start_intent_changed |= runtime.player_start_pending;
             let target = (state.player.position_secs + delta as f64).max(0.0);
             state.player.position_secs = target;
             runtime
@@ -1717,6 +1779,10 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 }
             });
         }
+        Effect::PodcastLoadEpisodes(id) => podcast_runtime::open_episodes(state, runtime, id),
+        Effect::PodcastSubscribe(url) => podcast_runtime::subscribe(state, runtime, url),
+        Effect::PodcastRefresh(ids) => podcast_runtime::refresh(state, runtime, ids),
+        Effect::PodcastUnsubscribe(id) => podcast_runtime::unsubscribe(state, runtime, id),
         Effect::LoadListenHistory => {
             let library = Arc::clone(&runtime.library);
             let devices = Arc::clone(&runtime.devices);
@@ -2070,7 +2136,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         } => {
             if stop {
                 runtime.player_start_pending = false;
-                runtime.player.stop();
+                stop_player(runtime);
                 push_media_update(state, runtime, true);
             } else if let Some(paused) = restart_paused {
                 start_current_audio(state, runtime, 0.0, paused);
@@ -2205,7 +2271,11 @@ fn start_current_audio(
     let Some(mut track) = state.player.queue.get(state.player.queue_pos).cloned() else {
         return;
     };
-    if track_file_missing(&track) {
+    runtime
+        .playback_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let remote = crate::podcasts::is_remote_url(&track.file_path);
+    if !remote && track_file_missing(&track) {
         if let Some(local) = local_track_for_playback(runtime, &track) {
             state.player.queue[state.player.queue_pos] = local.clone();
             track = local;
@@ -2225,7 +2295,8 @@ fn start_current_audio(
             state.player.listen_id = Some(runtime.devices.new_listen_id());
             state.player.prefetched_pos = None;
             runtime.player_start_pending = true;
-            runtime.player.stop();
+            runtime.start_intent_changed = false;
+            stop_player(runtime);
             state.status_message = Some(format!(
                 "federation: locating \"{}\" for this device…",
                 track.title
@@ -2284,10 +2355,17 @@ fn start_current_audio(
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
 
     runtime.player_start_pending = true;
+    runtime.start_intent_changed = false;
+    if remote {
+        // Podcast episode: stream it over HTTP instead of opening a file.
+        state.status_message = Some(format!("podcast: connecting to \"{}\"…", track.title));
+        podcast_runtime::start_stream(runtime, track, state.player.volume, position_secs, paused);
+        return;
+    }
     if track.is_fed_pending() {
         // A federated track that is not on disk yet: silence the previous
         // audio, download it and resume through FedTrackResolved.
-        runtime.player.stop();
+        stop_player(runtime);
         state.status_message = Some(format!("federation: fetching \"{}\"…", track.title));
         spawn_fed_resolve(
             runtime,
@@ -2302,7 +2380,7 @@ fn start_current_audio(
     }
     if track_file_missing(&track) {
         runtime.player_start_pending = false;
-        runtime.player.stop();
+        stop_player(runtime);
         state.player.playing = false;
         state.player.paused = false;
         state.status_message = Some(format!(
@@ -2443,6 +2521,11 @@ fn report_history(
     let Some(listen_id) = listen_id else {
         return;
     };
+    // Listening history is keyed by audio content ids, which streamed
+    // podcast episodes do not have.
+    if crate::podcasts::is_remote_url(&track.file_path) {
+        return;
+    }
     let Some(event) = runtime.devices.listen_event_for_track(
         listen_id.to_string(),
         track,
@@ -2610,6 +2693,12 @@ fn spawn_fed_resolve(
     let tx = runtime.event_tx.clone();
     let controller = runtime.player.clone();
     let streaming = Arc::clone(&runtime.fed_streaming);
+    // The playback request this resolve belongs to; a newer start or stop
+    // makes a stream that connects later stay silent.
+    let start_seq = runtime
+        .playback_seq
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let current_seq = Arc::clone(&runtime.playback_seq);
     tokio::spawn(async move {
         let progress = download_progress_sender(tx.clone(), title.clone());
         let result = if let Some(playback) =
@@ -2626,6 +2715,10 @@ fn spawn_fed_resolve(
                     return;
                 }
                 started = true;
+                if current_seq.load(std::sync::atomic::Ordering::SeqCst) != start_seq {
+                    tracing::debug!(title = %stream_title, "federated stream superseded before start");
+                    return;
+                }
                 stream_markers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2682,6 +2775,12 @@ fn spawn_content_id_resolve(
     let tx = runtime.event_tx.clone();
     let controller = runtime.player.clone();
     let streaming = Arc::clone(&runtime.fed_streaming);
+    // The playback request this resolve belongs to; a newer start or stop
+    // makes a stream that connects later stay silent.
+    let start_seq = runtime
+        .playback_seq
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let current_seq = Arc::clone(&runtime.playback_seq);
     tokio::spawn(async move {
         let result = match fed.track_by_content_id(&content_id, Some(&label)).await {
             Ok(fed_track) => {
@@ -2706,6 +2805,10 @@ fn spawn_content_id_resolve(
                                 return;
                             }
                             started = true;
+                            if current_seq.load(std::sync::atomic::Ordering::SeqCst) != start_seq {
+                                tracing::debug!(title = %stream_title, "federated stream superseded before start");
+                                return;
+                            }
                             stream_markers
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3133,7 +3236,7 @@ fn apply_queue_refresh(
     if state.player.queue.is_empty() {
         if state.player.playing {
             runtime.player_start_pending = false;
-            runtime.player.stop();
+            stop_player(runtime);
         }
         state.player = state::PlayerBar::default();
         state.queue_tab.cursor = 0;
@@ -3177,7 +3280,7 @@ fn apply_queue_refresh(
         (Some(_), _) => {
             // The playing track was deleted from the library.
             runtime.player_start_pending = false;
-            runtime.player.stop();
+            stop_player(runtime);
             state.player.queue_pos = refreshed_queue_pos.min(state.player.queue.len() - 1);
             state.player.current = None;
             state.player.playing = false;
@@ -3204,14 +3307,14 @@ fn reconcile_personal_playback(state: &mut AppState, runtime: &mut Runtime) {
         Ok(owner) => owner,
         Err(error) => {
             runtime.player.set_playback_allowed(false);
-            runtime.player.stop();
+            stop_player(runtime);
             state.status_message = Some(format!("playback coordination: {error}"));
             return;
         }
     };
     let Some(owner) = owner else {
         runtime.player.set_playback_allowed(false);
-        runtime.player.stop();
+        stop_player(runtime);
         runtime.player_start_pending = false;
         state.device_playback.role = state::DevicePlaybackRole::Control;
         state.device_playback.active_device_id = None;
@@ -3230,7 +3333,7 @@ fn reconcile_personal_playback(state: &mut AppState, runtime: &mut Runtime) {
         }
     } else {
         runtime.player.set_playback_allowed(false);
-        runtime.player.stop();
+        stop_player(runtime);
         runtime.player_start_pending = false;
         state.device_playback.role = state::DevicePlaybackRole::Control;
         state.device_playback.active_device_id = Some(owner);
@@ -3270,7 +3373,7 @@ fn handle_playback_command(
                 .set_volume(player::amplitude(state.player.volume));
             if !state.player.playing {
                 runtime.player_start_pending = false;
-                runtime.player.stop();
+                stop_player(runtime);
                 push_media_update(state, runtime, true);
                 publish_playback_snapshot(state, runtime);
                 return;
@@ -3336,7 +3439,17 @@ fn handle_playback_command(
 }
 
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
+    let Some(event) = podcast_runtime::handle_event(state, runtime, event) else {
+        return;
+    };
     match event {
+        // Folded into the state by podcast_runtime::handle_event above.
+        AppEvent::PodcastsLoaded(_)
+        | AppEvent::PodcastEpisodesLoaded { .. }
+        | AppEvent::PodcastSubscribed(_)
+        | AppEvent::PodcastRefreshed { .. }
+        | AppEvent::PodcastUnsubscribed { .. }
+        | AppEvent::PodcastAutoRefreshDue => {}
         AppEvent::StatusVisualizationReady(ready) => {
             runtime.status_visualizer.busy = false;
             state.status_visualizer.apply(ready);
@@ -3511,7 +3624,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
                 crate::jam::JamRole::Participant => {
                     if state.device_playback.is_audio_owner() {
-                        runtime.player.stop();
+                        stop_player(runtime);
                         runtime.player_start_pending = false;
                     }
                     state.device_playback.role = state::DevicePlaybackRole::Jam;
@@ -3543,6 +3656,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     seek,
                 } => {
                     wire.volume = state.player.volume;
+                    sanitize_jam_stream_urls(state, &mut wire);
                     crate::devices::PlaybackCommand::SetState { state: wire, seek }
                 }
                 crate::devices::PlaybackCommand::ActiveChanged { .. } => {
@@ -3767,7 +3881,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                             runtime.player_start_pending = false;
                             state.player.playing = false;
                             state.player.current = None;
-                            runtime.player.stop();
+                            stop_player(runtime);
                         }
                     }
                 }
@@ -4037,7 +4151,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             runtime.player_start_pending = false;
             // A background decoder may finish after ownership was handed off.
             // Ignoring Started alone would leave its obsolete audio playing.
-            runtime.player.stop();
+            stop_player(runtime);
             tracing::debug!(
                 ?event,
                 "ignored local player event while controlling remote playback"
@@ -4045,6 +4159,36 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::Player(player::PlayerEvent::Started) => {
             runtime.player_start_pending = false;
+            let intent_changed = std::mem::take(&mut runtime.start_intent_changed);
+            if let Some(track) = &state.player.current
+                && crate::podcasts::is_remote_url(&track.file_path)
+            {
+                // A stream connects for seconds; pause, seek and volume
+                // changes made meanwhile hit a stopped output. Re-apply them
+                // (these commands queue behind the stream's own start-up ones).
+                runtime
+                    .player
+                    .set_volume(player::amplitude(state.player.volume));
+                if intent_changed && state.player.position_secs > 0.0 {
+                    runtime
+                        .player
+                        .seek(Duration::from_secs_f64(state.player.position_secs));
+                }
+                if state.player.paused {
+                    runtime.player.pause();
+                } else {
+                    runtime.player.resume();
+                }
+                // Replace the "connecting" notice.
+                if state
+                    .status_message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("podcast: connecting"))
+                {
+                    state.status_message =
+                        Some(format!("▶ {} — {}", track.title, track.artist_line()));
+                }
+            }
         }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
             // The finished track gets a full-duration, completed entry.
@@ -4299,7 +4443,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                     if state.device_playback.is_control() {
                         record_control_playback_state(state, runtime, false);
                     } else {
-                        runtime.player.stop();
+                        stop_player(runtime);
                         push_media_update(state, runtime, true);
                     }
                     return;

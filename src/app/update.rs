@@ -106,6 +106,13 @@ pub enum Effect {
     },
     /// Load qualified listening history without blocking the UI thread.
     LoadListenHistory,
+    /// Load the episode catalog of one podcast (and refresh it when stale).
+    PodcastLoadEpisodes(i64),
+    /// Fetch an RSS feed and store it as a new subscription.
+    PodcastSubscribe(String),
+    /// Check these subscriptions for new episodes.
+    PodcastRefresh(Vec<i64>),
+    PodcastUnsubscribe(i64),
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -283,6 +290,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                     state.logs.selected_seq = None;
                     state.logs.follow = true;
                 }
+                Tab::Podcasts => podcasts_toggle_sort(state),
                 _ => {}
             }
             None
@@ -309,6 +317,15 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             state.cmdline.active = true;
             state.cmdline.input.clear();
             state.cmdline.begin_history_navigation();
+            None
+        }
+        Action::OpenSearch
+            if state.active_tab == Tab::Podcasts && state.podcasts.opened.is_some() =>
+        {
+            state.popup = Some(super::state::Popup::FedInput {
+                field: super::state::FedInputField::PodcastFilter,
+                input: crate::app::input::LineEdit::new(state.podcasts.filter.clone()),
+            });
             None
         }
         Action::OpenSearch => {
@@ -423,6 +440,10 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                     state.popup = Some(super::state::Popup::AddToPlaylist { target, cursor: 0 });
                     state.track_selection.clear();
                 }
+                None if state.active_tab == Tab::Podcasts => {
+                    state.status_message =
+                        Some("podcast episodes cannot be added to playlists".into());
+                }
                 None => state.status_message = Some("no track selected".into()),
             }
             None
@@ -470,11 +491,16 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 None
             }
         }
+        Action::EditSelected if state.active_tab == Tab::Podcasts => {
+            state.status_message = Some("podcast metadata comes from the RSS feed".into());
+            None
+        }
         Action::EditSelected => {
             open_edit_popup(state);
             None
         }
         Action::DeleteSelected => delete_selected(state),
+        Action::RefreshPodcasts => podcasts_refresh(state),
     }
 }
 
@@ -551,14 +577,22 @@ fn selected_playlist_target(
         return Some(super::state::PlaylistAddTarget::Fed(fed));
     }
 
-    let local = selected_tracks(state);
+    // Playlists hold library rows; streamed podcast episodes have none.
+    let local: Vec<TrackItem> = selected_tracks(state)
+        .into_iter()
+        .filter(|track| !crate::podcasts::is_remote_url(&track.file_path))
+        .collect();
     if !local.is_empty() {
         return Some(super::state::PlaylistAddTarget::Local(local));
+    }
+    if state.active_tab == Tab::Podcasts {
+        return None;
     }
 
     include_current
         .then(|| state.player.current.clone())
         .flatten()
+        .filter(|track| !crate::podcasts::is_remote_url(&track.file_path))
         .map(|track| super::state::PlaylistAddTarget::Local(vec![track]))
 }
 
@@ -690,6 +724,9 @@ fn delete_selected(state: &mut AppState) -> Option<Effect> {
 
     if state.active_tab == Tab::Queue {
         return remove_selected_from_queue(state);
+    }
+    if state.active_tab == Tab::Podcasts {
+        return podcasts_confirm_unsubscribe(state);
     }
     if state.active_tab == Tab::Playlists {
         match state.playlists.opened {
@@ -1016,7 +1053,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
             state.queue_tab.cursor,
             state.player.queue.len(),
         )),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Federation | Tab::Logs | Tab::Podcasts => None,
     }
 }
 
@@ -1070,11 +1107,14 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
             state.queue_tab.cursor,
             state.player.queue.clone(),
         )),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Federation | Tab::Logs | Tab::Podcasts => None,
     }
 }
 
 pub fn selected_tracks(state: &AppState) -> Vec<TrackItem> {
+    if state.active_tab == Tab::Podcasts {
+        return selected_episode_track(state).into_iter().collect();
+    }
     if state.active_tab == Tab::Global
         && state.search.similarity_source.is_some()
         && let Some(GlobalView::Search { cursor }) = state.global.stack.last()
@@ -1371,7 +1411,7 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 .map(|track| (*track).clone())
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Federation | Tab::Logs | Tab::Podcasts => None,
     }
 }
 
@@ -1775,6 +1815,10 @@ fn page_step(state: &AppState) -> isize {
 }
 
 fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
+    if state.active_tab == Tab::Podcasts {
+        podcasts_move(state, dy);
+        return;
+    }
     if state.active_tab == Tab::Federation {
         if dy != 0 {
             let last = settings_rows(state).len() as isize - 1;
@@ -2169,6 +2213,10 @@ fn jump_selection(state: &mut AppState, first: bool) {
         state.settings_cursor = if first { 0 } else { last };
         return;
     }
+    if state.active_tab == Tab::Podcasts {
+        podcasts_move(state, if first { isize::MIN } else { isize::MAX });
+        return;
+    }
     if state.active_tab == Tab::Logs {
         if first {
             let level = super::state::LOG_LEVELS[state.logs.level_index];
@@ -2258,6 +2306,9 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
     }
     if state.active_tab == Tab::Federation {
         return federation_select(state);
+    }
+    if state.active_tab == Tab::Podcasts {
+        return podcasts_select(state);
     }
     // Queue: jump playback to the track under the cursor. Earlier tracks
     // stay in the queue as "played"; picking one of them just moves the
@@ -3197,6 +3248,7 @@ fn go_back(state: &mut AppState) {
         Tab::Playlists => {
             state.playlists.opened = None;
         }
+        Tab::Podcasts => podcasts_close(state),
         Tab::Global => {
             // Esc on a view opened by Shift-J from another tab goes back to
             // that tab, not down the Global stack.
@@ -3251,7 +3303,194 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.logs.selected_seq = None;
         }
         Tab::Queue => {}
+        Tab::Podcasts => podcasts_close(state),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Podcasts tab
+// ---------------------------------------------------------------------------
+
+/// How long a feed counts as fresh: opening it or the periodic sweep only
+/// re-fetches feeds checked longer ago than this.
+pub const PODCAST_STALE_SECS: i64 = 30 * 60;
+
+fn podcasts_move(state: &mut AppState, dy: isize) {
+    let tab = &mut state.podcasts;
+    let (cursor, len) = match tab.opened {
+        Some(opened) => (opened.cursor, tab.visible_episode_indices().len()),
+        None => (tab.selected, tab.list_rows().len()),
+    };
+    if len == 0 {
+        return;
+    }
+    let target = (cursor as isize)
+        .saturating_add(dy)
+        .clamp(0, len as isize - 1) as usize;
+    match &mut tab.opened {
+        Some(opened) => opened.cursor = target,
+        None => tab.selected = target,
+    }
+}
+
+fn podcasts_toggle_sort(state: &mut AppState) {
+    let tab = &mut state.podcasts;
+    tab.sort = tab.sort.toggle();
+    if let Some(opened) = &mut tab.opened {
+        opened.cursor = 0;
+    }
+    state.status_message = Some(format!("episodes: {}", state.podcasts.sort.label()));
+}
+
+/// Esc: episode catalog → subscriptions list. The filter belongs to the
+/// catalog it was typed in, so it is dropped as well.
+fn podcasts_close(state: &mut AppState) {
+    let tab = &mut state.podcasts;
+    if let Some(opened) = tab.opened.take()
+        && let Some(index) = tab.podcasts().iter().position(|p| p.id == opened.id)
+    {
+        tab.selected = index + super::state::PODCAST_ACTION_ROWS;
+    }
+    tab.filter.clear();
+}
+
+/// Called whenever the filter text changes: keep the cursor on the first
+/// match so the list does not appear empty below a stale cursor.
+pub fn podcasts_set_filter(state: &mut AppState, filter: String) {
+    // Caret movement and Enter on an unchanged filter keep the cursor.
+    if state.podcasts.filter == filter {
+        return;
+    }
+    state.podcasts.filter = filter;
+    if let Some(opened) = &mut state.podcasts.opened {
+        opened.cursor = 0;
+    }
+}
+
+fn podcasts_select(state: &mut AppState) -> Option<Effect> {
+    use super::state::PodcastListRow;
+
+    if state.podcasts.opened.is_some() {
+        return play_selected_episode(state);
+    }
+    match state
+        .podcasts
+        .list_rows()
+        .get(state.podcasts.selected)
+        .copied()?
+    {
+        PodcastListRow::Add => {
+            if state.podcasts.subscribing {
+                state.status_message =
+                    Some("podcasts: a subscription is already being added".into());
+                return None;
+            }
+            state.popup = Some(super::state::Popup::FedInput {
+                field: super::state::FedInputField::PodcastFeedUrl,
+                input: crate::app::input::LineEdit::default(),
+            });
+            None
+        }
+        PodcastListRow::RefreshAll => podcasts_refresh(state),
+        PodcastListRow::Podcast(index) => {
+            let id = state.podcasts.podcasts().get(index)?.id;
+            state.podcasts.opened = Some(super::state::OpenedPodcast { id, cursor: 0 });
+            state.podcasts.filter.clear();
+            if !matches!(&state.podcasts.episodes, Some((loaded, Loadable::Ready(_))) if *loaded == id)
+            {
+                state.podcasts.episodes = Some((id, Loadable::Loading));
+            }
+            Some(Effect::PodcastLoadEpisodes(id))
+        }
+    }
+}
+
+/// Shift-R: the opened podcast, or every subscription from the list.
+fn podcasts_refresh(state: &mut AppState) -> Option<Effect> {
+    if state.active_tab != Tab::Podcasts {
+        return None;
+    }
+    let ids: Vec<i64> = match state.podcasts.opened {
+        Some(opened) => vec![opened.id],
+        None => state.podcasts.podcasts().iter().map(|p| p.id).collect(),
+    };
+    let ids: Vec<i64> = ids
+        .into_iter()
+        .filter(|id| !state.podcasts.refreshing.contains(id))
+        .collect();
+    if ids.is_empty() {
+        state.status_message = Some(if state.podcasts.podcasts().is_empty() {
+            "podcasts: no subscriptions yet".into()
+        } else {
+            "podcasts: already checking for new episodes".into()
+        });
+        return None;
+    }
+    state.podcasts.refreshing.extend(ids.iter().copied());
+    state.status_message = Some(format!(
+        "podcasts: checking {} feed(s) for new episodes…",
+        ids.len()
+    ));
+    Some(Effect::PodcastRefresh(ids))
+}
+
+fn podcasts_confirm_unsubscribe(state: &mut AppState) -> Option<Effect> {
+    if state.podcasts.opened.is_some() {
+        state.status_message =
+            Some("podcasts: go back to the podcast list (esc) to unsubscribe".into());
+        return None;
+    }
+    let Some(podcast) = state.podcasts.current_podcast() else {
+        state.status_message = Some("podcasts: select a podcast to unsubscribe".into());
+        return None;
+    };
+    state.popup = Some(super::state::Popup::ConfirmDelete {
+        target: super::state::DeleteTarget::Podcast(podcast.id),
+        label: format!("podcast \"{}\"", podcast.title),
+    });
+    None
+}
+
+/// The queueable track for the episode under the cursor.
+fn selected_episode_track(state: &AppState) -> Option<TrackItem> {
+    let opened = state.podcasts.opened?;
+    let podcast = state.podcasts.podcast(opened.id)?;
+    let episode = state.podcasts.selected_episode()?;
+    Some(crate::podcasts::episode_track(podcast, episode))
+}
+
+/// Enter on an episode: play it right now without discarding the queue. It
+/// is inserted after the current track and becomes the current track.
+fn play_selected_episode(state: &mut AppState) -> Option<Effect> {
+    let Some(track) = selected_episode_track(state) else {
+        state.status_message = Some(match state.podcasts.opened_episodes() {
+            Some(_) if !state.podcasts.filter.is_empty() => "no episode matches the filter".into(),
+            Some(_) => "this podcast has no episodes".into(),
+            None => "episodes are still loading".into(),
+        });
+        return None;
+    };
+    Some(play_track_now(state, track))
+}
+
+pub fn play_track_now(state: &mut AppState, track: TrackItem) -> Effect {
+    let player = &mut state.player;
+    let insert_at = if player.current.is_some() {
+        (player.queue_pos + 1).min(player.queue.len())
+    } else {
+        player.queue_pos.min(player.queue.len())
+    };
+    player.queue.insert(insert_at, track);
+    if let Some(end) = player.play_next_end.as_mut()
+        && *end >= insert_at
+    {
+        *end += 1;
+    }
+    player.queue_pos = insert_at;
+    player.prefetched_pos = None;
+    normalize_play_next_block(player);
+    state.track_selection.clear();
+    Effect::PlayCurrent
 }
 
 fn not_yet(state: &mut AppState, what: &str) {

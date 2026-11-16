@@ -206,4 +206,26 @@ pub enum AppEvent {
     JamInvite(Result<String, String>),
     /// Result of joining a Jam capability.
     JamJoined(Result<String, String>),
+    /// Podcast subscriptions (re)loaded from the podcast store.
+    PodcastsLoaded(Result<Vec<crate::podcasts::Podcast>, String>),
+    /// The stored episode catalog of one podcast.
+    PodcastEpisodesLoaded {
+        podcast_id: i64,
+        result: Result<Vec<crate::podcasts::Episode>, String>,
+    },
+    /// A new subscription was stored (its id) or rejected.
+    PodcastSubscribed(Result<i64, String>),
+    /// One feed refresh finished.
+    PodcastRefreshed {
+        podcast_id: i64,
+        result: Result<crate::podcasts::RefreshSummary, String>,
+        /// Background sweep: report errors in the log, not the status bar.
+        quiet: bool,
+    },
+    PodcastUnsubscribed {
+        podcast_id: i64,
+        result: Result<(), String>,
+    },
+    /// Periodic timer: refresh subscriptions whose feed went stale.
+    PodcastAutoRefreshDue,
 }

@@ -24,7 +24,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             error,
             ..
         }) => draw_edit(frame, state, title, fields, *focus, error.as_deref()),
-        Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, state, label),
+        Some(Popup::ConfirmDelete { target, label }) => {
+            draw_confirm_delete(frame, state, *target, label)
+        }
         Some(Popup::SimilarityPrivacyConsent { .. }) => {
             draw_similarity_privacy_consent(frame, state)
         }
@@ -43,7 +45,12 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         }) => draw_track_artists(frame, state, tracks, *cursor, *selected),
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, state, entry),
         Some(Popup::FedInput { field, input }) => {
-            draw_fed_input(frame, state, field.title(), field.help(), input)
+            let keys = if *field == crate::app::state::FedInputField::PodcastFilter {
+                "enter: keep · esc: clear"
+            } else {
+                "enter: apply · esc: cancel"
+            };
+            draw_fed_input(frame, state, field.title(), field.help(), keys, input)
         }
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, state, title, text),
         Some(Popup::FedCopyText {
@@ -891,6 +898,7 @@ fn draw_fed_input(
     state: &AppState,
     title: &str,
     help: &str,
+    keys: &str,
     input: &crate::app::input::LineEdit,
 ) {
     let area = centered(frame.area(), 72, 8);
@@ -916,8 +924,7 @@ fn draw_fed_input(
     let spans = super::line_edit_spans(input, usize::from(entry_area.width.saturating_sub(1)));
     frame.render_widget(Paragraph::new(Line::from(spans)), entry_area);
     frame.render_widget(
-        Paragraph::new(Line::styled("enter: apply · esc: cancel", theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(keys.to_string(), theme::dim())).alignment(Alignment::Center),
         hint_area,
     );
 }
@@ -1241,11 +1248,23 @@ fn draw_edit(
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
 }
 
-fn draw_confirm_delete(frame: &mut Frame, state: &AppState, label: &str) {
+fn draw_confirm_delete(
+    frame: &mut Frame,
+    state: &AppState,
+    target: crate::app::state::DeleteTarget,
+    label: &str,
+) {
+    // Unsubscribing only drops the feed's stored metadata, not music.
+    let (title, verb, key) = match target {
+        crate::app::state::DeleteTarget::Podcast(_) => {
+            (" Unsubscribe? ", "Unsubscribe from", "unsubscribe")
+        }
+        _ => (" Delete? ", "Delete", "delete"),
+    };
     let width = 64.min(frame.area().width.saturating_sub(4)).max(30);
     let area = centered(frame.area(), width, 7);
     let block = Block::bordered()
-        .title(" Delete? ")
+        .title(title)
         .title_style(theme::header_for(state))
         .border_style(theme::strong_border_for(state));
     let inner = block.inner(area);
@@ -1254,14 +1273,17 @@ fn draw_confirm_delete(frame: &mut Frame, state: &AppState, label: &str) {
 
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     frame.render_widget(
-        Paragraph::new(format!("Delete {label}?"))
+        Paragraph::new(format!("{verb} {label}?"))
             .wrap(Wrap { trim: false })
             .alignment(Alignment::Center),
         body,
     );
     frame.render_widget(
-        Paragraph::new(Line::styled("enter/y delete · esc/n cancel", theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(
+            format!("enter/y {key} · esc/n cancel"),
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
         footer,
     );
 }

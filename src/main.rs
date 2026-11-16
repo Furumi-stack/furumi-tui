@@ -7,6 +7,7 @@ mod jam;
 mod library;
 mod media;
 mod player;
+mod podcasts;
 mod share;
 mod similarity;
 mod status;

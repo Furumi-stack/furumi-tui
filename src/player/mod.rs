@@ -51,6 +51,12 @@ enum Command {
         seekable: bool,
         volume: f32,
     },
+    /// Play a source that was already probed and decoded off this thread
+    /// (remote podcast streams, whose probing waits on the network).
+    PlaySource {
+        source: DecodedSource,
+        volume: f32,
+    },
     /// Append the next track behind the current one without interrupting
     /// playback — rodio switches sources back to back (gapless-ish).
     Enqueue {
@@ -122,6 +128,12 @@ impl Controller {
         });
     }
 
+    /// Play an already decoded source, built with `decode_source_with`
+    /// outside the audio thread.
+    pub fn play_source(&self, source: DecodedSource, volume: f32) {
+        let _ = self.tx.send(Command::PlaySource { source, volume });
+    }
+
     pub fn enqueue(&self, reader: TrackReader, byte_len: Option<u64>) {
         let _ = self.tx.send(Command::Enqueue { reader, byte_len });
     }
@@ -186,7 +198,10 @@ fn run(
                 if !playback_allowed.load(Ordering::Acquire)
                     && matches!(
                         command,
-                        Command::Play { .. } | Command::Enqueue { .. } | Command::Resume
+                        Command::Play { .. }
+                            | Command::PlaySource { .. }
+                            | Command::Enqueue { .. }
+                            | Command::Resume
                     )
                 {
                     continue;
@@ -236,41 +251,19 @@ fn handle(
             seekable,
             volume,
         } => {
-            // The device is opened lazily on first playback so the app works
-            // on machines with no audio output until you actually press play.
-            if output.is_none() {
-                match DeviceSinkBuilder::open_default_sink() {
-                    Ok(device) => {
-                        let player = Player::connect_new(device.mixer());
-                        *output = Some(Output {
-                            _device: device,
-                            player,
-                        });
-                    }
-                    Err(err) => {
-                        on_event(PlayerEvent::Failed(format!("no audio device: {err}")));
-                        return;
-                    }
-                }
-            }
-            let out = output.as_ref().expect("output opened above");
-
+            let Some(out) = ensure_output(output, on_event) else {
+                return;
+            };
             match decode_source(reader, byte_len, mime_type.as_deref(), seekable) {
-                Ok(source) => {
-                    shared.analysis.clear();
-                    out.player.stop();
-                    out.player.set_volume(volume);
-                    out.player.append(analyzer::AnalyzedSource::new(
-                        source,
-                        Arc::clone(&shared.analysis),
-                    ));
-                    out.player.play();
-                    *track_loaded = true;
-                    on_event(PlayerEvent::Started);
-                }
+                Ok(source) => start_source(out, source, volume, shared, track_loaded, on_event),
                 Err(err) => {
                     on_event(PlayerEvent::Failed(format!("cannot decode track: {err}")));
                 }
+            }
+        }
+        Command::PlaySource { source, volume } => {
+            if let Some(out) = ensure_output(output, on_event) {
+                start_source(out, source, volume, shared, track_loaded, on_event);
             }
         }
         Command::Enqueue { reader, byte_len } => {
@@ -322,13 +315,71 @@ fn handle(
     }
 }
 
+/// The device is opened lazily on first playback so the app works on
+/// machines with no audio output until you actually press play.
+fn ensure_output<'a>(
+    output: &'a mut Option<Output>,
+    on_event: &impl Fn(PlayerEvent),
+) -> Option<&'a Output> {
+    if output.is_none() {
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(device) => {
+                let player = Player::connect_new(device.mixer());
+                *output = Some(Output {
+                    _device: device,
+                    player,
+                });
+            }
+            Err(err) => {
+                on_event(PlayerEvent::Failed(format!("no audio device: {err}")));
+                return None;
+            }
+        }
+    }
+    output.as_ref()
+}
+
+/// Replace whatever is playing with `source`.
+fn start_source(
+    out: &Output,
+    source: DecodedSource,
+    volume: f32,
+    shared: &Shared,
+    track_loaded: &mut bool,
+    on_event: &impl Fn(PlayerEvent),
+) {
+    shared.analysis.clear();
+    out.player.stop();
+    out.player.set_volume(volume);
+    out.player.append(analyzer::AnalyzedSource::new(
+        source,
+        Arc::clone(&shared.analysis),
+    ));
+    out.player.play();
+    *track_loaded = true;
+    on_event(PlayerEvent::Started);
+}
+
 pub(crate) type DecodedSource = Box<dyn Source + Send>;
 
 pub(crate) fn decode_source(
+    reader: TrackReader,
+    byte_len: Option<u64>,
+    mime_type: Option<&str>,
+    seekable: bool,
+) -> Result<DecodedSource, String> {
+    decode_source_with(reader, byte_len, mime_type, seekable, false)
+}
+
+/// `decode_source` with optional coarse (byte-estimate) seeking, which
+/// remote streams need: an accurate MP3 seek decodes every frame before the
+/// target, i.e. downloads it.
+pub(crate) fn decode_source_with(
     mut reader: TrackReader,
     byte_len: Option<u64>,
     mime_type: Option<&str>,
     seekable: bool,
+    coarse_seek: bool,
 ) -> Result<DecodedSource, String> {
     let mime_is_opus = mime_type.is_some_and(|mime| {
         let mime = mime.to_ascii_lowercase();
@@ -344,6 +395,7 @@ pub(crate) fn decode_source(
     let mut builder = Decoder::builder()
         .with_data(reader)
         .with_seekable(seekable)
+        .with_coarse_seek(coarse_seek)
         .with_gapless(true);
     if let Some(len) = byte_len {
         builder = builder.with_byte_len(len);

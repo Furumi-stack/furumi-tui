@@ -65,6 +65,9 @@ update it only when dependencies change.
   coordination.
 - `src/ui/` renders `AppState`; rendering code must not start background work
   or mutate persistence.
+- `src/podcasts/` owns RSS parsing, podcast persistence, feed fetching and
+  the HTTP range-request stream reader; `src/app/podcast_runtime.rs`
+  schedules its work and folds results into `AppState`.
 - `src/media.rs` owns OS media controls.
 - `src/visualizer.rs` and `src/visualizations/` own the Rhai visualization
   host and bundled scripts.
