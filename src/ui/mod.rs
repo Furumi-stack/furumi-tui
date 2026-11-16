@@ -4,6 +4,7 @@ mod federation;
 mod global;
 mod logs;
 mod playlists;
+mod podcasts;
 mod popup;
 pub mod theme;
 
@@ -73,6 +74,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Queue => draw_queue(frame, main_area, state),
         Tab::Federation => federation::draw(frame, main_area, state),
         Tab::Logs => logs::draw(frame, main_area, state),
+        Tab::Podcasts => podcasts::draw(frame, main_area, state),
     }
     draw_status(frame, status_area, state);
 
@@ -138,13 +140,22 @@ fn is_waiting_message(message: &str) -> bool {
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let titles = Tab::ALL
-        .iter()
-        .map(|tab| format!(" {} {} ", tab.index() + 1, tab.title()));
+    // Titles carry their own spacing. When all of them do not fit, inactive
+    // tabs collapse to their number so the active one is never cut off.
+    let full: usize = Tab::ALL.iter().map(|tab| tab.title().len() + 4).sum();
+    let compact = full > usize::from(area.width);
+    let titles = Tab::ALL.iter().map(|tab| {
+        if compact && *tab != state.active_tab {
+            format!(" {} ", tab.index() + 1)
+        } else {
+            format!(" {} {} ", tab.index() + 1, tab.title())
+        }
+    });
     let tabs = Tabs::new(titles)
         .select(state.active_tab.index())
         .style(theme::dim())
         .highlight_style(theme::tab_active_for(state))
+        .padding("", "")
         .divider("");
     frame.render_widget(tabs, area);
 }

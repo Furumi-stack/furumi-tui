@@ -181,7 +181,7 @@ fn expired_quit_confirmation_rearms() {
 fn tab_cycling_wraps() {
     let mut state = AppState::default();
     update(&mut state, Action::PrevTab);
-    assert_eq!(state.active_tab, Tab::Logs);
+    assert_eq!(state.active_tab, Tab::Podcasts);
     update(&mut state, Action::NextTab);
     assert_eq!(state.active_tab, Tab::Global);
 }
@@ -1072,4 +1072,253 @@ fn view_toggle() {
     assert_eq!(state.global.view, ViewMode::Table);
     update(&mut state, Action::ToggleViewMode);
     assert_eq!(state.global.view, ViewMode::Tiles);
+}
+
+// ---------------------------------------------------------------------------
+// Podcasts
+// ---------------------------------------------------------------------------
+
+fn podcast(id: i64, title: &str) -> crate::podcasts::Podcast {
+    crate::podcasts::Podcast {
+        id,
+        feed_url: format!("https://example.test/{id}.xml"),
+        title: title.into(),
+        author: None,
+        description: None,
+        link: None,
+        image_url: None,
+        cover_path: None,
+        episode_count: 0,
+        latest_published_at: None,
+        last_checked_at: None,
+        last_error: None,
+    }
+}
+
+fn episode(id: i64, title: &str, published_at: Option<i64>) -> crate::podcasts::Episode {
+    crate::podcasts::Episode {
+        id,
+        podcast_id: 7,
+        guid: format!("guid-{id}"),
+        title: title.into(),
+        description: None,
+        published_at,
+        duration_seconds: Some(60.0),
+        audio_url: format!("https://cdn.example.test/{id}.mp3"),
+        mime_type: Some("audio/mpeg".into()),
+        byte_len: None,
+        link: None,
+        image_url: None,
+    }
+}
+
+/// Podcasts tab with podcast 7 opened and three episodes loaded in store
+/// order (newest first) plus one undated episode.
+fn podcasts_state() -> AppState {
+    use crate::app::state::OpenedPodcast;
+    let mut state = AppState {
+        active_tab: Tab::Podcasts,
+        ..AppState::default()
+    };
+    state.podcasts.list = Some(Loadable::Ready(vec![
+        podcast(3, "Another show"),
+        podcast(7, "Vivat"),
+    ]));
+    state.podcasts.opened = Some(OpenedPodcast { id: 7, cursor: 0 });
+    state.podcasts.episodes = Some((
+        7,
+        Loadable::Ready(vec![
+            episode(30, "Выпуск 3: Рим", Some(3_000)),
+            episode(20, "Выпуск 2: Греция", Some(2_000)),
+            episode(10, "Выпуск 1: Египет", Some(1_000)),
+            episode(5, "Бонус без даты", None),
+        ]),
+    ));
+    state
+}
+
+#[test]
+fn podcast_tab_is_reachable_by_number_without_shifting_other_tabs() {
+    let mut state = AppState::default();
+    update(&mut state, Action::GoToTab(2));
+    assert_eq!(state.active_tab, Tab::Queue);
+    update(&mut state, Action::GoToTab(5));
+    assert_eq!(state.active_tab, Tab::Podcasts);
+}
+
+#[test]
+fn podcast_episode_filter_matches_every_word_case_insensitively() {
+    let mut state = podcasts_state();
+    let titles = |state: &AppState| -> Vec<String> {
+        let episodes = state.podcasts.opened_episodes().unwrap();
+        state
+            .podcasts
+            .visible_episode_indices()
+            .into_iter()
+            .map(|index| episodes[index].title.clone())
+            .collect()
+    };
+    assert_eq!(titles(&state).len(), 4);
+    podcasts_set_filter(&mut state, "ВЫПУСК рим".into());
+    assert_eq!(titles(&state), vec!["Выпуск 3: Рим"]);
+    podcasts_set_filter(&mut state, "nothing".into());
+    assert!(titles(&state).is_empty());
+    assert!(update(&mut state, Action::Select).is_none());
+    assert_eq!(
+        state.status_message.as_deref(),
+        Some("no episode matches the filter")
+    );
+}
+
+#[test]
+fn podcast_sort_toggles_and_keeps_undated_episodes_last() {
+    let mut state = podcasts_state();
+    let ids = |state: &AppState| -> Vec<i64> {
+        let episodes = state.podcasts.opened_episodes().unwrap();
+        state
+            .podcasts
+            .visible_episode_indices()
+            .into_iter()
+            .map(|index| episodes[index].id)
+            .collect()
+    };
+    assert_eq!(ids(&state), vec![30, 20, 10, 5]);
+    state.podcasts.opened.as_mut().unwrap().cursor = 2;
+    update(&mut state, Action::ToggleViewMode);
+    assert_eq!(ids(&state), vec![10, 20, 30, 5]);
+    assert_eq!(state.podcasts.opened.unwrap().cursor, 0);
+}
+
+#[test]
+fn podcast_search_key_opens_the_episode_filter_not_library_search() {
+    use crate::app::state::{FedInputField, Popup};
+    let mut state = podcasts_state();
+    update(&mut state, Action::OpenSearch);
+    assert_eq!(state.active_tab, Tab::Podcasts);
+    assert!(!state.cmdline.active);
+    assert!(matches!(
+        state.popup,
+        Some(Popup::FedInput {
+            field: FedInputField::PodcastFilter,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn enter_on_episode_plays_it_now_and_keeps_the_queue() {
+    let mut state = podcasts_state();
+    state.player.queue = vec![test_track(1), test_track(2)];
+    state.player.queue_pos = 0;
+    state.player.current = Some(test_track(1));
+    state.podcasts.opened.as_mut().unwrap().cursor = 1;
+
+    assert_eq!(
+        update(&mut state, Action::Select),
+        Some(Effect::PlayCurrent)
+    );
+    assert_eq!(state.player.queue.len(), 3);
+    assert_eq!(state.player.queue_pos, 1);
+    let queued = &state.player.queue[1];
+    assert_eq!(queued.title, "Выпуск 2: Греция");
+    assert_eq!(queued.file_path, "https://cdn.example.test/20.mp3");
+    assert_eq!(queued.release_title, "Vivat");
+    assert_eq!(
+        crate::podcasts::episode_id_from_track_id(queued.id),
+        Some(20)
+    );
+    // The music that was queued after the current track still follows.
+    assert_eq!(state.player.queue[2].id, 2);
+}
+
+#[test]
+fn episode_can_be_queued_with_the_regular_queue_keys() {
+    let mut state = podcasts_state();
+    state.player.queue = vec![test_track(1)];
+    state.player.current = Some(test_track(1));
+    update(&mut state, Action::QueueAddLast);
+    assert_eq!(state.player.queue.len(), 2);
+    assert_eq!(state.player.queue[1].title, "Выпуск 3: Рим");
+    assert_eq!(state.player.queue_pos, 0);
+}
+
+#[test]
+fn podcast_list_rows_open_add_refresh_and_podcasts() {
+    use crate::app::state::{FedInputField, PODCAST_ACTION_ROWS, Popup};
+    let mut state = podcasts_state();
+    update(&mut state, Action::Back);
+    assert!(state.podcasts.opened.is_none());
+    // Esc returns to the row of the podcast that was open.
+    assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS + 1);
+
+    update(&mut state, Action::SelectFirst);
+    assert_eq!(state.podcasts.selected, 0);
+    assert!(update(&mut state, Action::Select).is_none());
+    assert!(matches!(
+        state.popup,
+        Some(Popup::FedInput {
+            field: FedInputField::PodcastFeedUrl,
+            ..
+        })
+    ));
+    state.popup = None;
+
+    update(&mut state, Action::MoveDown);
+    assert_eq!(
+        update(&mut state, Action::Select),
+        Some(Effect::PodcastRefresh(vec![3, 7]))
+    );
+    // A second request while those are running is not duplicated.
+    assert_eq!(update(&mut state, Action::RefreshPodcasts), None);
+
+    update(&mut state, Action::MoveDown);
+    state.podcasts.episodes = None;
+    assert_eq!(
+        update(&mut state, Action::Select),
+        Some(Effect::PodcastLoadEpisodes(3))
+    );
+    assert_eq!(state.podcasts.opened.map(|opened| opened.id), Some(3));
+    assert!(matches!(
+        state.podcasts.episodes,
+        Some((3, Loadable::Loading))
+    ));
+}
+
+#[test]
+fn unsubscribe_asks_for_confirmation_from_the_list_only() {
+    use crate::app::state::{DeleteTarget, PODCAST_ACTION_ROWS, Popup};
+    let mut state = podcasts_state();
+    assert!(update(&mut state, Action::DeleteSelected).is_none());
+    assert!(state.popup.is_none());
+
+    update(&mut state, Action::Back);
+    state.podcasts.selected = PODCAST_ACTION_ROWS;
+    update(&mut state, Action::DeleteSelected);
+    assert!(matches!(
+        state.popup,
+        Some(Popup::ConfirmDelete {
+            target: DeleteTarget::Podcast(3),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn podcast_cursor_stays_inside_the_filtered_list() {
+    let mut state = podcasts_state();
+    update(&mut state, Action::SelectLast);
+    assert_eq!(state.podcasts.opened.unwrap().cursor, 3);
+    podcasts_set_filter(&mut state, "выпуск".into());
+    assert_eq!(state.podcasts.opened.unwrap().cursor, 0);
+    update(&mut state, Action::PageDown);
+    assert_eq!(state.podcasts.opened.unwrap().cursor, 2);
+}
+
+#[test]
+fn unchanged_podcast_filter_keeps_the_episode_cursor() {
+    let mut state = podcasts_state();
+    podcasts_set_filter(&mut state, "выпуск".into());
+    state.podcasts.opened.as_mut().unwrap().cursor = 2;
+    podcasts_set_filter(&mut state, "выпуск".into());
+    assert_eq!(state.podcasts.opened.unwrap().cursor, 2);
 }

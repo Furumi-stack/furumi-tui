@@ -557,7 +557,11 @@ fn handle_fed_input(
     key: KeyEvent,
 ) {
     match key.code {
-        KeyCode::Esc => {}
+        KeyCode::Esc => {
+            if field == FedInputField::PodcastFilter {
+                crate::app::update::podcasts_set_filter(state, String::new());
+            }
+        }
         KeyCode::Enter => {
             let value = input.trim().to_string();
             match field {
@@ -662,10 +666,28 @@ fn handle_fed_input(
                         );
                     }
                 }
+                FedInputField::PodcastFeedUrl => {
+                    if value.is_empty() {
+                        state.status_message = Some("podcast feed URL is empty".into());
+                    } else {
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::PodcastSubscribe(value),
+                        );
+                    }
+                }
+                // The filter is already applied live; Enter just keeps it.
+                FedInputField::PodcastFilter => {
+                    crate::app::update::podcasts_set_filter(state, value);
+                }
             }
         }
         _ => {
             input.handle_key(key);
+            if field == FedInputField::PodcastFilter {
+                crate::app::update::podcasts_set_filter(state, input.to_string());
+            }
             state.popup = Some(Popup::FedInput { field, input });
         }
     }
@@ -787,15 +809,24 @@ fn handle_device_leave(state: &mut AppState, runtime: &mut Runtime, key: KeyEven
 /// Pasted text goes into the focused text field when one is open.
 pub fn handle_paste(state: &mut AppState, pasted: &str) {
     let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
+    let mut filter = None;
     match &mut state.popup {
         Some(Popup::NewPlaylist { input, busy, .. }) if !*busy => input.insert_str(&cleaned),
-        Some(Popup::FedInput { input, .. }) => input.insert_str(&cleaned),
+        Some(Popup::FedInput { field, input }) => {
+            input.insert_str(&cleaned);
+            if *field == FedInputField::PodcastFilter {
+                filter = Some(input.to_string());
+            }
+        }
         Some(Popup::Edit { fields, focus, .. }) => {
             if let Some(field) = fields.get_mut(*focus) {
                 field.value.insert_str(&cleaned);
             }
         }
         _ => {}
+    }
+    if let Some(filter) = filter {
+        crate::app::update::podcasts_set_filter(state, filter);
     }
 }
 
@@ -969,13 +1000,22 @@ fn save_edit(
 
 fn handle_confirm_delete(
     state: &mut AppState,
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     target: DeleteTarget,
     label: String,
     key: KeyEvent,
 ) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+        KeyCode::Enter | KeyCode::Char('y') if matches!(target, DeleteTarget::Podcast(_)) => {
+            if let DeleteTarget::Podcast(id) = target {
+                super::perform_effect(
+                    state,
+                    runtime,
+                    crate::app::update::Effect::PodcastUnsubscribe(id),
+                );
+            }
+        }
         KeyCode::Enter | KeyCode::Char('y') => {
             let library = Arc::clone(&runtime.library);
             let result = match target {
@@ -989,6 +1029,7 @@ fn handle_confirm_delete(
                         library.delete_playlist(id)
                     }
                 },
+                DeleteTarget::Podcast(_) => unreachable!("handled by the guarded arm above"),
             };
             match result {
                 Ok(()) => {

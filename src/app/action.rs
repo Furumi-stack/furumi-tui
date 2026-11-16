@@ -57,6 +57,8 @@ pub enum Action {
     OpenSearch,
     EditSelected,
     DeleteSelected,
+    /// Podcasts: check the opened (or every) subscription for new episodes.
+    RefreshPodcasts,
 }
 
 /// Help-window sections, in display order.
@@ -138,7 +140,8 @@ impl Action {
             Action::EditSelected
             | Action::DeleteSelected
             | Action::CycleSourceMode
-            | Action::OpenLibraryFilters => Category::Library,
+            | Action::OpenLibraryFilters
+            | Action::RefreshPodcasts => Category::Library,
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
             Action::ToggleHelp | Action::Quit => Category::System,
         }
@@ -215,6 +218,7 @@ impl Action {
             Action::OpenSearch => "Search artists, releases, tracks".into(),
             Action::EditSelected => "Edit the selected item".into(),
             Action::DeleteSelected => "Delete the selected item".into(),
+            Action::RefreshPodcasts => "Podcasts: check for new episodes".into(),
         }
     }
 }

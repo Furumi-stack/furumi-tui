@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A Podcasts tab (key `6`) for RSS subscriptions: add a feed by URL, browse
+  the episode catalog with title search and date sorting, and play an episode
+  through the regular player and queue.
+- Episodes stream over HTTP with range-request seeking; only feed metadata
+  is stored locally, in `podcasts.sqlite3`, with covers in the cache
+  directory.
+- Background refresh of stale feeds (conditional requests, GUID
+  deduplication) and a `RefreshPodcasts` action (`Shift+R` in the
+  `podcasts` key context).
+
 ## [0.2.8] - 2026-09-02
 
 ### Added

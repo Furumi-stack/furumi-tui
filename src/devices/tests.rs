@@ -936,3 +936,54 @@ fn stale_synced_playlist_item_metadata_repairs_pending_fed_track() {
     assert!(detail.tracks[0].is_fed_pending());
     assert_eq!(detail.tracks[0].title, fed.title);
 }
+
+#[test]
+fn podcast_episode_survives_the_playback_wire_but_local_paths_do_not() {
+    let podcast = crate::podcasts::Podcast {
+        id: 1,
+        feed_url: "https://example.test/feed.xml".into(),
+        title: "Show".into(),
+        author: None,
+        description: None,
+        link: None,
+        image_url: None,
+        cover_path: Some("/home/user/.cache/cover.jpg".into()),
+        episode_count: 1,
+        latest_published_at: None,
+        last_checked_at: None,
+        last_error: None,
+    };
+    let episode = crate::podcasts::Episode {
+        id: 42,
+        podcast_id: 1,
+        guid: "g".into(),
+        title: "Episode".into(),
+        description: None,
+        published_at: None,
+        duration_seconds: Some(60.0),
+        audio_url: "https://cdn.example.test/42.mp3".into(),
+        mime_type: Some("audio/mpeg".into()),
+        byte_len: None,
+        link: None,
+        image_url: None,
+    };
+    let track = crate::podcasts::episode_track(&podcast, &episode);
+    let round_trip = PlaybackTrack::from_track(&track).to_track_item();
+    assert_eq!(round_trip.id, track.id);
+    assert_eq!(round_trip.file_path, episode.audio_url);
+    assert_eq!(
+        crate::app::state::track_key(&round_trip),
+        crate::app::state::track_key(&track)
+    );
+
+    // Local files never leak their path; a URL without an episode id is
+    // not trusted as a stream either.
+    let mut local = track.clone();
+    local.id = 7;
+    local.file_path = "/home/user/Music/a.flac".into();
+    assert!(PlaybackTrack::from_track(&local).file_path.is_empty());
+    local.file_path = "https://cdn.example.test/other.mp3".into();
+    let wire = PlaybackTrack::from_track(&local);
+    assert_eq!(wire.file_path, "https://cdn.example.test/other.mp3");
+    assert!(wire.to_track_item().file_path.is_empty());
+}

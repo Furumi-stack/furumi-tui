@@ -9,7 +9,7 @@
 # command: an Action name, optionally with parameters:
 #   command = { SeekForward = { seconds = 30 } }
 # context: optional view filter — global (default), library, search,
-#   playlists, queue, logs.
+#   playlists, queue, settings, logs, podcasts.
 
 [[keymaps]]
 key_sequence = "q"
@@ -50,6 +50,10 @@ command = { GoToTab = 3 }
 [[keymaps]]
 key_sequence = "5"
 command = { GoToTab = 4 }
+
+[[keymaps]]
+key_sequence = "6"
+command = { GoToTab = 5 }
 
 [[keymaps]]
 key_sequence = "y"
@@ -255,3 +259,8 @@ command = "OpenCommandLine"
 [[keymaps]]
 key_sequence = "/"
 command = "OpenSearch"
+
+[[keymaps]]
+key_sequence = "shift-r"
+command = "RefreshPodcasts"
+context = "podcasts"

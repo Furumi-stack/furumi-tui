@@ -79,6 +79,33 @@ The first selectable model is downloaded on demand and is licensed separately
 by MTG under CC BY-NC-SA 4.0 (a proprietary license is also available from
 MTG); Furumi itself remains WTFPL.
 
+## Podcasts
+
+The **Podcasts** tab (key `6`) subscribes to podcast RSS feeds and plays
+episodes through the same player, queue and media keys as your music.
+
+- Choose **Add podcast** and paste the feed URL, for example
+  `https://podster.fm/rss.xml?pid=778`. Furumi stores the feed's metadata
+  only: titles, notes, dates and durations. Audio files are never
+  downloaded in bulk.
+- Press `Enter` on a podcast to open its episode list. `/` searches episode
+  titles as you type, `v` switches between newest-first and oldest-first,
+  and `Shift+R` checks for new episodes.
+- `Enter` on an episode plays it right away, ahead of the rest of your
+  queue. `a` / `Shift+A` queue it like a track. The episode streams over HTTP
+  and seeks with range requests, so jumping into a long episode does not
+  download everything before that point.
+- Subscriptions are checked for new episodes in the background. A feed is
+  fetched again only after 30 minutes, and the request is conditional, so
+  an unchanged feed costs almost nothing. Episodes are matched by their RSS
+  GUID, so each one is listed once.
+- `Shift+D` on a podcast in the list unsubscribes from it.
+
+Subscriptions live in Furumi's data directory (`podcasts.sqlite3`). Covers are
+kept in the cache directory. Podcasts are local to each device: they are not
+yet synchronized between trusted devices or shared through federation, and
+playback position is not remembered.
+
 ## Install
 
 ### macOS

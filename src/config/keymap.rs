@@ -23,6 +23,7 @@ pub enum KeyContext {
     #[serde(rename = "settings", alias = "federation")]
     Federation,
     Logs,
+    Podcasts,
 }
 
 impl KeyContext {
@@ -35,6 +36,7 @@ impl KeyContext {
             KeyContext::Queue => "queue",
             KeyContext::Federation => "settings",
             KeyContext::Logs => "logs",
+            KeyContext::Podcasts => "podcasts",
         }
     }
 }

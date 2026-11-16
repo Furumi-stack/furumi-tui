@@ -695,6 +695,8 @@ pub enum DeleteTarget {
     Release(i64),
     Artist(i64),
     Playlist(i64),
+    /// Unsubscribe: drops the feed's stored metadata and cached cover.
+    Podcast(i64),
 }
 
 /// One text field of an edit form.
@@ -899,6 +901,9 @@ pub enum FedInputField {
     DeviceName,
     ConnectInvite,
     JamInvite,
+    PodcastFeedUrl,
+    /// Live episode-title filter of the opened podcast.
+    PodcastFilter,
 }
 
 impl FedInputField {
@@ -913,6 +918,8 @@ impl FedInputField {
             FedInputField::DeviceName => "Device name",
             FedInputField::ConnectInvite => "Connect device (paste frid://i invite)",
             FedInputField::JamInvite => "Join Jam (paste frid://j invite)",
+            FedInputField::PodcastFeedUrl => "Add podcast (RSS feed URL)",
+            FedInputField::PodcastFilter => "Search episodes by title",
         }
     }
 
@@ -944,6 +951,12 @@ impl FedInputField {
             }
             FedInputField::JamInvite => {
                 "Paste a frid://j capability to control the host player for this Jam only."
+            }
+            FedInputField::PodcastFeedUrl => {
+                "Paste the podcast's RSS feed URL. Only the episode list is stored; audio streams when you play an episode."
+            }
+            FedInputField::PodcastFilter => {
+                "Type words from the episode title; the list updates as you type. Enter keeps the filter, Esc clears it."
             }
         }
     }
@@ -1469,15 +1482,19 @@ pub enum Tab {
     Queue,
     Federation,
     Logs,
+    Podcasts,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    /// Display and `GoToTab` index order. Podcasts is appended so the
+    /// existing number keys (and user keymaps) keep their meaning.
+    pub const ALL: [Tab; 6] = [
         Tab::Global,
         Tab::Playlists,
         Tab::Queue,
         Tab::Federation,
         Tab::Logs,
+        Tab::Podcasts,
     ];
 
     pub fn title(self) -> &'static str {
@@ -1487,6 +1504,7 @@ impl Tab {
             Tab::Queue => "Queue",
             Tab::Federation => "Settings",
             Tab::Logs => "Logs",
+            Tab::Podcasts => "Podcasts",
         }
     }
 
@@ -1513,6 +1531,7 @@ impl Tab {
             Tab::Queue => KeyContext::Queue,
             Tab::Federation => KeyContext::Federation,
             Tab::Logs => KeyContext::Logs,
+            Tab::Podcasts => KeyContext::Podcasts,
         }
     }
 }
@@ -1646,6 +1665,169 @@ impl DevicePlaybackState {
     }
 }
 
+/// Podcasts tab: subscriptions list, or the episode catalog of one opened
+/// podcast. Only RSS metadata lives here; audio streams on demand.
+#[derive(Debug, Default)]
+pub struct PodcastsTab {
+    /// Subscriptions; `None` until the first load is requested.
+    pub list: Option<Loadable<Vec<crate::podcasts::Podcast>>>,
+    /// Cursor over `podcast_list_rows` (action rows first, then podcasts).
+    pub selected: usize,
+    pub opened: Option<OpenedPodcast>,
+    /// Episodes of the opened podcast, keyed by its id so a late result for
+    /// a podcast that is no longer open is ignored.
+    pub episodes: Option<(i64, Loadable<Vec<crate::podcasts::Episode>>)>,
+    /// Case-insensitive episode title filter; every word must match.
+    pub filter: String,
+    pub sort: EpisodeSort,
+    /// Feeds with a refresh in flight (spinner + dedup of requests).
+    pub refreshing: HashSet<i64>,
+    pub subscribing: bool,
+    /// Wall-clock seconds of the last automatic refresh sweep.
+    pub last_auto_refresh: Option<i64>,
+    /// Newly subscribed podcast to select once the reloaded list arrives.
+    pub pending_select: Option<i64>,
+}
+
+/// "Add podcast" and "Check for new episodes" rows above the podcasts.
+pub const PODCAST_ACTION_ROWS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenedPodcast {
+    pub id: i64,
+    /// Index into `visible_episode_indices`.
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EpisodeSort {
+    #[default]
+    NewestFirst,
+    OldestFirst,
+}
+
+impl EpisodeSort {
+    pub fn toggle(self) -> Self {
+        match self {
+            EpisodeSort::NewestFirst => EpisodeSort::OldestFirst,
+            EpisodeSort::OldestFirst => EpisodeSort::NewestFirst,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EpisodeSort::NewestFirst => "newest first",
+            EpisodeSort::OldestFirst => "oldest first",
+        }
+    }
+}
+
+/// One row of the podcast subscriptions list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodcastListRow {
+    Add,
+    RefreshAll,
+    /// Index into the loaded podcast list.
+    Podcast(usize),
+}
+
+impl PodcastsTab {
+    pub fn podcasts(&self) -> &[crate::podcasts::Podcast] {
+        match &self.list {
+            Some(Loadable::Ready(list)) => list,
+            _ => &[],
+        }
+    }
+
+    pub fn podcast(&self, id: i64) -> Option<&crate::podcasts::Podcast> {
+        self.podcasts().iter().find(|podcast| podcast.id == id)
+    }
+
+    pub fn list_rows(&self) -> Vec<PodcastListRow> {
+        let mut rows = vec![PodcastListRow::Add, PodcastListRow::RefreshAll];
+        rows.extend((0..self.podcasts().len()).map(PodcastListRow::Podcast));
+        rows
+    }
+
+    /// The podcast under the list cursor (list view) or the opened one.
+    pub fn current_podcast(&self) -> Option<&crate::podcasts::Podcast> {
+        if let Some(opened) = self.opened {
+            return self.podcast(opened.id);
+        }
+        match self.list_rows().get(self.selected)? {
+            PodcastListRow::Podcast(index) => self.podcasts().get(*index),
+            _ => None,
+        }
+    }
+
+    /// Episodes of the opened podcast, when loaded.
+    pub fn opened_episodes(&self) -> Option<&[crate::podcasts::Episode]> {
+        let opened = self.opened?;
+        match &self.episodes {
+            Some((id, Loadable::Ready(episodes))) if *id == opened.id => Some(episodes),
+            _ => None,
+        }
+    }
+
+    /// Indices into `opened_episodes()` after the title filter and sort.
+    pub fn visible_episode_indices(&self) -> Vec<usize> {
+        let Some(episodes) = self.opened_episodes() else {
+            return Vec::new();
+        };
+        visible_episode_indices(episodes, &self.filter, self.sort)
+    }
+
+    pub fn selected_episode(&self) -> Option<&crate::podcasts::Episode> {
+        let opened = self.opened?;
+        let episodes = self.opened_episodes()?;
+        let visible = visible_episode_indices(episodes, &self.filter, self.sort);
+        visible
+            .get(opened.cursor.min(visible.len().saturating_sub(1)))
+            .and_then(|&index| episodes.get(index))
+    }
+}
+
+/// Filter by title (every whitespace-separated term, case-insensitively)
+/// and order by publication date; undated episodes always go last.
+pub fn visible_episode_indices(
+    episodes: &[crate::podcasts::Episode],
+    filter: &str,
+    sort: EpisodeSort,
+) -> Vec<usize> {
+    let terms: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let mut indices: Vec<usize> = episodes
+        .iter()
+        .enumerate()
+        .filter(|(_, episode)| {
+            if terms.is_empty() {
+                return true;
+            }
+            let title = episode.title.to_lowercase();
+            terms.iter().all(|term| title.contains(term.as_str()))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_by(|&a, &b| {
+        let (a_ep, b_ep) = (&episodes[a], &episodes[b]);
+        match (a_ep.published_at, b_ep.published_at) {
+            (Some(x), Some(y)) => match sort {
+                EpisodeSort::NewestFirst => y.cmp(&x),
+                EpisodeSort::OldestFirst => x.cmp(&y),
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        // Stable sort keeps the store order (newest id first) for ties;
+        // reverse it for oldest-first so ties follow the same direction.
+        .then_with(|| match sort {
+            EpisodeSort::NewestFirst => a.cmp(&b),
+            EpisodeSort::OldestFirst => b.cmp(&a),
+        })
+    });
+    indices
+}
+
 /// Single source of truth for the UI. Mutated only by `update()` and the
 /// event handlers in the main loop; views render from `&AppState`.
 #[derive(Debug, Default)]
@@ -1696,6 +1878,7 @@ pub struct AppState {
     pub queue_tab: QueueTab,
     pub federation: FederationTab,
     pub similarity: SimilarityTab,
+    pub podcasts: PodcastsTab,
     /// The one federated artist card being viewed (name + loading state);
     /// opening another card replaces it.
     pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,

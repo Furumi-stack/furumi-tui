@@ -131,6 +131,12 @@ pub struct PlaybackTrack {
     pub fed: Option<SyncedFedTrack>,
 }
 
+/// The part of a track's `file_path` that may cross devices: only http(s)
+/// stream URLs (podcast episodes), never local filesystem paths.
+fn portable_remote_url(file_path: &str) -> Option<String> {
+    crate::podcasts::is_remote_url(file_path).then(|| file_path.to_string())
+}
+
 impl PlaybackTrack {
     fn portable_placeholder_id(&self) -> i64 {
         let key = self
@@ -183,7 +189,9 @@ impl PlaybackTrack {
             release_id: track.release_id,
             release_title: track.release_title.clone(),
             release_year: track.release_year,
-            file_path: String::new(),
+            // Local paths stay private; a streamed podcast episode's URL is
+            // the only way another device can play it.
+            file_path: portable_remote_url(&track.file_path).unwrap_or_default(),
             content_id: track
                 .content_id
                 .clone()
@@ -208,8 +216,16 @@ impl PlaybackTrack {
                 })
                 .collect()
         };
+        // A podcast episode keeps its episode-range id and stream URL, so the
+        // queue entry stays the same track across devices and round trips.
+        let episode_url = portable_remote_url(&self.file_path)
+            .filter(|_| crate::podcasts::episode_id_from_track_id(self.id).is_some());
         TrackItem {
-            id: self.portable_placeholder_id(),
+            id: if episode_url.is_some() {
+                self.id
+            } else {
+                self.portable_placeholder_id()
+            },
             title: self.title.clone(),
             track_number: self.track_number,
             disc_number: self.disc_number,
@@ -219,7 +235,7 @@ impl PlaybackTrack {
             release_id: self.release_id,
             release_title: self.release_title.clone(),
             release_year: self.release_year,
-            file_path: String::new(),
+            file_path: episode_url.unwrap_or_default(),
             content_id: self.content_id.clone(),
             cover_path: None,
             audio_format: self.audio_format.clone(),
