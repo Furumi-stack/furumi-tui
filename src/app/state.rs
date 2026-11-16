@@ -1854,6 +1854,7 @@ pub struct AppState {
     pub device_playback: DevicePlaybackState,
     pub jam: crate::jam::JamStatus,
     pub visualizer: crate::visualizer::VisualizerState,
+    pub status_visualizer: crate::visualizer::status::State,
     pub global: GlobalTab,
     pub artist_views: HashMap<i64, Loadable<ArtistDetail>>,
     /// Federated card data that enriches a local artist page in-place.

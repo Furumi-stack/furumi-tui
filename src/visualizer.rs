@@ -1,4 +1,4 @@
-//! Script-backed fullscreen visualizers.
+//! Script-backed fullscreen and status-bar visualizers.
 //!
 //! Rust owns the audio tap, script loading, sandboxed execution limits and
 //! terminal drawing primitives. Visual math lives in `.rhai` files: every
@@ -11,6 +11,9 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
+
+pub mod status;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Clear, Paragraph};
@@ -20,12 +23,12 @@ use serde::{Deserialize, Serialize};
 use crate::app::state::AppState;
 
 const PRIMARY_SCRIPT_ID: &str = "scope_spectrum";
-const BUNDLE_VERSION: u32 = 5;
 
 struct BundledScript {
     id: &'static str,
     file_name: &'static str,
     display_name: &'static str,
+    version: u32,
     source: &'static str,
 }
 
@@ -34,13 +37,22 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: PRIMARY_SCRIPT_ID,
         file_name: "scope_spectrum.rhai",
         display_name: "Scope spectrum",
+        version: 5,
         source: include_str!("visualizations/scope_spectrum.rhai"),
     },
     BundledScript {
         id: "pulsing_sphere",
         file_name: "pulsing_sphere.rhai",
         display_name: "Pulsing sphere",
+        version: 5,
         source: include_str!("visualizations/pulsing_sphere.rhai"),
+    },
+    BundledScript {
+        id: "morphing_cube",
+        file_name: "morphing_cube.rhai",
+        display_name: "Morphing cube",
+        version: 6,
+        source: include_str!("visualizations/morphing_cube.rhai"),
     },
 ];
 
@@ -114,6 +126,9 @@ impl VisualizerState {
     }
 
     pub fn load_library(&mut self) -> Result<()> {
+        if let Err(err) = status::ensure_script() {
+            tracing::warn!(%err, "status visualization initialization failed");
+        }
         ensure_bundled_scripts()?;
         self.config = load_config().unwrap_or_else(|err| {
             tracing::warn!(%err, "visualization settings failed to load; using defaults");
@@ -284,7 +299,10 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 }
 
 fn input_map(area: Rect, state: &AppState) -> Map {
-    let features = features_from_state(state);
+    input_map_with_features(area, state, features_from_state(state, true))
+}
+
+fn input_map_with_features(area: Rect, state: &AppState, features: AudioFeatures) -> Map {
     let mut input = Map::new();
     insert_int(&mut input, "width", i64::from(area.width));
     insert_int(&mut input, "height", i64::from(area.height));
@@ -329,7 +347,7 @@ fn input_map(area: Rect, state: &AppState) -> Map {
     input
 }
 
-fn features_from_state(state: &AppState) -> AudioFeatures {
+fn features_from_state(state: &AppState, scale_output: bool) -> AudioFeatures {
     let elapsed_secs = state
         .visualizer
         .started_at
@@ -355,12 +373,18 @@ fn features_from_state(state: &AppState) -> AudioFeatures {
         .unwrap_or(0.17);
     let analysis = &state.player.audio_analysis;
     let volume = f64::from(state.player.volume.min(100)) / 100.0;
-    let output_scale = if state.player.volume == 0 {
+    let output_scale = if !scale_output {
+        1.0
+    } else if state.player.volume == 0 {
         0.0
     } else {
         0.35 + volume * 0.65
     };
-    let active_scale = if state.player.paused { 0.12 } else { 1.0 };
+    let active_scale = if scale_output && state.player.paused {
+        0.12
+    } else {
+        1.0
+    };
     let scale = output_scale * active_scale;
 
     AudioFeatures {
@@ -373,7 +397,7 @@ fn features_from_state(state: &AppState) -> AudioFeatures {
         bass: (analysis.bass * scale).clamp(0.0, 1.0),
         mid: (analysis.mid * scale).clamp(0.0, 1.0),
         treble: (analysis.treble * scale).clamp(0.0, 1.0),
-        beat: if state.player.paused {
+        beat: if scale_output && state.player.paused {
             0.0
         } else {
             (analysis.beat * output_scale).clamp(0.0, 1.0)
@@ -423,6 +447,10 @@ impl Default for ScriptRuntime {
             .set_max_string_size(1_000_000)
             .set_max_array_size(120_000)
             .set_max_map_size(1_000_000);
+        engine.on_print(|message| tracing::debug!(message, "visualizer script"));
+        engine.on_debug(|message, source, position| {
+            tracing::debug!(message, ?source, ?position, "visualizer script")
+        });
         engine.disable_symbol("import");
         engine.disable_symbol("export");
         engine.register_fn("sin", |value: FLOAT| value.sin());
@@ -606,11 +634,15 @@ impl DrawCommand {
 }
 
 fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
+    render_commands_to_buffer(frame.buffer_mut(), area, commands);
+}
+
+fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCommand]) {
     for command in commands {
         match command {
-            DrawCommand::Clear { bg } => fill_rect(frame, area, " ", Style::new().bg(*bg)),
+            DrawCommand::Clear { bg } => fill_rect(buffer, area, " ", Style::new().bg(*bg)),
             DrawCommand::Cell { x, y, ch, fg, bg } => {
-                write_cell(frame, area, *x, *y, ch, Style::new().fg(*fg).bg(*bg));
+                write_cell(buffer, area, *x, *y, ch, Style::new().fg(*fg).bg(*bg));
             }
             DrawCommand::HLine {
                 x,
@@ -621,8 +653,8 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
                 bg,
             } => {
                 let style = Style::new().fg(*fg).bg(*bg);
-                for offset in 0..*w {
-                    write_cell(frame, area, x.saturating_add(offset), *y, ch, style);
+                for offset in 0..(*w).min(area.width.saturating_sub(*x)) {
+                    write_cell(buffer, area, x.saturating_add(offset), *y, ch, style);
                 }
             }
             DrawCommand::VLine {
@@ -634,8 +666,8 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
                 bg,
             } => {
                 let style = Style::new().fg(*fg).bg(*bg);
-                for offset in 0..*h {
-                    write_cell(frame, area, *x, y.saturating_add(offset), ch, style);
+                for offset in 0..(*h).min(area.height.saturating_sub(*y)) {
+                    write_cell(buffer, area, *x, y.saturating_add(offset), ch, style);
                 }
             }
             DrawCommand::Rect {
@@ -648,10 +680,10 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
                 bg,
             } => {
                 let style = Style::new().fg(*fg).bg(*bg);
-                for row in 0..*h {
-                    for col in 0..*w {
+                for row in 0..(*h).min(area.height.saturating_sub(*y)) {
+                    for col in 0..(*w).min(area.width.saturating_sub(*x)) {
                         write_cell(
-                            frame,
+                            buffer,
                             area,
                             x.saturating_add(col),
                             y.saturating_add(row),
@@ -673,7 +705,12 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
                 let line_style = Style::new().fg(*line_fg).bg(*bg);
                 let point_style = Style::new().fg(*fg).bg(*bg);
                 let mut previous_y: Option<u16> = None;
-                for (index, y) in ys.iter().copied().enumerate() {
+                for (index, y) in ys
+                    .iter()
+                    .copied()
+                    .take(usize::from(area.width.saturating_sub(*x)))
+                    .enumerate()
+                {
                     let Ok(offset) = u16::try_from(index) else {
                         break;
                     };
@@ -681,21 +718,25 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
                     if let Some(previous) = previous_y {
                         let from = previous.min(y);
                         let to = previous.max(y);
-                        for y in from..=to {
-                            write_cell(frame, area, x, y, line_ch, line_style);
+                        for y in from..=to.min(area.height.saturating_sub(1)) {
+                            write_cell(buffer, area, x, y, line_ch, line_style);
                         }
                     }
-                    write_cell(frame, area, x, y, ch, point_style);
+                    write_cell(buffer, area, x, y, ch, point_style);
                     previous_y = Some(y);
                 }
             }
             DrawCommand::Text { x, y, text, fg, bg } => {
-                for (offset, ch) in text.chars().enumerate() {
+                for (offset, ch) in text
+                    .chars()
+                    .take(usize::from(area.width.saturating_sub(*x)))
+                    .enumerate()
+                {
                     let Ok(offset) = u16::try_from(offset) else {
                         break;
                     };
                     write_cell(
-                        frame,
+                        buffer,
                         area,
                         x.saturating_add(offset),
                         *y,
@@ -708,24 +749,21 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
     }
 }
 
-fn fill_rect(frame: &mut Frame, area: Rect, symbol: &'static str, style: Style) {
+fn fill_rect(buffer: &mut Buffer, area: Rect, symbol: &'static str, style: Style) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.set_symbol(symbol).set_style(style);
             }
         }
     }
 }
 
-fn write_cell(frame: &mut Frame, area: Rect, x: u16, y: u16, symbol: &str, style: Style) {
+fn write_cell(buffer: &mut Buffer, area: Rect, x: u16, y: u16, symbol: &str, style: Style) {
     if x >= area.width || y >= area.height {
         return;
     }
-    if let Some(cell) = frame
-        .buffer_mut()
-        .cell_mut((area.x.saturating_add(x), area.y.saturating_add(y)))
-    {
+    if let Some(cell) = buffer.cell_mut((area.x.saturating_add(x), area.y.saturating_add(y))) {
         cell.set_symbol(symbol).set_style(style);
     }
 }
@@ -774,6 +812,9 @@ fn rgb_color(value: INT) -> Color {
 }
 
 fn parse_color(text: &str) -> Option<Color> {
+    if text == "default" {
+        return Some(Color::Reset);
+    }
     let hex = text.trim().trim_start_matches('#').trim_start_matches("0x");
     let value = u32::from_str_radix(hex, 16).ok()?;
     Some(Color::Rgb(
@@ -850,7 +891,7 @@ fn ensure_bundled_scripts() -> Result<()> {
 
 fn should_replace_bundled_script(existing: &str, script: &BundledScript) -> bool {
     let name_marker = format!("// name: {}", script.display_name);
-    let version_marker = format!("// bundle-version: {BUNDLE_VERSION}");
+    let version_marker = format!("// bundle-version: {}", script.version);
     existing
         .lines()
         .take(3)
@@ -918,9 +959,9 @@ mod tests {
         insert_int(&mut input, "analysis_sequence", 1);
         input.insert(
             "samples".into(),
-            (0..128)
+            (0..256)
                 .map(|index| {
-                    let sample = ((index as f64 / 128.0) * std::f64::consts::TAU).sin();
+                    let sample = ((index as f64 / 256.0) * std::f64::consts::TAU).sin();
                     Dynamic::from_float(sample as FLOAT)
                 })
                 .collect::<Array>()
@@ -990,5 +1031,285 @@ mod tests {
             "// name: Custom 1\nfn rgb(r, g, b) { let rr = clamp(r, 0, 255) as int; }",
             scope,
         ));
+    }
+
+    fn cube_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            include_str!("visualizations/morphing_cube.rhai"),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn cube_update_does_not_upgrade_other_presets() {
+        let cube = BUNDLED_SCRIPTS
+            .iter()
+            .find(|script| script.id == "morphing_cube")
+            .unwrap();
+        let old_cube = cube
+            .source
+            .replacen("// bundle-version: 6", "// bundle-version: 5", 1);
+        assert!(should_replace_bundled_script(&old_cube, cube));
+        for script in BUNDLED_SCRIPTS {
+            assert!(!should_replace_bundled_script(script.source, script));
+        }
+        let custom = old_cube.replacen("// name: Morphing cube", "// name: My cube", 1);
+        assert!(!should_replace_bundled_script(&custom, cube));
+    }
+
+    #[test]
+    fn cube_music_adds_particles_echoes_and_a_larger_pulse() {
+        let file = cube_file();
+        let mut runtime = ScriptRuntime::default();
+        let mut input = test_input();
+        for band in ["energy", "bass", "mid", "treble", "beat"] {
+            insert_float(&mut input, band, 0.0);
+        }
+        let quiet = runtime.render(file.path(), input.clone()).unwrap();
+        for band in ["energy", "bass", "mid", "treble", "beat"] {
+            insert_float(&mut input, band, 0.8);
+        }
+        let loud = runtime.render(file.path(), input).unwrap();
+        let effects = |commands: &[DrawCommand]| {
+            commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Cell { ch, .. } if ch != "o"))
+                .count()
+        };
+        assert!(
+            effects(&loud) > effects(&quiet) + 30,
+            "music should visibly populate the scene"
+        );
+        let lines = |commands: &[DrawCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        DrawCommand::Trace { .. } | DrawCommand::VLine { .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            lines(&loud),
+            lines(&quiet) + 30,
+            "two echoes and three rings"
+        );
+        let footprint = |commands: &[DrawCommand]| {
+            let vertices = cube_vertices(commands);
+            let xs: Vec<_> = vertices.iter().map(|p| p.0).collect();
+            let ys: Vec<_> = vertices.iter().map(|p| p.1).collect();
+            u32::from(xs.iter().max().unwrap() - xs.iter().min().unwrap())
+                * u32::from(ys.iter().max().unwrap() - ys.iter().min().unwrap())
+        };
+        assert!(
+            footprint(&loud) > footprint(&quiet) * 2,
+            "pulse should be substantially larger"
+        );
+    }
+
+    fn cube_vertices(commands: &[DrawCommand]) -> Vec<(u16, u16)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Cell { x, y, ch, .. } if ch == "o" => Some((*x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cube_rotates_and_each_audio_control_deforms_geometry() {
+        let file = cube_file();
+        let mut runtime = ScriptRuntime::default();
+        let mut input = test_input();
+        insert_int(&mut input, "width", 160);
+        insert_int(&mut input, "height", 60);
+        for band in ["energy", "bass", "mid", "treble", "beat"] {
+            insert_float(&mut input, band, 0.0);
+        }
+        let quiet = cube_vertices(&runtime.render(file.path(), input.clone()).unwrap());
+        assert_eq!(quiet.len(), 8);
+        for band in ["energy", "bass", "mid", "treble", "beat"] {
+            let mut loud = input.clone();
+            insert_float(&mut loud, band, 1.0);
+            let deformed = cube_vertices(&runtime.render(file.path(), loud).unwrap());
+            assert_ne!(
+                quiet, deformed,
+                "{band} should move vertices, not just colors"
+            );
+        }
+        insert_float(&mut input, "time", 3.0);
+        let rotated = cube_vertices(&runtime.render(file.path(), input).unwrap());
+        assert_ne!(quiet, rotated, "rotation should continue in silence");
+    }
+
+    #[test]
+    fn cube_stays_bounded_across_sizes_times_and_audio_extremes() {
+        let file = cube_file();
+        let mut runtime = ScriptRuntime::default();
+        // Much tighter than the production two-million-operation ceiling.
+        runtime.engine.set_max_operations(200_000);
+        for (width, height) in [
+            (1, 1),
+            (11, 7),
+            (12, 8),
+            (24, 80),
+            (80, 24),
+            (160, 50),
+            (320, 100),
+        ] {
+            for level in [0.0, 0.5, 1.0] {
+                for tick in 0..12 {
+                    let mut input = test_input();
+                    insert_int(&mut input, "width", width);
+                    insert_int(&mut input, "height", height);
+                    insert_float(&mut input, "time", f64::from(tick) * 1.37);
+                    for band in ["energy", "bass", "mid", "treble", "beat"] {
+                        insert_float(&mut input, band, level);
+                    }
+                    let commands = runtime.render(file.path(), input).unwrap();
+                    assert!(commands.len() <= 220);
+                    if width < 12 || height < 8 {
+                        assert_eq!(commands.len(), 1);
+                        continue;
+                    }
+                    assert_eq!(cube_vertices(&commands).len(), 8);
+                    let mut edges = 0;
+                    for command in &commands {
+                        match command {
+                            DrawCommand::Trace { x, ys, .. } => {
+                                edges += 1;
+                                assert!(usize::from(*x) + ys.len() <= width as usize);
+                                assert!(ys.iter().all(|y| i64::from(*y) < height));
+                            }
+                            DrawCommand::VLine { x, y, h, .. } => {
+                                edges += 1;
+                                assert!(i64::from(*x) < width);
+                                assert!(i64::from(*y) + i64::from(*h) <= height);
+                            }
+                            DrawCommand::Cell { x, y, .. } => {
+                                assert!(i64::from(*x) < width && i64::from(*y) < height);
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!((12..=54).contains(&edges));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cube_edges_handle_reversed_vertical_and_collapsed_projections() {
+        let runtime = ScriptRuntime::default();
+        let ast = runtime
+            .engine
+            .compile(include_str!("visualizations/morphing_cube.rhai"))
+            .unwrap();
+        for (ax, ay, bx, by) in [
+            (2_i64, 3_i64, 8_i64, 9_i64),
+            (8, 9, 2, 3),
+            (2, 9, 8, 3),
+            (8, 3, 2, 9),
+            (4, 9, 4, 3),
+            (4, 3, 4, 3),
+        ] {
+            let output = runtime
+                .engine
+                .call_fn::<Dynamic>(
+                    &mut Scope::new(),
+                    &ast,
+                    "edge",
+                    (ax, ay, bx, by, 0xffffff_i64, 0_i64),
+                )
+                .unwrap();
+            match DrawCommand::from_dynamic(output).unwrap() {
+                DrawCommand::Trace { x, ys, .. } => {
+                    assert_eq!(i64::from(x), ax.min(bx));
+                    assert_eq!(ys.len(), (ax - bx).unsigned_abs() as usize + 1);
+                    let (left_y, right_y) = if ax < bx { (ay, by) } else { (by, ay) };
+                    assert_eq!(i64::from(ys[0]), left_y);
+                    assert_eq!(i64::from(*ys.last().unwrap()), right_y);
+                }
+                DrawCommand::VLine { x, y, h, .. } => {
+                    assert_eq!(i64::from(x), ax);
+                    assert_eq!(i64::from(y), ay.min(by));
+                    assert_eq!(u64::from(h), (ay - by).unsigned_abs() + 1);
+                }
+                other => panic!("unexpected edge: {other:?}"),
+            }
+        }
+    }
+
+    /// Explicit, reproducible CPU measurement; no audio hardware or user config.
+    /// TestBackend includes buffer drawing/diff, but not terminal I/O/emulation.
+    #[test]
+    #[ignore = "manual benchmark: cargo test --release benchmark_visualizers -- --ignored --nocapture"]
+    fn benchmark_visualizers() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for script in BUNDLED_SCRIPTS {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), script.source).unwrap();
+            let mut runtime = ScriptRuntime::default();
+            for (width, height) in [(80_u16, 24_u16), (160, 50), (240, 80)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut script_times = Vec::new();
+                let mut frame_times = Vec::new();
+                let mut max_commands = 0;
+                for tick in 0..230 {
+                    let mut input = test_input();
+                    insert_int(&mut input, "width", i64::from(width));
+                    insert_int(&mut input, "height", i64::from(height));
+                    let time = f64::from(tick) * 0.05;
+                    insert_float(&mut input, "time", time);
+                    for (i, band) in ["energy", "bass", "mid", "treble", "beat"]
+                        .iter()
+                        .enumerate()
+                    {
+                        insert_float(&mut input, band, (time * (i + 1) as f64).sin() * 0.5 + 0.5);
+                    }
+                    let started = Instant::now();
+                    let commands = runtime.render(file.path(), input).unwrap();
+                    let script_elapsed = started.elapsed();
+                    terminal
+                        .draw(|frame| render_commands(frame, frame.area(), &commands))
+                        .unwrap();
+                    if tick >= 30 {
+                        script_times.push(script_elapsed.as_secs_f64() * 1000.0);
+                        frame_times.push(started.elapsed().as_secs_f64() * 1000.0);
+                        max_commands = max_commands.max(commands.len());
+                    }
+                }
+                script_times.sort_by(f64::total_cmp);
+                frame_times.sort_by(f64::total_cmp);
+                println!(
+                    "{} {width}x{height}: script p95={:.3}ms; frame median={:.3}ms p95={:.3}ms max={:.3}ms; commands<={max_commands}",
+                    script.id,
+                    script_times[189],
+                    frame_times[99],
+                    frame_times[189],
+                    frame_times[199]
+                );
+                if script.id == "morphing_cube" && width == 80 {
+                    for row in terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .chunks(usize::from(width))
+                    {
+                        println!(
+                            "{}",
+                            row.iter().map(|cell| cell.symbol()).collect::<String>()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

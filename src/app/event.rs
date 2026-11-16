@@ -14,6 +14,7 @@ pub enum AppEvent {
     UpdateProgress(String),
     UpdateInstalled(Result<(), String>),
     StatusMessage(String),
+    StatusVisualizationReady(crate::visualizer::status::Ready),
     /// A page of the artists list arrived (or failed).
     ArtistsLoaded(Result<ArtistsPage, String>),
     /// A full reload after a library change: replaces the loaded artist
