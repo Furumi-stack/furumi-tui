@@ -101,6 +101,9 @@ Download a prebuilt archive from the
 [GitHub releases](https://github.com/house-of-vanity/furumi_tui/releases), or
 build Furumi from source with Rust 1.97 or newer:
 
+The repository selects the stable Rust toolchain. With rustup, run
+`rustup update stable` to install or update it before building.
+
 ```bash
 cargo build --release --locked
 ./target/release/furumi
