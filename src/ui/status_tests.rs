@@ -108,3 +108,35 @@ fn status_animation_requires_local_unpaused_playback() {
     state.device_playback.role = crate::app::state::DevicePlaybackRole::Control;
     assert!(!crate::visualizer::status::playing(&state));
 }
+
+#[test]
+fn federation_mode_badge_stays_visible_at_the_right_edge() {
+    use crate::config::settings::LibrarySourceMode;
+    use ratatui::style::Color;
+    let mut state = playing_state();
+    for (mode, background) in [
+        (LibrarySourceMode::Local, Color::Yellow),
+        (LibrarySourceMode::My, Color::Cyan),
+        (LibrarySourceMode::Global, Color::Green),
+    ] {
+        state.global.filters.source_mode = mode;
+        for width in [20, 40, 80, 160, 200] {
+            for playing in [false, true] {
+                state.player.playing = playing;
+                state.cmdline.active = !playing;
+                let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+                terminal
+                    .draw(|frame| draw_status(frame, frame.area(), &state))
+                    .unwrap();
+                let label = format!(" federation: {} ", mode.label());
+                let start = width - label.len() as u16;
+                for (offset, ch) in label.chars().enumerate() {
+                    let cell = &terminal.backend().buffer()[(start + offset as u16, 0)];
+                    assert_eq!(cell.symbol(), ch.to_string());
+                    assert_eq!(cell.bg, background);
+                    assert_eq!(cell.fg, Color::Black);
+                }
+            }
+        }
+    }
+}

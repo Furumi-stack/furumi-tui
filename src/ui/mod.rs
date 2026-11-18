@@ -1,7 +1,7 @@
 mod additional_settings;
 pub mod art;
 mod federation;
-mod global;
+pub(crate) mod global;
 mod logs;
 mod playlists;
 mod popup;
@@ -400,10 +400,12 @@ fn player_right_line(state: &AppState, width: u16) -> (Line<'static>, u16) {
             format!(" {} ", state.device_playback.role.label()),
             theme::role_pill(state.device_playback.role),
         ));
-        spans.push(Span::styled(
-            format!(" · online {}", state.device_playback.online_devices.max(1)),
-            theme::dim(),
-        ));
+        if width >= 160 {
+            spans.push(Span::styled(
+                format!(" · online {}", state.device_playback.online_devices.max(1)),
+                theme::dim(),
+            ));
+        }
     }
     // Keep a gap between the flags and the username block to the right.
     spans.push(Span::raw("  "));
@@ -413,14 +415,34 @@ fn player_right_line(state: &AppState, width: u16) -> (Line<'static>, u16) {
     )
 }
 
+/// Reserve the source-mode badge first so playback details cannot clip it.
+fn player_row_areas(row: Rect, state: &AppState) -> [Rect; 3] {
+    let badge_width = (format!(" federation: {} ", state.global.filters.source_mode.label()).len()
+        as u16)
+        .min(row.width);
+    let content = Rect::new(
+        row.x,
+        row.y,
+        row.width.saturating_sub(badge_width),
+        row.height,
+    );
+    let badge = Rect::new(content.right(), row.y, badge_width, row.height);
+    let (line, _) = player_right_line(state, content.width);
+    let right_width = line.width().min(usize::from(content.width)) as u16;
+    let [title, right] = Layout::horizontal([
+        Constraint::Min(8.min(content.width)),
+        Constraint::Length(right_width),
+    ])
+    .areas(content);
+    [title, right, badge]
+}
+
 /// Shared geometry for rendering and background visualization requests.
 fn footer_areas(area: Rect, state: &AppState) -> [Rect; 3] {
     let [player_row, message_row] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let (line, volume_offset) = player_right_line(state, area.width);
-    let right_width = line.width().min(usize::from(area.width)) as u16;
-    let [_, right] =
-        Layout::horizontal([Constraint::Min(8), Constraint::Length(right_width)]).areas(player_row);
+    let [_, right, badge] = player_row_areas(player_row, state);
+    let (_, volume_offset) = player_right_line(state, area.width.saturating_sub(badge.width));
     let version_width = (env!("CARGO_PKG_VERSION").len() as u16 + 1).min(message_row.width);
     let version = Rect::new(
         message_row.x + message_row.width.saturating_sub(version_width) / 2,
@@ -469,11 +491,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     // Layout: track title left, time/progress/flags on the right. The
     // right block is built first and gets a fixed width; the title
     // truncates into whatever is left.
-    let (center, _) = player_right_line(state, area.width);
-    let center_width = (center.width() as u16).min(area.width);
-    let [title_area, right_area] =
-        Layout::horizontal([Constraint::Min(8), Constraint::Length(center_width)])
-            .areas(player_row);
+    let [title_area, right_area, mode_area] = player_row_areas(player_row, state);
+    let (center, _) = player_right_line(state, area.width.saturating_sub(mode_area.width));
 
     let mut spans = Vec::new();
     match &player.current {
@@ -498,6 +517,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), title_area);
     frame.render_widget(Paragraph::new(center), right_area);
+    let mode = state.global.filters.source_mode;
+    frame.render_widget(
+        Paragraph::new(format!(" federation: {} ", mode.label()))
+            .style(theme::source_mode_pill(mode)),
+        mode_area,
+    );
     draw_version(frame, version_area);
     if crate::visualizer::status::visible(state) {
         state.status_visualizer.draw(frame, visual_area);
@@ -550,7 +575,7 @@ fn active_artist_peer_search(state: &AppState) -> Option<String> {
     let Some(GlobalView::Artist { id, .. }) = state.global.stack.last() else {
         return None;
     };
-    if !matches!(state.artist_fed_views.get(id), Some(Loadable::Loading)) {
+    if !state.artist_federation_loading(*id) {
         return None;
     }
     let name = match state.artist_views.get(id) {

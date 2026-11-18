@@ -1281,3 +1281,68 @@ fn card_enrichment_refreshes_local_only_success_while_still_open() {
         );
     }
 }
+
+fn render_enrichment_card(state: &AppState) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::global::draw(frame, frame.area(), state))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+#[test]
+fn local_card_explains_source_filter_instead_of_waiting_for_a_request() {
+    use crate::app::enrichment;
+    let mut state = enrichment_state(false);
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
+    assert!(enrichment::prepare(&mut state, std::time::Instant::now()).is_none());
+    let text = render_enrichment_card(&state);
+    assert!(
+        !text.contains("federation: pending"),
+        "Local mode must not promise a request that is disabled"
+    );
+    assert!(
+        text.contains("Local"),
+        "the card must explain why network results are hidden"
+    );
+}
+
+#[test]
+fn card_refresh_animates_while_previous_results_stay_visible() {
+    use crate::app::enrichment::{self, Card};
+    use std::time::{Duration, Instant};
+    for release in [false, true] {
+        let mut state = enrichment_state(release);
+        let now = Instant::now();
+        assert!(enrichment::prepare(&mut state, now).is_some());
+        let card = if release {
+            Card::Release(1)
+        } else {
+            Card::Artist(1)
+        };
+        state.card_enrichment.complete(card, now);
+        if release {
+            enrichment::store_result(&mut state.release_fed_views, 1, Ok(Default::default()));
+        } else {
+            enrichment::store_result(&mut state.artist_fed_views, 1, Ok(Default::default()));
+        }
+        assert!(enrichment::prepare(&mut state, now + Duration::from_secs(30)).is_some());
+        let first = render_enrichment_card(&state);
+        assert!(first.contains(&format!("{} searching peers", state.spinner())));
+        state.advance_spinner();
+        let next = render_enrichment_card(&state);
+        assert!(next.contains(&format!("{} searching peers", state.spinner())));
+        assert_ne!(first, next);
+        state
+            .card_enrichment
+            .complete(card, now + Duration::from_secs(31));
+        assert!(!render_enrichment_card(&state).contains("searching peers"));
+    }
+}

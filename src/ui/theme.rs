@@ -73,6 +73,19 @@ pub fn role_pill(role: DevicePlaybackRole) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+pub fn source_mode_pill(mode: crate::config::settings::LibrarySourceMode) -> Style {
+    use crate::config::settings::LibrarySourceMode;
+    let bg = match mode {
+        LibrarySourceMode::Local => Color::Yellow,
+        LibrarySourceMode::My => Color::Cyan,
+        LibrarySourceMode::Global => Color::Green,
+    };
+    Style::new()
+        .fg(Color::Black)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn accent_color_for(state: &AppState) -> Color {
     match state.device_playback.role {
         DevicePlaybackRole::Jam => JAM_ACCENT,

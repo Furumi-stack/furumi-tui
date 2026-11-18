@@ -1718,6 +1718,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn artist_federation_loading(&self, id: i64) -> bool {
+        self.card_enrichment
+            .is_loading(super::enrichment::Card::Artist(id))
+            || matches!(self.artist_fed_views.get(&id), Some(Loadable::Loading))
+    }
+
+    pub fn release_federation_loading(&self, id: i64) -> bool {
+        self.card_enrichment
+            .is_loading(super::enrichment::Card::Release(id))
+            || matches!(self.release_fed_views.get(&id), Some(Loadable::Loading))
+    }
+
     pub fn advance_spinner(&mut self) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }

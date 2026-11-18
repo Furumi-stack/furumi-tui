@@ -21,6 +21,10 @@ pub(super) struct RefreshState {
 }
 
 impl RefreshState {
+    pub(super) fn is_loading(&self, card: Card) -> bool {
+        matches!(self.requests.get(&card), Some(None))
+    }
+
     fn begin(&mut self, visible: Option<Card>, now: Instant) -> bool {
         let reopened = self.visible != visible;
         self.visible = visible;

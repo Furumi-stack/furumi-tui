@@ -537,6 +537,17 @@ fn draw_artist(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor:
         about.push_str(&format!(" · appears on {}", detail.featured_tracks.len()));
     }
     let federation_line = match state.artist_fed_views.get(&id) {
+        _ if state.federation.settings.enabled
+            && !state.global.filters.source_mode.includes_network() =>
+        {
+            Some(Line::styled(
+                "federation: hidden by Local filter",
+                theme::dim(),
+            ))
+        }
+        _ if state.artist_federation_loading(id) => {
+            Some(super::loading_line(state, "searching peers…"))
+        }
         Some(Loadable::Loading) => Some(super::loading_line(state, "searching peers…")),
         Some(Loadable::Ready(card)) => {
             let tracks: usize = card
@@ -839,6 +850,17 @@ fn draw_release(frame: &mut Frame, area: Rect, state: &AppState, id: i64, cursor
     let year = detail.year.map(|y| format!(" · {y}")).unwrap_or_default();
     let tracks = crate::app::state::release_tracks(state, id, detail);
     let federation_line = match state.release_fed_views.get(&id) {
+        _ if state.federation.settings.enabled
+            && !state.global.filters.source_mode.includes_network() =>
+        {
+            Some(Line::styled(
+                "federation: hidden by Local filter",
+                theme::dim(),
+            ))
+        }
+        _ if state.release_federation_loading(id) => {
+            Some(super::loading_line(state, "searching peers…"))
+        }
         Some(Loadable::Loading) => Some(super::loading_line(state, "searching peers…")),
         Some(Loadable::Ready(release)) if !release.tracks.is_empty() => Some(Line::styled(
             format!("federation: +{} tracks", release.tracks.len()),
