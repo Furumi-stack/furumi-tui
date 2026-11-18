@@ -1680,6 +1680,7 @@ pub struct AppState {
     pub release_views: HashMap<i64, Loadable<ReleaseDetail>>,
     /// Federated tracks that enrich an already-open local release view.
     pub release_fed_views: HashMap<i64, Loadable<crate::federation::FedRelease>>,
+    pub(super) card_enrichment: super::enrichment::RefreshState,
     pub playlists: PlaylistsTab,
     pub playlist_views: HashMap<i64, Loadable<PlaylistDetail>>,
     /// Liked local-library content ids, for the ♥ markers everywhere tracks are shown.

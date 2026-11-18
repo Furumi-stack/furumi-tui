@@ -1,6 +1,7 @@
 pub mod action;
 mod cmdline;
 pub mod command;
+mod enrichment;
 pub mod event;
 pub mod input;
 pub(crate) mod popup;
@@ -310,54 +311,16 @@ fn spawn_release_federation_enrichment(
     });
 }
 
-fn maybe_enrich_open_artist(state: &mut AppState, runtime: &Runtime) {
-    if !state.federation.settings.enabled || state.active_tab != state::Tab::Global {
-        return;
-    }
-    let Some(state::GlobalView::Artist { id, .. }) = state.global.stack.last().copied() else {
-        return;
-    };
-    if state.artist_fed_views.contains_key(&id) {
-        return;
-    }
-    let Some(state::Loadable::Ready(detail)) = state.artist_views.get(&id) else {
-        return;
-    };
-    let name = detail.name.clone();
-    state.artist_fed_views.insert(id, state::Loadable::Loading);
-    spawn_artist_federation_enrichment(runtime, id, name);
-}
-
-fn maybe_enrich_open_release(state: &mut AppState, runtime: &Runtime) {
-    if !state.federation.settings.enabled
-        || !state.global.filters.source_mode.includes_network()
-        || state.active_tab != state::Tab::Global
-    {
-        return;
-    }
-    let Some(state::GlobalView::Release { id, .. }) = state.global.stack.last().copied() else {
-        return;
-    };
-    if state.release_fed_views.contains_key(&id) {
-        return;
-    }
-    let Some(state::Loadable::Ready(detail)) = state.release_views.get(&id) else {
-        return;
-    };
-    let mut artists = Vec::new();
-    for artist in &detail.artists {
-        if !artists.iter().any(|name: &String| {
-            music_dht::normalize_name(name) == music_dht::normalize_name(&artist.name)
-        }) {
-            artists.push(artist.name.clone());
+fn maybe_enrich_open_card(state: &mut AppState, runtime: &Runtime) {
+    match enrichment::prepare(state, std::time::Instant::now()) {
+        Some(enrichment::Request::Artist { id, name }) => {
+            spawn_artist_federation_enrichment(runtime, id, name);
         }
+        Some(enrichment::Request::Release { id, title, artists }) => {
+            spawn_release_federation_enrichment(runtime, id, title, artists);
+        }
+        None => {}
     }
-    if artists.is_empty() {
-        return;
-    }
-    let title = detail.title.clone();
-    state.release_fed_views.insert(id, state::Loadable::Loading);
-    spawn_release_federation_enrichment(runtime, id, title, artists);
 }
 
 fn spawn_content_id_backfill(runtime: &Runtime) {
@@ -1195,8 +1158,7 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
 
     maybe_refresh_network_library(state, runtime);
     maybe_fetch_network_artist_images(state, runtime);
-    maybe_enrich_open_artist(state, runtime);
-    maybe_enrich_open_release(state, runtime);
+    maybe_enrich_open_card(state, runtime);
 
     // Liked ids load once per session — markers are shown everywhere.
     if !state.likes_loaded {
@@ -3804,26 +3766,27 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::ArtistFederationLoaded { id, name, result } => {
             let cursor_anchor = state::artist_cursor_anchor(state, id);
-            let entry = match result {
-                Ok(card) => state::Loadable::Ready(card),
-                Err(message) => {
-                    tracing::debug!(artist = id, %name, %message, "artist federation enrichment failed");
-                    state::Loadable::Failed(message)
-                }
-            };
-            state.artist_fed_views.insert(id, entry);
+            state
+                .card_enrichment
+                .complete(enrichment::Card::Artist(id), std::time::Instant::now());
+            if let Err(message) = &result {
+                tracing::debug!(artist = id, %name, %message, "artist federation enrichment failed");
+            }
+            enrichment::store_result(&mut state.artist_fed_views, id, result);
             state::restore_artist_cursor_anchor(state, id, cursor_anchor);
         }
         AppEvent::ReleaseFederationLoaded { id, result } => {
-            let entry = match result {
-                Ok(Some(release)) => state::Loadable::Ready(release),
-                Ok(None) => state::Loadable::Ready(crate::federation::FedRelease::default()),
-                Err(message) => {
-                    tracing::debug!(release = id, %message, "release federation enrichment failed");
-                    state::Loadable::Failed(message)
-                }
-            };
-            state.release_fed_views.insert(id, entry);
+            state
+                .card_enrichment
+                .complete(enrichment::Card::Release(id), std::time::Instant::now());
+            if let Err(message) = &result {
+                tracing::debug!(release = id, %message, "release federation enrichment failed");
+            }
+            enrichment::store_result(
+                &mut state.release_fed_views,
+                id,
+                result.map(Option::unwrap_or_default),
+            );
         }
         AppEvent::NetworkArtistCacheUpdated { source_id, count } => {
             tracing::debug!(source = %source_id, count, "network artist cache updated");
@@ -3937,7 +3900,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             };
             state.artist_views.insert(id, entry);
-            maybe_enrich_open_artist(state, runtime);
+            maybe_enrich_open_card(state, runtime);
         }
         AppEvent::ReleaseViewLoaded { id, result } => {
             let entry = match result {
@@ -3948,7 +3911,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
             };
             state.release_views.insert(id, entry);
-            maybe_enrich_open_release(state, runtime);
+            maybe_enrich_open_card(state, runtime);
             // A Shift-J jump was waiting for this release: focus its track.
             if let Some((release_id, track_id)) = state.pending_release_focus
                 && release_id == id

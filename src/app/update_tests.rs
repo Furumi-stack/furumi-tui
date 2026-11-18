@@ -1073,3 +1073,211 @@ fn view_toggle() {
     update(&mut state, Action::ToggleViewMode);
     assert_eq!(state.global.view, ViewMode::Tiles);
 }
+
+fn enrichment_state(release: bool) -> AppState {
+    use crate::library::models::{ArtistRef, ReleaseDetail};
+    let mut state = AppState::default();
+    state.federation.settings.enabled = true;
+    state.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Global;
+    state.artist_views.insert(
+        1,
+        Loadable::Ready(ArtistDetail {
+            id: 1,
+            name: "Artist".into(),
+            image_path: None,
+            total_track_count: 1,
+            total_play_count: 0,
+            top_tracks: vec![test_track(1)],
+            featured_tracks: vec![],
+            releases: vec![],
+        }),
+    );
+    state.release_views.insert(
+        1,
+        Loadable::Ready(ReleaseDetail {
+            id: 1,
+            title: "Release".into(),
+            release_type: "album".into(),
+            year: None,
+            cover_path: None,
+            artists: vec![ArtistRef {
+                id: 1,
+                name: "Artist".into(),
+            }],
+            tracks: vec![test_track(1)],
+        }),
+    );
+    state.global.stack.push(if release {
+        GlobalView::Release { id: 1, cursor: 0 }
+    } else {
+        GlobalView::Artist { id: 1, cursor: 0 }
+    });
+    state
+}
+
+#[test]
+fn card_enrichment_retries_startup_failure_without_reopening() {
+    use crate::app::enrichment::{self, Card, Request};
+    use std::time::{Duration, Instant};
+    for release in [false, true] {
+        let mut state = enrichment_state(release);
+        let now = Instant::now();
+        let request = enrichment::prepare(&mut state, now).unwrap();
+        let card = match request {
+            Request::Artist { id: 1, ref name } if name == "Artist" => Card::Artist(1),
+            Request::Release {
+                id: 1,
+                ref title,
+                ref artists,
+            } if title == "Release" && artists == &["Artist"] => Card::Release(1),
+            _ => panic!("wrong enrichment request: {request:?}"),
+        };
+        // Slow requests are never duplicated, even after the refresh interval.
+        assert!(enrichment::prepare(&mut state, now + Duration::from_secs(60)).is_none());
+        let completed = now + Duration::from_secs(60);
+        state.card_enrichment.complete(card, completed);
+        if release {
+            enrichment::store_result(
+                &mut state.release_fed_views,
+                1,
+                Err("federation is not running".into()),
+            );
+        } else {
+            enrichment::store_result(
+                &mut state.artist_fed_views,
+                1,
+                Err("federation is not running".into()),
+            );
+        }
+        assert!(enrichment::prepare(&mut state, completed + Duration::from_secs(1)).is_none());
+        assert_eq!(
+            enrichment::prepare(&mut state, completed + Duration::from_secs(30)),
+            Some(request)
+        );
+        assert!(matches!(
+            state.artist_views.get(&1),
+            Some(Loadable::Ready(_))
+        ));
+        assert!(matches!(
+            state.release_views.get(&1),
+            Some(Loadable::Ready(_))
+        ));
+    }
+}
+
+#[test]
+fn card_enrichment_reopens_cached_cards_and_keeps_success_during_failed_refresh() {
+    use crate::app::enrichment::{self, Card};
+    use std::time::{Duration, Instant};
+    for release in [false, true] {
+        let mut state = enrichment_state(release);
+        let now = Instant::now();
+        let request = enrichment::prepare(&mut state, now).unwrap();
+        state.card_enrichment.complete(
+            if release {
+                Card::Release(1)
+            } else {
+                Card::Artist(1)
+            },
+            now,
+        );
+        if release {
+            enrichment::store_result(
+                &mut state.release_fed_views,
+                1,
+                Ok(crate::federation::FedRelease {
+                    title: "Release".into(),
+                    ..Default::default()
+                }),
+            );
+        } else {
+            enrichment::store_result(
+                &mut state.artist_fed_views,
+                1,
+                Ok(crate::federation::FedArtistCard {
+                    name: "Artist".into(),
+                    ..Default::default()
+                }),
+            );
+        }
+        // Successful but local-only/empty snapshots must also be refreshed.
+        assert!(enrichment::prepare(&mut state, now).is_none());
+        let view = state.global.stack.pop().unwrap();
+        assert!(enrichment::prepare(&mut state, now).is_none());
+        state.global.stack.push(view);
+        assert_eq!(
+            enrichment::prepare(&mut state, now + Duration::from_secs(1)),
+            Some(request)
+        );
+        if release {
+            assert!(matches!(
+                state.release_fed_views.get(&1),
+                Some(Loadable::Ready(_))
+            ));
+            enrichment::store_result(&mut state.release_fed_views, 1, Err("offline".into()));
+            assert!(
+                matches!(state.release_fed_views.get(&1), Some(Loadable::Ready(card)) if card.title == "Release")
+            );
+        } else {
+            assert!(matches!(
+                state.artist_fed_views.get(&1),
+                Some(Loadable::Ready(_))
+            ));
+            enrichment::store_result(&mut state.artist_fed_views, 1, Err("offline".into()));
+            assert!(
+                matches!(state.artist_fed_views.get(&1), Some(Loadable::Ready(card)) if card.name == "Artist")
+            );
+        }
+    }
+}
+
+#[test]
+fn card_enrichment_respects_network_mode_and_deduplicates_navigation() {
+    use crate::app::enrichment;
+    use crate::config::settings::LibrarySourceMode;
+    use std::time::Instant;
+    for release in [false, true] {
+        let mut state = enrichment_state(release);
+        let now = Instant::now();
+        state.federation.settings.enabled = false;
+        assert!(enrichment::prepare(&mut state, now).is_none());
+        state.federation.settings.enabled = true;
+        state.global.filters.source_mode = LibrarySourceMode::Local;
+        assert!(enrichment::prepare(&mut state, now).is_none());
+        state.global.filters.source_mode = LibrarySourceMode::Global;
+        assert!(enrichment::prepare(&mut state, now).is_some());
+        state.active_tab = Tab::Queue;
+        assert!(enrichment::prepare(&mut state, now).is_none());
+        state.active_tab = Tab::Global;
+        assert!(enrichment::prepare(&mut state, now).is_none());
+    }
+}
+
+#[test]
+fn card_enrichment_refreshes_local_only_success_while_still_open() {
+    use crate::app::enrichment::{self, Card};
+    use std::time::{Duration, Instant};
+    for release in [false, true] {
+        let mut state = enrichment_state(release);
+        let now = Instant::now();
+        let request = enrichment::prepare(&mut state, now).unwrap();
+        state.card_enrichment.complete(
+            if release {
+                Card::Release(1)
+            } else {
+                Card::Artist(1)
+            },
+            now,
+        );
+        if release {
+            enrichment::store_result(&mut state.release_fed_views, 1, Ok(Default::default()));
+        } else {
+            enrichment::store_result(&mut state.artist_fed_views, 1, Ok(Default::default()));
+        }
+        assert!(enrichment::prepare(&mut state, now + Duration::from_secs(29)).is_none());
+        assert_eq!(
+            enrichment::prepare(&mut state, now + Duration::from_secs(30)),
+            Some(request)
+        );
+    }
+}

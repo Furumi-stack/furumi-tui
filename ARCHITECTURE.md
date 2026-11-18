@@ -123,6 +123,14 @@ The DHT is the distributed index. Nodes publish compact searchable
 descriptions of their local library and query the network without contacting a
 central search service.
 
+Opening a local artist or release card in a network-enabled library view
+enriches it asynchronously. DHT matches identify likely catalog owners, while
+a bounded set of known peers can also answer directly when the index is
+incomplete. Card results are replaceable snapshots: reopening a card or
+periodic maintenance retries discovery, with at most one request per card in
+flight. A failed refresh keeps the last usable snapshot, and never prevents
+browsing the local tracks.
+
 Similarity discovery uses a separate schema-independent DHT overlay. A node
 derives a deterministic 256-bit routing signature from every local embedding,
 groups them into fixed two-level LSH buckets, and publishes compact summaries

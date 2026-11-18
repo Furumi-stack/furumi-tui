@@ -93,3 +93,45 @@ fn federation_search_ranks_exact_names_first() {
     assert_eq!(artists[0].name, "Ежемесячные");
     assert_eq!(tracks[0].title, "Ежемесячные");
 }
+
+#[test]
+fn artist_catalog_discovery_uses_known_peers_without_dht_hits() {
+    let own = music_dht::SecretKey::from_bytes(&[8; 32]).public();
+    let peer = test_owner();
+    assert_eq!(
+        artist_catalog_owners(&[], "artist", own, [own, peer, peer]),
+        vec![peer]
+    );
+    // Unrelated records must not send the card request to their owners.
+    assert!(artist_catalog_owners(&[dht_track(&["Other"], &[])], "artist", own, []).is_empty());
+}
+
+#[test]
+fn artist_catalog_discovery_prioritizes_matching_owners_and_bounds_fanout() {
+    let own = music_dht::SecretKey::from_bytes(&[8; 32]).public();
+    let peer = test_owner();
+    let known: Vec<_> = (10..60)
+        .map(|seed| music_dht::SecretKey::from_bytes(&[seed; 32]).public())
+        .collect();
+    for item in [
+        dht_track(&["Artist"], &[]),
+        dht_track(&["Host"], &["Artist"]),
+    ] {
+        let owners = artist_catalog_owners(
+            &[item],
+            "artist",
+            own,
+            known.iter().copied().chain([own, peer]),
+        );
+        assert_eq!(owners.len(), 32);
+        assert_eq!(owners[0], peer);
+        assert!(!owners.contains(&own));
+        assert_eq!(
+            owners
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            owners.len()
+        );
+    }
+}

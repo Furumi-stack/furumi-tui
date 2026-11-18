@@ -1486,31 +1486,38 @@ impl Federation {
         let own = service.endpoint_id();
         let own_hex = own.to_string();
         let normalized = music_dht::normalize_name(name);
-        let outcome = service
-            .search_network(name)
-            .await
-            .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
+        // A partial/unavailable DHT index must not prevent direct catalog
+        // requests to peers we already know. Keep discovery bounded so an
+        // open card cannot remain in Loading indefinitely.
+        let network_results = match tokio::time::timeout(
+            Duration::from_secs(10),
+            service.search_network(name),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => outcome.network_results,
+            Ok(Err(error)) => {
+                tracing::debug!(artist = %name, %error, "artist discovery failed; trying known peers");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!(artist = %name, "artist discovery timed out; trying known peers");
+                Vec::new()
+            }
+        };
         let cached_metadata = self.cached_metadata_snapshot();
         let has_cached_artist = cached_metadata
             .iter()
             .any(|cached| cached_has_artist(cached, &normalized));
-        let owners: std::collections::HashSet<EndpointId> = outcome
-            .network_results
-            .iter()
-            .filter(|item| {
-                (item.kind == ItemKind::Artist && item.normalized_name == normalized)
-                    || item
-                        .artist_names
-                        .iter()
-                        .any(|artist| music_dht::normalize_name(artist) == normalized)
-                    || item
-                        .featured_artist_names
-                        .iter()
-                        .any(|artist| music_dht::normalize_name(artist) == normalized)
-            })
-            .map(|item| item.owner)
-            .filter(|owner| *owner != own)
-            .collect();
+        let owners = artist_catalog_owners(
+            &network_results,
+            &normalized,
+            own,
+            service
+                .connected_peers()
+                .into_iter()
+                .chain(service.known_peers().into_iter().map(|peer| peer.peer_id)),
+        );
 
         let local_library = Arc::clone(&self.library);
         let local_name = name.to_string();
@@ -1565,7 +1572,7 @@ impl Federation {
             }
         }
         let mut card = catalog::merge_catalogs(name, catalogs);
-        add_dht_appearance_hits(&mut card, &outcome.network_results, &normalized, name);
+        add_dht_appearance_hits(&mut card, &network_results, &normalized, name);
         add_cached_appearance_hits(&mut card, &cached_metadata, &normalized, name);
         anyhow::ensure!(
             !card.releases.is_empty() || !card.appears_on.is_empty(),
@@ -2404,6 +2411,34 @@ fn cached_has_artist(cached: &CachedTrackMetadata, normalized_artist: &str) -> b
         .featured_artists
         .iter()
         .any(|artist| music_dht::normalize_name(artist) == normalized_artist)
+}
+
+/// Prefer advertised owners, then ask a bounded set of known peers directly.
+/// Catalog lookup is useful even before those peers' DHT records arrive.
+fn artist_catalog_owners(
+    items: &[LibraryItem],
+    normalized: &str,
+    own: EndpointId,
+    known: impl IntoIterator<Item = EndpointId>,
+) -> Vec<EndpointId> {
+    const MAX_CATALOG_PEERS: usize = 32;
+    let advertised = items
+        .iter()
+        .filter(|item| {
+            (item.kind == ItemKind::Artist && item.normalized_name == normalized)
+                || item
+                    .artist_names
+                    .iter()
+                    .chain(&item.featured_artist_names)
+                    .any(|artist| music_dht::normalize_name(artist) == normalized)
+        })
+        .map(|item| item.owner);
+    let mut seen = std::collections::HashSet::from([own]);
+    advertised
+        .chain(known)
+        .filter(|owner| seen.insert(*owner))
+        .take(MAX_CATALOG_PEERS)
+        .collect()
 }
 
 fn rank_fed_search_results(
