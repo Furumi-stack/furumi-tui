@@ -28,6 +28,13 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ConfirmPodcastUnsubscribe { title, .. }) => {
             draw_confirm_podcast_unsubscribe(frame, state, title)
         }
+        Some(Popup::ConfirmPodcastShare {
+            title,
+            urls,
+            warnings,
+            already_shared,
+            ..
+        }) => draw_confirm_podcast_share(frame, state, title, urls, warnings, *already_shared),
         Some(Popup::SimilarityPrivacyConsent { .. }) => {
             draw_similarity_privacy_consent(frame, state)
         }
@@ -1315,6 +1322,87 @@ fn draw_confirm_podcast_unsubscribe(frame: &mut Frame, state: &AppState, title: 
         ))
         .alignment(Alignment::Center),
         footer,
+    );
+}
+
+/// Sharing a podcast whose feed URL looks private. In Russian: the warning
+/// is about the user's own secret, so it must not be missed.
+fn draw_confirm_podcast_share(
+    frame: &mut Frame,
+    state: &AppState,
+    title: &str,
+    urls: &crate::podcasts::publication::ConfirmedUrls,
+    warnings: &[String],
+    already_shared: bool,
+) {
+    let width = 78.min(frame.area().width.saturating_sub(4)).max(30);
+    let mut lines = vec![
+        Line::styled(
+            format!("Поделиться подкастом «{title}» в федерации?"),
+            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(
+            "Карточка с адресом RSS-ленты станет видна всем участникам федерации, \
+             и любой из них сможет читать ленту по этому адресу.",
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Адрес похож на личный:",
+            ratatui::style::Style::new().fg(ratatui::style::Color::Yellow),
+        ),
+    ];
+    lines.extend(warnings.iter().map(|warning| {
+        Line::styled(
+            format!("• {warning}"),
+            ratatui::style::Style::new().fg(ratatui::style::Color::Yellow),
+        )
+    }));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Лента: {}", urls.feed_url.as_str()),
+        theme::dim(),
+    ));
+    if let Some(origin) = &urls.id_feed_url {
+        lines.push(Line::styled(
+            format!("Исходный адрес: {}", origin.as_str()),
+            theme::dim(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Публикацию можно отозвать, но копии, которые уже получили другие, \
+         отозвать нельзя. Подтверждение хранится только на этом устройстве.",
+        theme::dim(),
+    ));
+    let footer = if already_shared {
+        "enter/y опубликовать · x не делиться · esc/n отмена"
+    } else {
+        "enter/y опубликовать · esc/n отмена"
+    };
+    let inner_width = width.saturating_sub(2).max(1);
+    let body_height = lines
+        .iter()
+        .map(|line| {
+            let text_width = line.width().max(1) as u16;
+            text_width.div_ceil(inner_width)
+        })
+        .sum::<u16>();
+    let height = (body_height + 4).min(frame.area().height.saturating_sub(2));
+    let area = centered(frame.area(), width, height);
+    let block = Block::bordered()
+        .title(" Поделиться в федерации ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    frame.render_widget(
+        Paragraph::new(Line::styled(footer, theme::dim())).alignment(Alignment::Center),
+        footer_area,
     );
 }
 

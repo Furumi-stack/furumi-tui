@@ -17,6 +17,7 @@ use crate::app::state::{
     PodcastStoreStatus, SeasonRow,
 };
 use crate::app::update::podcasts::{played_label, sort_label};
+use crate::podcasts::publication::{Discovery, Publication};
 
 /// Width below which the side panel with the cover is dropped.
 const SIDE_PANEL_MIN_TOTAL_WIDTH: u16 = 80;
@@ -219,7 +220,7 @@ fn list_row(state: &AppState, row: PodcastListRow, width: u16) -> (Line<'static>
                 Span::raw("  ")
             };
             let summary = &podcast.summary;
-            let meta = if summary.unplayed_count > 0 {
+            let mut meta = if summary.unplayed_count > 0 {
                 format!(
                     "{} unplayed · {} ep",
                     summary.unplayed_count, summary.episode_count
@@ -227,6 +228,9 @@ fn list_row(state: &AppState, row: PodcastListRow, width: u16) -> (Line<'static>
             } else {
                 format!("{} ep", summary.episode_count)
             };
+            if summary.shared {
+                meta = format!("shared · {meta}");
+            }
             let title_width = usize::from(width).saturating_sub(2 + meta.width() + 2);
             let left = Line::from(vec![
                 marker,
@@ -293,13 +297,50 @@ fn draw_side_panel(frame: &mut Frame, area: Rect, state: &AppState, podcast: Opt
         counts.push_str(&format!(" · {} seasons", summary.season_count));
     }
     lines.push(Line::styled(counts, theme::dim()));
-    lines.push(Line::styled("private", theme::dim()));
+    lines.push(share_status_line(state, podcast));
     lines.push(fetch_status_line(state, podcast));
     if let Some(description) = &summary.meta.description {
         lines.push(Line::raw(""));
         lines.push(Line::raw(description.clone()));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
+}
+
+/// Public discovery state of one podcast: private, or shared and whether
+/// this device publishes its card.
+pub(crate) fn share_status_line(state: &AppState, podcast: &PodcastRow) -> Line<'static> {
+    let tab = &state.podcasts;
+    if tab.share_busy.contains(podcast.id()) {
+        return loading_line(state, "saving the share setting…");
+    }
+    if !podcast.summary.shared {
+        return Line::styled("private (not shared in the federation)", theme::dim());
+    }
+    let report = &tab.publication;
+    let (text, style) = match (&report.discovery, report.podcasts.get(podcast.id())) {
+        (Discovery::Off(reason), _) => (format!("shared · not published: {reason}"), theme::dim()),
+        (_, Some(Publication::HeldBack(_))) => (
+            "shared · held back on this device: the feed URL looks private, \
+             press Shift+F to confirm"
+                .to_string(),
+            Style::new().fg(Color::Yellow),
+        ),
+        (_, Some(Publication::Failed(error))) => {
+            (format!("shared · not published: {error}"), error_style())
+        }
+        (Discovery::Running { peers: 0 }, Some(Publication::Published)) => (
+            "shared · published from this device (no discovery peers yet)".to_string(),
+            theme::accent_for(state),
+        ),
+        (_, Some(Publication::Published)) => (
+            "shared · published from this device".to_string(),
+            theme::accent_for(state),
+        ),
+        (Discovery::Starting, _) | (_, Some(Publication::Pending) | None) => {
+            return loading_line(state, "shared · publishing…");
+        }
+    };
+    Line::styled(text, style)
 }
 
 /// Refresh status of one podcast: checking, the last error, or when it was

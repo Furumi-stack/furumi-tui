@@ -768,6 +768,18 @@ pub enum Popup {
         podcast_id: music_dht::podcast::PodcastId,
         title: String,
     },
+    /// Sharing a podcast whose feed URL looks private: the user confirms
+    /// publishing exactly `urls`. Enter/y publishes, Esc/n cancels; when the
+    /// podcast is already shared (publication held back on this device),
+    /// `x` turns sharing off.
+    ConfirmPodcastShare {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        urls: crate::podcasts::publication::ConfirmedUrls,
+        /// Russian descriptions of the privacy warnings.
+        warnings: Vec<String>,
+        already_shared: bool,
+    },
     /// Enabling network similarity reveals an embedding query to peers.
     SimilarityPrivacyConsent { enable_federation: bool },
     /// Derived data is safe to recreate but potentially expensive.
@@ -1796,6 +1808,10 @@ pub struct PodcastsTab {
     pub pending_select: Option<music_dht::podcast::PodcastId>,
     /// Last episode request sequence handed out.
     pub episode_seq: u64,
+    /// This device's public discovery publications (last reconciler pass).
+    pub publication: crate::podcasts::publication::PublicationReport,
+    /// A share check or share decision is being written.
+    pub share_busy: HashSet<music_dht::podcast::PodcastId>,
 }
 
 impl PodcastsTab {

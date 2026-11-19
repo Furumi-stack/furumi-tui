@@ -1734,7 +1734,10 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         | Effect::PodcastSubscribe(_)
         | Effect::PodcastRefresh { .. }
         | Effect::PodcastUnsubscribe { .. }
-        | Effect::PodcastSetPlayed { .. } => {}
+        | Effect::PodcastSetPlayed { .. }
+        | Effect::PodcastPrepareShare { .. }
+        | Effect::PodcastSetShared { .. }
+        | Effect::PodcastPublicationSync => {}
         Effect::LoadListenHistory => {
             let library = Arc::clone(&runtime.library);
             let devices = Arc::clone(&runtime.devices);
@@ -3531,7 +3534,10 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         | AppEvent::PodcastEpisodeStarted { .. }
         | AppEvent::PodcastEpisodeFailed { .. }
         | AppEvent::PodcastRefreshTick
-        | AppEvent::PodcastsDue(_) => {}
+        | AppEvent::PodcastsDue(_)
+        | AppEvent::PodcastSharePrepared { .. }
+        | AppEvent::PodcastShareSet { .. }
+        | AppEvent::PodcastPublication(_) => {}
         AppEvent::StatusVisualizationReady(ready) => {
             runtime.status_visualizer.busy = false;
             state.status_visualizer.apply(ready);

@@ -268,4 +268,19 @@ pub enum AppEvent {
     PodcastRefreshTick,
     /// Feeds due for a background refresh.
     PodcastsDue(Result<Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>, String>),
+    /// What sharing a podcast would publish (`Effect::PodcastPrepareShare`).
+    PodcastSharePrepared {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        result: Result<crate::podcasts::publication::ShareCheck, String>,
+    },
+    /// The share decision was written (`Effect::PodcastSetShared`).
+    PodcastShareSet {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        shared: bool,
+        result: Result<(), String>,
+    },
+    /// The publication reconciler finished a pass.
+    PodcastPublication(crate::podcasts::publication::PublicationReport),
 }

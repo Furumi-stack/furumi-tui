@@ -1834,6 +1834,311 @@ mod podcast_tab {
             Some(Effect::PodcastLoadEpisodes { .. })
         ));
     }
+
+    // --- Sharing in the federation (MR-T3) ---
+
+    use crate::podcasts::publication::{
+        ConfirmedUrls, Discovery, Publication, PublicationReport, ShareCheck,
+    };
+    use crossterm::event::KeyCode;
+
+    fn urls() -> ConfirmedUrls {
+        ConfirmedUrls {
+            feed_url: FeedUrl::parse("https://example.test/feed.xml").unwrap(),
+            id_feed_url: None,
+        }
+    }
+
+    fn check(warnings: bool, confirmed: bool) -> ShareCheck {
+        ShareCheck {
+            urls: urls(),
+            warnings: if warnings {
+                vec![
+                    music_dht::podcast_dht::FeedUrlPrivacyWarning::SecretQueryParameter {
+                        name: "token".into(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+            confirmed,
+        }
+    }
+
+    fn set_shared(shared: bool, confirm: Option<ConfirmedUrls>) -> Option<Effect> {
+        Some(Effect::PodcastSetShared {
+            podcast_id: podcast_id(),
+            title: "Show".into(),
+            shared,
+            confirm,
+        })
+    }
+
+    fn shared_row() -> crate::app::state::PodcastRow {
+        let mut row = fx::row("Show", 0, 1, 0);
+        row.summary.shared = true;
+        row
+    }
+
+    #[test]
+    fn sharing_a_podcast_checks_its_card_first_and_shares_without_warnings() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        assert_eq!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare {
+                podcast_id: podcast_id(),
+                title: "Show".into(),
+            })
+        );
+        // A second press while the check runs does nothing.
+        assert_eq!(update(&mut state, Action::TogglePodcastShare), None);
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(false, false)),
+        );
+        assert_eq!(effect, set_shared(true, None));
+        assert!(state.popup.is_none());
+        // Also inside the opened podcast.
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(1)));
+        assert!(matches!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare { .. })
+        ));
+        // Already confirmed for exactly these URLs: no dialog.
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, true)),
+        );
+        assert_eq!(effect, set_shared(true, None));
+    }
+
+    #[test]
+    fn a_private_looking_feed_url_is_shared_only_after_confirmation() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        update(&mut state, Action::TogglePodcastShare);
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        assert_eq!(effect, None, "nothing is written before the user confirms");
+        let Some(Popup::ConfirmPodcastShare {
+            warnings,
+            already_shared,
+            urls: shown,
+            ..
+        }) = &state.popup
+        else {
+            panic!("expected the share confirmation, got {:?}", state.popup);
+        };
+        assert_eq!(
+            warnings,
+            &vec!["в адресе ленты есть параметр «token», похожий на ключ доступа".to_string()]
+        );
+        assert!(!already_shared);
+        assert_eq!(shown, &urls());
+        assert!(state.podcasts.share_busy.is_empty());
+
+        // Esc keeps the podcast private; other keys keep the dialog.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('j')),
+            None
+        );
+        assert!(state.popup.is_some());
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('x')),
+            None
+        );
+        assert!(state.popup.is_some(), "x only stops an existing share");
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Esc),
+            None
+        );
+        assert!(state.popup.is_none());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("stays private"))
+        );
+
+        // Enter confirms exactly the URLs shown.
+        update(&mut state, Action::TogglePodcastShare);
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Enter),
+            set_shared(true, Some(urls()))
+        );
+        assert!(state.podcasts.share_busy.contains(&podcast_id()));
+        assert_eq!(
+            podcasts::share_set(&mut state, podcast_id(), "Show".into(), true, Ok(())),
+            Some(Effect::PodcastsReload)
+        );
+        assert!(state.podcasts.share_busy.is_empty());
+    }
+
+    #[test]
+    fn stopping_sharing_needs_no_dialog_and_a_held_publication_asks_again() {
+        let mut state = ready(vec![shared_row()]);
+        assert_eq!(
+            update(&mut state, Action::TogglePodcastShare),
+            set_shared(false, None)
+        );
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_id(), Publication::Published);
+        let effect = podcasts::share_set(&mut state, podcast_id(), "Show".into(), false, Ok(()));
+        assert_eq!(effect, Some(Effect::PodcastsReload));
+        assert!(state.podcasts.publication.podcasts.is_empty());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("private again"))
+        );
+
+        // Shared (for example from another device) but held back here: the
+        // key asks for this device's confirmation instead of unsharing.
+        let mut state = ready(vec![shared_row()]);
+        state.podcasts.publication.podcasts.insert(
+            podcast_id(),
+            Publication::HeldBack(check(true, false).warnings),
+        );
+        assert!(matches!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare { .. })
+        ));
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::ConfirmPodcastShare {
+                already_shared: true,
+                ..
+            })
+        ));
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('x')),
+            set_shared(false, None)
+        );
+        // Or confirms it (sharing is already on; the confirmation is new).
+        state.podcasts.share_busy.clear();
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('y')),
+            set_shared(true, Some(urls()))
+        );
+        // Held without warnings any more: just reconcile again.
+        state.podcasts.share_busy.clear();
+        assert_eq!(
+            podcasts::share_prepared(
+                &mut state,
+                podcast_id(),
+                "Show".into(),
+                Ok(check(false, false))
+            ),
+            Some(Effect::PodcastPublicationSync)
+        );
+    }
+
+    #[test]
+    fn share_errors_and_publication_failures_are_shown() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        update(&mut state, Action::TogglePodcastShare);
+        assert_eq!(
+            podcasts::share_prepared(&mut state, podcast_id(), "Show".into(), Err("boom".into())),
+            None
+        );
+        assert!(state.podcasts.share_busy.is_empty());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot share: boom"))
+        );
+        assert_eq!(
+            podcasts::share_set(
+                &mut state,
+                podcast_id(),
+                "Show".into(),
+                true,
+                Err("db".into())
+            ),
+            None
+        );
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot change sharing: db"))
+        );
+
+        state.status_message = None;
+        let mut report = PublicationReport {
+            discovery: Discovery::Running { peers: 3 },
+            ..PublicationReport::default()
+        };
+        report
+            .podcasts
+            .insert(podcast_id(), Publication::Failed("signing failed".into()));
+        podcasts::publication_reported(&mut state, report.clone());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot publish \"Show\": signing failed"))
+        );
+        // The same failure again is not repeated in the status bar.
+        state.status_message = None;
+        podcasts::publication_reported(&mut state, report);
+        assert_eq!(state.status_message, None);
+        assert_eq!(
+            state.podcasts.publication.discovery,
+            Discovery::Running { peers: 3 }
+        );
+    }
+
+    #[test]
+    fn share_actions_outside_the_tab_only_explain() {
+        let mut state = fx::ready_state(vec![fx::row("Show", 0, 1, 0)]);
+        state.active_tab = Tab::Global;
+        assert_eq!(update(&mut state, Action::TogglePodcastShare), None);
+        assert!(state.podcasts.share_busy.is_empty());
+        let mut opening = AppState {
+            active_tab: Tab::Podcasts,
+            ..AppState::default()
+        };
+        assert_eq!(update(&mut opening, Action::TogglePodcastShare), None);
+    }
 }
 
 /// Podcast episodes in the shared queue: identity by episode id (never the

@@ -904,6 +904,7 @@ mod tests {
             (key!(m), Action::ToggleEpisodePlayed),
             (shift('U'), Action::UnsubscribePodcast),
             (key!(b), Action::RestartEpisode),
+            (shift('F'), Action::TogglePodcastShare),
         ];
         for (key, action) in cases {
             assert_eq!(

@@ -136,6 +136,23 @@ pub enum Effect {
         episode_id: music_dht::podcast::EpisodeId,
         played: bool,
     },
+    /// Check what sharing a podcast would publish (privacy warnings) before
+    /// turning sharing on or confirming a held-back publication.
+    PodcastPrepareShare {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+    },
+    /// Turn sharing on or off (synced decision). `confirm` records, on this
+    /// device only, that the user confirmed publishing these feed URLs
+    /// despite privacy warnings.
+    PodcastSetShared {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        shared: bool,
+        confirm: Option<crate::podcasts::publication::ConfirmedUrls>,
+    },
+    /// Reconcile this device's public podcast cards now.
+    PodcastPublicationSync,
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -541,7 +558,8 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         | Action::CycleEpisodeSort
         | Action::CycleEpisodeFilter
         | Action::ToggleEpisodePlayed
-        | Action::UnsubscribePodcast => {
+        | Action::UnsubscribePodcast
+        | Action::TogglePodcastShare => {
             state.status_message = Some(format!(
                 "open the Podcasts tab ({}) for this command",
                 Tab::Podcasts.index() + 1

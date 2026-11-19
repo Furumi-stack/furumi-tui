@@ -18,6 +18,7 @@ use crate::app::state::{
     PODCAST_EPISODE_PAGE, PodcastListRow, PodcastRow, PodcastStoreStatus, Popup, SeasonRow, Tab,
 };
 use crate::library::models::TrackItem;
+use crate::podcasts::publication::{Publication, PublicationReport, ShareCheck, warning_ru};
 use crate::podcasts::refresh::{RefreshReport, SubscribeReport};
 
 /// The next page starts loading when the cursor is this close to the end.
@@ -59,6 +60,7 @@ pub(super) fn handle(state: &mut AppState, action: &Action) -> Option<Option<Eff
         Action::CycleEpisodeFilter => cycle_played_filter(state),
         Action::ToggleEpisodePlayed => toggle_played(state),
         Action::RestartEpisode => restart_selected(state),
+        Action::TogglePodcastShare => toggle_share(state),
         _ => return None,
     };
     Some(effect)
@@ -614,6 +616,222 @@ fn confirm_unsubscribe(state: &mut AppState) {
         podcast_id: row.id().clone(),
         title: row.title().to_string(),
     });
+}
+
+/// Shift-F: share the selected or opened podcast in the federation, or stop
+/// sharing it.
+///
+/// Turning sharing on first checks the card it would publish
+/// ([`Effect::PodcastPrepareShare`]); a feed URL that looks private asks for
+/// confirmation in [`Popup::ConfirmPodcastShare`] ([`share_prepared`]).
+/// A shared podcast whose publication is held back on this device (the URL
+/// changed or was shared from another device) asks again instead of turning
+/// sharing off; the dialog can still turn it off.
+fn toggle_share(state: &mut AppState) -> Option<Effect> {
+    if !store_ready(state) {
+        return None;
+    }
+    let Some(row) = state.podcasts.current_podcast() else {
+        state.status_message = Some("podcasts: select a podcast to share".into());
+        return None;
+    };
+    let podcast_id = row.id().clone();
+    let title = row.title().to_string();
+    let shared = row.summary.shared;
+    if state.podcasts.share_busy.contains(&podcast_id) {
+        state.status_message = Some("podcasts: still saving the share setting".into());
+        return None;
+    }
+    let held = matches!(
+        state.podcasts.publication.podcasts.get(&podcast_id),
+        Some(Publication::HeldBack(_))
+    );
+    state.podcasts.share_busy.insert(podcast_id.clone());
+    if shared && !held {
+        state.status_message = Some(format!(
+            "podcasts: stopping sharing {}…",
+            display_title(&title)
+        ));
+        return Some(Effect::PodcastSetShared {
+            podcast_id,
+            title,
+            shared: false,
+            confirm: None,
+        });
+    }
+    Some(Effect::PodcastPrepareShare { podcast_id, title })
+}
+
+/// The card check of [`toggle_share`] arrived: share right away, or ask
+/// about the privacy warnings first.
+pub fn share_prepared(
+    state: &mut AppState,
+    podcast_id: PodcastId,
+    title: String,
+    result: Result<ShareCheck, String>,
+) -> Option<Effect> {
+    let check = match result {
+        Ok(check) => check,
+        Err(err) => {
+            state.podcasts.share_busy.remove(&podcast_id);
+            state.status_message = Some(format!("podcasts: cannot share: {err}"));
+            return None;
+        }
+    };
+    let already_shared = state
+        .podcasts
+        .podcast(&podcast_id)
+        .is_some_and(|row| row.summary.shared);
+    if check.needs_confirmation() || (already_shared && !check.warnings.is_empty()) {
+        // Wait for the user; nothing is written until they confirm.
+        state.podcasts.share_busy.remove(&podcast_id);
+        state.popup = Some(Popup::ConfirmPodcastShare {
+            podcast_id,
+            title,
+            urls: check.urls,
+            warnings: check.warnings.iter().map(warning_ru).collect(),
+            already_shared,
+        });
+        return None;
+    }
+    if already_shared {
+        // Held back without warnings any more: the next pass publishes it.
+        state.podcasts.share_busy.remove(&podcast_id);
+        state.status_message = Some(format!(
+            "podcasts: {} is shared; publishing…",
+            display_title(&title)
+        ));
+        return Some(Effect::PodcastPublicationSync);
+    }
+    state.status_message = Some(format!("podcasts: sharing {}…", display_title(&title)));
+    Some(Effect::PodcastSetShared {
+        podcast_id,
+        title,
+        shared: true,
+        // Already confirmed earlier for exactly these URLs (or no warning).
+        confirm: None,
+    })
+}
+
+/// A key in [`Popup::ConfirmPodcastShare`]: Enter/y publishes exactly the
+/// URLs shown (and remembers that confirmation on this device), `x` stops
+/// sharing a podcast that is already shared, Esc/n/q cancels (nothing is
+/// written). Other keys keep the dialog open.
+pub fn share_confirmation_key(
+    state: &mut AppState,
+    popup: Popup,
+    code: crossterm::event::KeyCode,
+) -> Option<Effect> {
+    use crossterm::event::KeyCode;
+    let Popup::ConfirmPodcastShare {
+        podcast_id,
+        title,
+        urls,
+        warnings,
+        already_shared,
+    } = popup
+    else {
+        state.popup = Some(popup);
+        return None;
+    };
+    match code {
+        KeyCode::Enter | KeyCode::Char('y') => {
+            state.podcasts.share_busy.insert(podcast_id.clone());
+            state.status_message = Some(format!("podcasts: sharing {}…", display_title(&title)));
+            Some(Effect::PodcastSetShared {
+                podcast_id,
+                title,
+                shared: true,
+                confirm: Some(urls),
+            })
+        }
+        KeyCode::Char('x') if already_shared => {
+            state.podcasts.share_busy.insert(podcast_id.clone());
+            state.status_message = Some(format!(
+                "podcasts: stopping sharing {}…",
+                display_title(&title)
+            ));
+            Some(Effect::PodcastSetShared {
+                podcast_id,
+                title,
+                shared: false,
+                confirm: None,
+            })
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+            state.status_message = Some(if already_shared {
+                "podcasts: not published from this device until you confirm".into()
+            } else {
+                "podcasts: the podcast stays private".into()
+            });
+            None
+        }
+        _ => {
+            state.popup = Some(Popup::ConfirmPodcastShare {
+                podcast_id,
+                title,
+                urls,
+                warnings,
+                already_shared,
+            });
+            None
+        }
+    }
+}
+
+/// The share decision was written; the reconciler publishes or revokes.
+pub fn share_set(
+    state: &mut AppState,
+    podcast_id: PodcastId,
+    title: String,
+    shared: bool,
+    result: Result<(), String>,
+) -> Option<Effect> {
+    state.podcasts.share_busy.remove(&podcast_id);
+    let title = display_title(&title);
+    match result {
+        Ok(()) if shared => {
+            state.status_message = Some(format!(
+                "podcasts: {title} is shared in the federation (publishing from this device)"
+            ));
+            Some(Effect::PodcastsReload)
+        }
+        Ok(()) => {
+            state.podcasts.publication.podcasts.remove(&podcast_id);
+            state.status_message = Some(format!(
+                "podcasts: {title} is private again; the public card is being revoked"
+            ));
+            Some(Effect::PodcastsReload)
+        }
+        Err(err) => {
+            state.status_message = Some(format!("podcasts: cannot change sharing: {err}"));
+            None
+        }
+    }
+}
+
+/// A publication reconciler pass finished. Errors go to the status bar
+/// when they are new (the log has them too).
+pub fn publication_reported(state: &mut AppState, report: PublicationReport) {
+    let previous = std::mem::replace(&mut state.podcasts.publication, report);
+    let report = &state.podcasts.publication;
+    if let Some(error) = &report.error
+        && previous.error.as_ref() != Some(error)
+    {
+        state.status_message = Some(format!("podcasts: public discovery: {error}"));
+    }
+    for (podcast_id, publication) in &report.podcasts {
+        if let Publication::Failed(error) = publication
+            && previous.podcasts.get(podcast_id) != Some(publication)
+        {
+            let title = state
+                .podcasts
+                .podcast(podcast_id)
+                .map(|row| display_title(row.title()))
+                .unwrap_or_else(|| "a shared podcast".to_string());
+            state.status_message = Some(format!("podcasts: cannot publish {title}: {error}"));
+        }
+    }
 }
 
 fn refresh_targets(state: &mut AppState, rows: Vec<&PodcastRow>) -> Vec<(PodcastId, FeedUrl)> {

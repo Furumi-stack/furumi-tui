@@ -182,6 +182,74 @@ mod tests {
     }
 
     #[test]
+    fn podcast_share_state_is_shown_in_the_list_and_details() {
+        use crate::podcasts::publication::{Discovery, Publication};
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 3, 0)]);
+        state.podcasts.selected = crate::app::state::PODCAST_ACTION_ROWS;
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private (not shared"), "{screen}");
+        assert!(!screen.contains("shared · 3 ep"), "{screen}");
+
+        let mut row = podcast_fixtures::row("Test Show", 0, 3, 0);
+        row.summary.shared = true;
+        let mut state = podcast_fixtures::ready_state(vec![row]);
+        state.podcasts.selected = crate::app::state::PODCAST_ACTION_ROWS;
+        state.podcasts.publication.discovery = Discovery::Running { peers: 2 };
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_fixtures::podcast_id(), Publication::Published);
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("shared · 3 ep"), "{screen}");
+        assert!(screen.contains("shared · published from"), "{screen}");
+
+        state.podcasts.publication.podcasts.insert(
+            podcast_fixtures::podcast_id(),
+            Publication::HeldBack(Vec::new()),
+        );
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("held back"), "{screen}");
+
+        state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("not published:"), "{screen}");
+    }
+
+    #[test]
+    fn podcast_share_confirmation_lists_the_warnings_in_russian() {
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 1, 0)]);
+        state.popup = Some(crate::app::state::Popup::ConfirmPodcastShare {
+            podcast_id: podcast_fixtures::podcast_id(),
+            title: "Test Show".into(),
+            urls: crate::podcasts::publication::ConfirmedUrls {
+                feed_url: music_dht::podcast::FeedUrl::parse(
+                    "https://example.test/feed.xml?token=abc",
+                )
+                .unwrap(),
+                id_feed_url: None,
+            },
+            warnings: vec!["в адресе ленты есть параметр «token», похожий на ключ доступа".into()],
+            already_shared: false,
+        });
+        let screen = render(&state, 100, 30);
+        assert!(
+            screen.contains("Поделиться подкастом «Test Show»"),
+            "{screen}"
+        );
+        assert!(screen.contains("Адрес похож на личный"), "{screen}");
+        assert!(screen.contains("параметр «token»"), "{screen}");
+        assert!(screen.contains("feed.xml?token=abc"), "{screen}");
+        assert!(
+            screen.contains("enter/y опубликовать · esc/n отмена"),
+            "{screen}"
+        );
+        assert!(!screen.contains("x не делиться"), "{screen}");
+    }
+
+    #[test]
     fn podcast_seasons_and_episodes_render_progress() {
         use music_dht::podcast::ProgressStatus;
 
