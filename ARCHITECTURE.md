@@ -249,7 +249,13 @@ owner's liveness only from the owner's own announcements, so an old device
 that heard nothing would take over by automatic failover after
 `owner_timeout_ms` and replace the queue. This departs from FRID's
 `PLAYBACK_PROTOCOL.md` rule 1 ("otherwise send `None`") and is reported to
-FRID as a contract gap.
+FRID as a contract gap. An old device that mirrors such a queue drops the
+`source` its types do not know, so each placeholder becomes a music item
+titled "Private item"; when it later takes over (Play on it, a paused-startup
+claim, failover while this device is gone) or sends a command, it announces
+those. States from devices below v4 are therefore cleaned on receipt
+(`drop_echoed_private_items`: bare music items with that title and no content
+id, federated source, artist, release or duration), with a status message.
 
 Active-device leases and idle timing prevent stale snapshots from immediately
 taking control after a device reconnects. This provides practical coordination

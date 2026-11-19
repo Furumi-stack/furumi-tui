@@ -62,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such a queue to them is refused ("needs a Furumi update"), and their
   playback commands are ignored while the queue has episodes. They still get
   the playback coordination, with each episode shown as "Private item", so
-  they do not take playback over after two minutes of silence.
+  they do not take playback over after two minutes of silence. When such a
+  device does take over, the "Private item" entries it echoes back as music
+  are left out of the queue here, with a status message.
 - Jam guests see the host's podcast episodes as "Private item" (no title,
   feed or address). Guest changes that add, drop or duplicate them, or seek
   in them, are refused; a guest leaving a Jam drops the placeholders.

@@ -268,9 +268,12 @@ Podcasts and your connected devices:
   ignored while the queue has episodes, and they get no podcast data: they
   see such a queue with "Private item" in place of each episode, so they
   keep seeing this device as the playing one. An older device still takes
-  over when you choose it as the output (Play on it) or when it starts while
-  this device is paused (`take_paused_on_startup`); this device then shows
-  that device's queue, without the episodes (their saved positions stay).
+  over when you choose it as the output (Play on it), when it starts while
+  this device is paused (`take_paused_on_startup`), or by itself once this
+  device has been closed, asleep or offline for about two minutes. Its queue
+  then has an unplayable "Private item" music entry for each episode; this
+  device shows that queue without them (with a status message), and the
+  episodes' saved positions stay.
 - **Audio from the publisher.** Every device streams the episode from the
   publisher's server itself. Furumi peers never pass podcast audio to each
   other, and nothing is kept after playback.

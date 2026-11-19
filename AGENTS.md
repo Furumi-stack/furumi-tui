@@ -175,7 +175,9 @@ When changing it:
   device and its playback commands are ignored while the queue has episodes;
   never strip episodes from a queue to make it fit an old peer; an older
   peer still gets the playback coordination, with the queue redacted
-  (`redact_for_jam`), so its engine does not fail over;
+  (`redact_for_jam`), so its engine does not fail over, and the
+  "Private item" music entries it echoes back in its own states are left
+  out (`drop_echoed_private_items`), never adopted;
 - apply podcast operations and snapshot sections only through
   `PodcastStore` (`apply_remote_op`, `apply_snapshot`); never call the
   podcast store while holding the sync-log connection;
