@@ -109,6 +109,7 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
         state.search.results = None;
         state.search.fed_tracks.clear();
         state.search.fed_artists.clear();
+        state.search.fed_podcasts.clear();
         state.search.fed_loading = false;
         return;
     }
@@ -132,6 +133,7 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
     // node is up); its results render as a separate, marked section.
     state.search.fed_tracks.clear();
     state.search.fed_artists.clear();
+    state.search.fed_podcasts.clear();
     state.search.fed_loading = false;
     if runtime.federation.settings().enabled {
         state.search.fed_loading = true;
@@ -139,12 +141,34 @@ pub(super) fn schedule_search(state: &mut AppState, runtime: &Runtime) {
         let query = state.search.query.clone();
         let tx = runtime.event_tx.clone();
         let latest = Arc::clone(&runtime.search_seq);
+        let podcast_store = runtime
+            .podcasts
+            .as_ref()
+            .map(|podcasts| Arc::clone(&podcasts.services.store));
         tokio::spawn(async move {
             tokio::time::sleep(SEARCH_DEBOUNCE).await;
             if latest.load(Ordering::SeqCst) != seq {
                 return;
             }
-            let result = fed.search(&query).await.map_err(|err| format!("{err:#}"));
+            let mut result = fed.search(&query).await.map_err(|err| format!("{err:#}"));
+            // Which public podcasts this device already knows (feed
+            // aliases included), for the "subscribed" mark.
+            if let Ok(results) = &mut result
+                && let Some(store) = podcast_store
+                && !results.podcasts.is_empty()
+            {
+                let mut hits = std::mem::take(&mut results.podcasts);
+                results.podcasts = tokio::task::spawn_blocking(move || {
+                    if let Err(err) =
+                        crate::podcasts::discovery::resolve_local_ids(&store, &mut hits)
+                    {
+                        tracing::warn!("podcast search: feed aliases not resolved: {err:#}");
+                    }
+                    hits
+                })
+                .await
+                .unwrap_or_default();
+            }
             let _ = tx.send(AppEvent::FedSearchLoaded { seq, result });
         });
     }
@@ -171,6 +195,7 @@ pub(super) fn schedule_similarity_search(
     state.search.results = None;
     state.search.fed_tracks.clear();
     state.search.fed_artists.clear();
+    state.search.fed_podcasts.clear();
     state.search.fed_loading = false;
     state.active_tab = crate::app::state::Tab::Global;
     if let Some(crate::app::state::GlobalView::Search { cursor }) = state.global.stack.last_mut() {

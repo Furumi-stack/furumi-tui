@@ -28,6 +28,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ConfirmPodcastUnsubscribe { title, .. }) => {
             draw_confirm_podcast_unsubscribe(frame, state, title)
         }
+        Some(Popup::PodcastCard {
+            hit,
+            preview,
+            scroll,
+        }) => super::podcast_card::draw(frame, state, hit, preview.as_ref(), *scroll),
         Some(Popup::ConfirmPodcastShare {
             title,
             urls,
@@ -1824,7 +1829,7 @@ fn draw_name_entry(
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [rect] = Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
         .areas(area);

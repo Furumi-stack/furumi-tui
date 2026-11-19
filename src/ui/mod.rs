@@ -4,6 +4,7 @@ mod federation;
 pub(crate) mod global;
 mod logs;
 mod playlists;
+mod podcast_card;
 mod podcasts;
 mod popup;
 #[cfg(test)]
@@ -215,6 +216,142 @@ mod tests {
         state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
         let screen = render(&state, 110, 30);
         assert!(screen.contains("not published:"), "{screen}");
+    }
+
+    /// Search view with a federated artist and two public podcast cards;
+    /// the first podcast is subscribed on this device.
+    fn search_with_podcasts() -> AppState {
+        use crate::podcasts::discovery::{PodcastHit, test_hit};
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 3, 0)]);
+        state.active_tab = Tab::Global;
+        state.search.query = "show".into();
+        state.search.results = Some(Default::default());
+        state.search.fed_artists = vec![crate::federation::FedArtistHit {
+            name: "Show Band".into(),
+            peers: 2,
+        }];
+        let mut other = test_hit("https://feeds.example.test/other.xml", "Other Show");
+        other.card.author = None;
+        state.search.fed_podcasts = vec![
+            PodcastHit::new(test_hit("https://example.test/feed.xml", "Test Show")),
+            PodcastHit::new(other),
+        ];
+        state.global.stack.push(GlobalView::Search { cursor: 1 });
+        state
+    }
+
+    #[test]
+    fn search_marks_podcast_hits_apart_from_music() {
+        let screen = render(&search_with_podcasts(), 120, 20);
+        assert!(screen.contains("Federation"), "{screen}");
+        assert!(
+            screen.contains("Show Band  artist · open the card"),
+            "{screen}"
+        );
+        assert!(screen.contains("Podcasts · public cards"), "{screen}");
+        assert!(
+            screen.contains("[podcast] Test Show  Ferris Crab · open the card"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[podcast] Other Show  open the card"),
+            "{screen}"
+        );
+        assert!(screen.contains("✓ subscribed"), "{screen}");
+        assert!(screen.contains("12 ep · 1 publisher"), "{screen}");
+        // The podcasts come after the music rows.
+        let artist = screen.find("Show Band").unwrap();
+        let podcast = screen.find("[podcast]").unwrap();
+        assert!(artist < podcast, "{screen}");
+    }
+
+    #[test]
+    fn podcast_card_offers_subscribe_or_shows_already_subscribed() {
+        use crate::app::state::{Loadable, Popup};
+        use crate::podcasts::discovery::{FeedPreview, PreviewEpisode};
+        let mut state = search_with_podcasts();
+        let mut hit = state.search.fed_podcasts[1].clone();
+        hit.hit.claimed_feed_urls = vec![music_dht::podcast_dht::ClaimedFeedUrl {
+            feed_url: music_dht::podcast::FeedUrl::parse("https://elsewhere.test/claimed.xml")
+                .unwrap(),
+            publishers: hit.hit.publishers.clone(),
+        }];
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit.clone()),
+            preview: None,
+            scroll: 0,
+        });
+        let screen = render(&state, 110, 40);
+        assert!(screen.contains("[podcast] Other Show"), "{screen}");
+        assert!(screen.contains("они не проверены"), "{screen}");
+        assert!(screen.contains("Категории: Technology"), "{screen}");
+        assert!(
+            screen.contains("Выпусков: 12 · последний 2024-06-15"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Опубликовали: 1 устройство (не число подписчиков"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Лента: https://feeds.example.test/other.xml"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("(не проверен, не используется): https://elsewhere.test/claimed.xml"),
+            "{screen}"
+        );
+        assert!(screen.contains("[ Подписаться ]"), "{screen}");
+        assert!(
+            screen.contains("e — прочитать ленту без подписки"),
+            "{screen}"
+        );
+        assert!(screen.contains("enter подписаться"), "{screen}");
+        assert!(!screen.contains("Уже подписан"), "{screen}");
+
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit),
+            preview: Some(Loadable::Ready(FeedPreview {
+                title: "Other Show (feed)".into(),
+                episode_count: 3,
+                seasons: vec![(Some(1), 2), (None, 1)],
+                episodes: vec![PreviewEpisode {
+                    title: "Pilot".into(),
+                    season: Some(1),
+                    episode_number: Some(1),
+                    published_at_ms: Some(1_718_445_600_000),
+                    duration_ms: Some(2_700_000),
+                }],
+                moved_to: None,
+            })),
+            scroll: 0,
+        });
+        let screen = render(&state, 110, 40);
+        assert!(
+            screen.contains("Название в ленте: Other Show (feed)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("В ленте: 3 выпуска · сезон 1: 2, без сезона: 1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("• Pilot  S1E1 · 2024-06-15 · 45:00"),
+            "{screen}"
+        );
+        assert!(screen.contains("… и ещё 2"), "{screen}");
+
+        // The subscribed podcast: «Уже подписан», Enter opens it.
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(state.search.fed_podcasts[0].clone()),
+            preview: None,
+            scroll: 0,
+        });
+        let screen = render(&state, 110, 40);
+        assert!(screen.contains("✓ Уже подписан"), "{screen}");
+        assert!(screen.contains("enter открыть"), "{screen}");
+        assert!(!screen.contains("[ Подписаться ]"), "{screen}");
     }
 
     #[test]

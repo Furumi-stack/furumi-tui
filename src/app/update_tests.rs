@@ -2525,3 +2525,234 @@ mod podcast_queue {
         assert!(crate::app::update::podcasts::synced(&mut opening, Vec::new(), true).is_empty());
     }
 }
+
+mod podcast_discovery {
+    use crossterm::event::KeyCode;
+    use music_dht::podcast::{FeedUrl, PodcastId};
+    use music_dht::podcast_dht::ClaimedFeedUrl;
+
+    use super::*;
+    use crate::app::podcast_fixtures::{self as fx, podcast_id};
+    use crate::app::state::{Loadable, PODCAST_ACTION_ROWS, Popup};
+    use crate::app::update::podcast_discovery::{card_key, preview_loaded};
+    use crate::podcasts::discovery::{FeedPreview, PodcastHit, test_hit};
+
+    const ORIGIN: &str = "https://feeds.example.test/origin.xml";
+    const CLAIMED: &str = "https://elsewhere.example.test/claimed.xml";
+
+    /// A card whose publisher also claims the feed moved elsewhere.
+    fn claimed_hit() -> PodcastHit {
+        let mut hit = test_hit(ORIGIN, "Rust Radio");
+        let claimed = FeedUrl::parse(CLAIMED).unwrap();
+        hit.claimed_feed_urls = vec![ClaimedFeedUrl {
+            feed_url: claimed.clone(),
+            publishers: hit.publishers.clone(),
+        }];
+        hit.card.feed_url = claimed;
+        hit.card.id_feed_url = Some(FeedUrl::parse(ORIGIN).unwrap());
+        PodcastHit::new(hit)
+    }
+
+    /// The search view with one local track, a federated artist and the
+    /// given podcast hits; the podcast store is ready with `rows`.
+    fn search_state(rows: Vec<crate::app::state::PodcastRow>, hits: Vec<PodcastHit>) -> AppState {
+        let mut state = fx::ready_state(rows);
+        state.active_tab = Tab::Global;
+        state.search.query = "rust radio".into();
+        state.search.results = Some(crate::library::models::SearchResults {
+            tracks: vec![test_track(1)],
+            ..Default::default()
+        });
+        state.search.fed_artists = vec![crate::federation::FedArtistHit {
+            name: "Rust Radio Band".into(),
+            peers: 2,
+        }];
+        state.search.fed_podcasts = hits;
+        state.global.stack.push(GlobalView::Search { cursor: 0 });
+        state
+    }
+
+    fn open_card_at(state: &mut AppState, cursor: usize) -> Popup {
+        if let Some(GlobalView::Search { cursor: at }) = state.global.stack.last_mut() {
+            *at = cursor;
+        }
+        assert_eq!(update(state, Action::Select), None);
+        state.popup.take().expect("the card opens")
+    }
+
+    #[test]
+    fn the_cursor_reaches_podcast_hits_after_the_music_results() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert_eq!(state.search.total_len(), 3);
+        update(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.global.stack.last(),
+            Some(GlobalView::Search { cursor: 2 })
+        ));
+        // Enter on a podcast opens its card; nothing is played or queued.
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert!(state.player.queue.is_empty());
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { hit, preview: None, scroll: 0 }) if hit.title() == "Rust Radio"
+        ));
+        // The music rows keep their behavior.
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PlayCurrent)
+        );
+    }
+
+    #[test]
+    fn subscribing_from_a_card_uses_the_origin_url_only() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        let Some(Effect::PodcastSubscribeFromCard(hit)) = effect else {
+            panic!("expected a subscription, got {effect:?}");
+        };
+        assert_eq!(hit.feed_url.as_str(), ORIGIN);
+        assert_eq!(
+            hit.podcast_id,
+            PodcastId::from_feed_url(&FeedUrl::parse(ORIGIN).unwrap())
+        );
+        assert!(state.podcasts.subscribing);
+        assert!(matches!(state.popup, Some(Popup::PodcastCard { .. })));
+
+        // One subscription at a time.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Char('s')), None);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already being added"))
+        );
+
+        // Esc closes without anything else.
+        state.podcasts.subscribing = false;
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Esc), None);
+        assert!(state.popup.is_none());
+
+        // Without a podcast store nothing is requested.
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        state.podcasts.store = crate::app::state::PodcastStoreStatus::Opening;
+        let popup = open_card_at(&mut state, 2);
+        assert_eq!(card_key(&mut state, popup, KeyCode::Enter), None);
+        assert!(!state.podcasts.subscribing);
+    }
+
+    #[test]
+    fn already_subscribed_cards_open_the_podcast_instead() {
+        // Subscribed under the card's own id.
+        let mut hit = test_hit("https://example.test/feed.xml", "Test Show");
+        hit.card.episode_count = None;
+        let mut state = search_state(
+            vec![fx::row("Test Show", 0, 3, 0)],
+            vec![PodcastHit::new(hit)],
+        );
+        assert!(state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            matches!(&effect, Some(Effect::PodcastLoadEpisodes { query, .. }) if query.podcast_id == podcast_id()),
+            "{effect:?}"
+        );
+        assert_eq!(state.active_tab, Tab::Podcasts);
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS);
+        assert!(state.popup.is_none());
+        assert!(!state.podcasts.subscribing);
+
+        // Subscribed under another id: the card's origin URL is a feed
+        // alias of that podcast here (resolved by the search task).
+        let mut aliased = claimed_hit();
+        assert_ne!(aliased.hit.podcast_id, podcast_id());
+        aliased.local_id = podcast_id();
+        let mut state = search_state(vec![fx::row("Test Show", 0, 3, 0)], vec![aliased]);
+        assert!(state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            !matches!(effect, Some(Effect::PodcastSubscribeFromCard(_))),
+            "{effect:?}"
+        );
+        assert_eq!(state.active_tab, Tab::Podcasts);
+
+        // Not subscribed: an unsubscribed podcast is not in the rows.
+        let state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert!(!state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+    }
+
+    #[test]
+    fn the_episode_preview_is_requested_once_and_folded_in() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Char('e'));
+        let Some(Effect::PodcastPreview {
+            podcast_id: card_id,
+            feed_url,
+        }) = effect
+        else {
+            panic!("expected a preview request, got {effect:?}");
+        };
+        assert_eq!(feed_url.as_str(), ORIGIN, "never the claimed URL");
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Char('e')), None);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Loading),
+                ..
+            })
+        ));
+        // Scrolling keeps the card.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Down), None);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard { scroll: 1, .. })
+        ));
+
+        let feed = FeedPreview {
+            title: "Rust Radio".into(),
+            episode_count: 0,
+            seasons: Vec::new(),
+            episodes: Vec::new(),
+            moved_to: None,
+        };
+        // A preview of another card is ignored.
+        preview_loaded(&mut state, podcast_id(), Ok(Box::new(feed.clone())));
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Loading),
+                ..
+            })
+        ));
+        preview_loaded(
+            &mut state,
+            card_id.clone(),
+            Err("HTTP 404 Not Found".into()),
+        );
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Failed(_)),
+                ..
+            })
+        ));
+        // A failed preview may be asked again.
+        let popup = state.popup.take().unwrap();
+        assert!(matches!(
+            card_key(&mut state, popup, KeyCode::Char('e')),
+            Some(Effect::PodcastPreview { .. })
+        ));
+        preview_loaded(&mut state, card_id, Ok(Box::new(feed.clone())));
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { preview: Some(Loadable::Ready(ready)), .. }) if *ready == feed
+        ));
+    }
+}

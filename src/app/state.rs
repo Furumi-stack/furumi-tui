@@ -780,6 +780,16 @@ pub enum Popup {
         warnings: Vec<String>,
         already_shared: bool,
     },
+    /// A public podcast card from the search results: its claims, an
+    /// optional episode preview read from the feed, and "Подписаться" (or
+    /// "Уже подписан" when this device is subscribed under any of its ids).
+    PodcastCard {
+        hit: Box<crate::podcasts::discovery::PodcastHit>,
+        /// `None` until the user asks for the episodes (`e`).
+        preview: Option<Loadable<crate::podcasts::discovery::FeedPreview>>,
+        /// First body line shown.
+        scroll: u16,
+    },
     /// Enabling network similarity reveals an embedding query to peers.
     SimilarityPrivacyConsent { enable_federation: bool },
     /// Derived data is safe to recreate but potentially expensive.
@@ -1432,6 +1442,9 @@ pub struct SearchState {
     /// Artists a federated card can be opened for — from artist records and
     /// from the artist names of matching tracks.
     pub fed_artists: Vec<crate::federation::FedArtistHit>,
+    /// Public podcast cards (type `podcast`), listed after the federated
+    /// tracks; Enter opens the card.
+    pub fed_podcasts: Vec<crate::podcasts::discovery::PodcastHit>,
     pub fed_loading: bool,
     /// Present only for a track-seeded search; text-search refreshes must not
     /// replace this page with a title query.
@@ -1445,6 +1458,23 @@ pub struct SearchState {
 }
 
 impl SearchState {
+    /// Rows the cursor can reach in a text search: local artists, releases
+    /// and tracks, then federated artists, tracks and podcasts.
+    pub fn total_len(&self) -> usize {
+        self.results.as_ref().map_or(0, SearchResults::len)
+            + self.fed_artists.len()
+            + self.fed_tracks.len()
+            + self.fed_podcasts.len()
+    }
+
+    /// Something federated is shown (or still loading).
+    pub fn has_federated(&self) -> bool {
+        !self.fed_tracks.is_empty()
+            || !self.fed_artists.is_empty()
+            || !self.fed_podcasts.is_empty()
+            || self.fed_loading
+    }
+
     pub fn similarity_len(&self) -> usize {
         usize::from(self.similarity_source_track.is_some()) + self.similarity_tracks.len()
     }
@@ -1824,6 +1854,13 @@ impl PodcastsTab {
 
     pub fn podcast(&self, id: &music_dht::podcast::PodcastId) -> Option<&PodcastRow> {
         self.podcasts().iter().find(|row| row.id() == id)
+    }
+
+    /// This device is subscribed to the podcast of a public card: under the
+    /// card's id or under the id its origin URL resolves to here (a feed
+    /// alias of a podcast subscribed earlier).
+    pub fn subscribed_to(&self, hit: &crate::podcasts::discovery::PodcastHit) -> bool {
+        hit.ids().into_iter().any(|id| self.podcast(id).is_some())
     }
 
     pub fn list_rows(&self) -> Vec<PodcastListRow> {

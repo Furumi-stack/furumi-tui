@@ -67,7 +67,7 @@ pub(super) fn handle(state: &mut AppState, action: &Action) -> Option<Option<Eff
 }
 
 /// Whether podcast actions may run; explains why not in the status bar.
-fn store_ready(state: &mut AppState) -> bool {
+pub(super) fn store_ready(state: &mut AppState) -> bool {
     match &state.podcasts.store {
         PodcastStoreStatus::Ready => true,
         PodcastStoreStatus::Opening => {
@@ -371,6 +371,15 @@ pub fn reveal_episode_podcast(state: &mut AppState, track: &TrackItem) -> Option
     let episode = track.podcast_episode_ref()?;
     let podcast_id = episode.podcast_id.clone();
     let title = episode.podcast_title.clone();
+    reveal_podcast(state, podcast_id, &title)
+}
+
+/// Switches to the Podcasts tab and opens a subscribed podcast.
+pub(super) fn reveal_podcast(
+    state: &mut AppState,
+    podcast_id: PodcastId,
+    title: &str,
+) -> Option<Effect> {
     state.active_tab = Tab::Podcasts;
     state.help_visible = false;
     state.track_selection.clear();
@@ -400,7 +409,7 @@ pub fn reveal_episode_podcast(state: &mut AppState, track: &TrackItem) -> Option
         None => {
             state.status_message = Some(format!(
                 "podcasts: {} is not subscribed on this device",
-                display_title(&title)
+                display_title(title)
             ));
             None
         }
@@ -1077,7 +1086,7 @@ pub fn subscribed(state: &mut AppState, result: Result<SubscribeReport, String>)
     }
 }
 
-fn display_title(title: &str) -> String {
+pub(super) fn display_title(title: &str) -> String {
     if title.trim().is_empty() {
         "the podcast".to_string()
     } else {

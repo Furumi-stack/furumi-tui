@@ -1737,7 +1737,9 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         | Effect::PodcastSetPlayed { .. }
         | Effect::PodcastPrepareShare { .. }
         | Effect::PodcastSetShared { .. }
-        | Effect::PodcastPublicationSync => {}
+        | Effect::PodcastPublicationSync
+        | Effect::PodcastSubscribeFromCard(_)
+        | Effect::PodcastPreview { .. } => {}
         Effect::LoadListenHistory => {
             let library = Arc::clone(&runtime.library);
             let devices = Arc::clone(&runtime.devices);
@@ -3537,7 +3539,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         | AppEvent::PodcastsDue(_)
         | AppEvent::PodcastSharePrepared { .. }
         | AppEvent::PodcastShareSet { .. }
-        | AppEvent::PodcastPublication(_) => {}
+        | AppEvent::PodcastPublication(_)
+        | AppEvent::PodcastPreviewLoaded { .. } => {}
         AppEvent::StatusVisualizationReady(ready) => {
             runtime.status_visualizer.busy = false;
             state.status_visualizer.apply(ready);
@@ -3798,6 +3801,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Ok(results) => {
                     state.search.fed_artists = results.artists;
                     state.search.fed_tracks = results.tracks;
+                    state.search.fed_podcasts = results.podcasts;
                 }
                 Err(message) => tracing::warn!(%message, "federated search failed"),
             }

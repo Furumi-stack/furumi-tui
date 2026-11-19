@@ -20,10 +20,14 @@
 //! * [`progress`] writes resume positions, completions and listening
 //!   sessions in order on its own thread;
 //! * [`publication`] publishes the podcasts the user chose to share to the
-//!   public discovery overlay (`music_dht::podcast_dht`) and revokes them.
+//!   public discovery overlay (`music_dht::podcast_dht`) and revokes them;
+//! * [`discovery`] handles public cards found by search: their order, the
+//!   "already subscribed" mark, an episode preview read from the feed and
+//!   subscribing from a card.
 //!
 //! Only RSS metadata is stored. Audio stays on the publisher's server.
 
+pub mod discovery;
 pub mod fetch;
 pub mod playback;
 pub mod progress;

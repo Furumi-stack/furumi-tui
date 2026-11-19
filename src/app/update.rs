@@ -153,6 +153,15 @@ pub enum Effect {
     },
     /// Reconcile this device's public podcast cards now.
     PodcastPublicationSync,
+    /// Subscribe to the podcast of a public card with its origin feed URL
+    /// (`podcasts::discovery::subscribe_from_hit`); reported as
+    /// `AppEvent::PodcastSubscribed`.
+    PodcastSubscribeFromCard(Box<music_dht::podcast_dht::PodcastSearchHit>),
+    /// Read a public card's feed for an episode preview (nothing stored).
+    PodcastPreview {
+        podcast_id: music_dht::podcast::PodcastId,
+        feed_url: music_dht::podcast::FeedUrl,
+    },
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -2068,9 +2077,7 @@ fn move_selection(state: &mut AppState, dx: isize, dy: isize) {
             let total = if state.search.similarity_source.is_some() {
                 state.search.similarity_len()
             } else {
-                state.search.results.as_ref().map_or(0, |r| r.len())
-                    + state.search.fed_artists.len()
-                    + state.search.fed_tracks.len()
+                state.search.total_len()
             } as isize;
             if total == 0 {
                 return;
@@ -2194,9 +2201,7 @@ fn current_view_len(state: &AppState) -> usize {
             if state.search.similarity_source.is_some() {
                 state.search.similarity_len()
             } else {
-                state.search.results.as_ref().map_or(0, |r| r.len())
-                    + state.search.fed_artists.len()
-                    + state.search.fed_tracks.len()
+                state.search.total_len()
             }
         }
         Some(GlobalView::FedArtist { .. }) => fed_card_len(state),
@@ -2632,6 +2637,10 @@ fn select_current(state: &mut AppState) -> Option<Effect> {
             state.active_tab = Tab::Global;
             Some(Effect::FedOpenArtist(name))
         }
+        Outcome::OpenPodcastCard(index) => {
+            podcast_discovery::open_card(state, index);
+            None
+        }
         Outcome::OpenFedRelease { name, card, index } => {
             let start =
                 if card.releases.get(index).is_some_and(|release| {
@@ -2873,6 +2882,7 @@ enum Outcome {
         start: usize,
     },
     OpenFedArtist(String),
+    OpenPodcastCard(usize),
     OpenFedRelease {
         name: String,
         card: crate::federation::FedArtistCard,
@@ -2883,7 +2893,8 @@ enum Outcome {
 }
 
 /// Enter inside the federated section of the search results: artists open
-/// their card, tracks queue up like a local track list.
+/// their card, tracks queue up like a local track list, podcasts open their
+/// public card.
 fn fed_outcome(state: &AppState, fed_index: usize) -> Outcome {
     let artists = &state.search.fed_artists;
     if fed_index < artists.len() {
@@ -2891,7 +2902,12 @@ fn fed_outcome(state: &AppState, fed_index: usize) -> Outcome {
     }
     let start = fed_index - artists.len();
     if start >= state.search.fed_tracks.len() {
-        return Outcome::Nothing;
+        let podcast = start - state.search.fed_tracks.len();
+        return if podcast < state.search.fed_podcasts.len() {
+            Outcome::OpenPodcastCard(podcast)
+        } else {
+            Outcome::Nothing
+        };
     }
     Outcome::Play {
         tracks: state
@@ -3396,6 +3412,7 @@ fn not_yet(state: &mut AppState, what: &str) {
     state.status_message = Some(format!("{what}: coming in a later milestone"));
 }
 
+pub(crate) mod podcast_discovery;
 pub(crate) mod podcasts;
 
 #[cfg(test)]

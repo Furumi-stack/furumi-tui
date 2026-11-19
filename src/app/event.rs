@@ -283,4 +283,9 @@ pub enum AppEvent {
     },
     /// The publication reconciler finished a pass.
     PodcastPublication(crate::podcasts::publication::PublicationReport),
+    /// A public card's feed was read for a preview (`Effect::PodcastPreview`).
+    PodcastPreviewLoaded {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<Box<crate::podcasts::discovery::FeedPreview>, String>,
+    },
 }

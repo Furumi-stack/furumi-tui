@@ -12,9 +12,10 @@ use music_dht::podcast::{PodcastEpisodeRef, reaches_completion};
 
 use super::event::AppEvent;
 use super::state::{AppState, PodcastRow};
-use super::update::{Effect, podcasts};
+use super::update::{Effect, podcast_discovery, podcasts};
 use super::{Runtime, err_string, perform_effect};
 use crate::library::models::TrackItem;
+use crate::podcasts::discovery;
 use crate::podcasts::playback::{self, StartAt};
 use crate::podcasts::progress::{
     CHECKPOINT_INTERVAL, ProgressCommand, ProgressEvent, ProgressWriter,
@@ -169,8 +170,18 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
                     state.podcasts.refreshing.remove(id);
                 }
             }
-            if matches!(effect, Effect::PodcastSubscribe(_)) {
+            if matches!(
+                effect,
+                Effect::PodcastSubscribe(_) | Effect::PodcastSubscribeFromCard(_)
+            ) {
                 state.podcasts.subscribing = false;
+            }
+            if let Effect::PodcastPreview { podcast_id, .. } = &effect {
+                podcast_discovery::preview_loaded(
+                    state,
+                    podcast_id.clone(),
+                    Err("podcasts are unavailable".into()),
+                );
             }
             if let Effect::PodcastPrepareShare { podcast_id, .. }
             | Effect::PodcastSetShared { podcast_id, .. } = &effect
@@ -213,6 +224,26 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
                     .await
                     .map_err(err_string);
                 let _ = tx.send(AppEvent::PodcastSubscribed(result));
+            });
+        }
+        Effect::PodcastSubscribeFromCard(hit) => {
+            tokio::spawn(async move {
+                let result = discovery::subscribe_from_hit(&services, &hit, now_ms())
+                    .await
+                    .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastSubscribed(result));
+            });
+        }
+        Effect::PodcastPreview {
+            podcast_id,
+            feed_url,
+        } => {
+            tokio::spawn(async move {
+                let result = discovery::preview(&services.fetcher, &feed_url)
+                    .await
+                    .map(Box::new)
+                    .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastPreviewLoaded { podcast_id, result });
             });
         }
         Effect::PodcastRefresh { targets, manual } => {
@@ -346,6 +377,8 @@ fn is_podcast_effect(effect: &Effect) -> bool {
             | Effect::PodcastPrepareShare { .. }
             | Effect::PodcastSetShared { .. }
             | Effect::PodcastPublicationSync
+            | Effect::PodcastSubscribeFromCard(_)
+            | Effect::PodcastPreview { .. }
     )
 }
 
@@ -465,6 +498,10 @@ pub fn handle_event(
             podcasts::share_set(state, podcast_id, title, shared, result)
                 .into_iter()
                 .collect()
+        }
+        AppEvent::PodcastPreviewLoaded { podcast_id, result } => {
+            podcast_discovery::preview_loaded(state, podcast_id, result);
+            Vec::new()
         }
         AppEvent::PodcastPublication(report) => {
             podcasts::publication_reported(state, report);

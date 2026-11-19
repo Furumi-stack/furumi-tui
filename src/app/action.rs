@@ -249,7 +249,7 @@ impl Action {
             Action::CycleSourceMode => "Cycle source mode: Local / My / Global".into(),
             Action::OpenLibraryFilters => "Library filters…".into(),
             Action::OpenCommandLine => "Command line (:help for commands)".into(),
-            Action::OpenSearch => "Search artists, releases, tracks".into(),
+            Action::OpenSearch => "Search artists, releases, tracks, public podcasts".into(),
             Action::EditSelected => "Edit the selected item".into(),
             Action::DeleteSelected => "Delete the selected item".into(),
             Action::AddPodcast => "Add podcast (RSS URL)".into(),
