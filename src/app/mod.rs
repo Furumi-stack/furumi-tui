@@ -3381,6 +3381,9 @@ fn handle_playback_command(
                     runtime.player.seek(std::time::Duration::from_secs_f64(
                         state.player.position_secs,
                     ));
+                    // A seek from a controlling device is the user's
+                    // explicit action too (podcast progress generation).
+                    podcast_runtime::seeked(state, runtime, state.player.position_secs);
                 }
                 if state.player.paused && !old_paused {
                     runtime.player.pause();
