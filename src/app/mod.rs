@@ -392,7 +392,9 @@ fn spawn_content_id_backfill(runtime: &Runtime) {
             if let Err(err) = federation.sync_now().await {
                 tracing::warn!("federation sync after content id backfill failed: {err:#}");
             }
-            let _ = tx.send(AppEvent::FederationStatus(federation.status().await));
+            let _ = tx.send(AppEvent::FederationStatus(Box::new(
+                federation.status().await,
+            )));
             let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
         }
     });
@@ -503,7 +505,7 @@ pub async fn run(
         tokio::spawn(async move {
             fed.start_if_enabled().await;
             let status = fed.status().await;
-            let _ = tx.send(AppEvent::FederationStatus(status));
+            let _ = tx.send(AppEvent::FederationStatus(Box::new(status)));
             let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
         });
     }
@@ -1841,7 +1843,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                     Ok(()) => "federation: library published".to_string(),
                     Err(err) => format!("federation sync failed: {err:#}"),
                 };
-                let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+                let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
                 let _ = tx.send(AppEvent::FedSyncFinished(message));
             });
         }
@@ -1901,7 +1903,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             tokio::spawn(async move {
                 let result = fed.device_invite().await.map_err(|err| format!("{err:#}"));
                 let _ = tx.send(AppEvent::DeviceInvite(result));
-                let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+                let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
                 let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
             });
         }
@@ -2024,6 +2026,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                     let result = federation
                         .track_info(preview)
                         .await
+                        .map(Box::new)
                         .map_err(|err| format!("{err:#}"));
                     let _ = tx.send(AppEvent::FedTrackInfoLoaded {
                         placeholder_id,
@@ -2461,7 +2464,7 @@ pub(crate) fn fed_apply_settings(state: &mut AppState, runtime: &Runtime) {
         if let Err(err) = fed.apply_settings(settings).await {
             let _ = tx.send(AppEvent::StatusMessage(format!("federation: {err:#}")));
         }
-        let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
     });
 }
 
@@ -2474,7 +2477,7 @@ pub(crate) fn fed_connect(runtime: &Runtime, ticket: String) {
             Ok(peer) => format!("federation: connected to {}…", &peer[..peer.len().min(10)]),
             Err(err) => format!("federation: {err:#}"),
         };
-        let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
         let _ = tx.send(AppEvent::StatusMessage(message));
     });
 }
@@ -2492,7 +2495,7 @@ pub(crate) fn device_connect(runtime: &Runtime, invite: String) {
             .device_connect(&invite)
             .await
             .map_err(|err| format!("{err:#}"));
-        let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
         let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
         let _ = tx.send(AppEvent::DeviceConnectResult(result));
     });
@@ -2813,7 +2816,7 @@ fn fed_spawn_status(runtime: &Runtime) {
     let devices = Arc::clone(&runtime.devices);
     let tx = runtime.event_tx.clone();
     tokio::spawn(async move {
-        let _ = tx.send(AppEvent::FederationStatus(fed.status().await));
+        let _ = tx.send(AppEvent::FederationStatus(Box::new(fed.status().await)));
         let _ = tx.send(AppEvent::DeviceSyncStatus(devices.status()));
     });
 }
@@ -3427,7 +3430,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
         }
         AppEvent::FederationStatus(status) => {
-            state.federation.status = Some(status);
+            state.federation.status = Some(*status);
         }
         AppEvent::DeviceSyncStatus(status) => {
             state.federation.devices = Some(status);
@@ -3790,7 +3793,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                             && track.fed.as_ref().is_some_and(|fed| fed.item_id == item_id)
                     })
                 {
-                    *slot = enriched;
+                    *slot = *enriched;
                 }
             }
             Err(message) => {

@@ -130,7 +130,8 @@ pub enum AppEvent {
         tracks: Vec<TrackItem>,
     },
     /// A status snapshot for the Federation tab.
-    FederationStatus(crate::federation::FedStatus),
+    /// Boxed to keep `AppEvent` small; the status is large and rare.
+    FederationStatus(Box<crate::federation::FedStatus>),
     /// Federated live-search results (artists a card can be opened for,
     /// plus matching tracks).
     FedSearchLoaded {
@@ -172,7 +173,8 @@ pub enum AppEvent {
     FedTrackInfoLoaded {
         placeholder_id: i64,
         item_id: String,
-        result: Result<TrackItem, String>,
+        /// Boxed: `TrackItem` is large since it can carry a podcast episode.
+        result: Result<Box<TrackItem>, String>,
     },
     /// This peer's connection ticket, requested from the Federation tab.
     FedTicket(Result<String, String>),
