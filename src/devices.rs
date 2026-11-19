@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use furumi_library::podcasts::{
+    OpStamp as PodcastOpStamp, PodcastLocalOp, StampSource as PodcastStampSource,
+};
 use music_dht::device_sync::{ListenEvent, ListenTrackMetadata};
 use music_dht::{ByteStream, MusicDhtService, NetworkId, PeerTicket, SecretKey, StreamAcceptor};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1325,6 +1328,30 @@ impl DeviceSync {
         Ok(())
     }
 
+    /// Runs a `PodcastStore` local action with stamps reserved in this
+    /// device's sync log and appends the operations it returns with exactly
+    /// those stamps (`op_id`, `seq`, `hlc_ms`).
+    ///
+    /// The log connection stays locked from the first stamp until the
+    /// operations are appended, so no sync batch can read past a reserved
+    /// `seq` before its operation exists. Lock order is podcast store, then
+    /// this log: never call the podcast store while holding `self.conn`.
+    pub fn run_podcast_action<T>(
+        &self,
+        action: impl FnOnce(&mut dyn PodcastStampSource) -> Result<(T, Vec<PodcastLocalOp>)>,
+    ) -> Result<T> {
+        let identity = self.ensure_identity()?;
+        let mut log = PodcastLogStamps {
+            conn: &self.conn,
+            guard: None,
+            device_id: identity.device_id,
+            reserved: BTreeMap::new(),
+        };
+        let (value, ops) = action(&mut log)?;
+        log.append(ops)?;
+        Ok(value)
+    }
+
     pub async fn sync_once(
         &self,
         service: Arc<MusicDhtService>,
@@ -2303,6 +2330,9 @@ impl DeviceSync {
     }
 
     fn ops_for_peer(&self, peer_device_id: &str) -> Result<Vec<SyncOpWire>> {
+        // Podcast operations (`podcast_*`, protocol v4) stay in the log but
+        // are not sent yet: this client still announces protocol v3 and its
+        // wire types cannot carry them. Gated sending comes with sync v4.
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT o.op_id, o.origin_device_id, o.seq, o.hlc_ms, o.payload_json
@@ -2310,6 +2340,7 @@ impl DeviceSync {
              LEFT JOIN sync_peer_acks a
                ON a.peer_device_id = ?1 AND a.origin_device_id = o.origin_device_id
              WHERE o.seq > COALESCE(a.max_seq, 0)
+               AND substr(o.kind, 1, 8) != 'podcast_'
                AND (
                     o.kind != 'playback_command'
                     OR (
@@ -2797,6 +2828,104 @@ impl DeviceSync {
             [],
         )?;
         Ok(())
+    }
+}
+
+/// Stamp source over the sync log for [`DeviceSync::run_podcast_action`].
+struct PodcastLogStamps<'a> {
+    conn: &'a std::sync::Mutex<Connection>,
+    /// Taken at the first stamp and held until the operations are appended.
+    guard: Option<std::sync::MutexGuard<'a, Connection>>,
+    device_id: String,
+    /// `op_id` -> reserved `seq`.
+    reserved: BTreeMap<String, i64>,
+}
+
+impl PodcastStampSource for PodcastLogStamps<'_> {
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn next_stamp(&mut self) -> Result<PodcastOpStamp> {
+        let conn = self.guard.get_or_insert_with(|| lock(self.conn));
+        let seq = get_meta(conn, "local_seq")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let last_hlc = get_meta(conn, "last_hlc_ms")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let hlc_ms = now_ms().max(last_hlc + 1);
+        set_meta(conn, "local_seq", &seq.to_string())?;
+        set_meta(conn, "last_hlc_ms", &hlc_ms.to_string())?;
+        let op_id = format!("{}:{seq}", self.device_id);
+        self.reserved.insert(op_id.clone(), seq);
+        Ok(PodcastOpStamp::new(op_id, self.device_id.clone(), hlc_ms))
+    }
+}
+
+impl PodcastLogStamps<'_> {
+    fn append(mut self, ops: Vec<PodcastLocalOp>) -> Result<()> {
+        if ops.len() != self.reserved.len() {
+            tracing::warn!(
+                reserved = self.reserved.len(),
+                returned = ops.len(),
+                "podcast action reserved stamps it did not return operations for"
+            );
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let conn = self.guard.get_or_insert_with(|| lock(self.conn));
+        for op in ops {
+            let Some(&seq) = self.reserved.get(&op.stamp.op_id) else {
+                anyhow::bail!(
+                    "podcast operation {} was not stamped by this sync log",
+                    op.stamp.op_id
+                );
+            };
+            let op = op.into_wire(seq);
+            let payload = serde_json::to_value(&op.payload)?;
+            let kind = payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("podcast_unknown")
+                .to_string();
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_ops
+                    (op_id, origin_device_id, seq, kind, payload_json, hlc_ms,
+                     received_at_ms, tombstone)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    op.op_id,
+                    op.origin_device_id,
+                    op.seq,
+                    kind,
+                    payload.to_string(),
+                    op.hlc_ms,
+                    now_ms(),
+                    i64::from(op.payload.is_tombstone()),
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO sync_vectors (device_id, max_seq)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    max_seq = MAX(max_seq, excluded.max_seq)",
+                params![op.origin_device_id, op.seq],
+            )?;
+            tracing::debug!(op_id = %op.op_id, kind, "recorded podcast sync op");
+        }
+        Ok(())
+    }
+}
+
+impl crate::podcasts::OpLog for DeviceSync {
+    fn record(
+        &self,
+        action: &mut dyn FnMut(&mut dyn PodcastStampSource) -> Result<Vec<PodcastLocalOp>>,
+    ) -> Result<()> {
+        self.run_podcast_action(|stamps| Ok(((), action(stamps)?)))
     }
 }
 

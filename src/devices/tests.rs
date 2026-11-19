@@ -937,3 +937,136 @@ fn stale_synced_playlist_item_metadata_repairs_pending_fed_track() {
     assert!(detail.tracks[0].is_fed_pending());
     assert_eq!(detail.tracks[0].title, fed.title);
 }
+
+fn podcast_meta() -> music_dht::podcast::PodcastMeta {
+    music_dht::podcast::PodcastMeta {
+        feed_url: music_dht::podcast::FeedUrl::parse("https://example.test/feed.xml").unwrap(),
+        title: "Show".into(),
+        author: None,
+        description: None,
+        link: None,
+        image_url: None,
+    }
+}
+
+/// Rows of the local sync log: (op_id, seq, kind, payload_json, hlc_ms).
+fn logged_ops(sync: &DeviceSync) -> Vec<(String, i64, String, String, i64)> {
+    let conn = lock(&sync.conn);
+    let mut stmt = conn
+        .prepare("SELECT op_id, seq, kind, payload_json, hlc_ms FROM sync_ops ORDER BY seq")
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+}
+
+#[test]
+fn podcast_actions_are_appended_to_the_sync_log_with_their_stamps() {
+    let sync = test_sync();
+    let device_id = sync.ensure_identity().unwrap().device_id;
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    sync.record_content_like(&format!("b3:{}", "a".repeat(64)), true)
+        .unwrap();
+    let outcome = sync
+        .run_podcast_action(|stamps| {
+            let outcome = store.subscribe(stamps, &podcast_meta())?;
+            let ops = outcome.ops.clone();
+            Ok((outcome, ops))
+        })
+        .unwrap();
+    let ops = logged_ops(&sync);
+    assert_eq!(ops.len(), 2, "{ops:?}");
+    let (op_id, seq, kind, payload_json, hlc_ms) = &ops[1];
+    assert_eq!(kind, "podcast_subscription_set");
+    assert_eq!(*seq, 2);
+    assert_eq!(*op_id, format!("{device_id}:2"));
+    assert!(*hlc_ms > ops[0].4, "hlc keeps increasing");
+    // The log carries the shared FRID payload, and the store's register
+    // was written with exactly this stamp.
+    let payload: music_dht::device_sync::SyncOpPayload =
+        serde_json::from_str(payload_json).unwrap();
+    assert!(payload.is_podcast());
+    let register = store.subscription(&outcome.podcast_id).unwrap().unwrap();
+    assert_eq!(register.op_id, *op_id);
+    assert_eq!(register.hlc_ms, *hlc_ms);
+    let vector = sync.vector().unwrap();
+    assert_eq!(vector.get(&device_id), Some(&2));
+
+    // Unsubscribing emits two operations with consecutive stamps; a music
+    // operation afterwards continues the same sequence.
+    let unsubscribe = sync
+        .run_podcast_action(|stamps| {
+            let ops = store.unsubscribe(stamps, &outcome.podcast_id)?;
+            Ok((ops.len(), ops))
+        })
+        .unwrap();
+    assert_eq!(unsubscribe, 2);
+    sync.record_content_like(&format!("b3:{}", "b".repeat(64)), true)
+        .unwrap();
+    let ops = logged_ops(&sync);
+    let kinds: Vec<(i64, &str)> = ops
+        .iter()
+        .map(|(_, seq, kind, ..)| (*seq, kind.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (1, "track_like_set"),
+            (2, "podcast_subscription_set"),
+            (3, "podcast_subscription_set"),
+            (4, "podcast_share_set"),
+            (5, "track_like_set"),
+        ]
+    );
+
+    // An action that emits nothing leaves the log alone.
+    sync.run_podcast_action(|stamps| {
+        let ops = store.unsubscribe(stamps, &outcome.podcast_id)?;
+        Ok(((), ops))
+    })
+    .unwrap();
+    assert_eq!(logged_ops(&sync).len(), 5);
+}
+
+#[test]
+fn podcast_ops_are_not_sent_to_peers_before_sync_v4() {
+    let sync = test_sync();
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    sync.run_podcast_action(|stamps| {
+        let outcome = store.subscribe(stamps, &podcast_meta())?;
+        let ops = outcome.ops.clone();
+        Ok(((), ops))
+    })
+    .unwrap();
+    sync.record_content_like(&format!("b3:{}", "a".repeat(64)), true)
+        .unwrap();
+    // This client still speaks protocol v3; its wire types cannot carry the
+    // podcast payload, so the batch keeps only the music operation.
+    let ops = sync.ops_for_peer("dev_peer").unwrap();
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(ops[0].payload, SyncOpPayload::TrackLikeSet { .. }));
+}
+
+#[test]
+fn failed_podcast_actions_append_nothing() {
+    let sync = test_sync();
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    let unknown = music_dht::podcast::PodcastId::from_feed_url(
+        &music_dht::podcast::FeedUrl::parse("https://example.test/other.xml").unwrap(),
+    );
+    let result = sync.run_podcast_action(|stamps| {
+        let ops = store.set_shared(stamps, &unknown, true)?;
+        Ok(((), ops))
+    });
+    assert!(result.is_err());
+    assert!(logged_ops(&sync).is_empty());
+}
