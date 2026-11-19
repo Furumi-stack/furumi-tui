@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - unreleased
+
+### Added
+
+- Sharing a podcast in the federation (`Shift+F` in the `podcasts` context,
+  off by default): the synced share decision makes each device publish a
+  signed public card of the podcast in the FRID discovery overlay
+  (`podcast_dht`, advertised in the capability manifest); share-off and
+  unsubscribe revoke it with a tombstone. Feed URLs that look private are
+  published only after a confirmation on that device. The list and side
+  panel show whether a podcast is shared and whether this device publishes
+  it.
+- Search (`/`, with the federation running) also finds public podcast cards.
+  They are listed after the music results under "Podcasts · public cards" with
+  a `[podcast]` marker, the number of publishing devices, and "✓ subscribed"
+  when this device is subscribed (also through a feed alias). Local-only
+  search is unchanged.
+- Enter on a podcast hit opens its card: title, author, categories,
+  description, episode count, newest episode, publishing devices, feed URL
+  and unverified moved-feed claims. `e` reads the seasons and episodes from
+  the feed without subscribing. «Подписаться» (Enter) subscribes privately
+  with the card's origin feed URL, so the podcast id is the card's, and
+  reads everything from the feed itself; «Уже подписан» opens the podcast
+  in the Podcasts tab instead.
+
+### Changed
+
+- `furumi-tui` 0.5.0.
+
 ## [0.4.0] - unreleased
 
 ### Added
@@ -45,14 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is cancelled at the next start or stop; pause pressed while an episode
   connects is kept; seeks that do not move the audio are not saved.
 - Podcast key bindings in the `podcasts` context: `o`, `/`, `Shift+R`,
-  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`, `b`, `Shift+F`.
-- Sharing a podcast in the federation (`Shift+F`, off by default): the
-  synced share decision makes each device publish a signed public card of
-  the podcast in the FRID discovery overlay (`podcast_dht`, advertised in
-  the capability manifest); share-off and unsubscribe revoke it with a
-  tombstone. Feed URLs that look private are published only after a
-  confirmation on that device. The list and side panel show whether a
-  podcast is shared and whether this device publishes it.
+  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`, `b`.
 - An optional top-level `version` in `keymap.toml`; the current format is
   `version = 2`, and a `podcasts` binding context.
 

@@ -419,6 +419,21 @@ The TUI owns what the contract leaves to clients:
   (`podcast-share-confirmations.json`, mode 0600) and bound to the exact
   URLs. Without a readable podcast store this device revokes all its own
   cards. Logs carry counts only.
+- **Finding and subscribing.** `Federation::search` runs
+  `PodcastDht::search` next to the music DHT search and takes the podcast
+  entries of `merge_search_results` (exact titles first) as
+  `podcasts::discovery::PodcastHit`s; the music sections keep their own
+  aggregation and ranking, so music results are unchanged. Off the UI
+  thread each hit's origin URL is resolved with
+  `PodcastStore::resolve_podcast_id`, and the "subscribed" mark compares
+  that id and the card's id with the subscribed podcasts, so a feed alias
+  counts. A card is a publisher's claim: only `PodcastSearchHit::feed_url`
+  (the origin URL the id is hashed from) is ever fetched, both for the
+  episode preview (`discovery::preview`, nothing stored) and for
+  «Подписаться» (`discovery::subscribe_from_hit` → `refresh::subscribe_url`),
+  which refuses a hit whose id does not match its URL and stores only what
+  the feed says. Claimed moved-feed URLs are displayed, never fetched or
+  recorded as aliases. The new subscription is private.
 - **Progress.** `podcasts::progress` runs one writer thread so every
   progress write of this device is ordered. The app tick follows the
   position and actual listening time and sends: an explicit start (or
@@ -603,7 +618,8 @@ The source tree follows the architectural responsibilities:
 - `federation/` owns DHT-facing search, peer catalogs, and audio exchange;
 - `podcasts/` owns feed HTTP (conditional requests, redirects, limits),
   refresh scheduling policy, the episode stream reader and the progress
-  writer, and the publication of shared podcasts; the podcast model,
+  writer, the publication of shared podcasts and subscribing from public
+  cards; the podcast model,
   identity, merge rules, SQLite store and discovery overlay come from FRID;
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;

@@ -312,8 +312,33 @@ Sharing a podcast (public discovery):
   key of its public music library, so a shared podcast can be linked to
   that library and to the device's network address.
 - Publishing needs the federation to be running; the side panel shows
-  "not published" with the reason otherwise. Search and subscribing from a
-  public card come in a later step of this feature.
+  "not published" with the reason otherwise.
+
+Finding public podcasts:
+
+- The search (`/` outside the Podcasts tab, with the federation
+  running) also looks for public podcast cards. They are listed after the
+  music results under "Podcasts · public cards", each marked `[podcast]`,
+  with the number of devices that publish the card (devices, not
+  subscribers; anyone can create devices, so it is not a sign of trust) or
+  "✓ subscribed" when this device already follows the podcast, also when
+  you subscribed under an older or newer address of the same feed. Your
+  query words go to the discovery peers, as they do for music search. With
+  the federation off, search stays local and shows no podcasts.
+- Enter opens the card (in Russian): what its publishers claim (title,
+  author, categories, description, number of episodes and date of the
+  newest one), the feed URL, and addresses some publishers claim the feed
+  moved to, shown as unverified and never used. `e` reads the feed itself
+  and lists its seasons and episodes without subscribing; this is a request
+  to the podcast's own server, not to the publisher.
+- «Подписаться» (Enter) subscribes with the card's feed URL, the address
+  the podcast's id is derived from, so the podcast is the same one the
+  publisher shares. Furumi then reads the feed from its own server and
+  stores only what the feed says; the publisher does not need to stay
+  online, and nothing from the card is kept. The new subscription is
+  private like any other: it is not shared until you press `Shift+F`, and
+  your progress is your own. «Уже подписан» means this device is already
+  subscribed; Enter then opens the podcast in the Podcasts tab.
 
 Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
 same file the earlier podcast test build used; it is upgraded in place). If

@@ -67,9 +67,13 @@ update it only when dependencies change.
   (`music_dht::podcast`, `furumi_library::podcasts`) and must not be
   re-derived here. Public podcast cards are published only through
   `podcasts::publication` (`PodcastDht::sync_shares` over the merged
-  registers): never publish a podcast directly, never log feed URLs or ids
-  of podcasts that are not shared. Queue items are identified by `state::track_key` /
-  `TrackItem::key`, never by numeric id (every episode has the same sentinel
+  registers): never publish a podcast directly, never log feed URLs or ids of
+  podcasts that are not shared, never put progress, history, counters or
+  device names into a card. Public cards found by search are publisher claims:
+  subscribe and preview only through `podcasts::discovery`, which uses the
+  card's origin URL (`PodcastSearchHit::feed_url`), never a claimed URL, and
+  never stores card metadata. Queue items are identified by `state::track_key`
+  / `TrackItem::key`, never by numeric id (every episode has the same sentinel
   id); music-only code must skip `TrackItem::is_podcast()` items.
 - `src/devices.rs` owns trusted-device replication, membership, and playback
   coordination. Its wire types are the shared `music_dht::device_sync`
