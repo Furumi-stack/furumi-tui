@@ -61,6 +61,9 @@ update it only when dependencies change.
 - `src/player/` owns rodio playback and audio analysis.
 - `src/federation/` owns DHT discovery, peer catalogs, audio exchange, and
   federation caches.
+- `src/podcasts/` owns podcast feed HTTP and refresh policy; podcast identity,
+  merge rules and the SQLite store come from FRID (`music_dht::podcast`,
+  `furumi_library::podcasts`) and must not be re-derived here.
 - `src/devices.rs` owns trusted-device replication, membership, and playback
   coordination.
 - `src/ui/` renders `AppState`; rendering code must not start background work

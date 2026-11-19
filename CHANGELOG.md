@@ -9,13 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A Podcasts tab on `4`. It is a placeholder in this build and states that
-  podcasts are not available yet.
+- A Podcasts tab on `4`: subscribe to RSS/Atom feeds by URL, browse
+  podcast → seasons → episodes with saved position, played state, duration and
+  date, search episodes, filter by listening state, change the order, mark
+  episodes played or unplayed, check one or all feeds, and unsubscribe (progress
+  and history are kept). Feeds are checked in the background with conditional
+  requests and back-off; permanent redirects become feed aliases.
+- Podcast data uses the shared FRID store (`furumi_library::podcasts`) in
+  `podcasts.sqlite3`; a database of the earlier podcast test build is migrated
+  in place, and a newer or foreign file is refused without changes.
+- Podcast subscription and progress changes are recorded in the trusted-device
+  sync log with their own stamps. They are not sent to other devices yet.
+- Podcast key bindings in the `podcasts` context: `o`, `/`, `Shift+R`,
+  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`.
 - An optional top-level `version` in `keymap.toml`; the current format is
   `version = 2`, and a `podcasts` binding context.
 
 ### Changed
 
+- `music-dht` 0.6.0 and `furumi-library` 0.3.0.
 - Tab order is now `1` Library, `2` Playlists, `3` Queue, `4` Podcasts,
   `5` Settings, `6` Logs, for the tab bar, Tab/Shift+Tab, and the default
   number keys.

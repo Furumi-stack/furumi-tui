@@ -271,6 +271,39 @@ order and have their tab indices remapped. A `version` key that TOML attached
 to a binding (written after a `[[keymaps]]` header) is rejected, so a versioned
 file is never silently mistaken for a legacy one.
 
+## Podcasts
+
+Podcasts are a separate content type, not library tracks. The shared contract
+lives in FRID: `music_dht::podcast` defines podcast and episode identity, feed
+URL canonicalization, the RSS/Atom parser and the merge rules, and
+`furumi_library::podcasts::PodcastStore` persists the catalog, the personal
+registers (subscription, share, progress) and listening sessions in
+`podcasts.sqlite3`. The TUI does not re-derive ids or merge rules.
+
+The TUI owns what the contract leaves to clients:
+
+- **Fetching.** Feeds are fetched with conditional requests (ETag,
+  Last-Modified), bounded size and time, and redirects followed by hand so the
+  store learns whether every hop was permanent; only then does the new URL
+  become a feed alias and the fetch URL. Validators are dropped after a
+  permanent redirect because they belong to the old address.
+- **Scheduling.** The store keeps each feed's local fetch state (validators,
+  last error, consecutive failures, next check). A timer asks it which
+  subscriptions are due; feeds are checked at most a few at a time, a success
+  waits an hour, and failures back off exponentially (honouring
+  `Retry-After`). Errors never clear the stored catalog.
+- **Runtime boundary.** Every store call, fetch and parse runs on the blocking
+  pool or as a task and reports back through `AppEvent`s; `update::podcasts`
+  holds the pure state transitions. Store open failures (newer schema,
+  foreign file) disable only the Podcasts tab and leave the file untouched.
+- **Sync log.** Local actions (subscribe, unsubscribe, mark played) draw their
+  operation stamps from the device-sync log through
+  `DeviceSync::run_podcast_action`, and the operations are appended with
+  exactly those stamps, so the store's registers and the log agree. The lock
+  order is podcast store, then sync log. Podcast operations are protocol v4
+  payloads; until this client speaks sync v4 they stay in the log and are not
+  sent to peers.
+
 ## Scripted visualizations
 
 Visualizations are an extension boundary rather than hard-coded rendering
@@ -398,6 +431,7 @@ Furumi stores different kinds of state according to their lifetime:
 | State | Storage | Role |
 | --- | --- | --- |
 | Library, playlists, likes, history | SQLite | Durable local source of truth |
+| Podcast subscriptions, episodes, progress | SQLite (`podcasts.sqlite3`, FRID store) | Durable personal state and a refreshable episode catalog |
 | Device operation log and replicas | SQLite | Offline synchronization |
 | Versioned track embeddings | SQLite | Durable, locally rebuildable similarity data |
 | Federation catalog cache | SQLite/cache | Faster network browsing |
@@ -405,7 +439,8 @@ Furumi stores different kinds of state according to their lifetime:
 | Settings, keymap, identity | Platform config/data dirs | Node configuration |
 | Queue and playback snapshots | Application/device sync state | Continuity and handoff |
 
-Caches are replaceable. The local library and device operation log are durable.
+Caches are replaceable. The local library, the podcast store's personal state
+and the device operation log are durable.
 This distinction lets maintenance and recovery code discard derived network
 data without risking the user's collection.
 
@@ -434,6 +469,9 @@ The source tree follows the architectural responsibilities:
 - `similarity.rs` owns model acquisition, preprocessing, background indexing,
   and the replaceable exact in-memory index;
 - `federation/` owns DHT-facing search, peer catalogs, and audio exchange;
+- `podcasts/` owns feed HTTP (conditional requests, redirects, limits) and
+  refresh scheduling policy; the podcast model, identity and SQLite store
+  come from FRID;
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;
 - `ui/` renders the TUI;

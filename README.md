@@ -163,9 +163,9 @@ Shift+Tab cycle through them:
 | `5` | Settings |
 | `6` | Logs |
 
-The Podcasts tab is a placeholder in this build; podcast support is not
-available yet. On narrow terminals the tab bar shortens titles and then shows
-only the numbers, keeping the active tab's full name. Press `?` for the full list of bindings and commands.
+On narrow terminals the tab bar shortens titles and then shows only the
+numbers, keeping the active tab's full name. Press `?` for the full list of
+bindings and commands.
 
 Bindings can be overridden in `keymap.toml` in the platform config directory
 (`~/.config/furumi/keymap.toml` on Linux,
@@ -180,6 +180,40 @@ prototype podcast build); Furumi adapts their tab shortcuts in memory so they
 keep opening the same tabs, shows a short notice at startup, and never
 rewrites the file. Add `version = 2` once the indices match the new order to
 take them literally and silence the notice.
+
+### Podcasts
+
+The Podcasts tab (`4`) follows RSS and Atom podcast feeds. Furumi stores only
+the feed's episode information; audio stays on the publisher's server and is
+never imported into the music library or offered to other peers.
+
+- **Add podcast** (`o`, or the first row) takes a feed URL; `feed://`,
+  `podcast://` and URLs without a scheme are accepted. Nothing is stored unless
+  the URL serves a feed. New subscriptions are private.
+- The list shows each podcast's unplayed and total episode counts and its
+  check status; `!` marks a podcast whose last check failed, with the error in
+  the side panel (or below the list on narrow terminals).
+- `Enter` opens a podcast. Podcasts with seasons show their seasons first
+  (plus "All episodes" and "Without a season"); `Esc` goes back.
+- Episodes show the date, season/episode number, duration and listening
+  state: `●` not started, `◐` in progress with the saved position, `✓` played.
+  `/` searches titles and descriptions, `f` cycles all / unplayed / in
+  progress / played, `Shift+S` changes the order, `m` marks the selected
+  episode played or unplayed.
+- `Shift+R` checks the selected podcast for new episodes, `Ctrl+R` checks all
+  of them. Feeds are also checked in the background about once an hour with
+  conditional requests; a failing feed is retried with growing pauses and its
+  known episodes stay available. A permanent redirect moves the subscription
+  to the new address.
+- `Shift+U` (or `Shift+D`) unsubscribes after a confirmation. Listening
+  progress and history are kept, so subscribing again continues where you
+  left off.
+
+Playing episodes from the Podcasts tab is not available in this build yet.
+Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
+same file the earlier podcast test build used; it is upgraded in place). If
+that file was written by a newer Furumi or is not a podcast database, the tab
+explains why it is unavailable and the file is left unchanged.
 
 ### Now playing in tmux
 
