@@ -2594,7 +2594,7 @@ mod podcast_discovery {
         assert!(state.player.queue.is_empty());
         assert!(matches!(
             &state.popup,
-            Some(Popup::PodcastCard { hit, preview: None, scroll: 0 }) if hit.title() == "Rust Radio"
+            Some(Popup::PodcastCard { hit, preview: None, scroll: 0, .. }) if hit.title() == "Rust Radio"
         ));
         // The music rows keep their behavior.
         let mut state = search_state(Vec::new(), vec![claimed_hit()]);

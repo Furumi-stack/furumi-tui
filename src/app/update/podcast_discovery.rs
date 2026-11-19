@@ -26,6 +26,7 @@ pub fn open_card(state: &mut AppState, index: usize) {
         hit: Box::new(hit.clone()),
         preview: None,
         scroll: 0,
+        max_scroll: std::cell::Cell::new(u16::MAX),
     });
 }
 
@@ -37,6 +38,7 @@ pub fn card_key(state: &mut AppState, popup: Popup, key: KeyCode) -> Option<Effe
         hit,
         mut preview,
         mut scroll,
+        max_scroll,
     } = popup
     else {
         state.popup = Some(popup);
@@ -68,10 +70,14 @@ pub fn card_key(state: &mut AppState, popup: Popup, key: KeyCode) -> Option<Effe
         KeyCode::Home | KeyCode::Char('g') => scroll = 0,
         _ => {}
     }
+    // Never past the end the last draw measured, so scrolling back moves
+    // the view at once.
+    scroll = scroll.min(max_scroll.get());
     state.popup = Some(Popup::PodcastCard {
         hit,
         preview,
         scroll,
+        max_scroll,
     });
     effect
 }

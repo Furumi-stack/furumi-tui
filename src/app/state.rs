@@ -789,6 +789,10 @@ pub enum Popup {
         preview: Option<Loadable<crate::podcasts::discovery::FeedPreview>>,
         /// First body line shown.
         scroll: u16,
+        /// Largest useful `scroll` at the last draw (the wrapped body
+        /// height minus the visible rows); scroll keys stop there.
+        /// `u16::MAX` until the card was drawn.
+        max_scroll: std::cell::Cell<u16>,
     },
     /// Enabling network similarity reveals an embedding query to peers.
     SimilarityPrivacyConsent { enable_federation: bool },

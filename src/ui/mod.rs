@@ -245,6 +245,51 @@ mod tests {
         assert!(screen.contains("private (not shared"), "{screen}");
     }
 
+    #[test]
+    fn the_podcast_card_scrolls_exactly_to_its_last_line() {
+        use crate::app::state::Popup;
+        use crate::app::update::podcast_discovery::card_key;
+        use crossterm::event::KeyCode;
+        let mut state = search_with_podcasts();
+        let mut hit = state.search.fed_podcasts[1].clone();
+        // Long words word-wrap into far more rows than their character
+        // count suggests (one 50-character word per 90-column row).
+        let word = "x".repeat(50);
+        hit.hit.card.description = Some(vec![word.as_str(); 30].join(" "));
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit),
+            preview: None,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
+        });
+        let last_line = "e — прочитать ленту";
+        let screen = render(&state, 110, 30);
+        assert!(!screen.contains(last_line), "below the fold:\n{screen}");
+
+        // Paging far past the end stops at the last line ...
+        for _ in 0..20 {
+            let popup = state.popup.take().unwrap();
+            assert_eq!(card_key(&mut state, popup, KeyCode::PageDown), None);
+        }
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains(last_line), "{screen}");
+        let Some(Popup::PodcastCard {
+            scroll, max_scroll, ..
+        }) = &state.popup
+        else {
+            panic!("the card is open");
+        };
+        assert_eq!(*scroll, max_scroll.get());
+        let end = *scroll;
+        // ... and one step back moves the view at once.
+        let popup = state.popup.take().unwrap();
+        card_key(&mut state, popup, KeyCode::Up);
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { scroll, .. }) if *scroll == end - 1
+        ));
+    }
+
     /// Search view with a federated artist and two public podcast cards;
     /// the first podcast is subscribed on this device.
     fn search_with_podcasts() -> AppState {
@@ -308,6 +353,7 @@ mod tests {
             hit: Box::new(hit.clone()),
             preview: None,
             scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
         });
         let screen = render(&state, 110, 40);
         assert!(screen.contains("[podcast] Other Show"), "{screen}");
@@ -354,6 +400,7 @@ mod tests {
                 subscribed_as: None,
             })),
             scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
         });
         let screen = render(&state, 110, 40);
         assert!(
@@ -375,6 +422,7 @@ mod tests {
             hit: Box::new(state.search.fed_podcasts[0].clone()),
             preview: None,
             scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
         });
         let screen = render(&state, 110, 40);
         assert!(screen.contains("✓ Уже подписан"), "{screen}");

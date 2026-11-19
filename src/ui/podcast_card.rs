@@ -23,6 +23,7 @@ pub(super) fn draw(
     hit: &PodcastHit,
     preview: Option<&Loadable<FeedPreview>>,
     scroll: u16,
+    max_scroll: &std::cell::Cell<u16>,
 ) {
     let subscribed =
         crate::app::update::podcast_discovery::subscribed_id(state, hit, preview).is_some();
@@ -31,11 +32,12 @@ pub(super) fn draw(
 
     let width = 92.min(frame.area().width.saturating_sub(4)).max(30);
     let inner_width = width.saturating_sub(2).max(1);
-    let body_height = lines
-        .iter()
-        .map(|line| (line.width().max(1) as u16).div_ceil(inner_width))
-        .sum::<u16>();
-    let height = (body_height + 4).min(frame.area().height.saturating_sub(2));
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // The height of the word-wrapped text, as it is rendered.
+    let body_height = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    let height = body_height
+        .saturating_add(4)
+        .min(frame.area().height.saturating_sub(2));
     let area = centered(frame.area(), width, height);
     let block = Block::bordered()
         .title(" Подкаст · публичная карточка ")
@@ -46,13 +48,9 @@ pub(super) fn draw(
     frame.render_widget(block, area);
     let [body, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    let max_scroll = body_height.saturating_sub(body.height);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll.min(max_scroll), 0)),
-        body,
-    );
+    let last = body_height.saturating_sub(body.height);
+    max_scroll.set(last);
+    frame.render_widget(paragraph.scroll((scroll.min(last), 0)), body);
     let footer = if subscribed {
         "enter открыть · e выпуски · ↑↓ прокрутка · esc закрыть"
     } else {

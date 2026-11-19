@@ -32,7 +32,8 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             hit,
             preview,
             scroll,
-        }) => super::podcast_card::draw(frame, state, hit, preview.as_ref(), *scroll),
+            max_scroll,
+        }) => super::podcast_card::draw(frame, state, hit, preview.as_ref(), *scroll, max_scroll),
         Some(Popup::ConfirmPodcastShare {
             title,
             urls,
@@ -1386,14 +1387,12 @@ fn draw_confirm_podcast_share(
         "enter/y опубликовать · esc/n отмена"
     };
     let inner_width = width.saturating_sub(2).max(1);
-    let body_height = lines
-        .iter()
-        .map(|line| {
-            let text_width = line.width().max(1) as u16;
-            text_width.div_ceil(inner_width)
-        })
-        .sum::<u16>();
-    let height = (body_height + 4).min(frame.area().height.saturating_sub(2));
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // The height of the word-wrapped text, as it is rendered.
+    let body_height = u16::try_from(body.line_count(inner_width)).unwrap_or(u16::MAX);
+    let height = body_height
+        .saturating_add(4)
+        .min(frame.area().height.saturating_sub(2));
     let area = centered(frame.area(), width, height);
     let block = Block::bordered()
         .title(" Поделиться в федерации ")
@@ -1402,9 +1401,9 @@ fn draw_confirm_podcast_share(
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let [body, footer_area] =
+    let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    frame.render_widget(body, body_area);
     frame.render_widget(
         Paragraph::new(Line::styled(footer, theme::dim())).alignment(Alignment::Center),
         footer_area,
