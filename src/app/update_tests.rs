@@ -2008,12 +2008,36 @@ mod podcast_tab {
         let effect = podcasts::share_set(&mut state, podcast_id(), "Show".into(), false, Ok(()));
         assert_eq!(effect, Some(Effect::PodcastsReload));
         assert!(state.podcasts.publication.podcasts.is_empty());
+        assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
         assert!(
             state
                 .status_message
                 .as_deref()
                 .is_some_and(|m| m.contains("private again"))
         );
+
+        // The federation is off (since the start, or the app was restarted
+        // since the card was published): no pass knows whether a card from
+        // an earlier session is live, so one that was shared counts as not
+        // revoked yet, for share-off and unsubscribe alike.
+        for discovery in [
+            Discovery::Off("federation is off".into()),
+            Discovery::Starting,
+        ] {
+            let mut state = ready(vec![shared_row()]);
+            state.podcasts.publication.discovery = discovery.clone();
+            podcasts::share_set(&mut state, podcast_id(), "Show".into(), false, Ok(()));
+            assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
+            let mut state = ready(vec![shared_row()]);
+            state.podcasts.publication.discovery = discovery.clone();
+            podcasts::unsubscribed(&mut state, podcast_id(), "Show".into(), Ok(()));
+            assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
+            // A podcast that was not shared has no card to revoke.
+            let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+            state.podcasts.publication.discovery = discovery;
+            podcasts::unsubscribed(&mut state, podcast_id(), "Show".into(), Ok(()));
+            assert!(state.podcasts.publication.unrevoked.is_empty());
+        }
 
         // Shared (for example from another device) but held back here: the
         // key asks for this device's confirmation instead of unsharing.

@@ -18,10 +18,11 @@
 //!   every own publication that is not (share turned off or unsubscribed on
 //!   any trusted device). A stale device cannot republish, because its
 //!   registers lose to the newer share decision once they converge.
-//! * [`spawn`] runs the reconciler off the UI thread: after local share and
-//!   unsubscribe actions, after received podcast operations, after feed
-//!   refreshes (card metadata), when the overlay (re)starts, and
-//!   periodically.
+//! * [`spawn`] runs the reconciler off the UI thread: right after local
+//!   share-off and unsubscribe actions (quitting waits for those,
+//!   [`Reconciler::flush`]), after other local share actions, received
+//!   podcast operations and feed refreshes (card metadata), when the overlay
+//!   (re)starts, and periodically.
 //! * [`ShareConfirmations`] remembers, on this device only, that the user
 //!   confirmed publishing feed URLs that look private
 //!   (`PodcastCardSpec::privacy_warnings`). FRID leaves this confirmation to
@@ -665,12 +666,24 @@ pub struct PublicationReport {
 
 impl PublicationReport {
     /// Sharing of `podcast_id` was turned off (or it was unsubscribed) on
-    /// this device: until the next pass says otherwise, a card it may have
-    /// published counts as not revoked yet.
-    pub fn note_revocation(&mut self, podcast_id: &PodcastId) {
-        if let Some(publication) = self.podcasts.remove(podcast_id)
-            && !matches!(publication, Publication::HeldBack(_))
-        {
+    /// this device; `was_shared`: it was shared just before. Until the next
+    /// pass says otherwise, a card this device may have published counts as
+    /// not revoked yet.
+    ///
+    /// While the overlay runs, the last pass says whether a card was
+    /// published (a held-back one never was). Without a pass of the running
+    /// overlay (federation off, or not started yet) this device cannot tell
+    /// whether a card from an earlier session is still live, so a podcast
+    /// that was shared counts as not revoked.
+    pub fn note_revocation(&mut self, podcast_id: &PodcastId, was_shared: bool) {
+        let publication = self.podcasts.remove(podcast_id);
+        let maybe_live = match self.discovery {
+            Discovery::Running { .. } => publication.map_or(was_shared, |publication| {
+                !matches!(publication, Publication::HeldBack(_))
+            }),
+            Discovery::Off(_) | Discovery::Starting => was_shared,
+        };
+        if maybe_live {
             self.unrevoked.insert(podcast_id.clone());
         }
     }
@@ -850,9 +863,46 @@ pub struct Reconciler {
     urgent: Arc<Notify>,
     /// Number of revocations requested so far.
     revocations: Arc<AtomicU64>,
-    /// Revocations covered by a finished pass (or by a pass that found the
-    /// overlay off, when nothing can be sent).
-    covered: watch::Receiver<u64>,
+    /// Revocations whose decision is still being written
+    /// ([`Reconciler::begin_revocation`]).
+    in_flight: Arc<watch::Sender<usize>>,
+    /// Podcasts revoked here that were shared just before, not yet seen by
+    /// a pass. A pass without the overlay keeps them as not revoked.
+    revoked: Arc<Mutex<BTreeSet<PodcastId>>>,
+    /// The latest finished pass.
+    covered: watch::Receiver<Covered>,
+}
+
+/// What the latest finished pass covered.
+#[derive(Debug, Clone, Copy, Default)]
+struct Covered {
+    /// Revocations requested before it started.
+    revocations: u64,
+    /// Cards of private podcasts it found (or kept as) not revoked.
+    unrevoked: usize,
+}
+
+/// A share-off or unsubscribe being written: quitting waits for it
+/// ([`Reconciler::flush`]). Dropping it without [`RevocationTicket::done`]
+/// means the decision was not written.
+#[derive(Debug)]
+pub struct RevocationTicket {
+    reconciler: Reconciler,
+}
+
+impl RevocationTicket {
+    /// The decision was written: revoke now ([`Reconciler::revoke_now`]).
+    pub fn done(self, was_shared: Option<&PodcastId>) {
+        self.reconciler.revoke_now(was_shared);
+    }
+}
+
+impl Drop for RevocationTicket {
+    fn drop(&mut self) {
+        self.reconciler
+            .in_flight
+            .send_modify(|in_flight| *in_flight = in_flight.saturating_sub(1));
+    }
 }
 
 impl Reconciler {
@@ -862,38 +912,99 @@ impl Reconciler {
         self.wake.notify_one();
     }
 
+    /// A share-off or unsubscribe is about to be written (off the UI
+    /// thread): from now on, quitting waits for it to be written and
+    /// revoked. Call before starting the write, so a quit that is handled
+    /// before the write finishes still waits.
+    pub fn begin_revocation(&self) -> RevocationTicket {
+        self.in_flight.send_modify(|in_flight| *in_flight += 1);
+        RevocationTicket {
+            reconciler: self.clone(),
+        }
+    }
+
     /// Requests a reconciliation now, without the debounce: sharing was
     /// turned off or a podcast unsubscribed, and its card must be revoked
-    /// before the user may quit. See [`Reconciler::flush`].
-    pub fn revoke_now(&self) {
+    /// before the user may quit. `was_shared`: the podcast, when it was
+    /// shared just before (a card from this device may be live). See
+    /// [`Reconciler::flush`].
+    pub fn revoke_now(&self, was_shared: Option<&PodcastId>) {
+        if let Some(podcast_id) = was_shared {
+            self.revoked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(podcast_id.clone());
+        }
         self.revocations.fetch_add(1, Ordering::SeqCst);
         self.urgent.notify_one();
     }
 
-    /// Waits, at most `timeout`, until a pass started after every
-    /// [`Reconciler::revoke_now`] so far finished (the tombstones were
-    /// signed and pushed, or the overlay is off and nothing can be sent).
-    /// Returns at once when nothing is pending. `false` on timeout or when
+    /// Waits, at most `timeout`, until the revocations being written
+    /// ([`Reconciler::begin_revocation`]) are written and a pass started
+    /// after every [`Reconciler::revoke_now`] so far finished (the
+    /// tombstones were signed and pushed, or the overlay is off and nothing
+    /// can be sent). Returns at once when nothing is pending. `true` when
+    /// that pass left no card of a private podcast live from this device;
+    /// `false` when one may be (revocation failed, or the federation is off
+    /// and cards of an earlier session may be live), on timeout, or when
     /// the reconciler stopped.
     pub async fn flush(&self, timeout: Duration) -> bool {
-        let target = self.revocations.load(Ordering::SeqCst);
-        let mut covered = self.covered.clone();
-        if *covered.borrow() >= target {
-            return true;
-        }
-        // `revoke_now` already asked for the pass.
-        matches!(
-            tokio::time::timeout(timeout, covered.wait_for(|covered| *covered >= target)).await,
-            Ok(Ok(_))
-        )
+        let wait = async {
+            let mut in_flight = self.in_flight.subscribe();
+            if in_flight
+                .wait_for(|in_flight| *in_flight == 0)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let target = self.revocations.load(Ordering::SeqCst);
+            let mut covered = self.covered.clone();
+            // `revoke_now` already asked for the pass.
+            match covered
+                .wait_for(|covered| covered.revocations >= target)
+                .await
+            {
+                Ok(covered) => covered.unrevoked == 0,
+                Err(_) => false,
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.unwrap_or(false)
     }
+}
+
+/// The podcasts of `unrevoked` that are not shared now (a podcast shared
+/// again is no longer "private · not revoked"). Without a store, all.
+async fn still_private(
+    store: Option<&Arc<PodcastStore>>,
+    unrevoked: BTreeSet<PodcastId>,
+) -> BTreeSet<PodcastId> {
+    let Some(store) = store.cloned() else {
+        return unrevoked;
+    };
+    if unrevoked.is_empty() {
+        return unrevoked;
+    }
+    let fallback = unrevoked.clone();
+    tokio::task::spawn_blocking(move || {
+        unrevoked
+            .into_iter()
+            .filter(|podcast_id| {
+                !matches!(store.podcast(podcast_id), Ok(Some(summary)) if summary.shared)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 /// Runs the reconciler until the overlay watch closes. `dht` follows the
 /// federation node; while it is `None` nothing is published from this
-/// device and `report` says so (keeping the cards known not to be revoked
-/// yet: they are revoked once the overlay runs again). Between passes the
-/// overlay's peer count is refreshed every [`PEER_REFRESH_INTERVAL`].
+/// device and `report` says so, keeping as not revoked the cards known not
+/// to be revoked yet and those of podcasts that were shared and revoked
+/// here meanwhile (`Reconciler::revoke_now`): they are revoked once the
+/// overlay runs again. Between passes the overlay's peer count is
+/// refreshed every [`PEER_REFRESH_INTERVAL`].
 pub fn spawn(
     mut dht: watch::Receiver<Option<Arc<PodcastDht>>>,
     store: Option<Arc<PodcastStore>>,
@@ -903,11 +1014,14 @@ pub fn spawn(
     let wake = Arc::new(Notify::new());
     let urgent = Arc::new(Notify::new());
     let revocations = Arc::new(AtomicU64::new(0));
-    let (covered_tx, covered) = watch::channel(0);
+    let revoked = Arc::new(Mutex::new(BTreeSet::new()));
+    let (covered_tx, covered) = watch::channel(Covered::default());
     let reconciler = Reconciler {
         wake: Arc::clone(&wake),
         urgent: Arc::clone(&urgent),
         revocations: Arc::clone(&revocations),
+        in_flight: Arc::new(watch::channel(0).0),
+        revoked: Arc::clone(&revoked),
         covered,
     };
     tokio::spawn(async move {
@@ -916,20 +1030,33 @@ pub fn spawn(
         peers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         peers.reset();
         loop {
+            // Read before the revoked podcasts: `revoke_now` records the
+            // podcast before it counts the revocation.
             let requested = revocations.load(Ordering::SeqCst);
+            let revoked_here =
+                std::mem::take(&mut *revoked.lock().unwrap_or_else(PoisonError::into_inner));
             let current = dht.borrow_and_update().clone();
             last = match current {
+                // The pass sees this device's own publications: it revokes
+                // and reports exactly what is still live.
                 Some(dht) => reconcile(&dht, store.clone(), Arc::clone(&confirmations)).await,
-                None => PublicationReport {
-                    discovery: Discovery::Off(
-                        "federation is off or podcast discovery is unavailable".into(),
-                    ),
-                    unrevoked: std::mem::take(&mut last.unrevoked),
-                    ..PublicationReport::default()
-                },
+                None => {
+                    let mut unrevoked = std::mem::take(&mut last.unrevoked);
+                    unrevoked.extend(revoked_here);
+                    PublicationReport {
+                        discovery: Discovery::Off(
+                            "federation is off or podcast discovery is unavailable".into(),
+                        ),
+                        unrevoked: still_private(store.as_ref(), unrevoked).await,
+                        ..PublicationReport::default()
+                    }
+                }
             };
             report(last.clone());
-            covered_tx.send_replace(requested);
+            covered_tx.send_replace(Covered {
+                revocations: requested,
+                unrevoked: last.unrevoked.len(),
+            });
             let periodic = tokio::time::sleep(RECONCILE_INTERVAL);
             tokio::pin!(periodic);
             loop {

@@ -323,7 +323,7 @@ pub(crate) fn share_status_line(state: &AppState, podcast: &PodcastRow) -> Line<
         }
         if let Discovery::Off(_) = report.discovery {
             return Line::styled(
-                "private · public card not revoked yet: federation is off",
+                "private · public card may not be revoked yet: federation is off",
                 Style::new().fg(Color::Yellow),
             );
         }

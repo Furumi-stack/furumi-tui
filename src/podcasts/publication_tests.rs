@@ -616,10 +616,26 @@ fn revocations_that_fail_are_reported_without_ids() {
     report
         .podcasts
         .insert(secret.clone(), Publication::HeldBack(Vec::new()));
-    report.note_revocation(&show);
-    report.note_revocation(&secret);
+    report.discovery = Discovery::Running { peers: 1 };
+    report.note_revocation(&show, true);
+    report.note_revocation(&secret, true);
     assert!(report.podcasts.is_empty());
-    assert_eq!(report.unrevoked, [show].into_iter().collect());
+    assert_eq!(report.unrevoked, [show.clone()].into_iter().collect());
+
+    // Without a pass of the running overlay nothing tells whether a card
+    // of an earlier session is live: a podcast that was shared counts.
+    for discovery in [
+        Discovery::Off("federation is off".into()),
+        Discovery::Starting,
+    ] {
+        let mut report = PublicationReport {
+            discovery,
+            ..PublicationReport::default()
+        };
+        report.note_revocation(&show, true);
+        report.note_revocation(&diary, false);
+        assert_eq!(report.unrevoked, [show.clone()].into_iter().collect());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +946,43 @@ async fn reconciler_lifecycle() {
     assert!(report.podcasts.is_empty());
     assert!(reconciler.flush(Duration::from_millis(10)).await);
 
+    // Sharing off while the federation is off (a card of an earlier
+    // session may be live). Quitting while the decision is still being
+    // written waits for the write and the pass, then says the card may not
+    // be revoked; the Off reports keep it as not revoked.
+    let ticket = reconciler.begin_revocation();
+    assert!(
+        !reconciler.flush(Duration::from_millis(50)).await,
+        "the write is still running"
+    );
+    let flush = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move { reconciler.flush(Duration::from_secs(5)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!flush.is_finished(), "quitting waits for the write");
+    device.set_shared(&store, &show, false);
+    ticket.done(Some(&show));
+    assert!(!flush.await.unwrap(), "the card may not be revoked yet");
+    let report = next().await;
+    assert!(matches!(report.discovery, Discovery::Off(_)));
+    assert_eq!(report.unrevoked, [show.clone()].into_iter().collect());
+    reconciler.wake();
+    let report = next().await;
+    assert_eq!(
+        report.unrevoked,
+        [show.clone()].into_iter().collect(),
+        "kept while the federation is off"
+    );
+    // A write that failed (the ticket is dropped) is not waited for.
+    drop(reconciler.begin_revocation());
+    // Shared again: no longer "private · not revoked".
+    device.set_shared(&store, &show, true);
+    reconciler.wake();
+    let report = next().await;
+    assert!(report.unrevoked.is_empty());
+    assert!(reconciler.flush(Duration::from_millis(10)).await);
+
     // The overlay starts (two nodes, the overlay not bootstrapped yet): a
     // pass publishes right away.
     let a = Node::start(&temp.path().join("a"), network).await;
@@ -977,7 +1030,7 @@ async fn reconciler_lifecycle() {
     // Sharing off: the revocation does not wait for the debounce, and the
     // quit-time flush returns once the tombstone was sent.
     device.set_shared(&store, &show, false);
-    reconciler.revoke_now();
+    reconciler.revoke_now(Some(&show));
     assert!(
         reconciler.flush(RECONCILE_DEBOUNCE * 9 / 10).await,
         "revoked before the debounce would have ended"

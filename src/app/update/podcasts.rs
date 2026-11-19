@@ -806,7 +806,7 @@ pub fn share_set(
             Some(Effect::PodcastsReload)
         }
         Ok(()) => {
-            state.podcasts.publication.note_revocation(&podcast_id);
+            note_revocation(state, &podcast_id);
             state.status_message = Some(format!(
                 "podcasts: {title} is private again; the public card is being revoked"
             ));
@@ -817,6 +817,21 @@ pub fn share_set(
             None
         }
     }
+}
+
+/// Sharing of `podcast_id` was turned off or it was unsubscribed here: its
+/// card counts as not revoked until a pass says otherwise
+/// (`PublicationReport::note_revocation`; the row is not reloaded yet, so it
+/// still says whether the podcast was shared).
+fn note_revocation(state: &mut AppState, podcast_id: &PodcastId) {
+    let was_shared = state
+        .podcasts
+        .podcast(podcast_id)
+        .is_some_and(|row| row.summary.shared);
+    state
+        .podcasts
+        .publication
+        .note_revocation(podcast_id, was_shared);
 }
 
 /// A publication reconciler pass finished. Errors go to the status bar
@@ -1153,7 +1168,7 @@ pub fn unsubscribed(
 ) -> Option<Effect> {
     match result {
         Ok(()) => {
-            state.podcasts.publication.note_revocation(&podcast_id);
+            note_revocation(state, &podcast_id);
             state.status_message = Some(format!(
                 "podcasts: unsubscribed from {}; progress and history are kept",
                 display_title(&title)

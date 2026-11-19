@@ -228,7 +228,7 @@ mod tests {
         state
             .podcasts
             .publication
-            .note_revocation(&podcast_fixtures::podcast_id());
+            .note_revocation(&podcast_fixtures::podcast_id(), true);
         let screen = render(&state, 110, 30);
         assert!(screen.contains("private · revoking the"), "{screen}");
         if let Some(crate::app::state::Loadable::Ready(rows)) = &mut state.podcasts.list {
@@ -239,7 +239,8 @@ mod tests {
         assert!(!screen.contains("private (not shared"), "{screen}");
         state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
         let screen = render(&state, 110, 30);
-        assert!(screen.contains("not revoked yet:"), "{screen}");
+        assert!(screen.contains("may not be revoked yet:"), "{screen}");
+        assert!(screen.contains("federation is off"), "{screen}");
         state.podcasts.publication.unrevoked.clear();
         let screen = render(&state, 110, 30);
         assert!(screen.contains("private (not shared"), "{screen}");
