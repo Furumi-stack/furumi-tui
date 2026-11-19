@@ -154,6 +154,7 @@ mod tests {
             file_size_bytes: None,
             play_count: 0,
             fed: None,
+            podcast: None,
         };
 
         assert_eq!(
@@ -231,6 +232,7 @@ mod tests {
             file_size_bytes: None,
             play_count: 0,
             fed: None,
+            podcast: None,
         };
         let link = track_share_link(&track).expect("link");
         let parsed = parse_frid_link(&link).expect("parses back");

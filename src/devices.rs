@@ -229,6 +229,7 @@ impl PlaybackTrack {
             file_size_bytes: self.file_size_bytes,
             play_count: self.play_count,
             fed: self.fed.as_ref().map(SyncedFedTrack::to_fed_track),
+            podcast: None,
         }
     }
 }

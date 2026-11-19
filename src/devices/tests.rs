@@ -478,6 +478,7 @@ fn playback_tracks_do_not_sync_device_local_paths() {
         file_size_bytes: Some(123_456),
         play_count: 3,
         fed: None,
+        podcast: None,
     };
 
     let wire = PlaybackTrack::from_track(&source);

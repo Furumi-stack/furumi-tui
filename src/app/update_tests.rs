@@ -128,6 +128,7 @@ fn test_track(id: i64) -> TrackItem {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     }
 }
 
@@ -522,6 +523,7 @@ fn queue_advances_and_respects_repeat() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState::default();
     state.player.queue = vec![track(1), track(2)];
@@ -587,6 +589,7 @@ fn queue_tab_select_and_clear() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState {
         active_tab: Tab::Queue,
@@ -1062,6 +1065,7 @@ fn shuffle_reorders_tail_and_restores() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState::default();
     state.player.queue = (1..=8).map(track).collect();
@@ -1109,6 +1113,7 @@ fn shift_j_opens_release_from_queue() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState {
         active_tab: Tab::Queue,

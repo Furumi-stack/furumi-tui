@@ -338,6 +338,7 @@ mod tests {
                 file_size_bytes: None,
                 play_count: 0,
                 fed: None,
+                podcast: None,
             }],
         };
         let mut state = AppState::default();

@@ -4361,6 +4361,7 @@ mod similarity_search_tests {
                 file_size_bytes: None,
                 play_count: 0,
                 fed: None,
+                podcast: None,
             },
             score,
             embedding_signature: [signature; music_dht::similarity::SIMILARITY_SIGNATURE_BYTES],
@@ -4438,6 +4439,7 @@ mod queue_refresh_tests {
             file_size_bytes: None,
             play_count: 0,
             fed: None,
+            podcast: None,
         }
     }
 
