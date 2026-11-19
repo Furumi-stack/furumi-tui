@@ -15,7 +15,7 @@ use super::discovery::{
     PODCAST_SEARCH_TIMEOUT, PodcastHit, podcast_hits, preview, resolve_local_ids, search,
     subscribe_from_hit, test_hit,
 };
-use super::publication::{Publication, check_share, reconcile};
+use super::publication::{Publication, check_share, reconcile, set_shared};
 use super::publication_tests::{Node, wait_for};
 use super::refresh::{refresh, subscribe};
 use super::test_server::Route;
@@ -305,18 +305,22 @@ async fn stranger_subscribes() {
         .await
         .unwrap();
     let store_a = Arc::clone(&user_a.services.store);
-    user_a
-        .services
-        .log
-        .record(&mut |stamps| store_a.set_shared(stamps, &shared.podcast_id, true))
-        .unwrap();
     let confirmations = Arc::clone(&user_a.services.confirmations);
     let check = check_share(&store_a, &confirmations, &shared.podcast_id).unwrap();
-    if check.needs_confirmation() {
-        confirmations
-            .confirm(&shared.podcast_id, check.urls)
-            .unwrap();
-    }
+    set_shared(
+        &store_a,
+        &confirmations,
+        &shared.podcast_id,
+        true,
+        check.needs_confirmation().then_some(check.urls),
+        || {
+            user_a
+                .services
+                .log
+                .record(&mut |stamps| store_a.set_shared(stamps, &shared.podcast_id, true))
+        },
+    )
+    .unwrap();
     let report = reconcile(
         &a.dht,
         Some(Arc::clone(&store_a)),

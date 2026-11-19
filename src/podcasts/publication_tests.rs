@@ -16,7 +16,7 @@ use music_dht::{MusicDhtConfig, MusicDhtService, NetworkId};
 
 use super::publication::{
     Discovery, Publication, PublicationReport, ShareConfirmations, check_share, reconcile,
-    share_card, share_states, summarize, warning_ru,
+    set_shared, share_card, share_states, summarize, warning_ru,
 };
 
 const SHOW_URL: &str = "https://feeds.example.test/rust-radio.xml";
@@ -107,6 +107,27 @@ impl Device {
     fn unsubscribe(&mut self, store: &PodcastStore, id: &PodcastId) {
         self.act(|stamps| store.unsubscribe(stamps, id));
     }
+}
+
+/// The user confirms the URLs the dialog shows for a podcast that is
+/// already shared (held back here): no new decision is written, the
+/// confirmation is bound to the one in force (as the runtime does).
+fn confirm_shown(store: &PodcastStore, confirmations: &ShareConfirmations, id: &PodcastId) {
+    let check = check_share(store, confirmations, id).unwrap();
+    set_shared(store, confirmations, id, true, Some(check.urls), || Ok(())).unwrap();
+}
+
+/// Whether this device would publish `id` with its privacy confirmed.
+fn confirmed_here(
+    store: &PodcastStore,
+    confirmations: &ShareConfirmations,
+    id: &PodcastId,
+) -> bool {
+    share_states(store, confirmations)
+        .unwrap()
+        .into_iter()
+        .find(|state| state.subscription.podcast_id == *id)
+        .is_some_and(|state| state.is_shared() && state.privacy_confirmed)
 }
 
 fn shared_ids(store: &PodcastStore, confirmations: &ShareConfirmations) -> Vec<PodcastId> {
@@ -216,7 +237,20 @@ fn privacy_confirmations_are_local_and_bound_to_the_urls() {
         warning_ru(&check.warnings[0]),
         "в адресе ленты есть параметр «token», похожий на ключ доступа"
     );
-    confirmations.confirm(&secret, check.urls.clone()).unwrap();
+    // The user confirms in the dialog; the decision is written after the
+    // (pending) confirmation, which is then bound to it.
+    set_shared(
+        &store,
+        &confirmations,
+        &secret,
+        true,
+        Some(check.urls.clone()),
+        || {
+            device.set_shared(&store, &secret, true);
+            Ok(())
+        },
+    )
+    .unwrap();
 
     // Persisted on this device, read again after a restart.
     let reopened = ShareConfirmations::open(path.clone());
@@ -238,24 +272,121 @@ fn privacy_confirmations_are_local_and_bound_to_the_urls() {
         id_feed_url: Some(card.feed_url.clone()),
         ..card.clone()
     };
-    assert!(reopened.is_confirmed(&card));
-    assert!(!reopened.is_confirmed(&moved));
+    let share = store.share(&secret).unwrap();
+    assert!(reopened.is_confirmed(&card, share.as_ref()));
+    assert!(!reopened.is_confirmed(&moved, share.as_ref()));
 
-    // Shared but held: the confirmation is used by the share state.
-    device.set_shared(&store, &secret, true);
-    let state = share_states(&store, &reopened)
-        .unwrap()
-        .into_iter()
-        .find(|state| state.subscription.podcast_id == secret)
-        .unwrap();
-    assert!(state.privacy_confirmed);
+    // The share state uses the confirmation.
+    assert!(confirmed_here(&store, &reopened, &secret));
 
     reopened.forget(&secret).unwrap();
-    assert!(!ShareConfirmations::open(path.clone()).is_confirmed(&card));
+    assert!(!ShareConfirmations::open(path.clone()).is_confirmed(&card, share.as_ref()));
 
     // A corrupt file asks again instead of failing.
     std::fs::write(&path, b"{not json").unwrap();
-    assert!(!ShareConfirmations::open(path).is_confirmed(&card));
+    assert!(!ShareConfirmations::open(path).is_confirmed(&card, share.as_ref()));
+}
+
+#[test]
+fn a_confirmation_does_not_outlive_a_revocation_on_another_device() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = PodcastStore::open_in_memory().unwrap();
+    let confirmations = ShareConfirmations::open(temp.path().join("confirmations.json"));
+    let mut device = Device::new("device-a");
+    let secret = device.subscribe(&store, SECRET_URL, "Members Only");
+    let other = PodcastStore::open_in_memory().unwrap();
+    let mut device_b = Device::new("device-b");
+    let sync = |from: &[SyncOpWire], to: &PodcastStore| {
+        for op in from {
+            to.apply_remote_op(op).unwrap();
+        }
+    };
+
+    // A: the dialog, confirmed; the confirmation covers A's decision.
+    let check = check_share(&store, &confirmations, &secret).unwrap();
+    assert!(check.needs_confirmation());
+    set_shared(
+        &store,
+        &confirmations,
+        &secret,
+        true,
+        Some(check.urls),
+        || {
+            device.set_shared(&store, &secret, true);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(confirmed_here(&store, &confirmations, &secret));
+
+    // B turns sharing off and on again (confirming on B). A must ask its
+    // user again: the confirmation was given for the revoked decision.
+    sync(&device.ops, &other);
+    let ops = [
+        device_b.set_shared(&other, &secret, false),
+        device_b.set_shared(&other, &secret, true),
+    ]
+    .concat();
+    sync(&ops, &store);
+    assert!(
+        !confirmed_here(&store, &confirmations, &secret),
+        "held back again"
+    );
+    let check = check_share(&store, &confirmations, &secret).unwrap();
+    assert!(check.needs_confirmation());
+    assert!(
+        !ShareConfirmations::open(temp.path().join("confirmations.json")).is_confirmed(
+            &share_card(&store, &secret).unwrap().unwrap(),
+            store.share(&secret).unwrap().as_ref()
+        ),
+        "the superseded confirmation is dropped from the file"
+    );
+
+    // A confirms again (no new decision: B's is in force) ...
+    confirm_shown(&store, &confirmations, &secret);
+    assert!(confirmed_here(&store, &confirmations, &secret));
+    // ... and B only turns sharing off: when it is shared again later
+    // (from either device), A asks again.
+    let off = device_b.set_shared(&other, &secret, false);
+    sync(&off, &store);
+    assert!(shared_ids(&store, &confirmations).is_empty());
+    let check = check_share(&store, &confirmations, &secret).unwrap();
+    assert!(check.needs_confirmation(), "sharing again asks again");
+
+    // Shared again on B and confirmed on A; then B unsubscribes, subscribes
+    // again and shares: a new decision, A asks again.
+    let on = device_b.set_shared(&other, &secret, true);
+    sync(&on, &store);
+    confirm_shown(&store, &confirmations, &secret);
+    assert!(confirmed_here(&store, &confirmations, &secret));
+    device_b.unsubscribe(&other, &secret);
+    device_b.subscribe(&other, SECRET_URL, "Members Only");
+    let on = device_b.set_shared(&other, &secret, true);
+    assert!(!on.is_empty());
+    sync(&device_b.ops, &store);
+    assert!(!confirmed_here(&store, &confirmations, &secret));
+
+    // A pending confirmation (the decision is not written yet) covers
+    // nothing until a newer share decision exists.
+    let fresh = device.subscribe(
+        &store,
+        "https://feeds.example.test/vip.xml?key=0123456789abcdef",
+        "VIP",
+    );
+    let check = check_share(&store, &confirmations, &fresh).unwrap();
+    confirmations
+        .confirm(&fresh, check.urls, store.share(&fresh).unwrap().as_ref())
+        .unwrap();
+    assert!(
+        !check_share(&store, &confirmations, &fresh)
+            .unwrap()
+            .confirmed
+    );
+    device.set_shared(&store, &fresh, true);
+    assert!(
+        confirmed_here(&store, &confirmations, &fresh),
+        "covers the next decision"
+    );
 }
 
 #[test]
@@ -467,8 +598,7 @@ async fn two_nodes() {
     assert!(c.dht.search("members only", 10).await.unwrap().is_empty());
 
     // Confirming exactly the URLs shown publishes the held-back podcast.
-    let check = check_share(&store, &confirmations, &secret).unwrap();
-    confirmations.confirm(&secret, check.urls).unwrap();
+    confirm_shown(&store, &confirmations, &secret);
     let report = reconcile(&a.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
     assert_eq!(publication(&report, &secret), Some(Publication::Published));
     wait_for("the confirmed card", async || {
@@ -506,12 +636,7 @@ async fn two_nodes() {
     // Without a podcast store (it failed to open) every own card is revoked.
     device.subscribe(&store, SECRET_URL, "Members Only Show");
     device.set_shared(&store, &secret, true);
-    confirmations
-        .confirm(
-            &secret,
-            check_share(&store, &confirmations, &secret).unwrap().urls,
-        )
-        .unwrap();
+    confirm_shown(&store, &confirmations, &secret);
     let report = reconcile(&a.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
     assert_eq!(publication(&report, &secret), Some(Publication::Published));
     wait_for("the republished card", async || {

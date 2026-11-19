@@ -27,7 +27,10 @@
 //!   (`PodcastCardSpec::privacy_warnings`). FRID leaves this confirmation to
 //!   the client and does not sync it: every device asks its own user before
 //!   it publishes such a URL under its own identity. A confirmation is bound
-//!   to the exact URLs shown, so a feed that moves to another URL asks again.
+//!   to the exact URLs shown, so a feed that moves to another URL asks again,
+//!   and to the share decision it was given for (the share register's
+//!   operation), so a decision taken anywhere later — sharing turned off,
+//!   unsubscribing, sharing again — asks again too.
 //!
 //! Logging stays free of private data: only counts are logged, never feed
 //! URLs, titles or ids of podcasts that are not shared.
@@ -40,7 +43,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use furumi_library::podcasts::{PodcastListFilter, PodcastStore, PodcastSummary};
-use music_dht::podcast::{FeedUrl, PodcastId, SubscriptionRecord, effective_share};
+use music_dht::podcast::{FeedUrl, PodcastId, ShareRecord, SubscriptionRecord, effective_share};
 use music_dht::podcast_dht::{
     FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastShareState,
 };
@@ -49,8 +52,9 @@ use tokio::sync::{Notify, watch};
 
 /// Local file with the privacy confirmations, next to `podcasts.sqlite3`.
 pub const CONFIRMATIONS_FILE: &str = "podcast-share-confirmations.json";
-/// Format version of [`CONFIRMATIONS_FILE`].
-const CONFIRMATIONS_VERSION: u32 = 1;
+/// Format version of [`CONFIRMATIONS_FILE`]. Version 1 (URLs only, never
+/// released) is read as empty: the user is asked again.
+const CONFIRMATIONS_VERSION: u32 = 2;
 /// Periodic reconciliation (on top of the triggers). Cards are re-signed by
 /// the overlay's own maintenance every 10 minutes; this pass catches share
 /// decisions that changed while the overlay was busy or unreachable.
@@ -79,19 +83,77 @@ impl ConfirmedUrls {
     }
 }
 
+/// The share decision a confirmation was given for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Decision {
+    /// Confirmed before this device recorded its share decision: covers the
+    /// first share decision newer than the share register seen then
+    /// (`after`, its order key; `None`: no register yet).
+    Pending { after: Option<(u64, i64, String)> },
+    /// Covers exactly the share decision written by operation `op_id`.
+    Bound { op_id: String },
+}
+
+/// One confirmation: the URLs shown and the decision it was given for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Confirmation {
+    urls: ConfirmedUrls,
+    decision: Decision,
+}
+
+impl Confirmation {
+    /// Whether the confirmation covers the merged share register `share`.
+    fn covers(&self, share: Option<&ShareRecord>) -> bool {
+        let Some(share) = share.filter(|share| share.shared) else {
+            return false;
+        };
+        match &self.decision {
+            Decision::Bound { op_id } => *op_id == share.op_id,
+            Decision::Pending { after } => is_after(after.as_ref(), share),
+        }
+    }
+
+    /// A newer share decision than the confirmed one exists: sharing was
+    /// turned off, or turned on again after a revocation, here or on
+    /// another trusted device. Unsubscribing never changes the share
+    /// register, but sharing after subscribing again writes a new decision.
+    fn superseded(&self, share: Option<&ShareRecord>) -> bool {
+        match (&self.decision, share) {
+            (Decision::Bound { op_id }, Some(share)) => *op_id != share.op_id,
+            (Decision::Pending { after }, Some(share)) => {
+                !share.shared && is_after(after.as_ref(), share)
+            }
+            (_, None) => false,
+        }
+    }
+}
+
+/// `share` is newer than the register order key `after` (`None`: there was
+/// no register).
+fn is_after(after: Option<&(u64, i64, String)>, share: &ShareRecord) -> bool {
+    after.is_none_or(|(generation, hlc, op)| share.order_key() > (*generation, *hlc, op.as_str()))
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ConfirmationsFile {
     version: u32,
-    confirmed: BTreeMap<PodcastId, ConfirmedUrls>,
+    confirmed: BTreeMap<PodcastId, Confirmation>,
 }
 
 /// Device-local record of "publish this feed URL although it looks
 /// private" (`PodcastShareState::privacy_confirmed`). Not synced.
+///
+/// A confirmation covers the URLs shown and one share decision: it is
+/// recorded before the decision is written (pending), bound to the share
+/// register's operation once written ([`ShareConfirmations::bind`]), and
+/// dropped when a newer decision supersedes it — including decisions taken
+/// on other trusted devices ([`ShareConfirmations::prune`]).
 #[derive(Debug)]
 pub struct ShareConfirmations {
     /// `None`: in memory only (tests, or the podcast store is unavailable).
     path: Option<PathBuf>,
-    confirmed: Mutex<BTreeMap<PodcastId, ConfirmedUrls>>,
+    confirmed: Mutex<BTreeMap<PodcastId, Confirmation>>,
 }
 
 impl ShareConfirmations {
@@ -135,42 +197,105 @@ impl ShareConfirmations {
         }
     }
 
-    /// Whether the user confirmed publishing exactly these feed URLs.
-    pub fn is_confirmed(&self, card: &PodcastCardSpec) -> bool {
+    /// Whether the user confirmed publishing exactly these feed URLs for
+    /// the current share decision `share` (the merged share register).
+    pub fn is_confirmed(&self, card: &PodcastCardSpec, share: Option<&ShareRecord>) -> bool {
         self.lock()
             .get(&card.podcast_id)
-            .is_some_and(|urls| *urls == ConfirmedUrls::of(card))
+            .is_some_and(|confirmation| {
+                confirmation.urls == ConfirmedUrls::of(card) && confirmation.covers(share)
+            })
     }
 
-    /// Records the confirmation of `urls` (replacing an older one).
-    /// Blocking (writes the file).
-    pub fn confirm(&self, podcast_id: &PodcastId, urls: ConfirmedUrls) -> Result<()> {
-        let mut confirmed = self.lock();
-        if confirmed.get(podcast_id) == Some(&urls) {
+    /// Records the confirmation of `urls` for the next share decision after
+    /// `share` (the merged share register now, before this device writes
+    /// its decision), replacing an older one. Blocking (writes the file).
+    pub fn confirm(
+        &self,
+        podcast_id: &PodcastId,
+        urls: ConfirmedUrls,
+        share: Option<&ShareRecord>,
+    ) -> Result<()> {
+        let after = share.map(|share| {
+            let (generation, hlc, op) = share.order_key();
+            (generation, hlc, op.to_string())
+        });
+        self.update(podcast_id, |entry| {
+            *entry = Some(Confirmation {
+                urls,
+                decision: Decision::Pending { after },
+            });
+        })
+    }
+
+    /// Binds the confirmation of a podcast to the share decision `share`
+    /// this device just wrote (or found already written, when it confirms
+    /// a podcast shared elsewhere). No-op without a confirmation or when
+    /// `share` does not share. Blocking.
+    pub fn bind(&self, podcast_id: &PodcastId, share: &ShareRecord) -> Result<()> {
+        if !share.shared {
             return Ok(());
         }
-        let mut next = confirmed.clone();
-        next.insert(podcast_id.clone(), urls);
-        self.save(&next)?;
-        *confirmed = next;
-        Ok(())
+        self.update(podcast_id, |entry| {
+            if let Some(confirmation) = entry {
+                confirmation.decision = Decision::Bound {
+                    op_id: share.op_id.clone(),
+                };
+            }
+        })
+    }
+
+    /// Drops a confirmation that a newer share decision superseded (taken
+    /// here or on another trusted device), and binds a pending one to the
+    /// decision it now covers. Blocking.
+    pub fn prune(&self, podcast_id: &PodcastId, share: Option<&ShareRecord>) -> Result<()> {
+        self.update(podcast_id, |entry| {
+            let Some(confirmation) = entry else {
+                return;
+            };
+            if confirmation.superseded(share) {
+                *entry = None;
+            } else if let (Decision::Pending { .. }, Some(share)) = (&confirmation.decision, share)
+                && confirmation.covers(Some(share))
+            {
+                confirmation.decision = Decision::Bound {
+                    op_id: share.op_id.clone(),
+                };
+            }
+        })
     }
 
     /// Drops the confirmation of a podcast (sharing turned off or
     /// unsubscribed here): sharing it again asks again. Blocking.
     pub fn forget(&self, podcast_id: &PodcastId) -> Result<()> {
+        self.update(podcast_id, |entry| *entry = None)
+    }
+
+    /// Applies `change` to the entry of `podcast_id` and saves the file when
+    /// the entry changed.
+    fn update(
+        &self,
+        podcast_id: &PodcastId,
+        change: impl FnOnce(&mut Option<Confirmation>),
+    ) -> Result<()> {
         let mut confirmed = self.lock();
-        if !confirmed.contains_key(podcast_id) {
+        let current = confirmed.get(podcast_id).cloned();
+        let mut entry = current.clone();
+        change(&mut entry);
+        if entry == current {
             return Ok(());
         }
         let mut next = confirmed.clone();
-        next.remove(podcast_id);
+        match entry {
+            Some(confirmation) => next.insert(podcast_id.clone(), confirmation),
+            None => next.remove(podcast_id),
+        };
         self.save(&next)?;
         *confirmed = next;
         Ok(())
     }
 
-    fn save(&self, confirmed: &BTreeMap<PodcastId, ConfirmedUrls>) -> Result<()> {
+    fn save(&self, confirmed: &BTreeMap<PodcastId, Confirmation>) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -182,7 +307,7 @@ impl ShareConfirmations {
             .with_context(|| format!("saving {}", path.display()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<PodcastId, ConfirmedUrls>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<PodcastId, Confirmation>> {
         self.confirmed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -288,11 +413,41 @@ pub fn check_share(
 ) -> Result<ShareCheck> {
     let card = share_card(store, podcast_id)?
         .with_context(|| "the podcast is not subscribed".to_string())?;
+    let share = store.share(podcast_id)?;
     Ok(ShareCheck {
         urls: ConfirmedUrls::of(&card),
         warnings: card.privacy_warnings(),
-        confirmed: confirmations.is_confirmed(&card),
+        confirmed: confirmations.is_confirmed(&card, share.as_ref()),
     })
+}
+
+/// Writes a share decision with `record` (the synced `podcast_share_set`
+/// operation). The confirmation of `confirm` is recorded first (pending: it
+/// covers the next share decision), so a reconciler pass the decision
+/// triggers already sees it, and is then bound to the decision in force —
+/// the one just written, or, for a podcast shared elsewhere and held back
+/// here, the one already there (`set_shared` writes nothing then). Turning
+/// sharing off forgets it. Blocking.
+pub fn set_shared(
+    store: &PodcastStore,
+    confirmations: &ShareConfirmations,
+    podcast_id: &PodcastId,
+    shared: bool,
+    confirm: Option<ConfirmedUrls>,
+    record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if let Some(urls) = confirm {
+        let share = store.share(podcast_id)?;
+        confirmations.confirm(podcast_id, urls, share.as_ref())?;
+    }
+    record()?;
+    if !shared {
+        return confirmations.forget(podcast_id);
+    }
+    match store.share(podcast_id)? {
+        Some(share) => confirmations.bind(podcast_id, &share),
+        None => Ok(()),
+    }
 }
 
 /// One `PodcastShareState` per podcast with a subscription register, the
@@ -300,7 +455,8 @@ pub fn check_share(
 ///
 /// Only podcasts for which `effective_share` holds get a card; for every
 /// other podcast `card` is `None` and `privacy_confirmed` false, so no
-/// private metadata is prepared for publication at all.
+/// private metadata is prepared for publication at all. Confirmations that
+/// a newer share decision superseded (on any device) are dropped here.
 pub fn share_states(
     store: &PodcastStore,
     confirmations: &ShareConfirmations,
@@ -312,6 +468,11 @@ pub fn share_states(
             continue;
         };
         let share = store.share(podcast_id)?;
+        if let Err(err) = confirmations.prune(podcast_id, share.as_ref()) {
+            // Not dropping it only keeps a confirmation that no longer
+            // covers the current decision (`is_confirmed` checks that).
+            tracing::warn!("podcast share confirmation not updated: {err:#}");
+        }
         let shared = effective_share(Some(&subscription), share.as_ref());
         // A card that cannot be built from the catalog falls back to the
         // one `sync_shares` derives from the register (and fails there,
@@ -325,7 +486,7 @@ pub fn share_states(
         };
         let privacy_confirmed = card
             .as_ref()
-            .is_some_and(|card| confirmations.is_confirmed(card));
+            .is_some_and(|card| confirmations.is_confirmed(card, share.as_ref()));
         states.push(PodcastShareState {
             subscription,
             share,

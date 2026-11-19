@@ -354,26 +354,27 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
     None
 }
 
-/// Writes a share decision. The local confirmation is recorded before the
-/// synced decision, so the reconciler pass the decision triggers already
-/// sees it; turning sharing off forgets it. Blocking.
+/// Writes a share decision and keeps the local privacy confirmation bound
+/// to it (`publication::set_shared`). Blocking.
 fn set_shared(
     services: &Services,
     podcast_id: &music_dht::podcast::PodcastId,
     shared: bool,
     confirm: Option<publication::ConfirmedUrls>,
 ) -> anyhow::Result<()> {
-    if let Some(urls) = confirm {
-        services.confirmations.confirm(podcast_id, urls)?;
-    }
     let store = Arc::clone(&services.store);
-    services
-        .log
-        .record(&mut |stamps| store.set_shared(stamps, podcast_id, shared))?;
-    if !shared {
-        services.confirmations.forget(podcast_id)?;
-    }
-    Ok(())
+    publication::set_shared(
+        &services.store,
+        &services.confirmations,
+        podcast_id,
+        shared,
+        confirm,
+        || {
+            services
+                .log
+                .record(&mut |stamps| store.set_shared(stamps, podcast_id, shared))
+        },
+    )
 }
 
 fn is_podcast_effect(effect: &Effect) -> bool {
