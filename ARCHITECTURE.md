@@ -368,12 +368,27 @@ The TUI owns what the contract leaves to clients:
   stop bumps that generation, so a slow stream never replaces what the user
   chose since. A stale audio URL (4xx) triggers one feed refresh and a retry
   with the address the feed lists for the same episode id. A stream that
-  cannot seek does not start at a saved position it cannot reach.
+  cannot seek does not start at a saved position it cannot reach, and seeks
+  in it (or in an episode still connecting) are refused. The stream is
+  cancelled by the same generation: a superseded start stops connecting or
+  reading up to its resume offset, and a read blocked on a stalled server
+  inside the audio callback returns within 100 ms, so it cannot hold the
+  audio thread past the next stop or start. The player does not report the
+  end of a superseded source. Pause and resume pressed while a source is
+  prepared update the intent it starts with.
+- **End of a stream.** The reader records whether the decoder stopped on a
+  read error (lost connection, expired URL, cancellation) and whether the
+  server announced the file size. Only an end that the server described, or
+  one within the completion window, completes the episode and moves the
+  queue on; otherwise the last seen position is saved and playback stops on
+  the episode (`playback::played_to_the_end`).
 - **Progress.** `podcasts::progress` runs one writer thread so every
   progress write of this device is ordered. The app tick follows the
   position and actual listening time and sends: an explicit start (or
-  "start over"), checkpoints every 20 s and on pause, explicit seeks,
-  completion (`reaches_completion` or end of stream) and an end with the last
+  "start over"), checkpoints every 20 s and on pause, explicit seeks (saved
+  once the audio thread reports that the seek worked,
+  `PlayerEvent::Seeked`), completion (`reaches_completion` or the real end
+  of the stream) and an end with the last
   seen position on stop, track change, handoff and exit. When the store
   reports a newer generation (another device started over, for example), the
   playback stops checkpointing until the user's next explicit action.

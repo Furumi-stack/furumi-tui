@@ -220,11 +220,17 @@ Episodes play in the same queue as music:
   9 MB) and seeks with HTTP range requests. Nothing is downloaded ahead of
   time and nothing is kept after playback. If the server cannot seek (no
   file length), Furumi says that it cannot continue at the saved position
-  instead of starting from the wrong place; "start over" still works. If the
-  episode's address no longer works, the feed is checked once for a new one.
+  instead of starting from the wrong place; "start over" still works, and
+  seeking in such an episode is refused with a message. If the episode's
+  address no longer works, the feed is checked once for a new one.
+- If the connection is lost during an episode (no data for 30 seconds, or
+  the address stops working), playback stops there: the position is saved,
+  the episode is not marked played and the queue does not move on; play
+  continues from that position. A pause pressed while an episode is still
+  connecting is kept when the audio arrives.
 - The position is saved every 20 seconds while playing and on pause, seek,
   stop, track change and exit. An episode counts as played within the last
-  30 seconds (or 5 %) or when its stream ends; a listen enters the episode's
+  30 seconds (or 5 %) or when its stream reaches its end; a listen enters the episode's
   history when it completed or lasted at least 30 seconds. Seeking back and
   "start over" are real changes: an older save never moves the position
   forward again.
