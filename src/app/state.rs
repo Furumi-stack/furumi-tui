@@ -1445,7 +1445,11 @@ pub struct SearchState {
     /// Public podcast cards (type `podcast`), listed after the federated
     /// tracks; Enter opens the card.
     pub fed_podcasts: Vec<crate::podcasts::discovery::PodcastHit>,
+    /// The federated music search is running.
     pub fed_loading: bool,
+    /// The podcast search in the discovery overlay is running (separately,
+    /// so the music results never wait for it).
+    pub fed_podcasts_loading: bool,
     /// Present only for a track-seeded search; text-search refreshes must not
     /// replace this page with a title query.
     pub similarity_source: Option<i64>,
@@ -1473,6 +1477,7 @@ impl SearchState {
             || !self.fed_artists.is_empty()
             || !self.fed_podcasts.is_empty()
             || self.fed_loading
+            || self.fed_podcasts_loading
     }
 
     pub fn similarity_len(&self) -> usize {

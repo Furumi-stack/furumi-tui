@@ -13,13 +13,18 @@ use anyhow::{Result, bail};
 use furumi_library::podcasts::PodcastStore;
 use music_dht::LibraryItem;
 use music_dht::podcast::{FeedUrl, PodcastId};
-use music_dht::podcast_dht::{FederatedSearchHit, PodcastSearchHit, merge_search_results};
+use music_dht::podcast_dht::{
+    FederatedSearchHit, PodcastDht, PodcastSearchHit, merge_search_results,
+};
 
 use super::fetch::{FeedBody, Fetcher, Validators};
 use super::refresh::{self, Services, SubscribeReport};
 
 /// Podcast hits asked from the discovery overlay per search.
 pub const PODCAST_SEARCH_LIMIT: usize = 20;
+/// Upper bound of one podcast search, the overlay's bootstrap included (the
+/// overlay bounds only its lookups). The music lookup deadline.
+pub const PODCAST_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Episodes kept in a preview (newest first).
 pub const PREVIEW_EPISODES: usize = 200;
 
@@ -52,8 +57,9 @@ impl PodcastHit {
 
 /// The podcast hits of a federated search, in the order of
 /// [`merge_search_results`] (exact title matches first). The TUI keeps its
-/// own sections for the music results; only the podcast entries of the
-/// merged list are taken.
+/// own sections for the music results and searches podcasts separately;
+/// the order of the podcast entries does not depend on the music items
+/// (the merge is a stable exact-title partition), so [`search`] passes none.
 pub fn podcast_hits(
     query: &str,
     music: Vec<LibraryItem>,
@@ -66,6 +72,35 @@ pub fn podcast_hits(
             FederatedSearchHit::Music(_) => None,
         })
         .collect()
+}
+
+/// Searches the discovery overlay for public podcast cards, independently
+/// of the music search. Bounded by `timeout` (the overlay bootstraps first
+/// when it knows no peers, which its own lookup deadline does not cover).
+/// No overlay, an error or a timeout give no hits; the warning names
+/// neither the query nor any URL.
+pub async fn search(
+    dht: Option<&PodcastDht>,
+    query: &str,
+    timeout: std::time::Duration,
+) -> Vec<PodcastHit> {
+    let Some(dht) = dht else {
+        return Vec::new();
+    };
+    match tokio::time::timeout(timeout, dht.search(query, PODCAST_SEARCH_LIMIT)).await {
+        Ok(Ok(hits)) => podcast_hits(query, Vec::new(), hits),
+        Ok(Err(err)) => {
+            tracing::warn!("podcast discovery search failed: {err}");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_s = timeout.as_secs(),
+                "podcast discovery search timed out"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Resolves each hit's origin URL against the local store (feed aliases

@@ -1033,7 +1033,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         if !rows.is_empty() {
             rows.push((Line::default(), None, None));
         }
-        let header = if state.search.fed_loading {
+        let header = if state.search.fed_loading || state.search.fed_podcasts_loading {
             "Federation · searching…"
         } else {
             "Federation"

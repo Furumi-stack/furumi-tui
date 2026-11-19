@@ -12,7 +12,8 @@ use music_dht::podcast::{FeedUrl, PodcastId};
 use music_dht::podcast_dht::{ClaimedFeedUrl, FederatedSearchHit, SearchHitKind};
 
 use super::discovery::{
-    PodcastHit, podcast_hits, preview, resolve_local_ids, subscribe_from_hit, test_hit,
+    PODCAST_SEARCH_TIMEOUT, PodcastHit, podcast_hits, preview, resolve_local_ids, search,
+    subscribe_from_hit, test_hit,
 };
 use super::publication::{Publication, check_share, reconcile};
 use super::publication_tests::{Node, wait_for};
@@ -34,6 +35,41 @@ fn podcast_hits_put_exact_titles_first_and_keep_only_podcasts() {
         FederatedSearchHit::Podcast(exact).kind().as_str(),
         "podcast"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn podcast_search_is_bounded_and_empty_without_the_overlay() {
+    // Federation off (no overlay): no hits, nothing to wait for.
+    assert!(
+        search(None, "rust radio", PODCAST_SEARCH_TIMEOUT)
+            .await
+            .is_empty()
+    );
+
+    // An overlay that knows no overlay peers bootstraps from its music-DHT
+    // contacts before it searches, outside its own lookup deadline. With a
+    // contact that no longer answers, the search still ends at the bound.
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("furumi-tui-podcast-search-bound-test");
+    let a = Node::start(&temp.path().join("a"), network).await;
+    let gone = Node::start(&temp.path().join("gone"), network).await;
+    a.service
+        .connect(gone.service.ticket().await.unwrap())
+        .await
+        .unwrap();
+    wait_for("a music DHT contact", async || {
+        (!a.service.known_peers().is_empty()).then_some(())
+    })
+    .await;
+    gone.stop().await;
+    assert_eq!(a.dht.known_peers(), 0);
+    let bound = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let hits = search(Some(&a.dht), "rust radio", bound).await;
+    let elapsed = started.elapsed();
+    assert!(hits.is_empty());
+    assert!(elapsed < bound + Duration::from_secs(1), "took {elapsed:?}");
+    a.stop().await;
 }
 
 #[tokio::test]
@@ -296,12 +332,11 @@ async fn stranger_subscribes() {
     // B searches like the search view does: overlay search, merged order,
     // resolved against B's own store.
     let mut hits = wait_for("the shared card", async || {
-        let found = b.dht.search("test show", 10).await.unwrap();
+        let found = search(Some(&b.dht), "test show", PODCAST_SEARCH_TIMEOUT).await;
         (!found.is_empty()).then_some(found)
     })
     .await;
     assert_eq!(hits.len(), 1, "the private subscription is not found");
-    let mut hits = podcast_hits("test show", Vec::new(), std::mem::take(&mut hits));
     resolve_local_ids(&user_b.services.store, &mut hits).unwrap();
     let hit = hits.remove(0);
     assert_eq!(hit.hit.kind(), SearchHitKind::Podcast);
@@ -361,7 +396,11 @@ async fn stranger_subscribes() {
             .unwrap()
             .is_none()
     );
-    assert!(b.dht.search("test show", 10).await.unwrap().is_empty());
+    assert!(
+        search(Some(&b.dht), "test show", PODCAST_SEARCH_TIMEOUT)
+            .await
+            .is_empty()
+    );
     let rows = store_b
         .list_podcasts(PodcastListFilter::Subscribed)
         .unwrap();

@@ -346,10 +346,6 @@ pub struct FedArtistHit {
 pub struct FedSearchResults {
     pub artists: Vec<FedArtistHit>,
     pub tracks: Vec<FedTrack>,
-    /// Public podcast cards from the discovery overlay (explicit type
-    /// `podcast`), in `merge_search_results` order. Empty while the overlay
-    /// is not running.
-    pub podcasts: Vec<crate::podcasts::discovery::PodcastHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -1267,30 +1263,16 @@ impl Federation {
     /// card can be assembled for (from artist records and from the artist
     /// names of matching tracks/releases).
     ///
-    /// Public podcast cards are looked up in the discovery overlay at the
-    /// same time; a failure there only leaves the podcast hits empty.
+    /// Public podcast cards are searched separately
+    /// ([`Federation::search_podcasts`]), so the music results never wait
+    /// for the discovery overlay.
     pub async fn search(&self, query: &str) -> Result<FedSearchResults> {
         let service = self.service().await?;
         let normalized = music_dht::normalize_name(query);
-        let podcast_dht = self.podcast_dht.borrow().clone();
-        let (outcome, podcast_hits) = tokio::join!(service.search_network(query), async {
-            match podcast_dht {
-                Some(dht) => dht
-                    .search(query, crate::podcasts::discovery::PODCAST_SEARCH_LIMIT)
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::warn!("podcast discovery search failed: {err}");
-                        Vec::new()
-                    }),
-                None => Vec::new(),
-            }
-        });
-        let outcome = outcome.map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
-        let podcasts = crate::podcasts::discovery::podcast_hits(
-            query,
-            outcome.network_results.clone(),
-            podcast_hits,
-        );
+        let outcome = service
+            .search_network(query)
+            .await
+            .map_err(|err| anyhow::anyhow!("federated search failed: {err}"))?;
         let own = service.endpoint_id();
         let mut tracks: Vec<FedTrack> = outcome
             .network_results
@@ -1376,11 +1358,25 @@ impl Federation {
         artists.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| a.name.cmp(&b.name)));
         rank_fed_search_results(&mut artists, &mut tracks, &normalized);
 
-        Ok(FedSearchResults {
-            artists,
-            tracks,
-            podcasts,
-        })
+        Ok(FedSearchResults { artists, tracks })
+    }
+
+    /// Public podcast cards matching `query` in the discovery overlay
+    /// (explicit type `podcast`), bounded by
+    /// [`crate::podcasts::discovery::PODCAST_SEARCH_TIMEOUT`] including the
+    /// overlay's bootstrap. Empty while the overlay is not running, on an
+    /// error or on timeout.
+    pub async fn search_podcasts(
+        &self,
+        query: &str,
+    ) -> Vec<crate::podcasts::discovery::PodcastHit> {
+        let podcast_dht = self.podcast_dht.borrow().clone();
+        crate::podcasts::discovery::search(
+            podcast_dht.as_deref(),
+            query,
+            crate::podcasts::discovery::PODCAST_SEARCH_TIMEOUT,
+        )
+        .await
     }
 
     /// Bounded fan-out to known peers using the exact model/profile

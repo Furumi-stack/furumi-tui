@@ -3801,10 +3801,16 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 Ok(results) => {
                     state.search.fed_artists = results.artists;
                     state.search.fed_tracks = results.tracks;
-                    state.search.fed_podcasts = results.podcasts;
                 }
                 Err(message) => tracing::warn!(%message, "federated search failed"),
             }
+        }
+        AppEvent::FedPodcastsLoaded { seq, hits } => {
+            if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {
+                return;
+            }
+            state.search.fed_podcasts_loading = false;
+            state.search.fed_podcasts = hits;
         }
         AppEvent::FedSimilaritySearchLoaded { seq, result } => {
             if runtime.search_seq.load(std::sync::atomic::Ordering::SeqCst) != seq {

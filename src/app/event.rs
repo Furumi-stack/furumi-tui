@@ -138,6 +138,13 @@ pub enum AppEvent {
         seq: u64,
         result: Result<crate::federation::FedSearchResults, String>,
     },
+    /// Public podcast cards for the same live search (`seq`), delivered on
+    /// their own so the music results never wait for the overlay. Already
+    /// resolved against the podcast store.
+    FedPodcastsLoaded {
+        seq: u64,
+        hits: Vec<crate::podcasts::discovery::PodcastHit>,
+    },
     /// A federated artist card finished assembling.
     FedArtistLoaded {
         name: String,
