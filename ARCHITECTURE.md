@@ -406,8 +406,9 @@ The TUI owns what the contract leaves to clients:
   `podcast_dht` in its own manifest only while the overlay runs. A cache
   that cannot be opened is logged and only turns discovery off. What this
   device publishes is decided by `podcasts::publication`: after local share
-  and unsubscribe actions, received podcast operations, feed refreshes,
-  every overlay (re)start and every 5 minutes it builds one
+  and unsubscribe actions (at once: `Reconciler::revoke_now`), received
+  podcast operations and feed refreshes (debounced 1 s), every overlay
+  (re)start and every 5 minutes it builds one
   `PodcastShareState` per subscription (merged registers, a card from the
   catalog for shared podcasts only, the local privacy confirmation) and
   calls the declarative `PodcastDht::sync_shares`, which publishes what is
@@ -417,14 +418,24 @@ The TUI owns what the contract leaves to clients:
   republish. Publication runs from each device's own identity. Privacy
   confirmations of feed URLs that look private are device-local
   (`podcast-share-confirmations.json`, mode 0600) and bound to the exact
-  URLs. Without a readable podcast store this device revokes all its own
-  cards. Logs carry counts only.
-- **Finding and subscribing.** `Federation::search` runs
-  `PodcastDht::search` next to the music DHT search and takes the podcast
-  entries of `merge_search_results` (exact titles first) as
-  `podcasts::discovery::PodcastHit`s; the music sections keep their own
-  aggregation and ranking, so music results are unchanged. Off the UI
-  thread each hit's origin URL is resolved with
+  URLs and to the share decision (the share register's operation): a newer
+  decision on any device drops them. Cards leave out artwork and web links
+  that look private, and both for a private-looking feed. Without a
+  readable podcast store this device revokes all its own cards. The report
+  of each pass lists the private podcasts whose own card is still live
+  (`unrevoked`: pending, failed or federation off) for the side panel; the
+  overlay peer count is refreshed every 10 s between passes. Before the
+  node stops on quit, `Reconciler::flush` waits up to 4 s for a revocation
+  requested just before. Logs carry counts only.
+- **Finding and subscribing.** `Federation::search_podcasts`
+  (`podcasts::discovery::search`) runs `PodcastDht::search` as its own task,
+  bounded at 15 s including the overlay's bootstrap, apart from the music
+  search (`Federation::search`, unchanged), and delivers
+  `AppEvent::FedPodcastsLoaded` for the same search sequence, so music
+  results never wait for the overlay. The hits keep the podcast entries of
+  `merge_search_results` (exact titles first) as
+  `podcasts::discovery::PodcastHit`s. Off the UI thread each hit's origin
+  URL is resolved with
   `PodcastStore::resolve_podcast_id`, and the "subscribed" mark compares
   that id and the card's id with the subscribed podcasts, so a feed alias
   counts. A card is a publisher's claim: only `PodcastSearchHit::feed_url`
@@ -433,7 +444,11 @@ The TUI owns what the contract leaves to clients:
   «Подписаться» (`discovery::subscribe_from_hit` → `refresh::subscribe_url`),
   which refuses a hit whose id does not match its URL and stores only what
   the feed says. Claimed moved-feed URLs are displayed, never fetched or
-  recorded as aliases. The new subscription is private.
+  recorded as aliases. The new subscription is private. Subscribing to an
+  address whose feed announces (`itunes:new-feed-url`) a newer one this
+  device already follows reports that subscription instead of adding a
+  second one, and the preview (`discovery::preview_for`) resolves the
+  address the feed moved to, so the card reads «Уже подписан» then.
 - **Progress.** `podcasts::progress` runs one writer thread so every
   progress write of this device is ordered. The app tick follows the
   position and actual listening time and sends: an explicit start (or

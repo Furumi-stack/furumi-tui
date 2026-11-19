@@ -19,18 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published only after a confirmation on that device. The list and side
   panel show whether a podcast is shared and whether this device publishes
   it.
+- Turning sharing off or unsubscribing revokes this device's card at once,
+  and quitting waits up to 4 s for that; the side panel says when a
+  private podcast's card is not revoked yet (pending, failed or federation
+  off). A privacy confirmation covers one share decision: turning sharing
+  off (or on again after that) on any trusted device asks again. Cards
+  leave out artwork and web links that look like they carry an access key,
+  and both for a feed whose URL looks private.
 - Search (`/`, with the federation running) also finds public podcast cards.
   They are listed after the music results under "Podcasts · public cards" with
   a `[podcast]` marker, the number of publishing devices, and "✓ subscribed"
-  when this device is subscribed (also through a feed alias). Local-only
-  search is unchanged.
+  when this device is subscribed (also through a feed alias). The podcast
+  search runs apart from the federated music search (bounded at 15 s), so
+  music results never wait for it; local-only search is unchanged.
 - Enter on a podcast hit opens its card: title, author, categories,
   description, episode count, newest episode, publishing devices, feed URL
   and unverified moved-feed claims. `e` reads the seasons and episodes from
   the feed without subscribing. «Подписаться» (Enter) subscribes privately
   with the card's origin feed URL, so the podcast id is the card's, and
   reads everything from the feed itself; «Уже подписан» opens the podcast
-  in the Podcasts tab instead.
+  in the Podcasts tab instead, also when this device follows the feed under
+  the newer address it moved to (known once the feed was read), and
+  subscribing to such an older address adds no second subscription.
 
 ### Changed
 

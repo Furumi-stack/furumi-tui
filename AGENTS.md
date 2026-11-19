@@ -69,7 +69,10 @@ update it only when dependencies change.
   `podcasts::publication` (`PodcastDht::sync_shares` over the merged
   registers): never publish a podcast directly, never log feed URLs or ids of
   podcasts that are not shared, never put progress, history, counters or
-  device names into a card. Public cards found by search are publisher claims:
+  device names into a card. A local share-off or unsubscribe asks for an
+  immediate pass (`Reconciler::revoke_now`), which quitting waits for, and
+  privacy confirmations change only through `publication::set_shared` /
+  `ShareConfirmations` (bound to the share decision, never synced). Public cards found by search are publisher claims:
   subscribe and preview only through `podcasts::discovery`, which uses the
   card's origin URL (`PodcastSearchHit::feed_url`), never a claimed URL, and
   never stores card metadata. Queue items are identified by `state::track_key`
