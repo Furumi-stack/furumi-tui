@@ -496,6 +496,56 @@ fn cards_leave_out_artwork_and_links_that_look_private() {
     );
     assert!(card.privacy_warnings().is_empty());
 
+    // Public hosts name artwork and pages by UUIDs and content hashes in
+    // the path: kept (a key in the query is not).
+    for public in [
+        "https://megaphone.imgix.net/podcasts/1f2e3d4c-5b6a-11ee-8c99-0242ac120002/image/art.jpg",
+        "https://image.simplecastcdn.com/images/4c3b2a19-8d7e-4f6a-b5c4-d3e2f1a0b9c8/3a2b1c0d-9e8f-4a7b-6c5d-4e3f2a1b0c9d/3000x3000/art.jpg",
+        "https://is1-ssl.mzstatic.com/image/thumb/Podcasts126/v4/0a/1b/2c/0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d/mza_1234567890123456789.jpg/600x600bb.jpg",
+        "https://d3t3ozftmdmh3i.cloudfront.net/production/podcast_uploaded/1234567/1234567-1600000000000-0123456789abc.jpg",
+    ] {
+        assert!(
+            FeedUrl::parse(public)
+                .ok()
+                .and_then(|url| music_dht::podcast_dht::feed_url_privacy_warning(&url))
+                .is_some(),
+            "the feed URL rules flag {public}"
+        );
+        let show = device.subscribe_meta(
+            &store,
+            &PodcastMeta {
+                feed_url: FeedUrl::parse(&format!(
+                    "https://feeds.example.test/{}.xml",
+                    public.len()
+                ))
+                .unwrap(),
+                ..meta(SHOW_URL, public, public)
+            },
+        );
+        let card = share_card(&store, &show).unwrap().unwrap();
+        assert_eq!(card.image_url.as_deref(), Some(public));
+        assert_eq!(card.link.as_deref(), Some(public));
+    }
+    for signed in [
+        "https://cdn.example.test/art.jpg?sig=Zm9vYmFyYmF6cXV4cXV1eDEyMzQ1Njc4OQ",
+        "https://www.patreon.com/file?h=1234&i=5678",
+        "ftp://cdn.example.test/art.jpg",
+    ] {
+        let show = device.subscribe_meta(
+            &store,
+            &PodcastMeta {
+                feed_url: FeedUrl::parse(&format!(
+                    "https://feeds.example.test/signed-{}.xml",
+                    signed.len()
+                ))
+                .unwrap(),
+                ..meta(SHOW_URL, signed, signed)
+            },
+        );
+        let card = share_card(&store, &show).unwrap().unwrap();
+        assert_eq!((card.image_url, card.link), (None, None), "{signed}");
+    }
+
     // A member feed (its URL needs the dialog): artwork and page are left
     // out whatever they look like, the dialog shows the feed URLs only.
     let secret = device.subscribe_meta(

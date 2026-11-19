@@ -381,10 +381,10 @@ pub fn confirmations_path(db_path: &Path) -> PathBuf {
 /// URL this device fetches, `id_feed_url` the origin URL the podcast id was
 /// derived from. Bounded to the card limits.
 ///
-/// The artwork and web page URLs are left out when they look private
-/// themselves (`feed_url_privacy_warning`) or when the feed URLs do: member
-/// feeds serve signed artwork and item links, and the share dialog shows
-/// the feed URLs only.
+/// The artwork and web page URLs are left out when they look like they
+/// carry an access key themselves ([`looks_private`]) or when the feed URLs
+/// look private: member feeds serve signed artwork and item links, and the
+/// share dialog shows the feed URLs only.
 fn catalog_card(
     summary: &PodcastSummary,
     subscription: &SubscriptionRecord,
@@ -422,13 +422,27 @@ fn catalog_card(
 }
 
 /// An artwork or web page URL that must not be published: it carries what
-/// looks like an access key (the feed URL rules), or it is not a plain
-/// http(s) URL those rules can check.
+/// looks like an access key, or it is not a plain http(s) URL the rules can
+/// check.
+///
+/// The feed URL rules apply except the random-looking path segment: public
+/// podcast hosts and CDNs name artwork and pages by UUIDs and content
+/// hashes, so that rule would drop the artwork of most public podcasts.
+/// Signed and tokenized artwork carries its key in the query, which the
+/// other rules catch (user info is refused by `FeedUrl::parse`), and a
+/// member feed's artwork is left out with its feed anyway.
+/// `feed_url_privacy_warning` checks the path last, so a path warning means
+/// no other rule matched.
 fn looks_private(url: &str) -> bool {
-    FeedUrl::parse(url).map_or(true, |url| feed_url_privacy_warning(&url).is_some())
+    FeedUrl::parse(url).map_or(true, |url| {
+        !matches!(
+            feed_url_privacy_warning(&url),
+            None | Some(FeedUrlPrivacyWarning::HighEntropyPathSegment { .. })
+        )
+    })
 }
 
-/// The card [`share_states`] would publish for `podcast_id` (whether or not
+/// The card [`share_plan`] would publish for `podcast_id` (whether or not
 /// it is shared yet), for the share confirmation. `None` when there is no
 /// subscription.
 pub fn share_card(store: &PodcastStore, podcast_id: &PodcastId) -> Result<Option<PodcastCardSpec>> {
