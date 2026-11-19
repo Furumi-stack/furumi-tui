@@ -60,6 +60,8 @@ pub struct DeviceStatusRow {
     pub device_id: String,
     pub name: String,
     pub client_version: String,
+    /// Device-sync protocol version the device reported itself.
+    pub protocol_version: u16,
     pub endpoint_id: String,
     pub last_seen_ms: Option<i64>,
     pub revoked: bool,
@@ -292,6 +294,55 @@ struct PairingStatus {
     use_requester_group: bool,
 }
 
+/// How the protocol version in a device profile became known.
+///
+/// Version gating (podcast operations, snapshot sections and playback
+/// state need v4) depends on these values, so this device never stores its
+/// own [`PROTOCOL_VERSION`] for another device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionReport {
+    /// The device reported its own version (`None`: an older client left it
+    /// out). Replaces the stored version, so a downgrade is noticed.
+    SelfReported(Option<u16>),
+    /// Another device relayed the profile. Only raises the stored version:
+    /// v1–v3 relays substitute their own constant.
+    Relayed(u16),
+}
+
+impl VersionReport {
+    fn resolve(self, stored: Option<u16>) -> u16 {
+        match self {
+            VersionReport::SelfReported(reported) => {
+                music_dht::device_sync::profile_protocol_version(reported, stored)
+            }
+            VersionReport::Relayed(relayed) => {
+                music_dht::device_sync::relayed_protocol_version(relayed, stored)
+            }
+        }
+    }
+
+    /// Report carried by an entry of a `devices` list sent by `sender`.
+    fn for_listed(profile: &DeviceProfileWire, sender: Option<&str>) -> Self {
+        if sender == Some(profile.device_id.as_str()) {
+            VersionReport::SelfReported(Some(profile.protocol_version))
+        } else {
+            VersionReport::Relayed(profile.protocol_version)
+        }
+    }
+}
+
+/// The stored protocol version of a device, if any row exists.
+fn stored_protocol_version(conn: &Connection, device_id: &str) -> Result<Option<u16>> {
+    Ok(conn
+        .query_row(
+            "SELECT protocol_version FROM sync_devices WHERE device_id = ?1",
+            [device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .and_then(|version| u16::try_from(version).ok()))
+}
+
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -512,7 +563,7 @@ impl DeviceSync {
                 client_version: CLIENT_VERSION.to_string(),
                 endpoint_ticket: ticket.to_string(),
                 endpoint_id,
-                protocol_version: None,
+                protocol_version: Some(PROTOCOL_VERSION),
             })?;
         }
         Ok(())
@@ -549,7 +600,7 @@ impl DeviceSync {
             invite_id,
             secret,
             expires_at_ms,
-            protocol_version: None,
+            protocol_version: Some(PROTOCOL_VERSION),
         };
         Ok(encode_invite(&payload)?)
     }
@@ -661,13 +712,17 @@ impl DeviceSync {
                 ..
             } => {
                 self.set_group_id(&group_id)?;
-                if let Some(profile) = profile {
-                    self.apply_device_profile(&profile, true)?;
+                if let Some(profile) = &profile {
+                    self.apply_device_profile(
+                        profile,
+                        true,
+                        VersionReport::SelfReported(Some(profile.protocol_version)),
+                    )?;
                     if let Some(playback) = playback {
                         self.apply_playback_snapshot(&profile.device_id, playback)?;
                     }
                 }
-                self.apply_device_profiles(&devices)?;
+                self.apply_device_profiles(&devices, Some(&invite.device_id))?;
                 self.apply_snapshot(snapshot)?;
                 self.apply_ops(ops)?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
@@ -708,7 +763,8 @@ impl DeviceSync {
             conn.query_row(
                 "SELECT device_id, name, client_version, endpoint_id,
                         endpoint_ticket, created_at_ms,
-                        requester_group_id, requester_group_devices_json
+                        requester_group_id, requester_group_devices_json,
+                        protocol_version
                  FROM sync_pending_pairing
                  WHERE request_id = ?1",
                 [request_id],
@@ -718,7 +774,7 @@ impl DeviceSync {
                             device_id: row.get(0)?,
                             name: row.get(1)?,
                             client_version: row.get(2)?,
-                            protocol_version: PROTOCOL_VERSION,
+                            protocol_version: music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION,
                             endpoint_id: row.get(3)?,
                             endpoint_ticket: row.get(4)?,
                             revoked: false,
@@ -727,6 +783,8 @@ impl DeviceSync {
                         },
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<i64>>(8)?
+                            .and_then(|version| u16::try_from(version).ok()),
                     ))
                 },
             )
@@ -747,7 +805,13 @@ impl DeviceSync {
             )?
         };
         if accept && changed > 0 {
-            if let Some((profile, requester_group_id, requester_group_devices_json)) = pending {
+            if let Some((
+                profile,
+                requester_group_id,
+                requester_group_devices_json,
+                requester_version,
+            )) = pending
+            {
                 if use_requester_group {
                     if let Some(group_id) = requester_group_id
                         .as_deref()
@@ -757,9 +821,15 @@ impl DeviceSync {
                     }
                     let requester_devices: Vec<DeviceProfileWire> =
                         serde_json::from_str(&requester_group_devices_json)?;
-                    self.apply_device_profiles(&requester_devices)?;
+                    self.apply_device_profiles(&requester_devices, Some(&profile.device_id))?;
                 }
-                self.apply_device_profile(&profile, true)?;
+                // The version the requester reported in its own pairing
+                // request (requests stored by older builds have none).
+                self.apply_device_profile(
+                    &profile,
+                    true,
+                    VersionReport::SelfReported(requester_version),
+                )?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: profile.device_id,
                 })?;
@@ -1151,7 +1221,8 @@ impl DeviceSync {
                 playback,
                 ..
             } => {
-                self.apply_device_profiles(&devices)?;
+                // The responder lists itself: that entry is its own report.
+                self.apply_device_profiles(&devices, Some(&device.device_id))?;
                 if let Some(playback) = playback {
                     self.apply_playback_snapshot(&device.device_id, playback)?;
                 }
@@ -1222,8 +1293,9 @@ impl DeviceSync {
     fn own_profile(&self, endpoint_ticket: &str) -> Result<DeviceProfileWire> {
         let identity = self.ensure_identity()?;
         let endpoint_id = ticket_endpoint_id(endpoint_ticket).unwrap_or_default();
-        {
+        let previous_version = {
             let conn = lock(&self.conn);
+            let previous_version = stored_protocol_version(&conn, &identity.device_id)?;
             conn.execute(
                 "INSERT INTO sync_devices
                     (device_id, name, client_version, protocol_version, endpoint_id,
@@ -1246,6 +1318,19 @@ impl DeviceSync {
                     now_ms(),
                 ],
             )?;
+            previous_version
+        };
+        if previous_version.is_some_and(|version| version < PROTOCOL_VERSION) {
+            // First start of a new protocol version: announce it in the log
+            // too, so devices that only hear of this one through relays
+            // learn its version (`profile_protocol_version`).
+            self.record_local_op(SyncOpPayload::DeviceProfileSet {
+                name: identity.name.clone(),
+                client_version: CLIENT_VERSION.to_string(),
+                endpoint_ticket: endpoint_ticket.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                protocol_version: Some(PROTOCOL_VERSION),
+            })?;
         }
         Ok(DeviceProfileWire {
             device_id: identity.device_id,
@@ -1454,20 +1539,27 @@ impl DeviceSync {
                 client_version,
                 endpoint_ticket,
                 endpoint_id,
-                ..
+                protocol_version,
             } => {
                 let profile = DeviceProfileWire {
                     device_id: op.origin_device_id.clone(),
                     name: name.clone(),
                     client_version: client_version.clone(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: protocol_version
+                        .unwrap_or(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION),
                     endpoint_id: endpoint_id.clone(),
                     endpoint_ticket: endpoint_ticket.clone(),
                     revoked: false,
                     revoke_cutoff_seq: None,
                     updated_at_ms: op.hlc_ms,
                 };
-                self.apply_device_profile(&profile, false)?;
+                // The origin announces its own profile; profiles before v4
+                // carry no version and keep the stored one.
+                self.apply_device_profile(
+                    &profile,
+                    false,
+                    VersionReport::SelfReported(*protocol_version),
+                )?;
                 false
             }
             SyncOpPayload::DeviceTrusted { target_device_id } => {
@@ -1952,14 +2044,26 @@ impl DeviceSync {
         Ok(())
     }
 
-    fn apply_device_profiles(&self, devices: &[DeviceProfileWire]) -> Result<()> {
+    /// Stores the profiles of a `devices` list sent by `sender`. The entry
+    /// of the sender itself is its own version report; the others are
+    /// relayed.
+    fn apply_device_profiles(
+        &self,
+        devices: &[DeviceProfileWire],
+        sender: Option<&str>,
+    ) -> Result<()> {
         for profile in devices {
-            self.apply_device_profile(profile, false)?;
+            self.apply_device_profile(profile, false, VersionReport::for_listed(profile, sender))?;
         }
         Ok(())
     }
 
-    fn apply_device_profile(&self, profile: &DeviceProfileWire, trusted: bool) -> Result<()> {
+    fn apply_device_profile(
+        &self,
+        profile: &DeviceProfileWire,
+        trusted: bool,
+        version: VersionReport,
+    ) -> Result<()> {
         let own = self.ensure_identity()?.device_id;
         if profile.device_id == own {
             return Ok(());
@@ -1971,6 +2075,8 @@ impl DeviceSync {
         };
         {
             let conn = lock(&self.conn);
+            let protocol_version =
+                version.resolve(stored_protocol_version(&conn, &profile.device_id)?);
             conn.execute(
                 "INSERT INTO sync_devices
                     (device_id, name, client_version, protocol_version, endpoint_id,
@@ -2006,7 +2112,7 @@ impl DeviceSync {
                     profile.device_id,
                     profile.name,
                     profile.client_version,
-                    profile.protocol_version,
+                    protocol_version,
                     profile.endpoint_id,
                     profile.endpoint_ticket,
                     trusted_at_ms,
@@ -2399,7 +2505,7 @@ impl DeviceSync {
         let last_error = get_meta(&conn, "last_error")?;
         let mut stmt = conn.prepare(
             "SELECT device_id, name, client_version, endpoint_id, last_seen_ms,
-                    revoked_at_ms IS NOT NULL
+                    revoked_at_ms IS NOT NULL, protocol_version
              FROM sync_devices
              WHERE trusted_at_ms IS NOT NULL
              ORDER BY revoked_at_ms IS NOT NULL, name COLLATE NOCASE, device_id",
@@ -2415,6 +2521,8 @@ impl DeviceSync {
                     endpoint_id: row.get(3)?,
                     last_seen_ms: row.get(4)?,
                     revoked: row.get::<_, i64>(5)? != 0,
+                    protocol_version: u16::try_from(row.get::<_, i64>(6)?)
+                        .unwrap_or(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2870,9 +2978,10 @@ async fn handle_pair_request(
                 (request_id, device_id, name, client_version, endpoint_id,
                  endpoint_ticket, invite_id, created_at_ms, status,
                  requester_group_id, requester_group_active_devices,
-                 requester_group_devices_json, use_requester_group)
+                 requester_group_devices_json, use_requester_group,
+                 protocol_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending',
-                     ?9, ?10, ?11, 0)",
+                     ?9, ?10, ?11, 0, ?12)",
             params![
                 request_id,
                 profile.device_id,
@@ -2885,6 +2994,7 @@ async fn handle_pair_request(
                 requester_group_id.as_deref(),
                 requester_group_active_devices as i64,
                 requester_group_devices_json,
+                profile.protocol_version,
             ],
         )?
     };
@@ -2962,9 +3072,13 @@ async fn handle_pair_request(
     {
         sync.set_group_id(group_id)?;
         response_group_id = group_id.to_string();
-        sync.apply_device_profiles(&requester_group_devices)?;
+        sync.apply_device_profiles(&requester_group_devices, Some(&profile.device_id))?;
     }
-    sync.apply_device_profile(&profile, true)?;
+    sync.apply_device_profile(
+        &profile,
+        true,
+        VersionReport::SelfReported(Some(profile.protocol_version)),
+    )?;
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
@@ -3053,8 +3167,12 @@ async fn handle_hello(
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
-    sync.apply_device_profile(&profile, false)?;
-    sync.apply_device_profiles(&devices)?;
+    sync.apply_device_profile(
+        &profile,
+        false,
+        VersionReport::SelfReported(Some(profile.protocol_version)),
+    )?;
+    sync.apply_device_profiles(&devices, Some(&profile.device_id))?;
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
@@ -3295,6 +3413,13 @@ CREATE TABLE IF NOT EXISTS sync_playback_applied (
         "use_requester_group",
         "ALTER TABLE sync_pending_pairing
          ADD COLUMN use_requester_group INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Protocol version the requester reported in its pairing request.
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "protocol_version",
+        "ALTER TABLE sync_pending_pairing ADD COLUMN protocol_version INTEGER",
     )?;
     Ok(())
 }

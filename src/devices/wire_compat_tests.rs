@@ -531,3 +531,46 @@ fn v3_peers_would_drop_the_source_of_podcast_items() {
     assert_eq!(forwarded.source, None);
     assert_eq!(forwarded.id, 0);
 }
+
+#[test]
+fn version_reports_stay_readable_by_older_clients() {
+    let link = encode_invite(&InviteWire {
+        v: 1,
+        ticket: "ticket".into(),
+        device_id: "tui_a".into(),
+        invite_id: "inv".into(),
+        secret: "s3cr3t".into(),
+        expires_at_ms: 10,
+        protocol_version: Some(PROTOCOL_VERSION),
+    })
+    .unwrap();
+    let invite = parse_invite(&link).unwrap();
+    assert_eq!(invite.inviter_protocol_version(), PROTOCOL_VERSION);
+    let json = serde_json::to_string(&invite).unwrap();
+    assert!(
+        json.ends_with(&format!(r#","p":{PROTOCOL_VERSION}}}"#)),
+        "{json}"
+    );
+    // `p` is an unknown field for 0.3.x and is ignored there.
+    assert_eq!(
+        serde_json::from_str::<legacy::InviteWire>(&json)
+            .unwrap()
+            .invite_id,
+        "inv"
+    );
+
+    let announcement = SyncOpPayload::DeviceProfileSet {
+        name: "TUI".into(),
+        client_version: CLIENT_VERSION.into(),
+        endpoint_ticket: "t".into(),
+        endpoint_id: "e".into(),
+        protocol_version: Some(PROTOCOL_VERSION),
+    };
+    let json = serde_json::to_string(&announcement).unwrap();
+    assert!(json.ends_with(&format!(r#","protocol_version":{PROTOCOL_VERSION}}}"#)));
+    let old: legacy::SyncOpPayload = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        old,
+        legacy::SyncOpPayload::DeviceProfileSet { .. }
+    ));
+}

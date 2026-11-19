@@ -54,8 +54,18 @@ async fn localhost_devices_exchange_state_and_handoff() {
         let profile_b = b
             .own_profile(&service_b.ticket().await.unwrap().to_string())
             .unwrap();
-        a.apply_device_profile(&profile_b, true).unwrap();
-        b.apply_device_profile(&profile_a, true).unwrap();
+        a.apply_device_profile(
+            &profile_b,
+            true,
+            VersionReport::SelfReported(Some(profile_b.protocol_version)),
+        )
+        .unwrap();
+        b.apply_device_profile(
+            &profile_a,
+            true,
+            VersionReport::SelfReported(Some(profile_a.protocol_version)),
+        )
+        .unwrap();
         a.claim_playback(&profile_a.device_id).unwrap();
         a.playback_tick(true, true).unwrap();
         let mut state = empty_playback_state();
@@ -163,7 +173,12 @@ async fn localhost_devices_exchange_state_and_handoff() {
         silent_profile.device_id = "silent-peer".into();
         silent_profile.endpoint_id = silent.endpoint_id().to_string();
         silent_profile.endpoint_ticket = silent.ticket().await.unwrap().to_string();
-        a.apply_device_profile(&silent_profile, true).unwrap();
+        a.apply_device_profile(
+            &silent_profile,
+            true,
+            VersionReport::SelfReported(Some(silent_profile.protocol_version)),
+        )
+        .unwrap();
         lock(&a.conn)
             .execute(
                 "UPDATE sync_devices SET last_seen_ms = ?1 WHERE device_id = 'silent-peer'",
@@ -709,6 +724,7 @@ fn newer_device_trust_reactivates_revoked_device() {
             updated_at_ms: 20,
         },
         false,
+        VersionReport::Relayed(PROTOCOL_VERSION),
     )
     .unwrap();
     assert!(!device_revoked(&sync, device_id));
@@ -1101,4 +1117,139 @@ fn podcast_episodes_never_enter_music_listening_history() {
         )
         .is_none()
     );
+}
+
+fn stored_version(sync: &DeviceSync, device_id: &str) -> Option<u16> {
+    stored_protocol_version(&lock(&sync.conn), device_id).unwrap()
+}
+
+fn profile_wire(device_id: &str, protocol_version: u16) -> DeviceProfileWire {
+    DeviceProfileWire {
+        device_id: device_id.to_string(),
+        name: device_id.to_string(),
+        client_version: "0.0.0".to_string(),
+        protocol_version,
+        endpoint_id: String::new(),
+        endpoint_ticket: String::new(),
+        revoked: false,
+        revoke_cutoff_seq: None,
+        updated_at_ms: 1,
+    }
+}
+
+fn profile_set_op(origin: &str, seq: i64, protocol_version: Option<u16>) -> SyncOpWire {
+    SyncOpWire {
+        op_id: format!("{origin}:{seq}"),
+        origin_device_id: origin.to_string(),
+        seq,
+        hlc_ms: seq,
+        payload: SyncOpPayload::DeviceProfileSet {
+            name: origin.to_string(),
+            client_version: "0.0.0".to_string(),
+            endpoint_ticket: String::new(),
+            endpoint_id: String::new(),
+            protocol_version,
+        },
+    }
+}
+
+#[test]
+fn peer_versions_come_from_the_peer_itself_never_from_this_build() {
+    let sync = test_sync();
+    sync.apply_device_trusted("dev_new", 1).unwrap();
+    sync.apply_device_trusted("dev_old", 1).unwrap();
+    // A device known only from `device_trusted` has reported nothing.
+    assert_eq!(
+        stored_version(&sync, "dev_new"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+
+    // Its own profile announcement (v4) is a self-report.
+    sync.apply_op(&profile_set_op("dev_new", 1, Some(4)))
+        .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(4));
+    // An announcement of an older client carries no version: this device
+    // keeps what it knows and never substitutes its own constant.
+    sync.apply_op(&profile_set_op("dev_old", 1, None)).unwrap();
+    assert_eq!(
+        stored_version(&sync, "dev_old"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+
+    // Relays of v1-v3 clients list every device with their own constant:
+    // a relayed value only raises the stored version.
+    sync.apply_device_profiles(
+        &[profile_wire("dev_new", 3), profile_wire("dev_old", 3)],
+        Some("dev_relay"),
+    )
+    .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(4));
+    assert_eq!(stored_version(&sync, "dev_old"), Some(3));
+
+    // The sender's own entry of a `devices` list is a self-report, so a
+    // downgraded device is noticed.
+    sync.apply_device_profiles(&[profile_wire("dev_new", 3)], Some("dev_new"))
+        .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(3));
+}
+
+#[test]
+fn accepted_pairing_keeps_the_version_the_requester_reported() {
+    let sync = test_sync();
+    let insert = |request_id: &str, device_id: &str, version: Option<i64>| {
+        lock(&sync.conn)
+            .execute(
+                "INSERT INTO sync_pending_pairing
+                    (request_id, device_id, name, client_version, endpoint_id,
+                     endpoint_ticket, invite_id, created_at_ms, status, protocol_version)
+                 VALUES (?1, ?2, 'phone', '0.0.0', '', '', 'inv', 1, 'pending', ?3)",
+                params![request_id, device_id, version],
+            )
+            .unwrap();
+    };
+    insert("req_v3", "dev_v3", Some(3));
+    // A request stored by an older build of this client has no version.
+    insert("req_legacy", "dev_legacy", None);
+    sync.answer_pairing("req_v3", true, false).unwrap();
+    sync.answer_pairing("req_legacy", true, false).unwrap();
+    assert_eq!(stored_version(&sync, "dev_v3"), Some(3));
+    assert_eq!(
+        stored_version(&sync, "dev_legacy"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+}
+
+#[test]
+fn a_new_protocol_version_is_announced_once_in_the_log() {
+    let sync = test_sync();
+    let device_id = sync.ensure_identity().unwrap().device_id;
+    let announcements = |sync: &DeviceSync| {
+        logged_ops(sync)
+            .into_iter()
+            .filter(|(_, _, kind, ..)| kind == "device_profile_set")
+            .map(|(_, _, _, payload, _)| serde_json::from_str::<SyncOpPayload>(&payload).unwrap())
+            .collect::<Vec<_>>()
+    };
+    // A fresh identity already reports this version in every hello.
+    sync.own_profile("").unwrap();
+    assert!(announcements(&sync).is_empty());
+    // The row written by the previous release.
+    lock(&sync.conn)
+        .execute(
+            "UPDATE sync_devices SET protocol_version = ?2 WHERE device_id = ?1",
+            params![device_id, PROTOCOL_VERSION - 1],
+        )
+        .unwrap();
+    sync.own_profile("").unwrap();
+    sync.own_profile("").unwrap();
+    let announced = announcements(&sync);
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert!(matches!(
+        announced[0],
+        SyncOpPayload::DeviceProfileSet {
+            protocol_version: Some(PROTOCOL_VERSION),
+            ..
+        }
+    ));
+    assert_eq!(stored_version(&sync, &device_id), Some(PROTOCOL_VERSION));
 }
