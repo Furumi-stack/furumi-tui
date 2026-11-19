@@ -12,7 +12,9 @@
 //! into that store. Everything sent to a peer is gated by the version that
 //! peer reported itself (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
 //! `playback_allowed_for_peer`; a queue with podcast items reaches an older
-//! peer only redacted, for its ownership engine).
+//! peer only redacted, for its ownership engine, and the placeholders such a
+//! peer echoes back as music are left out of what it sends:
+//! `drop_echoed_private_items`).
 
 use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
@@ -203,6 +205,74 @@ pub fn is_private_track_item(track: &TrackItem) -> bool {
         && track.id <= PRIVATE_ITEM_ID_BASE
         && track.id > PRIVATE_ITEM_ID_BASE - PRIVATE_ITEM_ID_SPAN
         && track.title == music_dht::device_sync::PRIVATE_ITEM_TITLE
+}
+
+/// Whether a music item received from a device below protocol v4 is a
+/// "Private item" placeholder that it echoes back.
+///
+/// Such a device gets this device's queue redacted
+/// ([`DeviceSync::local_playback_snapshot_for`]) and, while it controls this
+/// device, mirrors it with its own types, which have no
+/// `PlaybackTrack::source`. Each placeholder then turns into a music item
+/// titled "Private item" with nothing else: no content id, federated
+/// source, artist, release or duration. When that device takes playback
+/// over (Play on it, a paused-startup claim, automatic failover) or sends a
+/// command, it announces those items as its queue.
+fn is_echoed_private_item(track: &PlaybackTrack) -> bool {
+    track.source.is_none()
+        && track.title == music_dht::device_sync::PRIVATE_ITEM_TITLE
+        && track.content_id.is_none()
+        && track.fed.is_none()
+        && track.artist_names.is_empty()
+        && track.featured_artist_names.is_empty()
+        && track.release_title.is_empty()
+        && track.duration_seconds == 0.0
+}
+
+/// Removes the "Private item" placeholders that a device below protocol v4
+/// echoed back ([`is_echoed_private_item`]) from a state it sent, and
+/// returns how many there were. They stand for episodes this device keeps
+/// private; as music items they could never play, and they would spread to
+/// every queue as such. The position moves with the queue; when the
+/// current item was one of them, the next item is current from its start.
+pub fn drop_echoed_private_items(state: &mut PlaybackStateWire) -> usize {
+    let current = state.queue_pos;
+    let mut dropped = 0;
+    let mut kept_before = 0;
+    let mut current_dropped = false;
+    let mut index = 0;
+    state.queue.retain(|track| {
+        let echoed = is_echoed_private_item(track);
+        if echoed {
+            dropped += 1;
+            current_dropped |= index == current;
+        } else if index < current {
+            kept_before += 1;
+        }
+        index += 1;
+        !echoed
+    });
+    if dropped == 0 {
+        return 0;
+    }
+    state.queue_pos = kept_before.min(state.queue.len().saturating_sub(1));
+    if current_dropped {
+        state.position_secs = 0.0;
+    }
+    if state.queue.is_empty() {
+        state.playing = false;
+    }
+    dropped
+}
+
+/// Status for placeholders left out of a state from an older device.
+fn echoed_private_items_message(device: &str, dropped: usize) -> String {
+    let items = if dropped == 1 { "entry" } else { "entries" };
+    format!(
+        "left out {dropped} \"{}\" {items} of {device}'s queue: they stand for podcast \
+         episodes, and {device} needs a Furumi update to play them",
+        music_dht::device_sync::PRIVATE_ITEM_TITLE
+    )
 }
 
 /// Queue entries for a received queue, with `resolve_music` deciding music
@@ -396,6 +466,9 @@ struct PlaybackShared {
     engine_group: String,
     local: Option<PlaybackSnapshot>,
     remote: BTreeMap<String, PlaybackSnapshot>,
+    /// Echoed placeholders last left out of each older device's snapshot
+    /// (`drop_echoed_private_items`), to report a change only once.
+    echoed: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1957,6 +2030,18 @@ impl DeviceSync {
             }
             return Ok(());
         }
+        // Its state may hold the placeholders it was sent, echoed back as
+        // music items: they are left out, never adopted.
+        let mut command = command.clone();
+        let echoed = if music_dht::device_sync::supports_podcasts(peer_version) {
+            0
+        } else {
+            match &mut command {
+                PlaybackCommand::SetState { state, .. }
+                | PlaybackCommand::ActiveChanged { state, .. } => drop_echoed_private_items(state),
+            }
+        };
+        let command = &command;
         let handoff = matches!(command, PlaybackCommand::ActiveChanged { .. });
         if !handoff && target_device_id != identity.device_id {
             return Ok(());
@@ -1992,6 +2077,12 @@ impl DeviceSync {
                 authority: authority.clone(),
                 origin: origin.to_string(),
             });
+            if echoed > 0 {
+                let _ = tx.send(AppEvent::StatusMessage(echoed_private_items_message(
+                    &self.device_label(origin),
+                    echoed,
+                )));
+            }
         }
         Ok(())
     }
@@ -3056,7 +3147,7 @@ impl DeviceSync {
         Some(snapshot)
     }
 
-    fn apply_playback_snapshot(&self, sender: &str, snapshot: PlaybackSnapshot) -> Result<()> {
+    fn apply_playback_snapshot(&self, sender: &str, mut snapshot: PlaybackSnapshot) -> Result<()> {
         let identity = self.ensure_identity()?;
         if snapshot.device_id != sender || snapshot.device_id == identity.device_id {
             return Ok(());
@@ -3064,12 +3155,18 @@ impl DeviceSync {
         let Some(coordination) = &snapshot.coordination else {
             return Ok(());
         };
+        let echoed =
+            if music_dht::device_sync::supports_podcasts(self.peer_protocol_version(sender)?) {
+                0
+            } else {
+                drop_echoed_private_items(&mut snapshot.state)
+            };
         if !self.with_playback_engine(|engine| {
             engine.observe(&snapshot.device_id, coordination, playback_clock())
         })? {
             return Ok(());
         }
-        let should_send = {
+        let (should_send, report_echoed) = {
             let mut shared = lock(&self.playback);
             let changed = shared.remote.get(&snapshot.device_id).is_none_or(|old| {
                 old.coordination.as_ref().is_none_or(|c| {
@@ -3082,10 +3179,17 @@ impl DeviceSync {
                     .remote
                     .insert(snapshot.device_id.clone(), snapshot.clone());
             }
-            changed
+            let reported = shared.echoed.insert(snapshot.device_id.clone(), echoed);
+            (changed, changed && echoed > 0 && reported != Some(echoed))
         };
         if should_send && let Some(tx) = lock(&self.event_tx).as_ref() {
+            let device = snapshot.device_name.clone();
             let _ = tx.send(AppEvent::DevicePlayback(snapshot));
+            if report_echoed {
+                let _ = tx.send(AppEvent::StatusMessage(echoed_private_items_message(
+                    &device, echoed,
+                )));
+            }
         }
         Ok(())
     }

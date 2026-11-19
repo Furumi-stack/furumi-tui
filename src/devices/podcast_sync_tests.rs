@@ -891,6 +891,272 @@ fn an_old_device_keeps_hearing_from_a_podcast_queue_owner_and_never_fails_over()
     assert!(local.state.queue[1].podcast_episode_ref().is_some());
 }
 
+/// What a 0.3.x device makes of a queue item it received and announces
+/// again: it mirrors the item with its own types, which have no
+/// `PlaybackTrack::source`, and serializes the queue entry back (the same
+/// music path as `to_track_item` / `from_track` here).
+fn republished_by_old_device(
+    received: &super::wire_compat_tests::legacy::PlaybackTrack,
+) -> PlaybackTrack {
+    let parsed: PlaybackTrack =
+        serde_json::from_value(serde_json::to_value(received).unwrap()).unwrap();
+    assert!(parsed.source.is_none(), "the old types carry no source");
+    PlaybackTrack::from_track(&parsed.to_track_item())
+}
+
+fn other_music_wire() -> PlaybackTrack {
+    let mut track = music_wire();
+    track.title = "Other song".into();
+    track.content_id = Some(format!("b3:{}", "e".repeat(64)));
+    track
+}
+
+fn queue_titles(state: &PlaybackStateWire) -> Vec<&str> {
+    state
+        .queue
+        .iter()
+        .map(|track| track.title.as_str())
+        .collect()
+}
+
+/// An old device mirrors the redacted queue it is sent while this device
+/// owns playback. When it then takes over (Play on it, a paused-startup
+/// claim, or automatic failover once this device was gone for two
+/// minutes), it announces that queue as its own, each "Private item" now an
+/// ordinary music item that nothing can play. This device leaves those out
+/// instead of adopting them, and says why.
+#[test]
+fn placeholders_an_old_device_echoes_back_are_left_out() {
+    use super::wire_compat_tests::legacy;
+
+    let mut a = device();
+    trust_old_device(&a);
+    a.sync.claim_playback(&a.id).unwrap();
+    let episode = episode_ref(9);
+    let mut state = state_with(
+        vec![
+            music_wire(),
+            PlaybackTrack::podcast_episode(episode.clone()),
+            other_music_wire(),
+        ],
+        42.0,
+    );
+    state.queue_pos = 1;
+    state.paused = false;
+    a.sync.playback_tick(true, true).unwrap();
+    publish(&a, state);
+
+    // The old device receives the redacted queue and mirrors it.
+    let legacy::WireMessage::Hello {
+        playback: Some(received),
+        ..
+    } = serde_json::from_str(&hello_json(&a, "dev_old")).unwrap()
+    else {
+        panic!("the old device gets a playback snapshot");
+    };
+    let mirrored: Vec<PlaybackTrack> = received
+        .state
+        .queue
+        .iter()
+        .map(republished_by_old_device)
+        .collect();
+    let echoed = mirrored[1].clone();
+    assert_eq!(echoed.title, music_dht::device_sync::PRIVATE_ITEM_TITLE);
+    assert!(echoed.source.is_none(), "a music item now");
+    assert!(echoed.id < 0, "the old device's portable id");
+    assert!(
+        !is_private_track_item(&echoed.to_track_item()),
+        "not a placeholder of this device"
+    );
+
+    // It takes over and announces the mirrored queue, with a higher claim.
+    let mut old = Engine::new(
+        "dev_old".into(),
+        PlaybackConfig::default(),
+        Default::default(),
+        0,
+    );
+    assert!(old.observe(&a.id, received.coordination.as_ref().unwrap(), 0));
+    assert!(old.transfer("dev_old", 1));
+    let announced: legacy::PlaybackStateWire = serde_json::from_value(
+        serde_json::to_value(PlaybackStateWire {
+            queue: mirrored,
+            ..received_state_v4(&received.state)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let old_profile = legacy::DeviceProfileWire {
+        device_id: "dev_old".into(),
+        name: "Old laptop".into(),
+        client_version: "0.3.5".into(),
+        protocol_version: 3,
+        endpoint_id: String::new(),
+        endpoint_ticket: String::new(),
+        revoked: false,
+        revoke_cutoff_seq: None,
+        updated_at_ms: 1,
+    };
+    let hello = legacy::WireMessage::Hello {
+        group_id: a.sync.ensure_identity().unwrap().group_id,
+        profile: old_profile.clone(),
+        devices: vec![old_profile],
+        vector: BTreeMap::new(),
+        ops: Vec::new(),
+        snapshot: legacy::SyncSnapshot::default(),
+        playback: Some(legacy::PlaybackSnapshot {
+            device_id: "dev_old".into(),
+            device_name: "Old laptop".into(),
+            active: true,
+            updated_at_ms: now_ms(),
+            state: announced,
+            coordination: Some(old.announcement()),
+        }),
+    };
+    while a.events.try_recv().is_ok() {}
+    receive(&a.sync, &serde_json::to_string(&hello).unwrap());
+
+    // This device follows the takeover with the music items only.
+    let mut adopted = None;
+    let mut messages = Vec::new();
+    while let Ok(event) = a.events.try_recv() {
+        match event {
+            AppEvent::DevicePlayback(snapshot) => adopted = Some(snapshot),
+            AppEvent::StatusMessage(message) => messages.push(message),
+            _ => {}
+        }
+    }
+    let adopted = adopted.expect("the takeover reaches the UI");
+    assert_eq!(
+        a.sync
+            .with_playback_engine(|engine| engine.owner().map(str::to_owned))
+            .unwrap()
+            .as_deref(),
+        Some("dev_old")
+    );
+    assert_eq!(queue_titles(&adopted.state), ["Song", "Other song"]);
+    // The echoed item was current: the next one is, from its start.
+    assert_eq!(adopted.state.queue_pos, 1);
+    assert_eq!(adopted.state.position_secs, 0.0);
+    let items = track_items_from_wire(&adopted.state.queue, PlaybackTrack::to_track_item);
+    assert!(
+        items
+            .iter()
+            .all(|item| item.title != music_dht::device_sync::PRIVATE_ITEM_TITLE),
+        "{items:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Old laptop") && message.contains("Private item")),
+        "{messages:?}"
+    );
+    // Its next announcements say nothing new.
+    let mut again = adopted.clone();
+    again.state.queue.insert(1, echoed.clone());
+    old.heartbeat(5_000);
+    again.coordination = Some(old.announcement());
+    a.sync.apply_playback_snapshot("dev_old", again).unwrap();
+    assert!(
+        std::iter::from_fn(|| a.events.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::StatusMessage(_)))
+    );
+
+    // A command it builds from its stale mirror, once this device's queue
+    // has no episode left (so commands from it are accepted), is cleaned
+    // the same way.
+    let mut b = device();
+    trust_old_device(&b);
+    b.sync.claim_playback(&b.id).unwrap();
+    publish(&b, state_with(vec![music_wire()], 0.0));
+    let mut old = Engine::new(
+        "dev_old".into(),
+        PlaybackConfig::default(),
+        Default::default(),
+        0,
+    );
+    old.transfer("dev_old", 0);
+    let stamp = old.stamp().unwrap();
+    let mut stale = state_with(vec![music_wire(), echoed, other_music_wire()], 7.0);
+    stale.queue_pos = 2;
+    let take_over = PlaybackCommand::ActiveChanged {
+        active_device_id: "dev_old".into(),
+        active_device_name: "Old laptop".into(),
+        state: stale,
+    };
+    b.sync
+        .apply_playback_command(&b.id, &take_over, Some(&stamp), "dev_old", "dev_old:7")
+        .unwrap();
+    let mut applied = None;
+    let mut messages = Vec::new();
+    while let Ok(event) = b.events.try_recv() {
+        match event {
+            AppEvent::PlaybackCommand {
+                command: PlaybackCommand::ActiveChanged { state, .. },
+                ..
+            } => applied = Some(state),
+            AppEvent::StatusMessage(message) => messages.push(message),
+            _ => {}
+        }
+    }
+    let applied = applied.expect("an ordinary handoff");
+    assert_eq!(queue_titles(&applied), ["Song", "Other song"]);
+    assert_eq!(applied.queue_pos, 1);
+    assert_eq!(applied.position_secs, 7.0, "the current item was kept");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Old laptop")),
+        "{messages:?}"
+    );
+}
+
+/// The v4 form of a state an old device received (its queue is replaced).
+fn received_state_v4(
+    state: &super::wire_compat_tests::legacy::PlaybackStateWire,
+) -> PlaybackStateWire {
+    serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap()
+}
+
+/// Only a bare music item titled "Private item" counts as an echoed
+/// placeholder: a song with that title and an artist or a content id stays,
+/// and so does a real placeholder (its source says so).
+#[test]
+fn only_bare_music_items_from_old_devices_count_as_echoed_placeholders() {
+    let echoed = {
+        let mut track = PlaybackTrack::private_placeholder();
+        track.source = None;
+        track.id = -42;
+        track
+    };
+    let mut named_song = echoed.clone();
+    named_song.artist_names = vec!["Band".into()];
+    let mut with_content = echoed.clone();
+    with_content.content_id = Some(format!("b3:{}", "f".repeat(64)));
+    let mut state = state_with(
+        vec![
+            echoed.clone(),
+            named_song,
+            with_content,
+            PlaybackTrack::private_placeholder(),
+            echoed,
+        ],
+        3.0,
+    );
+    state.queue_pos = 2;
+    assert_eq!(drop_echoed_private_items(&mut state), 2);
+    assert_eq!(state.queue.len(), 3);
+    assert_eq!(state.queue_pos, 1, "the same current item");
+    assert_eq!(state.position_secs, 3.0);
+    assert!(state.queue[2].is_private_placeholder());
+
+    let mut only_echoes = state_with(vec![state.queue[0].clone()], 1.0);
+    only_echoes.queue[0].artist_names.clear();
+    assert_eq!(drop_echoed_private_items(&mut only_echoes), 1);
+    assert!(only_echoes.queue.is_empty());
+    assert!(!only_echoes.playing);
+}
+
 /// Feed and audio URLs may carry private tokens; the debug log (shown in
 /// the Logs tab) never prints them.
 #[test]
