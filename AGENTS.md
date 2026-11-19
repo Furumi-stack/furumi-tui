@@ -66,10 +66,12 @@ update it only when dependencies change.
   podcast identity, merge rules and the SQLite store come from FRID
   (`music_dht::podcast`, `furumi_library::podcasts`) and must not be
   re-derived here. Queue items are identified by `state::track_key` /
-  `TrackItem::key`, never by numeric id; music-only code must skip
-  `TrackItem::is_podcast()` items.
+  `TrackItem::key`, never by numeric id (every episode has the same sentinel
+  id); music-only code must skip `TrackItem::is_podcast()` items.
 - `src/devices.rs` owns trusted-device replication, membership, and playback
-  coordination.
+  coordination. Its wire types are the shared `music_dht::device_sync`
+  definitions; do not add local copies (golden tests in
+  `devices/wire_compat_tests.rs` keep the v3 JSON).
 - `src/ui/` renders `AppState`; rendering code must not start background work
   or mutate persistence.
 - `src/media.rs` owns OS media controls.
@@ -162,7 +164,21 @@ When changing it:
 - keep snapshots able to repair peers that missed older operations;
 - treat membership and revocation as replicated durable state;
 - keep playback commands targeted and deduplicated;
-- test merge behavior from at least two operation orders.
+- test merge behavior from at least two operation orders;
+- never store this build's protocol version for another device: use the
+  device's own report (`profile_protocol_version`) and only raise a stored
+  version from relayed profiles (`relayed_protocol_version`);
+- gate everything a peer cannot parse by the version it reported: podcast
+  operations, podcast snapshot sections and playback state with podcast items
+  go only to v4 peers (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
+  `playback_allowed_for_peer`), a podcast queue is never handed to an older
+  device and its playback commands are ignored while the queue has episodes;
+  never strip episodes from a queue to make it fit an old peer;
+- apply podcast operations and snapshot sections only through
+  `PodcastStore` (`apply_remote_op`, `apply_snapshot`); never call the
+  podcast store while holding the sync-log connection;
+- keep Jam snapshots redacted (`redact_for_jam`) and map guest placeholders
+  back with `restore_jam_private_items`.
 
 Do not replace eventual reconciliation with assumptions about a continuously
 connected leader.
@@ -228,7 +244,9 @@ Add tests at the closest stable boundary:
 - pure state transitions in `app/update_tests.rs`;
 - SQLite behavior and migrations in `library/tests.rs`;
 - operation merge, tombstone, membership, and playback sync behavior in
-  `devices/tests.rs`;
+  `devices/tests.rs`; podcast sync between device stores and simulated v3
+  peers in `devices/podcast_sync_tests.rs`; wire shapes in
+  `devices/wire_compat_tests.rs`;
 - search/ranking/federation conversion in `federation/tests.rs`;
 - protocol-specific tests beside `federation/audio.rs` or
   `federation/catalog.rs` when appropriate.

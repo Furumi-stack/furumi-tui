@@ -66,12 +66,27 @@ This layer connects devices owned or trusted by the same user. It carries
 personal state such as:
 
 - likes and playlist operations;
+- podcast subscriptions, episode progress and listening sessions;
 - device membership and revocation;
 - acknowledgements and synchronization progress;
 - playback state, commands, and handoff information.
 
 Pairing establishes the trust relationship. After that, changes are replicated
 through an append-only operation log and applied to materialized local tables.
+The wire types are the shared `music_dht::device_sync` definitions (protocol
+v4); golden tests keep the v3 JSON of furumi-tui 0.3.x byte for byte.
+
+Each device stores the protocol version that the other devices report
+themselves (their hello and pairing profiles, the sender's own entry of a
+`devices` list, their own profile announcements). A relayed profile only
+raises a stored version, because older relays list every device with their
+own constant; this build never stores its own version for another device.
+Everything a peer cannot parse is gated by that version: podcast operations,
+podcast snapshot sections and playback state that contains podcast items
+reach only v4 peers (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
+`playback_allowed_for_peer`). An older client would reject a whole message
+over one unknown operation kind, or silently drop an episode it does not
+understand.
 
 ### Music federation
 
@@ -97,8 +112,12 @@ audio. Other TUI peers use a dedicated Jam ALPN to submit the same portable
 playback commands used by connected-device control and receive the host's
 playback snapshot. They receive queue metadata, not audio.
 
-Jam never exchanges trusted membership, likes, playlists, or listening
-history. Volume remains local. Commands carry unique IDs and are retried until
+Jam never exchanges trusted membership, likes, playlists, listening history
+or podcast state. The host's podcast episodes are private: the published
+snapshot replaces them with opaque placeholders (`redact_for_jam`), guest
+commands that add episodes are dropped, and a guest's placeholders are mapped
+back to the host's episodes (`restore_jam_private_items`); a change that
+drops, duplicates or seeks in them is refused. Volume remains local. Commands carry unique IDs and are retried until
 the host acknowledges them, while inactive participants expire from the
 runtime session. Regenerating the capability or restarting the host invalidates
 the previous link.
@@ -189,6 +208,12 @@ The synchronization model combines:
 - per-peer acknowledgements to determine when old tombstones can be compacted;
 - snapshots to repair a peer that missed older operations.
 
+Vectors only grow, so operations hidden from a peer while it ran an older
+protocol are never sent again after it upgrades. Snapshots are the recovery
+path for that case; the podcast sections carry the subscription, share and
+progress registers and the most recent listening sessions, bounded by the
+shared FRID limits and by the line budget of each message.
+
 This is eventual consistency scoped to a trusted device group. A temporarily
 offline laptop can modify playlists, another device can continue playback, and
 both can later converge without a permanently available coordinator.
@@ -212,7 +237,12 @@ The synchronized state describes the queue, current item, position, pause
 state, volume, shuffle/repeat mode, and the active playback owner. Commands are
 targeted and deduplicated. Handoff transfers intent and position; the receiving
 device resolves the track against its own library or federation sources before
-starting its audio engine.
+starting its audio engine. Each queue item names its source: a podcast episode
+travels as `PlaybackSource::PodcastEpisode` with the reference needed to play
+it (the receiving device streams it from the publisher at the handed-off
+position, with or without a subscription). A queue with episodes is not handed
+to a device below protocol v4, and playback commands from such a device are
+ignored while the local queue has episodes.
 
 Active-device leases and idle timing prevent stale snapshots from immediately
 taking control after a device reconnects. This provides practical coordination
@@ -296,23 +326,33 @@ The TUI owns what the contract leaves to clients:
   pool or as a task and reports back through `AppEvent`s; `update::podcasts`
   holds the pure state transitions. Store open failures (newer schema,
   foreign file) disable only the Podcasts tab and leave the file untouched.
-- **Sync log.** Local actions (subscribe, unsubscribe, mark played) draw their
-  operation stamps from the device-sync log through
+- **Sync log.** Local actions (subscribe, unsubscribe, mark played, progress)
+  draw their operation stamps from the device-sync log through
   `DeviceSync::run_podcast_action`, and the operations are appended with
   exactly those stamps, so the store's registers and the log agree. The lock
-  order is podcast store, then sync log. Podcast operations are protocol v4
-  payloads; until this client speaks sync v4 they stay in the log and are not
-  sent to peers.
+  order is podcast store, then sync log; device sync never calls the store
+  while it holds the log. Only the newest progress operation of an origin per
+  episode stays in the log (later operations of one origin always win the
+  register comparison).
+- **Device sync.** Received podcast operations are kept in the log (and
+  relayed) and merged into the store with `PodcastStore::apply_remote_op`;
+  invalid ones are skipped but acknowledged. Operations that arrive before
+  the store opens wait in `sync_podcast_pending` and are applied when it is
+  attached. Snapshot sections are exported with `fill_snapshot` and merged
+  with `apply_snapshot` after the operations of the same message. The UI
+  reloads what it shows after such changes and checks the feed of a
+  subscription that came from another device.
 - **Queue identity.** An episode is a `TrackItem` with an explicit
   `podcast` reference (`TrackItem::podcast_episode`); its numeric id is a
   shared sentinel and never identifies it. Queue keys check the episode id
   first (`ep:…`), then music content ids, federated sources and library rows.
   Music-only paths (likes, playlists, history, content-id resolution,
   federation download, similarity, share links, metadata edits, release and
-  artist jumps) check `is_podcast()` and skip episodes. Sync protocol 3
-  cannot describe an episode, so peers and Jam guests receive the shared
-  private placeholder, a queue with episodes is not handed off, and remote
-  `SetState` commands do not replace it.
+  artist jumps) check `is_podcast()` and skip episodes. On the wire an
+  episode is `PlaybackSource::PodcastEpisode`; received ones become episodes
+  again (`TrackItem::from_playback_track`) and the library source mode never
+  drops them. Jam private placeholders are numbered queue entries that go
+  back on the wire as `PlaybackSource::Private`.
 - **Playback.** Starting an episode resolves its current audio URL and
   resume position from the store, opens `podcasts::stream` (a bounded
   Range-request reader on its own thread), decodes and positions it with
@@ -328,9 +368,12 @@ The TUI owns what the contract leaves to clients:
   "start over"), checkpoints every 20 s and on pause, explicit seeks,
   completion (`reaches_completion` or end of stream) and an end with the last
   seen position on stop, track change, handoff and exit. When the store
-  reports a newer generation, the playback stops checkpointing until the
-  user's next explicit action. Listening sessions are recorded at pause,
-  completion and end; the store keeps those that pass the shared threshold.
+  reports a newer generation (another device started over, for example), the
+  playback stops checkpointing until the user's next explicit action.
+  Listening sessions are recorded at pause, completion and end; the store
+  keeps those that pass the shared threshold. Queue items carry the latest
+  progress generation this device saw, so a handoff target starts its
+  session above it.
 
 ## Scripted visualizations
 
@@ -459,7 +502,7 @@ Furumi stores different kinds of state according to their lifetime:
 | State | Storage | Role |
 | --- | --- | --- |
 | Library, playlists, likes, history | SQLite | Durable local source of truth |
-| Podcast subscriptions, episodes, progress | SQLite (`podcasts.sqlite3`, FRID store) | Durable personal state and a refreshable episode catalog |
+| Podcast subscriptions, episodes, progress | SQLite (`podcasts.sqlite3`, FRID store) | Durable personal state (synced with trusted devices) and a refreshable episode catalog |
 | Device operation log and replicas | SQLite | Offline synchronization |
 | Versioned track embeddings | SQLite | Durable, locally rebuildable similarity data |
 | Federation catalog cache | SQLite/cache | Faster network browsing |

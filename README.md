@@ -231,12 +231,39 @@ Episodes play in the same queue as music:
 - Likes, playlists, music history, similarity search and share links are for
   music only and skip episodes; `Shift+J` on an episode opens its podcast.
 
-Episodes play on this device only for now: a queue with episodes cannot be
-handed to another device, and other devices or Jam guests see episodes as
-"Private item". Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
+Podcasts and your connected devices:
+
+- **Private by default.** Subscriptions, episode progress and listening
+  history are personal. They are synchronized only between your trusted
+  devices (Connected Devices), never published to the federation: no DHT
+  record, public catalog or search result contains them. Publishing a
+  podcast for discovery is a separate, explicit choice that this version
+  does not offer yet.
+- **Synchronized between trusted devices.** A podcast you subscribe to on
+  one device appears on the others without typing its URL again; each
+  device then checks the feed itself. Unsubscribing, "played", the saved
+  position and "start over" follow the same way, also through a device
+  that relays them and after a device was offline for a while. When two
+  devices played the same episode offline, they agree on one position and
+  keep both listening sessions.
+- **Handoff.** A queue with episodes moves to another device like music:
+  the episode continues there at the handed-off position, paused or
+  playing, even if that device is not subscribed. Devices that run an older
+  Furumi (device sync before v4) cannot keep episodes: handing such a queue
+  to them is refused with "needs a Furumi update", their remote control is
+  ignored while the queue has episodes, and they get no podcast data.
+- **Audio from the publisher.** Every device streams the episode from the
+  publisher's server itself. Furumi peers never pass podcast audio to each
+  other, and nothing is kept after playback.
+- **Jam.** Guests see the host's episodes as "Private item" (no title, feed
+  or address), cannot add episodes to the host's queue and cannot seek in a
+  private item. They can still reorder the queue and skip.
+
+Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
 same file the earlier podcast test build used; it is upgraded in place). If
 that file was written by a newer Furumi or is not a podcast database, the tab
-explains why it is unavailable and the file is left unchanged.
+explains why it is unavailable and the file is left unchanged; podcast
+changes from other devices then wait in the device-sync log until it opens.
 
 ### Now playing in tmux
 
@@ -325,11 +352,16 @@ Run the local protocol checks from the TUI repository:
 
 ```bash
 cargo test localhost_devices_exchange_state_and_handoff
+cargo test localhost_devices_sync_podcasts
+cargo test devices::podcast_sync_tests
 python scripts/test_device_interop.py ../furumusic
 ```
 
 The first test uses real iroh streams, isolated SQLite databases, ownership
-handoff, and a stalled peer. The second builds both player test binaries and
+handoff, and a stalled peer. The podcast tests sync subscriptions, progress
+and "start over" between TUI device stores (over iroh streams and through
+the JSON messages), check a handoff with an episode and simulate a device
+sync v3 peer with the exact JSON types of furumi-tui 0.3.x. The second builds both player test binaries and
 exchanges their actual JSON messages over `127.0.0.1`: queue metadata,
 bidirectional handoff, pause/seek and duplicate command fencing. It exercises
 the TUI command adapter and web player hub, but does not start a browser or

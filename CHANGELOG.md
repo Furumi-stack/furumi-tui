@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - unreleased
+
 ### Added
 
 - A Podcasts tab on `4`: subscribe to RSS/Atom feeds by URL, browse
@@ -18,8 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Podcast data uses the shared FRID store (`furumi_library::podcasts`) in
   `podcasts.sqlite3`; a database of the earlier podcast test build is migrated
   in place, and a newer or foreign file is refused without changes.
-- Podcast subscription and progress changes are recorded in the trusted-device
-  sync log with their own stamps. They are not sent to other devices yet.
+- Podcasts sync between trusted devices (device-sync protocol 4):
+  subscriptions, unsubscribing, feed addresses, episode progress ("played",
+  position, "start over") and listening sessions. A podcast subscribed on one
+  device appears on the others without its URL; each device checks the feed
+  itself. Podcast operations are applied to the podcast store, kept in the
+  sync log and relayed; snapshots carry the podcast state (bounded) so new
+  devices and devices that upgrade from an older version catch up. Periodic
+  progress saves are coalesced in the log.
+- A queue with podcast episodes is handed to other devices with the episode,
+  its position and pause; the receiving device does not need the
+  subscription.
 - Podcast episodes play from the Podcasts tab and the shared queue (mixed
   with music): audio streams from the publisher through a bounded HTTP Range
   buffer, Play continues from the saved position, `b` starts over, and the
@@ -37,9 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Queue items are keyed by their source: podcast episodes by episode id,
   library rows as `lib:<id>` instead of `local:<id>`. Likes, playlists,
   music history, similarity, share links and metadata edits skip episodes.
-- Peers and Jam guests see podcast episodes as "Private item" (sync
-  protocol 3 cannot describe them); a queue with episodes is not handed to
-  another device and remote queue changes do not replace it.
+- Device sync speaks protocol 4 and uses the shared `music_dht::device_sync`
+  wire types instead of private copies; v3 messages are unchanged byte for
+  byte (golden tests). Devices below protocol 4 never receive podcast
+  operations, podcast snapshot sections or a queue with episodes: handing
+  such a queue to them is refused ("needs a Furumi update"), and their
+  playback commands are ignored while the queue has episodes.
+- Jam guests see the host's podcast episodes as "Private item" (no title,
+  feed or address). Guest changes that add, drop or duplicate them, or seek
+  in them, are refused; a guest leaving a Jam drops the placeholders.
+- Controlling another v4 device may queue and play episodes there; an
+  episode started by another device's command at position 0 resumes from its
+  saved position.
 - Tab order is now `1` Library, `2` Playlists, `3` Queue, `4` Podcasts,
   `5` Settings, `6` Logs, for the tab bar, Tab/Shift+Tab, and the default
   number keys.
@@ -55,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are shown.
 - The help window names the target tab for number-key shortcuts
   ("Go to Settings") instead of "Go to tab N".
+
+### Fixed
+
+- The protocol version stored for another device came from this build's own
+  constant (on profile announcements and accepted pairings), not from the
+  device. Versions now come from the device's own reports; relayed profiles
+  only raise them. Invites and profile announcements carry the version, and
+  the first start of a new version announces it.
 
 ## [0.2.8] - 2026-09-02
 
