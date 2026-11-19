@@ -303,6 +303,34 @@ The TUI owns what the contract leaves to clients:
   order is podcast store, then sync log. Podcast operations are protocol v4
   payloads; until this client speaks sync v4 they stay in the log and are not
   sent to peers.
+- **Queue identity.** An episode is a `TrackItem` with an explicit
+  `podcast` reference (`TrackItem::podcast_episode`); its numeric id is a
+  shared sentinel and never identifies it. Queue keys check the episode id
+  first (`ep:…`), then music content ids, federated sources and library rows.
+  Music-only paths (likes, playlists, history, content-id resolution,
+  federation download, similarity, share links, metadata edits, release and
+  artist jumps) check `is_podcast()` and skip episodes. Sync protocol 3
+  cannot describe an episode, so peers and Jam guests receive the shared
+  private placeholder, a queue with episodes is not handed off, and remote
+  `SetState` commands do not replace it.
+- **Playback.** Starting an episode resolves its current audio URL and
+  resume position from the store, opens `podcasts::stream` (a bounded
+  Range-request reader on its own thread), decodes and positions it with
+  coarse seeking, all off the UI and audio threads, then hands the source to
+  the audio thread with the player's source generation. Any later start or
+  stop bumps that generation, so a slow stream never replaces what the user
+  chose since. A stale audio URL (4xx) triggers one feed refresh and a retry
+  with the address the feed lists for the same episode id. A stream that
+  cannot seek does not start at a saved position it cannot reach.
+- **Progress.** `podcasts::progress` runs one writer thread so every
+  progress write of this device is ordered. The app tick follows the
+  position and actual listening time and sends: an explicit start (or
+  "start over"), checkpoints every 20 s and on pause, explicit seeks,
+  completion (`reaches_completion` or end of stream) and an end with the last
+  seen position on stop, track change, handoff and exit. When the store
+  reports a newer generation, the playback stops checkpointing until the
+  user's next explicit action. Listening sessions are recorded at pause,
+  completion and end; the store keeps those that pass the shared threshold.
 
 ## Scripted visualizations
 
@@ -469,9 +497,10 @@ The source tree follows the architectural responsibilities:
 - `similarity.rs` owns model acquisition, preprocessing, background indexing,
   and the replaceable exact in-memory index;
 - `federation/` owns DHT-facing search, peer catalogs, and audio exchange;
-- `podcasts/` owns feed HTTP (conditional requests, redirects, limits) and
-  refresh scheduling policy; the podcast model, identity and SQLite store
-  come from FRID;
+- `podcasts/` owns feed HTTP (conditional requests, redirects, limits),
+  refresh scheduling policy, the episode stream reader and the progress
+  writer; the podcast model, identity, merge rules and SQLite store come
+  from FRID;
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;
 - `ui/` renders the TUI;

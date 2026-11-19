@@ -209,8 +209,31 @@ never imported into the music library or offered to other peers.
   progress and history are kept, so subscribing again continues where you
   left off.
 
-Playing episodes from the Podcasts tab is not available in this build yet.
-Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
+Episodes play in the same queue as music:
+
+- `Enter` on an episode plays it right after the current item and continues
+  from the saved position; a played episode starts from the beginning. `b`
+  ("start over") plays it from the beginning even when it is in progress.
+  `a` / `Shift+A` queue episodes like tracks, and the queue can mix music and
+  episodes.
+- Audio streams from the publisher's server through a bounded buffer (about
+  9 MB) and seeks with HTTP range requests. Nothing is downloaded ahead of
+  time and nothing is kept after playback. If the server cannot seek (no
+  file length), Furumi says that it cannot continue at the saved position
+  instead of starting from the wrong place; "start over" still works. If the
+  episode's address no longer works, the feed is checked once for a new one.
+- The position is saved every 20 seconds while playing and on pause, seek,
+  stop, track change and exit. An episode counts as played within the last
+  30 seconds (or 5 %) or when its stream ends; a listen enters the episode's
+  history when it completed or lasted at least 30 seconds. Seeking back and
+  "start over" are real changes: an older save never moves the position
+  forward again.
+- Likes, playlists, music history, similarity search and share links are for
+  music only and skip episodes; `Shift+J` on an episode opens its podcast.
+
+Episodes play on this device only for now: a queue with episodes cannot be
+handed to another device, and other devices or Jam guests see episodes as
+"Private item". Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
 same file the earlier podcast test build used; it is upgraded in place). If
 that file was written by a newer Furumi or is not a podcast database, the tab
 explains why it is unavailable and the file is left unchanged.

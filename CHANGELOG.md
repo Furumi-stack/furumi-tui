@@ -20,14 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in place, and a newer or foreign file is refused without changes.
 - Podcast subscription and progress changes are recorded in the trusted-device
   sync log with their own stamps. They are not sent to other devices yet.
+- Podcast episodes play from the Podcasts tab and the shared queue (mixed
+  with music): audio streams from the publisher through a bounded HTTP Range
+  buffer, Play continues from the saved position, `b` starts over, and the
+  position is saved every 20 s and on pause, seek, stop, track change and
+  exit. Completion and listening sessions follow the shared FRID rules. A
+  stale audio URL triggers one feed check for the episode's new address.
 - Podcast key bindings in the `podcasts` context: `o`, `/`, `Shift+R`,
-  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`.
+  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`, `b`.
 - An optional top-level `version` in `keymap.toml`; the current format is
   `version = 2`, and a `podcasts` binding context.
 
 ### Changed
 
 - `music-dht` 0.6.0 and `furumi-library` 0.3.0.
+- Queue items are keyed by their source: podcast episodes by episode id,
+  library rows as `lib:<id>` instead of `local:<id>`. Likes, playlists,
+  music history, similarity, share links and metadata edits skip episodes.
+- Peers and Jam guests see podcast episodes as "Private item" (sync
+  protocol 3 cannot describe them); a queue with episodes is not handed to
+  another device and remote queue changes do not replace it.
 - Tab order is now `1` Library, `2` Playlists, `3` Queue, `4` Podcasts,
   `5` Settings, `6` Logs, for the tab bar, Tab/Shift+Tab, and the default
   number keys.
