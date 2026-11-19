@@ -42,7 +42,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use furumi_library::podcasts::{
-    PODCAST_DB_FILE, PodcastLocalOp, PodcastStore, PodcastStoreError, StampSource,
+    LEGACY_PROTOTYPE_SCHEMA_VERSION, PODCAST_DB_FILE, PodcastListFilter, PodcastLocalOp,
+    PodcastStore, PodcastStoreError, StampSource,
 };
 
 pub use fetch::Fetcher;
@@ -81,8 +82,12 @@ pub fn covers_dir() -> Result<PathBuf> {
 /// without writing anything, a database from a newer Furumi or a file that
 /// is not a podcast database. Blocking: call it on the blocking pool.
 pub fn open_services(db_path: &Path, covers_dir: PathBuf, log: Arc<dyn OpLog>) -> Result<Services> {
+    let from_prototype = is_prototype_database(db_path);
     let store = PodcastStore::open(db_path)?;
     tracing::info!(path = %db_path.display(), "podcast store opened");
+    if from_prototype {
+        forget_prototype_validators(&store);
+    }
     match store.legacy_quarantine() {
         Ok(entries) if !entries.is_empty() => tracing::warn!(
             count = entries.len(),
@@ -96,6 +101,65 @@ pub fn open_services(db_path: &Path, covers_dir: PathBuf, log: Arc<dyn OpLog>) -
         fetcher: Arc::new(Fetcher::new(covers_dir)?),
         log,
     })
+}
+
+/// Whether `path` is a database of the prototype podcast build, which
+/// `PodcastStore::open` is about to import. Read-only; any doubt is "no".
+fn is_prototype_database(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    rusqlite::Connection::open_with_flags(path, flags)
+        .and_then(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))
+        .is_ok_and(|version| version == LEGACY_PROTOTYPE_SCHEMA_VERSION)
+}
+
+/// Drops the HTTP validators imported from a prototype database.
+///
+/// The prototype stored no seasons, episode numbers or episode types, and
+/// its GUID-less episodes stay provisional until a feed is parsed again. With
+/// the imported `ETag` / `Last-Modified` the first check would be answered
+/// "304 Not Modified" and the feed never parsed while it does not change, so
+/// a finished series would never show its seasons. Without them the first
+/// check downloads and applies the feed. The fetch state is local (never
+/// synced). Contract gap: FRID's prototype import should not carry the
+/// validators over.
+fn forget_prototype_validators(store: &PodcastStore) {
+    let result = (|| -> Result<usize> {
+        let mut cleared = 0;
+        for podcast in store.list_podcasts(PodcastListFilter::All)? {
+            let id = &podcast.podcast_id;
+            let state = store.fetch_state(id)?;
+            if state.etag.is_none() && state.last_modified.is_none() {
+                continue;
+            }
+            let checked = state
+                .last_success_at_ms
+                .or(state.checked_at_ms)
+                .unwrap_or(0);
+            store.record_fetch_success(id, checked, None, None, state.next_check_at_ms)?;
+            if let Some(error) = &state.last_error {
+                store.record_fetch_failure(
+                    id,
+                    state.checked_at_ms.unwrap_or(checked),
+                    error,
+                    state.next_check_at_ms,
+                )?;
+            }
+            cleared += 1;
+        }
+        Ok(cleared)
+    })();
+    match result {
+        Ok(0) => {}
+        Ok(cleared) => tracing::info!(
+            cleared,
+            "imported podcasts get a full first feed check (prototype validators dropped)"
+        ),
+        Err(err) => tracing::warn!("dropping imported podcast validators failed: {err:#}"),
+    }
 }
 
 /// A readable reason why the store did not open; the typed store errors

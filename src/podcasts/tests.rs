@@ -534,8 +534,12 @@ fn prototype_database_is_migrated_in_place() {
     let expected =
         PodcastId::from_feed_url(&FeedUrl::parse("https://example.test/feed.xml").unwrap());
     assert_eq!(rows[0].podcast_id, expected);
+    // The prototype's validators are dropped: the first check parses the
+    // feed (`imported_podcasts_get_their_seasons_on_the_first_check`).
     let fetch = store.fetch_state(&expected).unwrap();
-    assert_eq!(fetch.etag.as_deref(), Some("\"e1\""));
+    assert_eq!(fetch.etag, None);
+    assert_eq!(fetch.last_success_at_ms, Some(1_700_000_100_000));
+    assert_eq!(fetch.next_check_at_ms, None, "due at once");
     drop(services);
 
     // The original rows are kept, renamed.
@@ -585,4 +589,91 @@ fn foreign_or_newer_databases_are_refused_unchanged() {
         assert!(message.contains(expected), "{message}");
         assert_eq!(std::fs::read(path).unwrap(), before, "{}", path.display());
     }
+}
+
+/// A prototype database knew no seasons or episode numbers. Its stored
+/// `ETag` would make the first check "304 Not Modified" forever for a feed
+/// that no longer changes, so the seasons would never appear.
+#[tokio::test]
+async fn imported_podcasts_get_their_seasons_on_the_first_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start();
+    let feed = "<?xml version=\"1.0\"?><rss version=\"2.0\" \
+         xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\"><channel>\
+         <title>Old Show</title><item><title>Old Pilot</title><guid>ep-1</guid>\
+         <pubDate>Sat, 15 Jun 2024 10:00:00 GMT</pubDate>\
+         <itunes:season>1</itunes:season><itunes:episode>1</itunes:episode>\
+         <enclosure url=\"/audio/1.mp3\" type=\"audio/mpeg\" length=\"100\"/></item>\
+         </channel></rss>";
+    // The server answers the prototype's validator with 304.
+    server.set(
+        "/feed.xml",
+        Route::new(feed, "application/rss+xml").etag("\"e1\""),
+    );
+    let feed_url = server.url("/feed.xml");
+    let path = dir.path().join(furumi_library::podcasts::PODCAST_DB_FILE);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(PROTOTYPE_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO podcasts (feed_url, title, etag, last_modified, added_at, last_checked_at)
+             VALUES (?1, 'Old Show', '\"e1\"', 'Sat, 15 Jun 2024 10:00:00 GMT',
+                     1700000000, 1700000100)",
+            [&feed_url],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO podcast_episodes
+                (podcast_id, guid, title, published_at, duration_seconds, audio_url, first_seen_at)
+             VALUES (1, 'ep-1', 'Old Pilot', 1718445600, 1800.0, ?1, 1700000000)",
+            [server.url("/audio/1.mp3")],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let services = super::open_services(
+        &path,
+        dir.path().join("covers"),
+        Arc::new(MemoryLog::default()),
+    )
+    .unwrap();
+    let store = Arc::clone(&services.store);
+    let id = PodcastId::from_feed_url(&FeedUrl::parse(&feed_url).unwrap());
+    assert!(
+        store
+            .seasons(&id)
+            .unwrap()
+            .iter()
+            .all(|s| s.season.is_none()),
+        "the prototype had no seasons"
+    );
+    let due = store.podcasts_due_for_refresh(NOW, 16).unwrap();
+    assert_eq!(due.len(), 1);
+    let report = refresh(&services, &id, &due[0].1, NOW).await.unwrap();
+    assert!(!report.not_modified);
+    let requests = server.requests("/feed.xml");
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].contains_key("if-none-match"));
+    assert!(!requests[0].contains_key("if-modified-since"));
+    let seasons = store.seasons(&id).unwrap();
+    assert_eq!(
+        seasons.iter().map(|s| s.season).collect::<Vec<_>>(),
+        [Some(1)]
+    );
+    // From then on the checks are conditional again.
+    let report = refresh(&services, &id, &due[0].1, NOW + 1).await.unwrap();
+    assert!(report.not_modified);
+    drop(services);
+
+    // A store that was already migrated keeps its validators on reopen.
+    let services = super::open_services(
+        &path,
+        dir.path().join("covers"),
+        Arc::new(MemoryLog::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        services.store.fetch_state(&id).unwrap().etag.as_deref(),
+        Some("\"e1\"")
+    );
 }
