@@ -1705,12 +1705,23 @@ impl DeviceSync {
             )
         };
         let _ = self.apply_op(&op)?;
-        tracing::debug!(
-            op_id = %op.op_id,
-            tombstone,
-            payload = %payload_json,
-            "recorded personal-sync op"
-        );
+        if payload_may_hold_private_urls(&op.payload) {
+            // Feed and audio URLs may carry private tokens, and the Logs tab
+            // keeps this crate's debug output: log the kind only.
+            tracing::debug!(
+                op_id = %op.op_id,
+                tombstone,
+                kind = payload_kind(&op.payload),
+                "recorded personal-sync op"
+            );
+        } else {
+            tracing::debug!(
+                op_id = %op.op_id,
+                tombstone,
+                payload = %payload_json,
+                "recorded personal-sync op"
+            );
+        }
         if gc_after_record {
             let _ = self.gc_tombstones();
         }
@@ -3913,6 +3924,17 @@ fn coalesce_progress_ops(conn: &Connection, op: &SyncOpWire) -> Result<()> {
         params![op.origin_device_id, op.seq, episode_id.as_str()],
     )?;
     Ok(())
+}
+
+/// Podcast operations and playback commands with podcast items carry feed
+/// and audio URLs, which may hold private tokens: never log their payload.
+fn payload_may_hold_private_urls(payload: &SyncOpPayload) -> bool {
+    payload.is_podcast()
+        || matches!(
+            payload,
+            SyncOpPayload::PlaybackCommand { command, .. }
+                if music_dht::device_sync::playback_command_has_podcasts(command)
+        )
 }
 
 fn payload_kind(payload: &SyncOpPayload) -> &'static str {

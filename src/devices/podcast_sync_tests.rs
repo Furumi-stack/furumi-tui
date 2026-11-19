@@ -786,3 +786,63 @@ fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
             .any(|event| matches!(event, AppEvent::PlaybackCommand { .. }))
     );
 }
+
+/// Feed and audio URLs may carry private tokens; the debug log (shown in
+/// the Logs tab) never prints them.
+#[test]
+fn podcast_payloads_are_not_written_to_the_debug_log() {
+    use std::io::Write;
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Buffer::default();
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+    );
+    let a = device();
+    let b = device();
+    pair(&a, &b);
+    let mut episode = episode_ref(9);
+    episode.audio_url = "https://cdn.example/ep9.mp3?token=SECRET-AUDIO".into();
+    tracing::subscriber::with_default(subscriber, || {
+        a.sync.claim_playback(&a.id).unwrap();
+        a.sync
+            .record_playback_command(
+                &b.id,
+                PlaybackCommand::SetState {
+                    state: state_with(vec![PlaybackTrack::podcast_episode(episode.clone())], 1.0),
+                    seek: false,
+                },
+            )
+            .unwrap();
+        a.sync
+            .record_playback_command(
+                &b.id,
+                PlaybackCommand::SetState {
+                    state: state_with(vec![music_wire()], 2.0),
+                    seek: false,
+                },
+            )
+            .unwrap();
+    });
+    let logged = String::from_utf8(lock(&buffer.0).clone()).unwrap();
+    assert!(!logged.contains("SECRET-AUDIO"), "{logged}");
+    assert!(logged.contains("kind=\"playback_command\""), "{logged}");
+    // Music payloads are still logged in full.
+    assert!(logged.contains("\"title\":\"Song\""), "{logged}");
+}
