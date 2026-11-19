@@ -1,5 +1,8 @@
 //! Minimal HTTP/1.1 server on 127.0.0.1 for podcast tests (no internet).
-//! One request per connection (`Connection: close`).
+//! One request per connection (`Connection: close`). Besides feeds it serves
+//! audio like a publisher: `Range` requests (206 / 416) unless disabled,
+//! optionally without `Content-Length`, and connections cut after a number
+//! of bytes to simulate outages.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -17,6 +20,14 @@ pub(super) struct Route {
     /// `Location` of a redirect status.
     pub location: Option<String>,
     pub retry_after: Option<String>,
+    /// Honour `Range` requests with 206 responses.
+    pub ranges: bool,
+    /// Send `Content-Length` (and the total in `Content-Range`).
+    pub send_length: bool,
+    /// Cut the body after this many bytes (absolute file offset)...
+    pub cut_after: Option<usize>,
+    /// ...for this many requests; later requests are served in full.
+    pub fail_times: usize,
 }
 
 impl Route {
@@ -29,7 +40,30 @@ impl Route {
             last_modified: None,
             location: None,
             retry_after: None,
+            ranges: true,
+            send_length: true,
+            cut_after: None,
+            fail_times: 0,
         }
+    }
+
+    /// A server that ignores `Range` and always answers 200 with the file.
+    pub fn no_ranges(mut self) -> Route {
+        self.ranges = false;
+        self
+    }
+
+    /// No `Content-Length`: the client cannot know the file size.
+    pub fn no_length(mut self) -> Route {
+        self.send_length = false;
+        self
+    }
+
+    /// The first `times` responses stop after byte `after`.
+    pub fn cut(mut self, after: usize, times: usize) -> Route {
+        self.cut_after = Some(after);
+        self.fail_times = times;
+        self
     }
 
     pub fn redirect(status: u16, location: &str) -> Route {
@@ -68,6 +102,8 @@ pub(super) type RequestHeaders = HashMap<String, String>;
 struct ServerState {
     routes: HashMap<String, Route>,
     requests: HashMap<String, Vec<RequestHeaders>>,
+    /// Cut responses served so far, per path.
+    cuts: HashMap<String, usize>,
 }
 
 pub(super) struct TestServer {
@@ -102,6 +138,14 @@ impl TestServer {
     /// Headers of every request received for `path`, in order.
     pub fn requests(&self, path: &str) -> Vec<RequestHeaders> {
         self.lock().requests.get(path).cloned().unwrap_or_default()
+    }
+
+    /// The `Range` header of every request for `path` (`None` if absent).
+    pub fn ranges(&self, path: &str) -> Vec<Option<String>> {
+        self.requests(path)
+            .into_iter()
+            .map(|headers| headers.get("range").cloned())
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ServerState> {
@@ -139,14 +183,27 @@ fn handle(stream: TcpStream, state: &Mutex<ServerState>) {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
-    let route = {
+    let (route, cut) = {
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         state
             .requests
             .entry(path.clone())
             .or_default()
             .push(headers.clone());
-        state.routes.get(&path).cloned()
+        let route = state.routes.get(&path).cloned();
+        let cut = match &route {
+            Some(route) if route.cut_after.is_some() => {
+                let served = state.cuts.entry(path.clone()).or_default();
+                if *served < route.fail_times {
+                    *served += 1;
+                    route.cut_after
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        (route, cut)
     };
     let mut out = stream;
     let Some(route) = route else {
@@ -169,7 +226,47 @@ fn handle(stream: TcpStream, state: &Mutex<ServerState>) {
         );
         return;
     }
+    let total = route.body.len();
+    let mut status = route.status;
+    let (mut start, mut end) = (0usize, total);
     let mut extra = String::new();
+    if route.status == 200
+        && route.ranges
+        && let Some(range) = headers
+            .get("range")
+            .and_then(|range| range.strip_prefix("bytes="))
+        && let Some((from, to)) = range.split_once('-')
+        && let Ok(from) = from.trim().parse::<usize>()
+    {
+        if from >= total {
+            let _ = write!(
+                out,
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return;
+        }
+        status = 206;
+        start = from;
+        end = to
+            .trim()
+            .parse::<usize>()
+            .map_or(total, |to| (to + 1).min(total));
+        let size = if route.send_length {
+            total.to_string()
+        } else {
+            "*".to_string()
+        };
+        extra.push_str(&format!(
+            "Content-Range: bytes {start}-{}/{size}\r\n",
+            end - 1
+        ));
+    }
+    if route.ranges {
+        extra.push_str("Accept-Ranges: bytes\r\n");
+    }
+    if route.send_length {
+        extra.push_str(&format!("Content-Length: {}\r\n", end - start));
+    }
     for (name, value) in [
         ("ETag", &route.etag),
         ("Last-Modified", &route.last_modified),
@@ -180,8 +277,9 @@ fn handle(stream: TcpStream, state: &Mutex<ServerState>) {
             extra.push_str(&format!("{name}: {value}\r\n"));
         }
     }
-    let reason = match route.status {
+    let reason = match status {
         200 => "OK",
+        206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
         307 => "Temporary Redirect",
@@ -192,16 +290,63 @@ fn handle(stream: TcpStream, state: &Mutex<ServerState>) {
     };
     if write!(
         out,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
-        route.status,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {}\r\n{extra}Connection: close\r\n\r\n",
         route.content_type,
-        route.body.len()
     )
     .is_err()
     {
         return;
     }
-    let _ = out.write_all(&route.body);
+    let limit = cut.map_or(end, |cut| cut.clamp(start, end));
+    for chunk in route.body[start..limit].chunks(64 * 1024) {
+        if out.write_all(chunk).is_err() {
+            return;
+        }
+    }
     let _ = out.flush();
     let _ = out.shutdown(std::net::Shutdown::Both);
+}
+
+/// Deterministic pseudo-random bytes.
+pub(super) fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Sample rate of [`wav`].
+pub(super) const WAV_RATE: u32 = 8_000;
+
+/// A mono 16-bit PCM WAV file of `seconds` (8 kHz). Every sample of second
+/// `n` has the value `n * 40` (up to 13 minutes), so a decoded sample tells where playback
+/// is.
+pub(super) fn wav(seconds: u32) -> Vec<u8> {
+    const RATE: u32 = WAV_RATE;
+    let samples = RATE * seconds;
+    let data_len = samples * 2;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&RATE.to_le_bytes());
+    out.extend_from_slice(&(RATE * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for n in 0..samples {
+        let second = (n / RATE) as i16;
+        out.extend_from_slice(&second.saturating_mul(40).to_le_bytes());
+    }
+    out
 }

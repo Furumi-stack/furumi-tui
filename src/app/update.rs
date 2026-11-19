@@ -20,8 +20,12 @@ pub const QUIT_CONFIRM_HINT: &str = "press quit again to exit";
 pub enum Effect {
     CheckUpdate,
     InstallUpdate(crate::updater::Update),
-    /// (Re)start playback of `queue[queue_pos]`.
+    /// (Re)start playback of `queue[queue_pos]` (a podcast episode resumes
+    /// from its saved position).
     PlayCurrent,
+    /// Play `queue[queue_pos]`, a podcast episode, from the beginning as an
+    /// explicit "start over".
+    PlayCurrentFromStart,
     TogglePause,
     StopPlayback,
     /// Seek relative to the current position, in seconds.
@@ -529,6 +533,7 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::DeleteSelected => delete_selected(state),
+        Action::RestartEpisode => podcasts::restart_current(state),
         Action::AddPodcast
         | Action::SearchEpisodes
         | Action::RefreshPodcast
@@ -1475,7 +1480,8 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 .map(|track| (*track).clone())
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
-        Tab::Podcasts | Tab::Federation | Tab::Logs => None,
+        Tab::Podcasts => state.podcasts.selected_episode_track(),
+        Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -1531,6 +1537,9 @@ fn selected_release_id(state: &AppState) -> Option<i64> {
 /// an async fetch effect.
 fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
     let tracks = selected_tracks(state);
+    if tracks.iter().any(TrackItem::is_podcast) && !podcasts::episodes_play_here(state) {
+        return None;
+    }
     if !tracks.is_empty() {
         let count = tracks.len();
         let title = tracks[0].title.clone();

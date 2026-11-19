@@ -29,6 +29,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::keymap::{KeyResolution, Keymap};
 use crate::library::Library;
 use crate::player;
+use crate::podcasts::playback::StartAt;
 use crate::ui;
 use event::AppEvent;
 use state::AppState;
@@ -83,6 +84,8 @@ pub struct Runtime {
     /// Podcast store and feed client; `None` until opened (or if opening
     /// failed, which only disables the Podcasts tab).
     pub podcasts: Option<podcast_runtime::PodcastRuntime>,
+    /// The podcast episode this device plays, for progress saving.
+    pub podcast_playback: Option<podcast_runtime::EpisodePlayback>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -491,6 +494,7 @@ pub async fn run(
         status_publisher: crate::status::Publisher::spawn(),
         status_visualizer: crate::visualizer::status::Renderer::default(),
         podcasts: None,
+        podcast_playback: None,
     };
     spawn_content_id_backfill(&runtime);
     podcast_runtime::spawn_open(&runtime);
@@ -557,6 +561,7 @@ pub async fn run(
                 state.advance_spinner();
                 expire_quit_confirmation(&mut state);
                 sync_player_shared(&mut state, &runtime);
+                podcast_runtime::tick(&state, &mut runtime);
                 runtime
                     .status_publisher
                     .publish(crate::status::PlaybackStatus::from_player(&state.player));
@@ -595,6 +600,7 @@ pub async fn run(
             }
             state.shutting_down = true;
             terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
+            podcast_runtime::shutdown(&mut runtime).await;
             runtime.federation.shutdown().await;
             return Ok(());
         }
@@ -870,9 +876,10 @@ fn extrapolate_control_position(state: &mut AppState) {
 
 pub(crate) fn become_control_device(
     state: &mut AppState,
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     snapshot: crate::devices::PlaybackSnapshot,
 ) {
+    podcast_runtime::end_playback(runtime);
     runtime.player.set_playback_allowed(false);
     if state.device_playback.is_audio_owner() {
         runtime.player.stop();
@@ -1633,6 +1640,11 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             push_media_metadata(state, runtime);
             push_media_update(state, runtime, true);
         }
+        Effect::PlayCurrentFromStart => {
+            start_current_audio_from(state, runtime, StartAt::Restart, false);
+            push_media_metadata(state, runtime);
+            push_media_update(state, runtime, true);
+        }
         Effect::TogglePause => {
             if state.player.paused {
                 runtime.player.pause();
@@ -1642,6 +1654,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             push_media_update(state, runtime, true);
         }
         Effect::StopPlayback => {
+            podcast_runtime::end_playback(runtime);
             runtime.player_start_pending = false;
             runtime.player.stop();
             push_media_update(state, runtime, true);
@@ -1652,6 +1665,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             runtime
                 .player
                 .seek(std::time::Duration::from_secs_f64(target));
+            podcast_runtime::seeked(state, runtime, target);
         }
         Effect::SetVolume(volume) => {
             runtime.player.set_volume(player::amplitude(volume));
@@ -2090,7 +2104,7 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 runtime.player.stop();
                 push_media_update(state, runtime, true);
             } else if let Some(paused) = restart_paused {
-                start_current_audio(state, runtime, 0.0, paused);
+                start_current_audio_from(state, runtime, StartAt::Resume, paused);
                 push_media_metadata(state, runtime);
                 push_media_update(state, runtime, true);
             } else {
@@ -2104,6 +2118,7 @@ fn is_controlled_playback_effect(effect: &Effect) -> bool {
     matches!(
         effect,
         Effect::PlayCurrent
+            | Effect::PlayCurrentFromStart
             | Effect::TogglePause
             | Effect::StopPlayback
             | Effect::SeekBy(_)
@@ -2120,7 +2135,7 @@ fn perform_control_playback_effect(state: &mut AppState, runtime: &mut Runtime, 
     let local_only_volume = state.device_playback.role == state::DevicePlaybackRole::Jam
         && matches!(effect, Effect::SetVolume(_));
     match effect {
-        Effect::PlayCurrent => {
+        Effect::PlayCurrent | Effect::PlayCurrentFromStart => {
             state.player.current = state.player.queue.get(state.player.queue_pos).cloned();
             state.player.playing = state.player.current.is_some();
             state.player.paused = false;
@@ -2208,21 +2223,41 @@ fn shell_quote(path: &Path) -> String {
 }
 
 /// Start playing `queue[queue_pos]`: open the local file in a background
-/// task and hand the reader to the audio thread.
+/// task and hand the reader to the audio thread. A podcast episode resumes
+/// from its saved position.
 fn play_current(state: &mut AppState, runtime: &mut Runtime) {
-    start_current_audio(state, runtime, 0.0, false);
+    start_current_audio_from(state, runtime, StartAt::Resume, false);
 }
 
+/// Start `queue[queue_pos]` at an exact position (handoff, restarting the
+/// same item after a queue change).
 fn start_current_audio(
     state: &mut AppState,
     runtime: &mut Runtime,
     position_secs: f64,
     paused: bool,
 ) {
+    let ms = (position_secs.max(0.0) * 1_000.0).round() as i64;
+    start_current_audio_from(state, runtime, StartAt::Position { ms }, paused);
+}
+
+fn start_current_audio_from(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    start: StartAt,
+    paused: bool,
+) {
+    let position_secs = match start {
+        StartAt::Position { ms } => ms as f64 / 1_000.0,
+        StartAt::Resume | StartAt::Restart => 0.0,
+    };
     let Some(mut track) = state.player.queue.get(state.player.queue_pos).cloned() else {
         return;
     };
-    if track_file_missing(&track) {
+    // The episode that was playing ends here (its last seen position is
+    // saved), whatever plays next.
+    podcast_runtime::end_playback(runtime);
+    if !track.is_podcast() && track_file_missing(&track) {
         if let Some(local) = local_track_for_playback(runtime, &track) {
             state.player.queue[state.player.queue_pos] = local.clone();
             track = local;
@@ -2301,6 +2336,12 @@ fn start_current_audio(
     state.status_message = Some(format!("▶ {} — {}", track.title, track.artist_line()));
 
     runtime.player_start_pending = true;
+    if track.is_podcast() {
+        // Streamed from the publisher; the start position (resume, exact or
+        // start over) is resolved with the store in the background.
+        podcast_runtime::start_episode(state, runtime, &track, start, paused);
+        return;
+    }
     if track.is_fed_pending() {
         // A federated track that is not on disk yet: silence the previous
         // audio, download it and resume through FedTrackResolved.
@@ -2403,6 +2444,11 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     let Some(track) = &player.current else {
         return;
     };
+    // An episode ends through its own completion path, and the next item
+    // must not start behind a stream; episodes are never prefetched either.
+    if track.is_podcast() {
+        return;
+    }
     if track.duration_seconds <= 0.0
         || track.duration_seconds - player.position_secs > PREFETCH_MARGIN_SECS
     {
@@ -2414,6 +2460,9 @@ fn maybe_prefetch_next(state: &mut AppState, runtime: &Runtime) {
     let Some(mut next) = player.queue.get(next_pos).cloned() else {
         return;
     };
+    if next.is_podcast() {
+        return;
+    }
     if track_file_missing(&next) {
         if let Some(local) = local_track_for_playback(runtime, &next) {
             state.player.queue[next_pos] = local.clone();
@@ -3397,7 +3446,9 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         | AppEvent::PodcastSubscribed(_)
         | AppEvent::PodcastRefreshed { .. }
         | AppEvent::PodcastUnsubscribed { .. }
-        | AppEvent::PodcastPlayedSet { .. }
+        | AppEvent::PodcastProgress(_)
+        | AppEvent::PodcastEpisodeStarted { .. }
+        | AppEvent::PodcastEpisodeFailed { .. }
         | AppEvent::PodcastRefreshTick
         | AppEvent::PodcastsDue(_) => {}
         AppEvent::StatusVisualizationReady(ready) => {
@@ -4111,6 +4162,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             runtime.player_start_pending = false;
         }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
+            // An episode that played to the end is complete.
+            podcast_runtime::finished(runtime);
             // The finished track gets a full-duration, completed entry.
             if let Some(finished) = state.player.current.clone() {
                 report_history(
@@ -4147,6 +4200,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             }
         }
         AppEvent::Player(player::PlayerEvent::Failed(message)) => {
+            podcast_runtime::player_failed(runtime);
             runtime.player_start_pending = false;
             tracing::error!(%message, "playback failed");
             state.player.playing = false;

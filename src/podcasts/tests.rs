@@ -18,11 +18,11 @@ use super::refresh::{
 };
 use super::test_server::{Route, TestServer};
 
-const NOW: i64 = 1_700_000_000_000;
+pub(super) const NOW: i64 = 1_700_000_000_000;
 
 /// In-memory sync log: hands out stamps and keeps the appended operations.
 #[derive(Default)]
-struct MemoryLog {
+pub(super) struct MemoryLog {
     ops: Mutex<Vec<SyncOpWire>>,
 }
 
@@ -65,7 +65,7 @@ impl OpLog for MemoryLog {
 }
 
 impl MemoryLog {
-    fn kinds(&self) -> Vec<String> {
+    pub(super) fn kinds(&self) -> Vec<String> {
         self.ops
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -80,14 +80,14 @@ impl MemoryLog {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
-    services: Services,
-    log: Arc<MemoryLog>,
-    server: TestServer,
+    pub(super) services: Services,
+    pub(super) log: Arc<MemoryLog>,
+    pub(super) server: TestServer,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(MemoryLog::default());
     let services = super::open_services(
@@ -104,7 +104,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn rss(items: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn rss(items: &[(&str, &str)]) -> Vec<u8> {
     let items: String = items
         .iter()
         .map(|(guid, title)| {

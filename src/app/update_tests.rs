@@ -2017,4 +2017,132 @@ mod podcast_queue {
         assert!(state.podcasts.opened.is_some());
         assert!(matches!(effect, Some(Effect::PodcastLoadEpisodes { .. })));
     }
+
+    fn episodes_tab(statuses: &[Option<(music_dht::podcast::ProgressStatus, i64)>]) -> AppState {
+        let items = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| {
+                let n = index as u32 + 1;
+                fx::episode(n, &format!("Episode {n}"), *status)
+            })
+            .collect();
+        fx::with_episodes(fx::ready_state(vec![fx::row("Show", 2, 2, 0)]), items)
+    }
+
+    #[test]
+    fn enter_plays_the_episode_right_after_the_current_item() {
+        let mut state = episodes_tab(&[None, None]);
+        state.player.queue = vec![test_track(1), test_track(2)];
+        state.player.queue_pos = 0;
+        state.player.current = Some(test_track(1));
+        state.player.playing = true;
+        state.podcasts.opened.as_mut().unwrap().episode_cursor = 1;
+
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(
+            keys(&state.player.queue),
+            keys(&[test_track(1), episode_track(2), test_track(2)])
+        );
+        assert_eq!(state.player.queue_pos, 1);
+        let queued = state.player.queue[1].podcast_episode_ref().unwrap();
+        assert_eq!(queued.podcast_title, "Show");
+        assert_eq!(queued.audio_url, "https://example.test/2.mp3");
+
+        // Enter again on the playing episode does not queue it twice.
+        state.player.current = Some(state.player.queue[1].clone());
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert_eq!(state.player.queue.len(), 3);
+        state.player.paused = true;
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::TogglePause)
+        );
+        assert!(!state.player.paused);
+        // "Start over" restarts it in place.
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        assert_eq!(state.player.queue.len(), 3);
+        assert_eq!(state.player.queue_pos, 1);
+    }
+
+    #[test]
+    fn start_over_plays_a_selected_episode_from_the_beginning() {
+        let mut state = episodes_tab(&[Some((
+            music_dht::podcast::ProgressStatus::InProgress,
+            600_000,
+        ))]);
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        assert_eq!(keys(&state.player.queue), keys(&[episode_track(1)]));
+        assert_eq!(state.player.queue_pos, 0);
+        // The queue item carries the generation the list showed (handoff
+        // and start-over order after it).
+        let queued = state.player.queue[0].podcast_episode_ref().unwrap();
+        assert_eq!(queued.progress_generation, Some(1));
+        // On another tab, `b` (if bound there) restarts the playing episode.
+        state.active_tab = Tab::Queue;
+        state.player.current = Some(state.player.queue[0].clone());
+        state.player.playing = true;
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        state.player.current = Some(test_track(3));
+        assert_eq!(update(&mut state, Action::RestartEpisode), None);
+    }
+
+    #[test]
+    fn episodes_can_be_queued_but_not_while_another_device_plays() {
+        let mut state = episodes_tab(&[None, None]);
+        assert_eq!(
+            update(&mut state, Action::QueueAddLast),
+            Some(Effect::QueueOrderChanged {
+                restart_current: false
+            })
+        );
+        state.podcasts.opened.as_mut().unwrap().episode_cursor = 1;
+        update(&mut state, Action::QueueAddLast);
+        assert_eq!(
+            keys(&state.player.queue),
+            keys(&[episode_track(1), episode_track(2)])
+        );
+
+        state.device_playback.role = crate::app::state::DevicePlaybackRole::Control;
+        assert_eq!(update(&mut state, Action::QueueAddNext), None);
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert_eq!(state.player.queue.len(), 2);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("another device")
+        );
+    }
+
+    #[test]
+    fn saved_progress_updates_the_episode_list_in_place() {
+        let mut state = episodes_tab(&[None, None]);
+        let mut record = fx::episode(
+            2,
+            "Episode 2",
+            Some((music_dht::podcast::ProgressStatus::InProgress, 90_000)),
+        )
+        .progress
+        .unwrap();
+        record.generation = 4;
+        assert!(crate::app::update::podcasts::progress_saved(&mut state, record).is_empty());
+        let items = &state.podcasts.episodes.as_ref().unwrap().items;
+        assert!(items[0].progress.is_none());
+        assert_eq!(items[1].resume_position_ms(), 90_000);
+        assert_eq!(items[1].progress.as_ref().unwrap().generation, 4);
+    }
 }

@@ -1863,6 +1863,15 @@ impl PodcastsTab {
         let list = self.opened_episodes()?;
         list.items.get(opened.episode_cursor)
     }
+
+    /// The selected episode as a queue item (explicit podcast source).
+    pub fn selected_episode_track(&self) -> Option<TrackItem> {
+        let item = self.selected_episode()?;
+        let row = self.podcast(&item.episode.podcast_id)?;
+        let mut episode = item.episode.to_ref(&row.summary.meta);
+        episode.progress_generation = item.progress.as_ref().map(|record| record.generation);
+        Some(TrackItem::podcast_episode(episode))
+    }
 }
 
 /// Single source of truth for the UI. Mutated only by `update()` and the

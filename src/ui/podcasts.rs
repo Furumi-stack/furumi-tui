@@ -571,11 +571,21 @@ fn draw_episode_row(
         .published_at_ms
         .map(|ms| format_date(ms.div_euclid(1000)))
         .unwrap_or_else(|| " ".repeat(10));
-    let (marker, right) = episode_state(item);
-    let marker_style = match item.status() {
+    let (mut marker, mut right) = episode_state(item);
+    let mut marker_style = match item.status() {
         ProgressStatus::NotStarted => theme::accent_for(state),
         _ => theme::dim(),
     };
+    // The episode playing on this device shows its live position.
+    if let Some(position_ms) = playing_position_ms(state, &episode.episode_id) {
+        marker = "▶";
+        marker_style = theme::accent_for(state);
+        let position = format_duration_ms(position_ms);
+        right = match episode.duration_ms.filter(|ms| *ms > 0) {
+            Some(ms) => format!("{position} / {}", format_duration_ms(ms)),
+            None => position,
+        };
+    }
     let number = match (episode.season, episode.episode_number) {
         (Some(season), Some(number)) => format!("S{season}E{number} "),
         (None, Some(number)) => format!("#{number} "),
@@ -606,6 +616,17 @@ fn draw_episode_row(
         (!right.is_empty()).then_some(right),
         selected,
     );
+}
+
+/// Position of `episode_id` when it is the item playing (or paused) here.
+fn playing_position_ms(
+    state: &AppState,
+    episode_id: &music_dht::podcast::EpisodeId,
+) -> Option<i64> {
+    let player = &state.player;
+    let current = player.current.as_ref()?.podcast_episode_ref()?;
+    (player.playing && current.episode_id == *episode_id)
+        .then(|| (player.position_secs.max(0.0) * 1_000.0).round() as i64)
 }
 
 fn draw_notes(frame: &mut Frame, area: Rect, state: &AppState, item: &EpisodeListItem) {

@@ -73,6 +73,8 @@ pub enum Action {
     ToggleEpisodePlayed,
     /// Podcasts: unsubscribe (progress and history are kept).
     UnsubscribePodcast,
+    /// Podcasts: play the selected (or playing) episode from the beginning.
+    RestartEpisode,
 }
 
 /// Help-window sections, in display order.
@@ -165,7 +167,8 @@ impl Action {
             | Action::CycleEpisodeSort
             | Action::CycleEpisodeFilter
             | Action::ToggleEpisodePlayed
-            | Action::UnsubscribePodcast => Category::Podcasts,
+            | Action::UnsubscribePodcast
+            | Action::RestartEpisode => Category::Podcasts,
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
             Action::ToggleHelp | Action::Quit => Category::System,
         }
@@ -253,6 +256,7 @@ impl Action {
             Action::CycleEpisodeFilter => "Filter: all/unplayed/played".into(),
             Action::ToggleEpisodePlayed => "Mark played / unplayed".into(),
             Action::UnsubscribePodcast => "Unsubscribe (keeps progress)".into(),
+            Action::RestartEpisode => "Play episode from the start".into(),
         }
     }
 }

@@ -13,13 +13,25 @@
 //!   `PodcastStore::apply_feed` and keeps the local fetch state (validators,
 //!   errors, back-off);
 //! * [`OpLog`] hands store actions the stamps of the device-sync log and
-//!   appends the operations they return.
+//!   appends the operations they return;
+//! * [`stream`] plays an episode straight from the publisher through a
+//!   bounded HTTP Range reader, and [`playback`] resolves the current audio
+//!   URL and resume position, opens and positions it;
+//! * [`progress`] writes resume positions, completions and listening
+//!   sessions in order on its own thread.
 //!
 //! Only RSS metadata is stored. Audio stays on the publisher's server.
 
 pub mod fetch;
+pub mod playback;
+pub mod progress;
 pub mod refresh;
+pub mod stream;
 
+#[cfg(test)]
+mod playback_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod test_server;
 #[cfg(test)]

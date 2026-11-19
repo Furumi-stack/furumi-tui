@@ -903,6 +903,7 @@ mod tests {
             (key!(f), Action::CycleEpisodeFilter),
             (key!(m), Action::ToggleEpisodePlayed),
             (shift('U'), Action::UnsubscribePodcast),
+            (key!(b), Action::RestartEpisode),
         ];
         for (key, action) in cases {
             assert_eq!(

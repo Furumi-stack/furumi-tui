@@ -272,8 +272,9 @@ command = "OpenCommandLine"
 key_sequence = "/"
 command = "OpenSearch"
 
-# Podcasts tab. Enter opens a podcast, its seasons and episodes; Esc goes
-# back. Shift-D also unsubscribes here.
+# Podcasts tab. Enter opens a podcast, its seasons and episodes, and plays
+# an episode (continuing where you stopped); Esc goes back. a / shift-a queue
+# the episode; Shift-D also unsubscribes here.
 [[keymaps]]
 key_sequence = "o"
 command = "AddPodcast"
@@ -312,4 +313,9 @@ context = "podcasts"
 [[keymaps]]
 key_sequence = "shift-u"
 command = "UnsubscribePodcast"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "b"
+command = "RestartEpisode"
 context = "podcasts"

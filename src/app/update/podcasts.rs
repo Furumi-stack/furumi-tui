@@ -7,15 +7,17 @@
 use furumi_library::podcasts::{
     EpisodeListItem, EpisodeQuery, EpisodeSort, PlayedFilter, SeasonFilter, SeasonSummary,
 };
-use music_dht::podcast::{EpisodeId, FeedUrl, PodcastId, ProgressStatus};
+use music_dht::podcast::{EpisodeId, FeedUrl, PodcastId, ProgressRecord, ProgressStatus};
 
 use super::Effect;
 use crate::app::action::Action;
 use crate::app::input::LineEdit;
+use crate::app::state::track_key;
 use crate::app::state::{
     AppState, EpisodeList, FedInputField, Loadable, OpenedPodcast, PODCAST_ACTION_ROWS,
     PODCAST_EPISODE_PAGE, PodcastListRow, PodcastRow, PodcastStoreStatus, Popup, SeasonRow, Tab,
 };
+use crate::library::models::TrackItem;
 use crate::podcasts::refresh::{RefreshReport, SubscribeReport};
 
 /// The next page starts loading when the cursor is this close to the end.
@@ -56,6 +58,7 @@ pub(super) fn handle(state: &mut AppState, action: &Action) -> Option<Option<Eff
         Action::CycleEpisodeSort => cycle_sort(state),
         Action::CycleEpisodeFilter => cycle_played_filter(state),
         Action::ToggleEpisodePlayed => toggle_played(state),
+        Action::RestartEpisode => restart_selected(state),
         _ => return None,
     };
     Some(effect)
@@ -158,11 +161,125 @@ fn select(state: &mut AppState) -> Option<Effect> {
         state.podcasts.search.clear();
         return Some(load_episodes(state, None));
     }
-    if state.podcasts.selected_episode().is_some() {
-        state.status_message =
-            Some("podcasts: episode playback is not available in this build yet".into());
+    let track = state.podcasts.selected_episode_track()?;
+    play_episode_now(state, track, false)
+}
+
+// ---------------------------------------------------------------------------
+// Playback
+
+/// Episodes play on this device only for now: a device that controls
+/// another one would hand them over as private placeholders (sync protocol
+/// v3 cannot carry them). Says so and returns `false` in that case.
+pub fn episodes_play_here(state: &mut AppState) -> bool {
+    if state.device_playback.is_control() {
+        state.status_message = Some(
+            "podcasts: playback is on another device; episodes play only on this device \
+             (take playback over here first)"
+                .into(),
+        );
+        return false;
     }
-    None
+    true
+}
+
+/// Enter on an episode: play it now, right after the current item, keeping
+/// the rest of the queue. Ordinary Play resumes from the saved position;
+/// `restart` is the explicit "start over".
+pub(super) fn play_episode_now(
+    state: &mut AppState,
+    track: TrackItem,
+    restart: bool,
+) -> Option<Effect> {
+    if !episodes_play_here(state) {
+        return None;
+    }
+    let key = track_key(&track);
+    let player = &mut state.player;
+    if let Some(index) = player
+        .current
+        .as_ref()
+        .filter(|current| track_key(current) == key)
+        .and_then(|_| {
+            if player
+                .queue
+                .get(player.queue_pos)
+                .is_some_and(|queued| track_key(queued) == key)
+            {
+                Some(player.queue_pos)
+            } else {
+                player
+                    .queue
+                    .iter()
+                    .position(|queued| track_key(queued) == key)
+            }
+        })
+    {
+        // Already the current item.
+        player.queue_pos = index;
+        if restart {
+            return Some(Effect::PlayCurrentFromStart);
+        }
+        if player.playing && player.paused {
+            player.paused = false;
+            return Some(Effect::TogglePause);
+        }
+        if player.playing {
+            state.status_message = Some("podcasts: this episode is playing".into());
+            return None;
+        }
+        return Some(Effect::PlayCurrent);
+    }
+    let len = player.queue.len();
+    let at = if player.current.is_some() {
+        (player.queue_pos + 1).min(len)
+    } else {
+        player.queue_pos.min(len)
+    };
+    player.queue.insert(at, track);
+    if let Some(end) = player.play_next_end
+        && end >= at
+    {
+        player.play_next_end = Some(end + 1);
+    }
+    player.prefetched_pos = None;
+    player.queue_pos = at;
+    super::normalize_play_next_block(player);
+    Some(if restart {
+        Effect::PlayCurrentFromStart
+    } else {
+        Effect::PlayCurrent
+    })
+}
+
+/// `b` on the episode list: play the selected episode from the beginning.
+fn restart_selected(state: &mut AppState) -> Option<Effect> {
+    match state.podcasts.selected_episode_track() {
+        Some(track) => play_episode_now(state, track, true),
+        None => restart_current(state),
+    }
+}
+
+/// "Start over" for the episode that is playing.
+pub fn restart_current(state: &mut AppState) -> Option<Effect> {
+    let Some(track) = state.player.current.clone().filter(TrackItem::is_podcast) else {
+        state.status_message = Some("podcasts: select an episode or play one first".into());
+        return None;
+    };
+    play_episode_now(state, track, true)
+}
+
+/// The progress writer saved (or found) a progress register: show it in
+/// the episode list without reloading it.
+pub fn progress_saved(state: &mut AppState, record: ProgressRecord) -> Vec<Effect> {
+    if let Some(list) = state.podcasts.episodes.as_mut() {
+        for item in &mut list.items {
+            if item.episode.episode_id == record.episode_id {
+                item.progress = Some(record.clone());
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn open_podcast(state: &mut AppState, index: usize) -> Option<Effect> {
@@ -186,10 +303,7 @@ fn open_podcast(state: &mut AppState, index: usize) -> Option<Effect> {
 
 /// Shift-J (or the info popup's artist jump) on a podcast episode: opens its
 /// podcast on the Podcasts tab instead of a music release or artist.
-pub fn reveal_episode_podcast(
-    state: &mut AppState,
-    track: &crate::library::models::TrackItem,
-) -> Option<Effect> {
+pub fn reveal_episode_podcast(state: &mut AppState, track: &TrackItem) -> Option<Effect> {
     let episode = track.podcast_episode_ref()?;
     let podcast_id = episode.podcast_id.clone();
     let title = episode.podcast_title.clone();

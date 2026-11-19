@@ -235,9 +235,21 @@ pub enum AppEvent {
         title: String,
         result: Result<(), String>,
     },
-    PodcastPlayedSet {
-        played: bool,
-        result: Result<(), String>,
+    /// Result of the progress writer (saves, supersedes, mark played).
+    PodcastProgress(crate::podcasts::progress::ProgressEvent),
+    /// An episode stream is playing; `generation` is the player source
+    /// generation of the start that requested it.
+    PodcastEpisodeStarted {
+        generation: u64,
+        episode: Box<music_dht::podcast::PodcastEpisodeRef>,
+        start_ms: i64,
+        duration_ms: Option<i64>,
+        restart: bool,
+    },
+    /// Starting an episode failed (network, decoding, cannot resume).
+    PodcastEpisodeFailed {
+        generation: u64,
+        message: String,
     },
     /// Scheduler timer: ask the store which feeds are due.
     PodcastRefreshTick,
