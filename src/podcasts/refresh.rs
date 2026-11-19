@@ -30,6 +30,8 @@ pub struct Services {
     pub store: Arc<PodcastStore>,
     pub fetcher: Arc<Fetcher>,
     pub log: Arc<dyn OpLog>,
+    /// Device-local privacy confirmations for sharing (never synced).
+    pub confirmations: Arc<super::publication::ShareConfirmations>,
 }
 
 impl std::fmt::Debug for Services {
