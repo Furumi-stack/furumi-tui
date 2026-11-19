@@ -12,8 +12,8 @@ use music_dht::podcast::{FeedUrl, PodcastId};
 use music_dht::podcast_dht::{ClaimedFeedUrl, FederatedSearchHit, SearchHitKind};
 
 use super::discovery::{
-    PODCAST_SEARCH_TIMEOUT, PodcastHit, podcast_hits, preview, resolve_local_ids, search,
-    subscribe_from_hit, test_hit,
+    PODCAST_SEARCH_TIMEOUT, PodcastHit, podcast_hits, preview, preview_for, resolve_local_ids,
+    search, subscribe_from_hit, test_hit,
 };
 use super::publication::{Publication, check_share, reconcile, set_shared};
 use super::publication_tests::{Node, wait_for};
@@ -192,6 +192,85 @@ async fn hits_resolve_to_the_podcast_a_feed_alias_belongs_to() {
     assert_eq!(hits[0].local_id, subscribed.podcast_id);
     assert!(hits[0].ids().contains(&&subscribed.podcast_id));
     assert_eq!(hits[1].local_id, hits[1].hit.podcast_id);
+}
+
+#[tokio::test]
+async fn a_card_for_an_older_address_finds_the_subscription_under_the_newer_one() {
+    use furumi_library::podcasts::PodcastListFilter;
+    // The user follows the feed under its newer address; a long-standing
+    // publisher's card names the older one (the card's origin).
+    let f = fixture();
+    let feed = |announce: Option<&str>| {
+        let announce = announce
+            .map(|url| format!("<itunes:new-feed-url>{url}</itunes:new-feed-url>"))
+            .unwrap_or_default();
+        format!(
+            "<?xml version=\"1.0\"?><rss version=\"2.0\" \
+             xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\"><channel>\
+             <title>Test Show</title>{announce}{}</channel></rss>",
+            item("a", "Pilot", 1, "Sat, 01 Jun 2024 10:00:00 GMT"),
+        )
+    };
+    let subscribed_rows = || {
+        f.services
+            .store
+            .list_podcasts(PodcastListFilter::Subscribed)
+            .unwrap()
+            .len()
+    };
+
+    // 1. The old address redirects permanently to the new one.
+    f.server
+        .set("/old.xml", Route::redirect(301, &f.server.url("/new.xml")));
+    f.server
+        .set("/new.xml", Route::new(feed(None), "application/rss+xml"));
+    let followed = subscribe(&f.services, &f.server.url("/new.xml"), NOW)
+        .await
+        .unwrap();
+    let card = test_hit(&f.server.url("/old.xml"), "Test Show");
+    let url = card.feed_url.clone();
+    let preview = preview_for(&f.services, &url).await.unwrap();
+    assert_eq!(preview.subscribed_as.as_ref(), Some(&followed.podcast_id));
+    let report = subscribe_from_hit(&f.services, &card, NOW).await.unwrap();
+    assert!(report.already_subscribed);
+    assert_eq!(report.podcast_id, followed.podcast_id);
+    assert_eq!(subscribed_rows(), 1);
+
+    // 2. The old address only announces the new one (itunes:new-feed-url,
+    //    no redirect): no second subscription for the same podcast.
+    let new_url = f.server.url("/new2.xml");
+    f.server
+        .set("/new2.xml", Route::new(feed(None), "application/rss+xml"));
+    f.server.set(
+        "/old2.xml",
+        Route::new(feed(Some(&new_url)), "application/rss+xml"),
+    );
+    let followed = subscribe(&f.services, &new_url, NOW).await.unwrap();
+    let kinds = f.log.kinds().len();
+    let card = test_hit(&f.server.url("/old2.xml"), "Test Show");
+    let url = card.feed_url.clone();
+    let preview = preview_for(&f.services, &url).await.unwrap();
+    assert_eq!(preview.moved_to, Some(FeedUrl::parse(&new_url).unwrap()));
+    assert_eq!(preview.subscribed_as.as_ref(), Some(&followed.podcast_id));
+    let report = subscribe_from_hit(&f.services, &card, NOW).await.unwrap();
+    assert!(report.already_subscribed);
+    assert_eq!(report.podcast_id, followed.podcast_id);
+    assert_eq!(subscribed_rows(), 2, "one row per podcast");
+    assert_eq!(f.log.kinds().len(), kinds, "nothing was written");
+
+    // A card whose feed moved to an address this device does not follow
+    // is not marked.
+    f.server.set(
+        "/elsewhere.xml",
+        Route::new(
+            feed(Some("https://feeds.example.test/unknown.xml")),
+            "application/rss+xml",
+        ),
+    );
+    let url = FeedUrl::parse(&f.server.url("/elsewhere.xml")).unwrap();
+    let preview = preview_for(&f.services, &url).await.unwrap();
+    assert!(preview.moved_to.is_some());
+    assert_eq!(preview.subscribed_as, None);
 }
 
 #[tokio::test]

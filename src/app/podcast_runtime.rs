@@ -251,7 +251,7 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
             feed_url,
         } => {
             tokio::spawn(async move {
-                let result = discovery::preview(&services.fetcher, &feed_url)
+                let result = discovery::preview_for(&services, &feed_url)
                     .await
                     .map(Box::new)
                     .map_err(err_string);

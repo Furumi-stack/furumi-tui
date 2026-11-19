@@ -46,7 +46,7 @@ pub fn card_key(state: &mut AppState, popup: Popup, key: KeyCode) -> Option<Effe
     match key {
         KeyCode::Esc | KeyCode::Char('q') => return None,
         KeyCode::Enter | KeyCode::Char('s') => {
-            if let Some(id) = subscribed_id(state, &hit) {
+            if let Some(id) = subscribed_id(state, &hit, preview.as_ref()) {
                 // «Уже подписан»: show the subscription instead.
                 return reveal_podcast(state, id, hit.title());
             }
@@ -76,10 +76,22 @@ pub fn card_key(state: &mut AppState, popup: Popup, key: KeyCode) -> Option<Effe
     effect
 }
 
-/// The id under which this device is subscribed to the card's podcast.
-fn subscribed_id(state: &AppState, hit: &PodcastHit) -> Option<PodcastId> {
+/// The id under which this device is subscribed to the card's podcast: the
+/// card's id, the id its origin URL resolves to here (a feed alias), or —
+/// once the feed was read — the podcast followed under the newer address
+/// the feed moved to.
+pub fn subscribed_id(
+    state: &AppState,
+    hit: &PodcastHit,
+    preview: Option<&Loadable<FeedPreview>>,
+) -> Option<PodcastId> {
+    let moved = match preview {
+        Some(Loadable::Ready(preview)) => preview.subscribed_as.as_ref(),
+        _ => None,
+    };
     hit.ids()
         .into_iter()
+        .chain(moved)
         .find(|id| state.podcasts.podcast(id).is_some())
         .cloned()
 }

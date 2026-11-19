@@ -2680,6 +2680,38 @@ mod podcast_discovery {
         );
         assert_eq!(state.active_tab, Tab::Podcasts);
 
+        // Subscribed under the newer address the card's feed moved to:
+        // known once the feed was read (`e`), then Enter opens it too.
+        let unknown = claimed_hit();
+        assert!(!unknown.ids().contains(&&podcast_id()));
+        let mut state = search_state(vec![fx::row("Test Show", 0, 3, 0)], vec![unknown]);
+        assert!(!state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let card_id = state.search.fed_podcasts[0].hit.podcast_id.clone();
+        assert!(matches!(
+            card_key(&mut state, popup, KeyCode::Char('e')),
+            Some(Effect::PodcastPreview { .. })
+        ));
+        preview_loaded(
+            &mut state,
+            card_id,
+            Ok(Box::new(FeedPreview {
+                title: "Test Show".into(),
+                episode_count: 1,
+                seasons: Vec::new(),
+                episodes: Vec::new(),
+                moved_to: Some(FeedUrl::parse("https://example.test/feed.xml").unwrap()),
+                subscribed_as: Some(podcast_id()),
+            })),
+        );
+        let popup = state.popup.take().unwrap();
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            matches!(&effect, Some(Effect::PodcastLoadEpisodes { query, .. }) if query.podcast_id == podcast_id()),
+            "{effect:?}"
+        );
+        assert!(!state.podcasts.subscribing);
+
         // Not subscribed: an unsubscribed podcast is not in the rows.
         let state = search_state(Vec::new(), vec![claimed_hit()]);
         assert!(!state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
@@ -2721,6 +2753,7 @@ mod podcast_discovery {
             seasons: Vec::new(),
             episodes: Vec::new(),
             moved_to: None,
+            subscribed_as: None,
         };
         // A preview of another card is ignored.
         preview_loaded(&mut state, podcast_id(), Ok(Box::new(feed.clone())));

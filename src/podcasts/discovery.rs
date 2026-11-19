@@ -150,6 +150,10 @@ pub struct FeedPreview {
     pub episodes: Vec<PreviewEpisode>,
     /// The feed answered from, or announced, another address.
     pub moved_to: Option<FeedUrl>,
+    /// This device is subscribed to the podcast under `moved_to` (it
+    /// followed the feed's newer address, the card names the older one):
+    /// the card shows «Уже подписан». Set by [`preview_for`].
+    pub subscribed_as: Option<PodcastId>,
 }
 
 /// Reads the feed at `url` (a card's origin URL) for a preview. Nothing is
@@ -199,7 +203,22 @@ pub async fn preview(fetcher: &Fetcher, url: &FeedUrl) -> Result<FeedPreview> {
             .collect(),
         episodes,
         moved_to,
+        subscribed_as: None,
     })
+}
+
+/// [`preview`], plus whether this device already follows the podcast under
+/// the newer address the feed moved to (`subscribed_as`). The store is only
+/// read.
+pub async fn preview_for(services: &Services, url: &FeedUrl) -> Result<FeedPreview> {
+    let mut preview = preview(&services.fetcher, url).await?;
+    if let Some(moved) = preview.moved_to.clone() {
+        let store = std::sync::Arc::clone(&services.store);
+        preview.subscribed_as =
+            tokio::task::spawn_blocking(move || refresh::subscribed_podcast(&store, &moved))
+                .await??;
+    }
+    Ok(preview)
 }
 
 /// A search hit for `feed_url` as one publisher would announce it (tests of

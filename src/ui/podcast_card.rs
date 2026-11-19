@@ -24,7 +24,8 @@ pub(super) fn draw(
     preview: Option<&Loadable<FeedPreview>>,
     scroll: u16,
 ) {
-    let subscribed = state.podcasts.subscribed_to(hit);
+    let subscribed =
+        crate::app::update::podcast_discovery::subscribed_id(state, hit, preview).is_some();
     let subscribing = state.podcasts.subscribing;
     let lines = card_lines(state, hit, preview, subscribed, subscribing);
 

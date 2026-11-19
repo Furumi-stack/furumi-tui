@@ -351,6 +351,7 @@ mod tests {
                     duration_ms: Some(2_700_000),
                 }],
                 moved_to: None,
+                subscribed_as: None,
             })),
             scroll: 0,
         });
