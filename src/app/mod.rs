@@ -4924,6 +4924,39 @@ mod playback_bridge_tests {
     }
 
     #[test]
+    fn an_older_jam_guest_cannot_drop_the_hosts_episodes() {
+        // A furumi 0.3 guest reads the redacted queue with its own types,
+        // which drop the `source` of every item
+        // (`devices::wire_compat_tests::v3_peers_would_drop_the_source_of_podcast_items`):
+        // the state it sends back has bare music items where the host's
+        // episodes are.
+        let host = mixed_state();
+        let published = music_dht::device_sync::redact_for_jam(playback_state_from_ui(&host));
+        let mut echoed = serde_json::to_value(&published).unwrap();
+        for item in echoed["queue"].as_array_mut().unwrap() {
+            item.as_object_mut().unwrap().remove("source");
+        }
+        echoed["paused"] = false.into();
+        let echoed: PlaybackStateWire = serde_json::from_value(echoed).unwrap();
+        assert_eq!(echoed.queue.len(), host.player.queue.len());
+        assert!(
+            echoed
+                .queue
+                .iter()
+                .all(|track| !track.requires_podcast_support())
+        );
+        let json = serde_json::to_string(&echoed).unwrap();
+        for secret in ["Episode 1", "Episode 2", "example.test", "Show"] {
+            assert!(!json.contains(secret), "{secret} reached the old guest");
+        }
+
+        // Its commands are refused while the queue holds episodes: the host
+        // keeps them instead of playing "Private item" as music.
+        assert!(jam_participant_state(&host, echoed.clone(), false).is_none());
+        assert!(jam_participant_state(&host, echoed, true).is_none());
+    }
+
+    #[test]
     fn a_guest_leaving_a_jam_drops_the_hosts_placeholders() {
         let mut guest = AppState::default();
         let published =
