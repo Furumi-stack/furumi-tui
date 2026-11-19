@@ -164,13 +164,17 @@ Shift+Tab cycle through them:
 | `6` | Logs |
 
 The Podcasts tab is a placeholder in this build; podcast support is not
-available yet. Press `?` for the full list of bindings and commands.
+available yet. On narrow terminals the tab bar shortens titles and then shows
+only the numbers, keeping the active tab's full name. Press `?` for the full list of bindings and commands.
 
 Bindings can be overridden in `keymap.toml` in the platform config directory
-(`~/.config/furumi/keymap.toml` on Linux and macOS); the bundled
+(`~/.config/furumi/keymap.toml` on Linux,
+`~/Library/Application Support/furumi/keymap.toml` on macOS); the bundled
 `src/config/default_keymap.toml` documents the format. Start the file with
 `version = 2`, the current format: its `GoToTab` indices are used exactly as
-written (`0` Library … `5` Logs). Files without `version` were written for the
+written (`0` Library … `5` Logs). `version` must come before the first
+`[[keymaps]]` entry; written after one, TOML would attach it to that entry, so
+Furumi rejects such a file with an error instead of guessing. Files without `version` were written for the
 older tab order (Settings and Logs on `4`/`5`, Podcasts on `6` in the
 prototype podcast build); Furumi adapts their tab shortcuts in memory so they
 keep opening the same tabs, shows a short notice at startup, and never

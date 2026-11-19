@@ -267,7 +267,9 @@ format `version`. Files from an older format are adapted in memory when they
 are loaded and the user is told once per start; Furumi never rewrites a
 user's configuration. The current format, version 2, orders tabs as Library,
 Playlists, Queue, Podcasts, Settings, Logs; unversioned files use the earlier
-order and have their tab indices remapped.
+order and have their tab indices remapped. A `version` key that TOML attached
+to a binding (written after a `[[keymaps]]` header) is rejected, so a versioned
+file is never silently mistaken for a legacy one.
 
 ## Scripted visualizations
 

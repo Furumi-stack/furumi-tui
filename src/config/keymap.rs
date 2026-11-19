@@ -62,6 +62,11 @@ struct RawBinding {
     command: Action,
     #[serde(default)]
     context: KeyContext,
+    /// Never valid here: a `version = N` line written after a `[[keymaps]]`
+    /// header lands inside that entry. Caught so the file is not silently
+    /// treated as legacy (and its tab indices remapped) despite the version.
+    #[serde(default)]
+    version: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -369,6 +374,11 @@ fn parse_file(text: &str) -> Result<(Option<u32>, Vec<Binding>)> {
         .keymaps
         .into_iter()
         .map(|raw| {
+            if raw.version.is_some() {
+                bail!(
+                    "`version` must be a top-level key placed before the first [[keymaps]] entry"
+                );
+            }
             let keys = parse_sequence(&raw.key_sequence)
                 .with_context(|| format!("bad key_sequence {:?}", raw.key_sequence))?;
             Ok(Binding {
@@ -793,6 +803,30 @@ mod tests {
         let user = parse_user_keymap(&format!("version = 3\n{LEGACY_TABS}")).unwrap();
         assert_eq!(go_to_tab_indices(&user.bindings), [0, 2, 3, 4, 5]);
         assert!(user.notice.unwrap().contains("newer"));
+    }
+
+    #[test]
+    fn version_inside_a_keymaps_entry_is_rejected() {
+        // Appended at the end, TOML puts `version` into the last entry; the
+        // file must not silently fall back to the legacy remap.
+        let err = parse_user_keymap(
+            "[[keymaps]]\nkey_sequence = \"4\"\ncommand = { GoToTab = 3 }\nversion = 2\n",
+        )
+        .err()
+        .expect("misplaced version must be rejected");
+        assert!(
+            format!("{err:#}").contains("before the first [[keymaps]]"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_keymaps_entries_are_still_ignored() {
+        let user = parse_user_keymap(
+            "version = 2\n[[keymaps]]\nkey_sequence = \"4\"\ncommand = { GoToTab = 3 }\nnote = \"mine\"\n",
+        )
+        .unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [3]);
     }
 
     #[test]
