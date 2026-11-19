@@ -36,6 +36,8 @@ pub mod refresh;
 pub mod stream;
 
 #[cfg(test)]
+mod discovery_tests;
+#[cfg(test)]
 mod playback_tests;
 #[cfg(test)]
 mod publication_tests;

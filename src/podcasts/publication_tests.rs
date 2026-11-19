@@ -22,7 +22,7 @@ const SECRET_URL: &str = "https://feeds.example.test/members.xml?token=012345678
 const PRIVATE_URL: &str = "https://feeds.example.test/diary.xml";
 
 /// Stamps of one device's local actions; keeps the operations they emit.
-struct Device {
+pub(super) struct Device {
     id: &'static str,
     seq: i64,
     ops: Vec<SyncOpWire>,
@@ -49,7 +49,7 @@ impl StampSource for Stamps<'_> {
 }
 
 impl Device {
-    fn new(id: &'static str) -> Self {
+    pub(super) fn new(id: &'static str) -> Self {
         Self {
             id,
             seq: 0,
@@ -93,7 +93,7 @@ impl Device {
         id.unwrap()
     }
 
-    fn set_shared(
+    pub(super) fn set_shared(
         &mut self,
         store: &PodcastStore,
         id: &PodcastId,
@@ -259,14 +259,14 @@ fn privacy_confirmations_are_local_and_bound_to_the_urls() {
 // ---------------------------------------------------------------------------
 // Two loopback nodes
 
-struct Node {
-    service: Arc<MusicDhtService>,
-    dht: Arc<PodcastDht>,
+pub(super) struct Node {
+    pub(super) service: Arc<MusicDhtService>,
+    pub(super) dht: Arc<PodcastDht>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Node {
-    async fn start(directory: &std::path::Path, network: NetworkId) -> Self {
+    pub(super) async fn start(directory: &std::path::Path, network: NetworkId) -> Self {
         std::fs::create_dir_all(directory).unwrap();
         let config = MusicDhtConfig::builder()
             .data_dir(directory)
@@ -297,7 +297,7 @@ impl Node {
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         for task in &self.tasks {
             task.abort();
         }
@@ -305,7 +305,7 @@ impl Node {
     }
 }
 
-async fn wait_for<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
+pub(super) async fn wait_for<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
     let started = std::time::Instant::now();
     loop {
         if let Some(value) = check().await {
