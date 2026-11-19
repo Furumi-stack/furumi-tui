@@ -16,7 +16,7 @@ use music_dht::{MusicDhtConfig, MusicDhtService, NetworkId};
 
 use super::publication::{
     Discovery, Publication, PublicationReport, ShareConfirmations, check_share, reconcile,
-    set_shared, share_card, share_states, summarize, warning_ru,
+    set_shared, share_card, share_plan, share_states, summarize, warning_ru,
 };
 
 const SHOW_URL: &str = "https://feeds.example.test/rust-radio.xml";
@@ -391,6 +391,77 @@ fn a_confirmation_does_not_outlive_a_revocation_on_another_device() {
         confirmed_here(&store, &confirmations, &fresh),
         "covers the next decision"
     );
+}
+
+#[test]
+fn a_confirmation_for_a_decision_that_was_not_written_is_dropped() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("confirmations.json");
+    let store = PodcastStore::open_in_memory().unwrap();
+    let confirmations = ShareConfirmations::open(path.clone());
+    let mut device = Device::new("device-a");
+    let secret = device.subscribe(&store, SECRET_URL, "Members Only");
+    let other = PodcastStore::open_in_memory().unwrap();
+    let mut device_b = Device::new("device-b");
+
+    // The user confirms, but the decision cannot be written (for example
+    // the podcast was unsubscribed by a sync meanwhile, or the database
+    // failed): nothing of the confirmation is left.
+    let check = check_share(&store, &confirmations, &secret).unwrap();
+    assert!(check.needs_confirmation());
+    let result = set_shared(
+        &store,
+        &confirmations,
+        &secret,
+        true,
+        Some(check.urls.clone()),
+        || anyhow::bail!("not subscribed"),
+    );
+    assert!(result.is_err());
+    assert!(shared_ids(&store, &confirmations).is_empty());
+
+    // Days later sharing is turned on on device B: A was never asked for
+    // that decision, so it holds the podcast back.
+    for op in &device.ops {
+        other.apply_remote_op(op).unwrap();
+    }
+    for op in &device_b.set_shared(&other, &secret, true) {
+        store.apply_remote_op(op).unwrap();
+    }
+    assert!(!confirmed_here(&store, &confirmations, &secret));
+    assert!(
+        share_plan(&store, &confirmations)
+            .unwrap()
+            .held
+            .contains_key(&secret),
+        "held back on A"
+    );
+    assert!(
+        check_share(&store, &confirmations, &secret)
+            .unwrap()
+            .needs_confirmation()
+    );
+    assert!(!ShareConfirmations::open(path.clone()).is_confirmed(
+        &share_card(&store, &secret).unwrap().unwrap(),
+        store.share(&secret).unwrap().as_ref()
+    ));
+
+    // A pending confirmation left in the file by a call that never
+    // finished (the app was killed before the decision was written) is
+    // dropped when the file is read again.
+    let fresh = device.subscribe(
+        &store,
+        "https://feeds.example.test/vip.xml?key=0123456789abcdef",
+        "VIP",
+    );
+    let check = check_share(&store, &confirmations, &fresh).unwrap();
+    confirmations
+        .confirm(&fresh, check.urls, store.share(&fresh).unwrap().as_ref())
+        .unwrap();
+    let reopened = ShareConfirmations::open(path);
+    device.set_shared(&store, &fresh, true);
+    assert!(confirmed_here(&store, &confirmations, &fresh));
+    assert!(!confirmed_here(&store, &reopened, &fresh));
 }
 
 #[test]

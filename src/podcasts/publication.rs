@@ -189,6 +189,13 @@ impl ShareConfirmations {
                 BTreeMap::new()
             }
         };
+        // A pending confirmation only lives between `confirm` and `bind`
+        // within one `set_shared` call; one found at start belongs to a
+        // call that never finished (the decision may not have been written)
+        // and must not cover a later decision taken elsewhere.
+        let mut confirmed = confirmed;
+        confirmed
+            .retain(|_, confirmation| !matches!(confirmation.decision, Decision::Pending { .. }));
         Self {
             path: Some(path),
             confirmed: Mutex::new(confirmed),
@@ -274,6 +281,29 @@ impl ShareConfirmations {
     /// unsubscribed here): sharing it again asks again. Blocking.
     pub fn forget(&self, podcast_id: &PodcastId) -> Result<()> {
         self.update(podcast_id, |entry| *entry = None)
+    }
+
+    /// The confirmation of a podcast as it is now, to put back with
+    /// [`ShareConfirmations::restore`].
+    fn entry(&self, podcast_id: &PodcastId) -> Option<Confirmation> {
+        self.lock().get(podcast_id).cloned()
+    }
+
+    /// Puts back the confirmation `previous` of a podcast (the decision it
+    /// was given for could not be written). Takes effect in memory even
+    /// when the file cannot be saved: a pending confirmation left in the
+    /// file is dropped when it is read again ([`ShareConfirmations::open`]).
+    /// Blocking.
+    fn restore(&self, podcast_id: &PodcastId, previous: Option<Confirmation>) -> Result<()> {
+        let mut confirmed = self.lock();
+        if confirmed.get(podcast_id) == previous.as_ref() {
+            return Ok(());
+        }
+        match previous {
+            Some(confirmation) => confirmed.insert(podcast_id.clone(), confirmation),
+            None => confirmed.remove(podcast_id),
+        };
+        self.save(&confirmed)
     }
 
     /// Applies `change` to the entry of `podcast_id` and saves the file when
@@ -459,11 +489,23 @@ pub fn set_shared(
     confirm: Option<ConfirmedUrls>,
     record: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    // What to put back if the decision cannot be written: a pending
+    // confirmation must not outlive this call, or it would cover the next
+    // share decision taken on any device, which this user never saw.
+    let mut previous = None;
     if let Some(urls) = confirm {
         let share = store.share(podcast_id)?;
+        previous = Some(confirmations.entry(podcast_id));
         confirmations.confirm(podcast_id, urls, share.as_ref())?;
     }
-    record()?;
+    if let Err(err) = record() {
+        if let Some(previous) = previous
+            && let Err(restore) = confirmations.restore(podcast_id, previous)
+        {
+            tracing::warn!("podcast share confirmation not restored: {restore:#}");
+        }
+        return Err(err);
+    }
     if !shared {
         return confirmations.forget(podcast_id);
     }
