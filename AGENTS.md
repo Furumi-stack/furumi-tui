@@ -186,6 +186,11 @@ The TUI is keyboard-first and cross-platform.
 - Use semantic `Action` values rather than checking raw keys inside views.
 - Add default bindings in `src/config/default_keymap.toml`.
 - Preserve user overrides and context-specific bindings.
+- Tabs are ordered Library, Playlists, Queue, Podcasts, Settings, Logs
+  (`1`–`6`). `Tab::ALL` defines that order for the tab bar, Tab/Shift+Tab,
+  and `GoToTab` indices. Changing it, or the meaning of any other
+  positional action argument, requires a new `KEYMAP_VERSION` and an
+  in-memory migration of older keymap files; never rewrite the user's file.
 - Account for narrow terminals, Unicode display width, and empty/loading/error
   states.
 - Restore raw mode, alternate screen, bracketed paste, and keyboard

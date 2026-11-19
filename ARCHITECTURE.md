@@ -257,6 +257,18 @@ The audio engine is similarly isolated. The application owns the logical
 queue, while `player::Controller` owns rodio playback and receives explicit
 commands. Prefetching prepares the next source before the current item ends.
 
+### Versioned key bindings
+
+Key bindings are semantic `Action` values loaded from the bundled defaults and
+merged with the user's `keymap.toml`. Some actions carry positional meaning
+(`GoToTab(index)` follows the displayed tab order), so changing the tab order
+changes what an existing user file means. The keymap file therefore carries a
+format `version`. Files from an older format are adapted in memory when they
+are loaded and the user is told once per start; Furumi never rewrites a
+user's configuration. The current format, version 2, orders tabs as Library,
+Playlists, Queue, Podcasts, Settings, Logs; unversioned files use the earlier
+order and have their tab indices remapped.
+
 ## Scripted visualizations
 
 Visualizations are an extension boundary rather than hard-coded rendering

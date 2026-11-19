@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A Podcasts tab on `4`. It is a placeholder in this build and states that
+  podcasts are not available yet.
+- An optional top-level `version` in `keymap.toml`; the current format is
+  `version = 2`, and a `podcasts` binding context.
+
+### Changed
+
+- Tab order is now `1` Library, `2` Playlists, `3` Queue, `4` Podcasts,
+  `5` Settings, `6` Logs, for the tab bar, Tab/Shift+Tab, and the default
+  number keys.
+- Keymap files without `version` keep their tab shortcuts: `GoToTab` indices
+  are remapped in memory (3 → 4 Settings, 4 → 5 Logs, and 5 → 3 Podcasts
+  from the prototype podcast build) with a one-time startup notice. The file
+  is not rewritten; `version = 2` files are used as written.
+- The help window names the target tab for number-key shortcuts
+  ("Go to Settings") instead of "Go to tab N".
+
 ## [0.2.8] - 2026-09-02
 
 ### Added
