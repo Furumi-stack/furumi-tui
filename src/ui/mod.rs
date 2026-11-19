@@ -216,6 +216,33 @@ mod tests {
         state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
         let screen = render(&state, 110, 30);
         assert!(screen.contains("not published:"), "{screen}");
+
+        // Sharing turned off here: until a pass revoked the card, the panel
+        // does not claim the podcast is simply private.
+        state.podcasts.publication.discovery = Discovery::Running { peers: 2 };
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_fixtures::podcast_id(), Publication::Published);
+        state
+            .podcasts
+            .publication
+            .note_revocation(&podcast_fixtures::podcast_id());
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private · revoking the"), "{screen}");
+        if let Some(crate::app::state::Loadable::Ready(rows)) = &mut state.podcasts.list {
+            rows[0].summary.shared = false;
+        }
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private · revoking the"), "{screen}");
+        assert!(!screen.contains("private (not shared"), "{screen}");
+        state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("not revoked yet:"), "{screen}");
+        state.podcasts.publication.unrevoked.clear();
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private (not shared"), "{screen}");
     }
 
     /// Search view with a federated artist and two public podcast cards;

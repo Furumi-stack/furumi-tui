@@ -9,12 +9,14 @@ use anyhow::Result;
 use furumi_library::podcasts::{OpStamp, PodcastLocalOp, PodcastStore, StampSource};
 use music_dht::device_sync::SyncOpWire;
 use music_dht::podcast::{FeedUrl, PodcastId, PodcastMeta};
-use music_dht::podcast_dht::{FeedUrlPrivacyWarning, PODCAST_DHT_ALPN, PodcastDht};
+use music_dht::podcast_dht::{
+    FeedUrlPrivacyWarning, PODCAST_DHT_ALPN, PodcastDht, PodcastDhtSyncStats, PodcastSyncFailure,
+};
 use music_dht::{MusicDhtConfig, MusicDhtService, NetworkId};
 
 use super::publication::{
     Discovery, Publication, PublicationReport, ShareConfirmations, check_share, reconcile,
-    share_card, share_states, warning_ru,
+    share_card, share_states, summarize, warning_ru,
 };
 
 const SHOW_URL: &str = "https://feeds.example.test/rust-radio.xml";
@@ -256,6 +258,67 @@ fn privacy_confirmations_are_local_and_bound_to_the_urls() {
     assert!(!ShareConfirmations::open(path).is_confirmed(&card));
 }
 
+#[test]
+fn revocations_that_fail_are_reported_without_ids() {
+    let show = PodcastId::from_feed_url(&FeedUrl::parse(SHOW_URL).unwrap());
+    let diary = PodcastId::from_feed_url(&FeedUrl::parse(PRIVATE_URL).unwrap());
+    let secret = PodcastId::from_feed_url(&FeedUrl::parse(SECRET_URL).unwrap());
+
+    // The tombstone of the private diary could not be pushed: its card is
+    // still live and the user is told, without the podcast's id or URL.
+    let mut report = PublicationReport::default();
+    let stats = PodcastDhtSyncStats {
+        failed: vec![PodcastSyncFailure {
+            podcast_id: diary.clone(),
+            error: "no replica reached".into(),
+        }],
+        ..PodcastDhtSyncStats::default()
+    };
+    let active = [show.clone(), diary.clone()].into_iter().collect();
+    summarize(&mut report, vec![show.clone()], stats, &active);
+    assert_eq!(report.podcasts.get(&show), Some(&Publication::Published));
+    assert_eq!(
+        report.podcasts.get(&diary),
+        None,
+        "private: not listed as shared"
+    );
+    assert_eq!(report.unrevoked, [diary.clone()].into_iter().collect());
+    let error = report.error.clone().unwrap();
+    assert_eq!(error, "1 public card could not be revoked yet; retrying");
+    assert!(!error.contains(diary.as_str()));
+
+    // A private podcast whose card is still active (not revoked yet) is
+    // unrevoked too, without an error; a failed shared one is Failed.
+    let mut report = PublicationReport::default();
+    let stats = PodcastDhtSyncStats {
+        failed: vec![PodcastSyncFailure {
+            podcast_id: show.clone(),
+            error: "signing failed".into(),
+        }],
+        ..PodcastDhtSyncStats::default()
+    };
+    let active = [secret.clone()].into_iter().collect();
+    summarize(&mut report, vec![show.clone()], stats, &active);
+    assert_eq!(
+        report.podcasts.get(&show),
+        Some(&Publication::Failed("signing failed".into()))
+    );
+    assert_eq!(report.unrevoked, [secret.clone()].into_iter().collect());
+    assert_eq!(report.error, None);
+
+    // Turning sharing off in the UI counts a published card as not revoked
+    // until the next pass; a held-back one was never published here.
+    let mut report = PublicationReport::default();
+    report.podcasts.insert(show.clone(), Publication::Published);
+    report
+        .podcasts
+        .insert(secret.clone(), Publication::HeldBack(Vec::new()));
+    report.note_revocation(&show);
+    report.note_revocation(&secret);
+    assert!(report.podcasts.is_empty());
+    assert_eq!(report.unrevoked, [show].into_iter().collect());
+}
+
 // ---------------------------------------------------------------------------
 // Two loopback nodes
 
@@ -470,6 +533,125 @@ async fn two_nodes() {
             .iter()
             .all(|publication| !publication.active)
     );
+
+    a.stop().await;
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reconciler_follows_the_overlay_and_revokes_without_the_debounce() {
+    tokio::time::timeout(Duration::from_secs(180), reconciler_lifecycle())
+        .await
+        .unwrap();
+}
+
+/// `publication::spawn` as the runtime drives it: the federation watch,
+/// debounced wakes, immediate revocations with the quit-time flush, the live
+/// peer count, and the end of the task with the watch.
+async fn reconciler_lifecycle() {
+    use super::publication::{PEER_REFRESH_INTERVAL, RECONCILE_DEBOUNCE, spawn};
+
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("furumi-tui-podcast-reconciler-test");
+    let store = Arc::new(PodcastStore::open_in_memory().unwrap());
+    let confirmations = Arc::new(ShareConfirmations::in_memory());
+    let mut device = Device::new("device-a");
+    let show = device.subscribe(&store, SHOW_URL, "Rust Radio Weekly");
+    device.set_shared(&store, &show, true);
+
+    let (overlay, watched) = tokio::sync::watch::channel(None);
+    let (tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let reconciler = spawn(
+        watched,
+        Some(Arc::clone(&store)),
+        confirmations,
+        move |report| {
+            let _ = tx.send(report);
+        },
+    );
+    let mut next = async || reports.recv().await.expect("a report");
+
+    // Federation off: nothing is published, nothing to wait for on quit.
+    let report = next().await;
+    assert!(matches!(report.discovery, Discovery::Off(_)));
+    assert!(report.podcasts.is_empty());
+    assert!(reconciler.flush(Duration::from_millis(10)).await);
+
+    // The overlay starts (two nodes, the overlay not bootstrapped yet): a
+    // pass publishes right away.
+    let a = Node::start(&temp.path().join("a"), network).await;
+    let c = Node::start(&temp.path().join("c"), network).await;
+    c.service
+        .connect(a.service.ticket().await.unwrap())
+        .await
+        .unwrap();
+    wait_for("music DHT contacts", async || {
+        (!a.service.known_peers().is_empty()).then_some(())
+    })
+    .await;
+    overlay.send_replace(Some(Arc::clone(&a.dht)));
+    let report = next().await;
+    assert!(matches!(report.discovery, Discovery::Running { .. }));
+    assert_eq!(publication(&report, &show), Some(Publication::Published));
+
+    // The peer count follows the overlay without another pass.
+    a.dht.bootstrap().await.unwrap();
+    c.dht.bootstrap().await.unwrap();
+    let mut report = report;
+    let started = std::time::Instant::now();
+    while !matches!(report.discovery, Discovery::Running { peers } if peers >= 1) {
+        assert!(
+            started.elapsed() < PEER_REFRESH_INTERVAL * 3,
+            "the peer count is refreshed"
+        );
+        report = next().await;
+    }
+    assert_eq!(publication(&report, &show), Some(Publication::Published));
+
+    // Wakes within the debounce are handled by one pass.
+    reconciler.wake();
+    reconciler.wake();
+    reconciler.wake();
+    let report = next().await;
+    assert_eq!(publication(&report, &show), Some(Publication::Published));
+    assert!(
+        tokio::time::timeout(RECONCILE_DEBOUNCE * 2, reports.recv())
+            .await
+            .is_err(),
+        "one pass for several wakes"
+    );
+
+    // Sharing off: the revocation does not wait for the debounce, and the
+    // quit-time flush returns once the tombstone was sent.
+    device.set_shared(&store, &show, false);
+    reconciler.revoke_now();
+    assert!(
+        reconciler.flush(RECONCILE_DEBOUNCE * 9 / 10).await,
+        "revoked before the debounce would have ended"
+    );
+    let report = reports.recv().await.unwrap();
+    assert!(report.podcasts.is_empty());
+    assert!(report.unrevoked.is_empty());
+    assert!(
+        a.dht
+            .published()
+            .await
+            .unwrap()
+            .iter()
+            .all(|publication| !publication.active)
+    );
+    assert!(!found(&c, &show).await);
+
+    // The overlay stops: off again; the task ends with the watch.
+    overlay.send_replace(None);
+    let mut report = reports.recv().await.unwrap();
+    while !matches!(report.discovery, Discovery::Off(_)) {
+        // A peer count refresh may still come in between.
+        assert!(report.podcasts.is_empty());
+        report = reports.recv().await.unwrap();
+    }
+    drop(overlay);
+    assert!(reports.recv().await.is_none(), "the reconciler stopped");
 
     a.stop().await;
     c.stop().await;

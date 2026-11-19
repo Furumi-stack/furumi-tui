@@ -313,10 +313,25 @@ pub(crate) fn share_status_line(state: &AppState, podcast: &PodcastRow) -> Line<
     if tab.share_busy.contains(podcast.id()) {
         return loading_line(state, "saving the share setting…");
     }
-    if !podcast.summary.shared {
-        return Line::styled("private (not shared in the federation)", theme::dim());
-    }
     let report = &tab.publication;
+    // A card from this device that is still live although the podcast is
+    // private now (revocation pending, failed, or federation off).
+    let unrevoked = report.unrevoked.contains(podcast.id());
+    if !podcast.summary.shared || (unrevoked && !report.podcasts.contains_key(podcast.id())) {
+        if !unrevoked {
+            return Line::styled("private (not shared in the federation)", theme::dim());
+        }
+        if let Discovery::Off(_) = report.discovery {
+            return Line::styled(
+                "private · public card not revoked yet: federation is off",
+                Style::new().fg(Color::Yellow),
+            );
+        }
+        return loading_line(
+            state,
+            "private · revoking the public card from this device…",
+        );
+    }
     let (text, style) = match (&report.discovery, report.podcasts.get(podcast.id())) {
         (Discovery::Off(reason), _) => (format!("shared · not published: {reason}"), theme::dim()),
         (_, Some(Publication::HeldBack(_))) => (

@@ -806,7 +806,7 @@ pub fn share_set(
             Some(Effect::PodcastsReload)
         }
         Ok(()) => {
-            state.podcasts.publication.podcasts.remove(&podcast_id);
+            state.podcasts.publication.note_revocation(&podcast_id);
             state.status_message = Some(format!(
                 "podcasts: {title} is private again; the public card is being revoked"
             ));
@@ -1153,6 +1153,7 @@ pub fn unsubscribed(
 ) -> Option<Effect> {
     match result {
         Ok(()) => {
+            state.podcasts.publication.note_revocation(&podcast_id);
             state.status_message = Some(format!(
                 "podcasts: unsubscribed from {}; progress and history are kept",
                 display_title(&title)

@@ -34,6 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ use anyhow::{Context, Result};
 use furumi_library::podcasts::{PodcastListFilter, PodcastStore, PodcastSummary};
 use music_dht::podcast::{FeedUrl, PodcastId, SubscriptionRecord, effective_share};
 use music_dht::podcast_dht::{
-    FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastShareState,
+    FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastShareState,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
@@ -57,6 +58,9 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Triggers within this window are handled by one pass (a "check all"
 /// refresh finishes many feeds in a row).
 pub const RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// How often the overlay's peer count is checked between passes, so the
+/// Podcasts tab does not show a stale "no discovery peers yet".
+pub const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The feed URLs a privacy confirmation covers: exactly the URLs of the card
 /// the user was shown.
@@ -369,8 +373,27 @@ pub struct PublicationReport {
     pub discovery: Discovery,
     /// Shared podcasts only.
     pub podcasts: BTreeMap<PodcastId, Publication>,
-    /// The pass as a whole failed (store or overlay error).
+    /// Podcasts that are no longer shared but whose card from this device is
+    /// still live: the revocation is pending, failed (retried every pass),
+    /// or waits for the overlay (federation off). In memory only; never
+    /// logged.
+    pub unrevoked: BTreeSet<PodcastId>,
+    /// The pass as a whole failed (store or overlay error), or cards could
+    /// not be revoked.
     pub error: Option<String>,
+}
+
+impl PublicationReport {
+    /// Sharing of `podcast_id` was turned off (or it was unsubscribed) on
+    /// this device: until the next pass says otherwise, a card it may have
+    /// published counts as not revoked yet.
+    pub fn note_revocation(&mut self, podcast_id: &PodcastId) {
+        if let Some(publication) = self.podcasts.remove(podcast_id)
+            && !matches!(publication, Publication::HeldBack(_))
+        {
+            self.unrevoked.insert(podcast_id.clone());
+        }
+    }
 }
 
 /// Reconciles this device's publications with the share registers of
@@ -466,6 +489,42 @@ pub async fn reconcile(
             BTreeSet::new()
         }
     };
+    summarize(&mut report, shared, stats, &active);
+    report
+}
+
+/// Folds one `sync_shares` result and the set of this device's active
+/// publications into `report`: the state of each shared podcast, the cards
+/// of private podcasts that are still live (`unrevoked`), and an error when
+/// revocations failed (counts only, no ids).
+pub(super) fn summarize(
+    report: &mut PublicationReport,
+    shared: Vec<PodcastId>,
+    stats: PodcastDhtSyncStats,
+    active: &BTreeSet<PodcastId>,
+) {
+    let shared_set: BTreeSet<&PodcastId> = shared.iter().collect();
+    let revoke_failed: BTreeSet<PodcastId> = stats
+        .failed
+        .iter()
+        .filter(|failure| !shared_set.contains(&failure.podcast_id))
+        .map(|failure| failure.podcast_id.clone())
+        .collect();
+    // Cards of podcasts that are private now but still live from here.
+    report.unrevoked = active
+        .iter()
+        .filter(|podcast_id| !shared_set.contains(podcast_id))
+        .cloned()
+        .chain(revoke_failed.iter().cloned())
+        .collect();
+    if !revoke_failed.is_empty() && report.error.is_none() {
+        let count = revoke_failed.len();
+        tracing::warn!(count, "podcast publication: public cards not revoked yet");
+        report.error = Some(format!(
+            "{count} public card{} could not be revoked yet; retrying",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
     let held: BTreeMap<PodcastId, Vec<FeedUrlPrivacyWarning>> = stats
         .held_back
         .into_iter()
@@ -488,13 +547,20 @@ pub async fn reconcile(
         };
         report.podcasts.insert(podcast_id, publication);
     }
-    report
 }
 
 /// Wakes the running reconciler.
 #[derive(Debug, Clone)]
 pub struct Reconciler {
+    /// Debounced passes (feed refreshes, received operations).
     wake: Arc<Notify>,
+    /// Immediate passes (revocations).
+    urgent: Arc<Notify>,
+    /// Number of revocations requested so far.
+    revocations: Arc<AtomicU64>,
+    /// Revocations covered by a finished pass (or by a pass that found the
+    /// overlay off, when nothing can be sent).
+    covered: watch::Receiver<u64>,
 }
 
 impl Reconciler {
@@ -503,11 +569,39 @@ impl Reconciler {
     pub fn wake(&self) {
         self.wake.notify_one();
     }
+
+    /// Requests a reconciliation now, without the debounce: sharing was
+    /// turned off or a podcast unsubscribed, and its card must be revoked
+    /// before the user may quit. See [`Reconciler::flush`].
+    pub fn revoke_now(&self) {
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        self.urgent.notify_one();
+    }
+
+    /// Waits, at most `timeout`, until a pass started after every
+    /// [`Reconciler::revoke_now`] so far finished (the tombstones were
+    /// signed and pushed, or the overlay is off and nothing can be sent).
+    /// Returns at once when nothing is pending. `false` on timeout or when
+    /// the reconciler stopped.
+    pub async fn flush(&self, timeout: Duration) -> bool {
+        let target = self.revocations.load(Ordering::SeqCst);
+        let mut covered = self.covered.clone();
+        if *covered.borrow() >= target {
+            return true;
+        }
+        // `revoke_now` already asked for the pass.
+        matches!(
+            tokio::time::timeout(timeout, covered.wait_for(|covered| *covered >= target)).await,
+            Ok(Ok(_))
+        )
+    }
 }
 
 /// Runs the reconciler until the overlay watch closes. `dht` follows the
 /// federation node; while it is `None` nothing is published from this
-/// device and `report` says so.
+/// device and `report` says so (keeping the cards known not to be revoked
+/// yet: they are revoked once the overlay runs again). Between passes the
+/// overlay's peer count is refreshed every [`PEER_REFRESH_INTERVAL`].
 pub fn spawn(
     mut dht: watch::Receiver<Option<Arc<PodcastDht>>>,
     store: Option<Arc<PodcastStore>>,
@@ -515,32 +609,69 @@ pub fn spawn(
     report: impl Fn(PublicationReport) + Send + 'static,
 ) -> Reconciler {
     let wake = Arc::new(Notify::new());
+    let urgent = Arc::new(Notify::new());
+    let revocations = Arc::new(AtomicU64::new(0));
+    let (covered_tx, covered) = watch::channel(0);
     let reconciler = Reconciler {
         wake: Arc::clone(&wake),
+        urgent: Arc::clone(&urgent),
+        revocations: Arc::clone(&revocations),
+        covered,
     };
     tokio::spawn(async move {
+        let mut last = PublicationReport::default();
+        let mut peers = tokio::time::interval(PEER_REFRESH_INTERVAL);
+        peers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        peers.reset();
         loop {
+            let requested = revocations.load(Ordering::SeqCst);
             let current = dht.borrow_and_update().clone();
-            match current {
-                Some(dht) => {
-                    let pass = reconcile(&dht, store.clone(), Arc::clone(&confirmations)).await;
-                    report(pass);
-                }
-                None => report(PublicationReport {
+            last = match current {
+                Some(dht) => reconcile(&dht, store.clone(), Arc::clone(&confirmations)).await,
+                None => PublicationReport {
                     discovery: Discovery::Off(
                         "federation is off or podcast discovery is unavailable".into(),
                     ),
+                    unrevoked: std::mem::take(&mut last.unrevoked),
                     ..PublicationReport::default()
-                }),
-            }
-            tokio::select! {
-                _ = wake.notified() => tokio::time::sleep(RECONCILE_DEBOUNCE).await,
-                changed = dht.changed() => {
-                    if changed.is_err() {
-                        return;
+                },
+            };
+            report(last.clone());
+            covered_tx.send_replace(requested);
+            let periodic = tokio::time::sleep(RECONCILE_INTERVAL);
+            tokio::pin!(periodic);
+            loop {
+                tokio::select! {
+                    _ = urgent.notified() => break,
+                    _ = wake.notified() => {
+                        tokio::time::sleep(RECONCILE_DEBOUNCE).await;
+                        // Wakes during the debounce are covered by this
+                        // pass: drop the permit they left.
+                        let _ = futures_util::FutureExt::now_or_never(wake.notified());
+                        break;
+                    }
+                    changed = dht.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    _ = &mut periodic => break,
+                    _ = peers.tick() => {
+                        // Keep the peer count live (the first bootstrap
+                        // usually finishes after the first pass).
+                        let Discovery::Running { peers: shown } = &mut last.discovery else {
+                            continue;
+                        };
+                        let Some(known) = dht.borrow().as_ref().map(|dht| dht.known_peers()) else {
+                            continue;
+                        };
+                        if *shown != known {
+                            *shown = known;
+                            report(last.clone());
+                        }
                     }
                 }
-                _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
             }
         }
     });

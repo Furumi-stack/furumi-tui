@@ -33,6 +33,9 @@ const SCHEDULER_FIRST_DELAY: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_REFRESHES: usize = 4;
 /// Feeds started per scheduler pass.
 const MAX_DUE_PER_PASS: usize = 16;
+/// How long quitting waits for a pending revocation (share turned off or
+/// unsubscribed just before) to be signed and pushed.
+const PUBLICATION_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Podcast services available once the store opened.
 pub struct PodcastRuntime {
@@ -151,6 +154,15 @@ fn spawn_publication(
 fn wake_publication(runtime: &Runtime) {
     if let Some(podcasts) = &runtime.podcasts {
         podcasts.publication.wake();
+    }
+}
+
+/// Asks the publication reconciler for an immediate pass: a card must be
+/// revoked (sharing turned off or unsubscribed here). Quitting waits for
+/// it, bounded ([`PUBLICATION_FLUSH_TIMEOUT`]).
+fn revoke_publication(runtime: &Runtime) {
+    if let Some(podcasts) = &runtime.podcasts {
+        podcasts.publication.revoke_now();
     }
 }
 
@@ -475,8 +487,10 @@ pub fn handle_event(
             title,
             result,
         } => {
-            // Unsubscribing revokes this device's card.
-            wake_publication(runtime);
+            // Unsubscribing revokes this device's card, right away.
+            if result.is_ok() {
+                revoke_publication(runtime);
+            }
             podcasts::unsubscribed(state, podcast_id, title, result)
                 .into_iter()
                 .collect()
@@ -494,7 +508,11 @@ pub fn handle_event(
             shared,
             result,
         } => {
-            wake_publication(runtime);
+            if !shared && result.is_ok() {
+                revoke_publication(runtime);
+            } else {
+                wake_publication(runtime);
+            }
             podcasts::share_set(state, podcast_id, title, shared, result)
                 .into_iter()
                 .collect()
@@ -1095,18 +1113,32 @@ fn progress_event(
     }
 }
 
-/// Before exit: end the playing episode's session and give the progress
-/// writer a moment to save it.
+/// Before exit (before the federation node stops): end the playing
+/// episode's session and give the progress writer a moment to save it, and
+/// let a revocation requested just before (sharing turned off, unsubscribed)
+/// reach the overlay.
 pub(crate) async fn shutdown(runtime: &mut Runtime) {
     end_playback(runtime);
-    let Some(mut progress) = runtime
-        .podcasts
-        .as_mut()
-        .and_then(|podcasts| podcasts.progress.take())
-    else {
+    let Some(podcasts) = runtime.podcasts.as_mut() else {
         return;
     };
-    let _ = tokio::task::spawn_blocking(move || progress.close(Duration::from_secs(3))).await;
+    let publication = podcasts.publication.clone();
+    let progress = podcasts.progress.take();
+    let flush = async {
+        if !publication.flush(PUBLICATION_FLUSH_TIMEOUT).await {
+            tracing::warn!(
+                "podcast publication: a public card may not be revoked yet; \
+                 it is revoked on the next start with federation on"
+            );
+        }
+    };
+    let close = async {
+        if let Some(mut progress) = progress {
+            let _ =
+                tokio::task::spawn_blocking(move || progress.close(Duration::from_secs(3))).await;
+        }
+    };
+    tokio::join!(flush, close);
 }
 
 #[cfg(test)]
