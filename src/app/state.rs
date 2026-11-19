@@ -1496,6 +1496,18 @@ impl Tab {
         }
     }
 
+    /// Abbreviated title for the tab bar on narrow terminals.
+    pub fn short_title(self) -> &'static str {
+        match self {
+            Tab::Global => "Lib",
+            Tab::Playlists => "Lists",
+            Tab::Queue => "Queue",
+            Tab::Podcasts => "Pods",
+            Tab::Federation => "Set",
+            Tab::Logs => "Logs",
+        }
+    }
+
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|t| *t == self).unwrap()
     }

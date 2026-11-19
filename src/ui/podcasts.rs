@@ -29,10 +29,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
             theme::dim(),
         ),
     ];
-    let height = (lines.len() as u16).min(inner.height);
+    // Center on the estimated wrapped height, but let the paragraph use every
+    // row down to the bottom so narrow terminals never cut off the text.
+    let wrapped = estimated_rows(&lines, inner.width).min(inner.height);
+    let top = inner.height.saturating_sub(wrapped) / 2;
     let body = Rect {
-        y: inner.y + inner.height.saturating_sub(height) / 2,
-        height,
+        y: inner.y + top,
+        height: inner.height - top,
         ..inner
     };
     frame.render_widget(
@@ -41,4 +44,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState) {
             .wrap(Wrap { trim: true }),
         body,
     );
+}
+
+/// Rows the lines need when wrapped to `width` (a lower bound: word wrapping
+/// may need one more row per line, which the paragraph area leaves room for).
+fn estimated_rows(lines: &[Line], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
