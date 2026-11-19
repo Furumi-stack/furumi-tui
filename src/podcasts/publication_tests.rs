@@ -657,6 +657,62 @@ async fn two_nodes() {
     })
     .await;
 
+    // Another trusted device B turns sharing off and on again while A does
+    // not reconcile in between (closed, offline, or within the debounce).
+    // The confirmation was given for the revoked decision: A holds the
+    // podcast back and revokes its card, although it already publishes the
+    // same feed URL (FRID alone would keep publishing it).
+    let other = PodcastStore::open_in_memory().unwrap();
+    for op in &device.ops {
+        other.apply_remote_op(op).unwrap();
+    }
+    let mut device_b = Device::new("device-b");
+    let off_on = [
+        device_b.set_shared(&other, &secret, false),
+        device_b.set_shared(&other, &secret, true),
+    ]
+    .concat();
+    for op in &off_on {
+        store.apply_remote_op(op).unwrap();
+    }
+    let report = reconcile(&a.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
+    assert!(
+        matches!(
+            publication(&report, &secret),
+            Some(Publication::HeldBack(warnings)) if !warnings.is_empty()
+        ),
+        "{report:?}"
+    );
+    assert!(
+        check_share(&store, &confirmations, &secret)
+            .unwrap()
+            .needs_confirmation()
+    );
+    assert!(
+        a.dht
+            .published()
+            .await
+            .unwrap()
+            .iter()
+            .any(|publication| publication.podcast_id == secret && !publication.active),
+        "the card confirmed for the earlier decision is revoked"
+    );
+    assert!(!found(&c, &secret).await);
+    // A second pass changes nothing; confirming again publishes it.
+    let report = reconcile(&a.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
+    assert!(matches!(
+        publication(&report, &secret),
+        Some(Publication::HeldBack(_))
+    ));
+    assert!(!found(&c, &secret).await);
+    confirm_shown(&store, &confirmations, &secret);
+    let report = reconcile(&a.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
+    assert_eq!(publication(&report, &secret), Some(Publication::Published));
+    wait_for("the card confirmed again", async || {
+        found(&c, &secret).await.then_some(())
+    })
+    .await;
+
     // Sharing off: the tombstone wins over the card at the stranger.
     let shared_op = device.ops.clone();
     device.set_shared(&store, &show, false);

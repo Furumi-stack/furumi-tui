@@ -5,7 +5,7 @@
 //! turns the merged registers into this device's own publications in the
 //! FRID overlay `music_dht::podcast_dht`:
 //!
-//! * [`share_states`] builds one `PodcastShareState` per subscription, the
+//! * [`share_plan`] builds one `PodcastShareState` per subscription, the
 //!   integration pattern FRID documents for SQLite clients: the merged
 //!   subscription and share registers, a card whose `feed_url` is the URL
 //!   this device fetches (catalog) and whose `id_feed_url` is the origin
@@ -30,7 +30,11 @@
 //!   to the exact URLs shown, so a feed that moves to another URL asks again,
 //!   and to the share decision it was given for (the share register's
 //!   operation), so a decision taken anywhere later — sharing turned off,
-//!   unsubscribing, sharing again — asks again too.
+//!   unsubscribing, sharing again — asks again too. A podcast whose card
+//!   looks private and is not confirmed for the current decision is held
+//!   back by [`share_plan`] itself, and a card this device published for an
+//!   earlier decision is revoked (`sync_shares` alone would keep publishing
+//!   feed URLs it already publishes).
 //!
 //! Logging stays free of private data: only counts are logged, never feed
 //! URLs, titles or ids of podcasts that are not shared.
@@ -45,8 +49,8 @@ use anyhow::{Context, Result};
 use furumi_library::podcasts::{PodcastListFilter, PodcastStore, PodcastSummary};
 use music_dht::podcast::{FeedUrl, PodcastId, ShareRecord, SubscriptionRecord, effective_share};
 use music_dht::podcast_dht::{
-    FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastShareState,
-    feed_url_privacy_warning,
+    FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastPrivacyHold,
+    PodcastShareState, feed_url_privacy_warning,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
@@ -469,18 +473,36 @@ pub fn set_shared(
     }
 }
 
+/// What this device hands to `PodcastDht::sync_shares`: the share states,
+/// and the shared podcasts it holds back itself.
+#[derive(Debug, Default)]
+pub struct SharePlan {
+    /// One state per subscription, except the held-back podcasts.
+    pub states: Vec<PodcastShareState>,
+    /// Shared podcasts whose card has privacy warnings this device's user
+    /// has not confirmed for the current share decision. They are left out
+    /// of [`SharePlan::states`], so `sync_shares` revokes a card this device
+    /// published for them earlier.
+    pub held: BTreeMap<PodcastId, Vec<FeedUrlPrivacyWarning>>,
+}
+
 /// One `PodcastShareState` per podcast with a subscription register, the
-/// input of `PodcastDht::sync_shares`. Blocking.
+/// input of `PodcastDht::sync_shares`, and the podcasts held back. Blocking.
 ///
 /// Only podcasts for which `effective_share` holds get a card; for every
 /// other podcast `card` is `None` and `privacy_confirmed` false, so no
 /// private metadata is prepared for publication at all. Confirmations that
 /// a newer share decision superseded (on any device) are dropped here.
-pub fn share_states(
-    store: &PodcastStore,
-    confirmations: &ShareConfirmations,
-) -> Result<Vec<PodcastShareState>> {
-    let mut states = Vec::new();
+///
+/// A shared podcast whose card looks private and is not confirmed for the
+/// current decision is held back here rather than by `sync_shares`: FRID
+/// keeps publishing a card whose feed URLs this device already publishes
+/// even without the confirmation, so a device that missed an intermediate
+/// "share off" (closed, offline, or within the debounce) would go on
+/// publishing a private-looking URL nobody confirmed for the new decision.
+/// Leaving the podcast out makes `sync_shares` revoke that card instead.
+pub fn share_plan(store: &PodcastStore, confirmations: &ShareConfirmations) -> Result<SharePlan> {
+    let mut plan = SharePlan::default();
     for summary in store.list_podcasts(PodcastListFilter::All)? {
         let podcast_id = &summary.podcast_id;
         let Some(subscription) = store.subscription(podcast_id)? else {
@@ -506,14 +528,36 @@ pub fn share_states(
         let privacy_confirmed = card
             .as_ref()
             .is_some_and(|card| confirmations.is_confirmed(card, share.as_ref()));
-        states.push(PodcastShareState {
+        if shared && !privacy_confirmed {
+            let warnings = match &card {
+                Some(card) => card.privacy_warnings(),
+                None => PodcastCardSpec::from_subscription(&subscription)
+                    .map(|card| card.privacy_warnings())
+                    .unwrap_or_default(),
+            };
+            if !warnings.is_empty() {
+                plan.held.insert(podcast_id.clone(), warnings);
+                continue;
+            }
+        }
+        plan.states.push(PodcastShareState {
             subscription,
             share,
             card,
             privacy_confirmed,
         });
     }
-    Ok(states)
+    Ok(plan)
+}
+
+/// The share states of [`share_plan`] (held-back podcasts left out).
+/// Blocking.
+#[cfg(test)]
+pub(super) fn share_states(
+    store: &PodcastStore,
+    confirmations: &ShareConfirmations,
+) -> Result<Vec<PodcastShareState>> {
+    share_plan(store, confirmations).map(|plan| plan.states)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,32 +638,44 @@ pub async fn reconcile(
     };
     // Why every own card is revoked, when the registers are unknown.
     let mut revoke_all: Option<String> = None;
-    let states = match store {
+    let SharePlan { states, held } = match store {
         Some(store) => {
-            match tokio::task::spawn_blocking(move || share_states(&store, &confirmations)).await {
-                Ok(Ok(states)) => states,
+            match tokio::task::spawn_blocking(move || share_plan(&store, &confirmations)).await {
+                Ok(Ok(plan)) => plan,
                 Ok(Err(err)) => {
                     revoke_all = Some(format!("cannot read share decisions ({err:#})"));
-                    Vec::new()
+                    SharePlan::default()
                 }
                 Err(err) => {
                     revoke_all = Some(format!("cannot read share decisions ({err})"));
-                    Vec::new()
+                    SharePlan::default()
                 }
             }
         }
         None => {
             revoke_all = Some("the podcast database is unavailable".into());
-            Vec::new()
+            SharePlan::default()
         }
     };
     let shared: Vec<PodcastId> = states
         .iter()
         .filter(|state| state.is_shared())
         .map(|state| state.subscription.podcast_id.clone())
+        .chain(held.keys().cloned())
         .collect();
     let stats = match dht.sync_shares(states).await {
-        Ok(stats) => stats,
+        Ok(mut stats) => {
+            stats
+                .held_back
+                .extend(
+                    held.into_iter()
+                        .map(|(podcast_id, warnings)| PodcastPrivacyHold {
+                            podcast_id,
+                            warnings,
+                        }),
+                );
+            stats
+        }
         Err(err) => {
             tracing::warn!("podcast publication failed: {err}");
             report.error = Some(format!("publication failed: {err}"));
