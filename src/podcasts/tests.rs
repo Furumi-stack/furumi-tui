@@ -743,6 +743,83 @@ async fn imported_podcasts_get_their_seasons_on_the_first_check() {
     );
 }
 
+/// The import commits inside `PodcastStore::open` and the validators are
+/// dropped afterwards. A start that stopped in between (killed, or a failed
+/// write) finishes the job at the next start, and the imported back-off is
+/// kept.
+#[test]
+fn dropping_prototype_validators_resumes_after_an_interrupted_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(furumi_library::podcasts::PODCAST_DB_FILE);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(PROTOTYPE_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO podcasts (feed_url, title, etag, added_at, last_checked_at)
+             VALUES ('https://example.test/ok.xml', 'Fine Show', '\"e1\"', 1700000000, 1700000100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO podcasts
+                (feed_url, title, last_modified, added_at, last_checked_at, last_error)
+             VALUES ('https://example.test/broken.xml', 'Broken Show',
+                     'Sat, 15 Jun 2024 10:00:00 GMT', 1700000000, 1700000200, 'HTTP 500')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let ok = PodcastId::from_feed_url(&FeedUrl::parse("https://example.test/ok.xml").unwrap());
+    let broken =
+        PodcastId::from_feed_url(&FeedUrl::parse("https://example.test/broken.xml").unwrap());
+
+    // The first start: the marker is written, then the import commits, and
+    // the process stops before the validators are dropped.
+    let marker = super::validators_marker(&path);
+    assert!(super::is_prototype_database(&path));
+    std::fs::write(&marker, b"").unwrap();
+    drop(PodcastStore::open(&path).unwrap());
+    assert!(!super::is_prototype_database(&path), "migrated");
+
+    // The next start finishes the job.
+    let services = super::open_services(
+        &path,
+        dir.path().join("covers"),
+        Arc::new(MemoryLog::default()),
+    )
+    .unwrap();
+    let store = &services.store;
+    let fetch = store.fetch_state(&ok).unwrap();
+    assert_eq!(fetch.etag, None);
+    assert_eq!(fetch.last_error, None);
+    let fetch = store.fetch_state(&broken).unwrap();
+    assert_eq!(fetch.last_modified, None);
+    assert_eq!(fetch.last_error.as_deref(), Some("HTTP 500"));
+    assert_eq!(
+        fetch.consecutive_failures, 1,
+        "the imported back-off is kept"
+    );
+    assert_eq!(fetch.checked_at_ms, Some(1_700_000_200_000));
+    assert!(!marker.exists(), "done once");
+
+    // Validators of later checks are kept on every start after that.
+    store
+        .record_fetch_success(&ok, NOW, Some("\"e2\""), None, None)
+        .unwrap();
+    drop(services);
+    let services = super::open_services(
+        &path,
+        dir.path().join("covers"),
+        Arc::new(MemoryLog::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        services.store.fetch_state(&ok).unwrap().etag.as_deref(),
+        Some("\"e2\"")
+    );
+}
+
 fn feed_url(f: &Fixture, path: &str) -> FeedUrl {
     FeedUrl::parse(&f.server.url(path)).unwrap()
 }

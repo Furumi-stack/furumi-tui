@@ -82,11 +82,26 @@ pub fn covers_dir() -> Result<PathBuf> {
 /// without writing anything, a database from a newer Furumi or a file that
 /// is not a podcast database. Blocking: call it on the blocking pool.
 pub fn open_services(db_path: &Path, covers_dir: PathBuf, log: Arc<dyn OpLog>) -> Result<Services> {
-    let from_prototype = is_prototype_database(db_path);
+    // The import commits inside `PodcastStore::open`; dropping its
+    // validators happens afterwards. A marker written before the import and
+    // removed only once every podcast was handled makes that step resumable
+    // after a crash or a failed write in between.
+    let marker = validators_marker(db_path);
+    let mut pending = marker.is_file();
+    if is_prototype_database(db_path) {
+        if let Err(err) = std::fs::write(&marker, b"") {
+            tracing::warn!("cannot record the pending prototype feed checks: {err}");
+        }
+        pending = true;
+    }
     let store = PodcastStore::open(db_path)?;
     tracing::info!(path = %db_path.display(), "podcast store opened");
-    if from_prototype {
-        forget_prototype_validators(&store);
+    if pending && forget_prototype_validators(&store) {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("cannot remove {}: {err}", marker.display()),
+        }
     }
     match store.legacy_quarantine() {
         Ok(entries) if !entries.is_empty() => tracing::warn!(
@@ -116,7 +131,21 @@ fn is_prototype_database(path: &Path) -> bool {
         .is_ok_and(|version| version == LEGACY_PROTOTYPE_SCHEMA_VERSION)
 }
 
-/// Drops the HTTP validators imported from a prototype database.
+/// Marker next to the podcast store: the validators imported from a
+/// prototype database still have to be dropped
+/// ([`forget_prototype_validators`]).
+fn validators_marker(db_path: &Path) -> PathBuf {
+    let mut name = db_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".full-check-pending");
+    db_path.with_file_name(name)
+}
+
+/// Drops the HTTP validators imported from a prototype database. Returns
+/// whether every podcast was handled (otherwise it runs again at the next
+/// start).
 ///
 /// The prototype stored no seasons, episode numbers or episode types, and
 /// its GUID-less episodes stay provisional until a feed is parsed again. With
@@ -124,9 +153,17 @@ fn is_prototype_database(path: &Path) -> bool {
 /// "304 Not Modified" and the feed never parsed while it does not change, so
 /// a finished series would never show its seasons. Without them the first
 /// check downloads and applies the feed. The fetch state is local (never
-/// synced). Contract gap: FRID's prototype import should not carry the
-/// validators over.
-fn forget_prototype_validators(store: &PodcastStore) {
+/// synced).
+///
+/// Only the public fetch-state API exists for this: the validators are
+/// cleared by recording a success at the last check, keeping the next check
+/// time, and an imported error is recorded again as many times as it was
+/// counted, so the back-off stays as imported. The one side effect is that a
+/// podcast imported with an error gets a last success time (its last check),
+/// which is not shown while the error is. Running this again only costs one
+/// unconditional feed download per podcast. Contract gap: FRID's prototype
+/// import should not carry the validators over.
+fn forget_prototype_validators(store: &PodcastStore) -> bool {
     let result = (|| -> Result<usize> {
         let mut cleared = 0;
         for podcast in store.list_podcasts(PodcastListFilter::All)? {
@@ -141,24 +178,35 @@ fn forget_prototype_validators(store: &PodcastStore) {
                 .unwrap_or(0);
             store.record_fetch_success(id, checked, None, None, state.next_check_at_ms)?;
             if let Some(error) = &state.last_error {
-                store.record_fetch_failure(
-                    id,
-                    state.checked_at_ms.unwrap_or(checked),
-                    error,
-                    state.next_check_at_ms,
-                )?;
+                for _ in 0..state.consecutive_failures.max(1) {
+                    store.record_fetch_failure(
+                        id,
+                        state.checked_at_ms.unwrap_or(checked),
+                        error,
+                        state.next_check_at_ms,
+                    )?;
+                }
             }
             cleared += 1;
         }
         Ok(cleared)
     })();
     match result {
-        Ok(0) => {}
-        Ok(cleared) => tracing::info!(
-            cleared,
-            "imported podcasts get a full first feed check (prototype validators dropped)"
-        ),
-        Err(err) => tracing::warn!("dropping imported podcast validators failed: {err:#}"),
+        Ok(cleared) => {
+            if cleared > 0 {
+                tracing::info!(
+                    cleared,
+                    "imported podcasts get a full first feed check (prototype validators dropped)"
+                );
+            }
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                "dropping imported podcast validators failed (retried at the next start): {err:#}"
+            );
+            false
+        }
     }
 }
 
