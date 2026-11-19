@@ -333,9 +333,12 @@ The TUI owns what the contract leaves to clients:
   subscriptions are due; feeds are checked at most a few at a time, a success
   waits an hour, and failures back off exponentially (honouring
   `Retry-After`). Errors never clear the stored catalog.
-- **Runtime boundary.** Every store call, fetch and parse runs on the blocking
-  pool or as a task and reports back through `AppEvent`s; `update::podcasts`
-  holds the pure state transitions. Store open failures (newer schema,
+- **Runtime boundary.** Every store call, fetch and parse of the app runs on
+  the blocking pool or as a task and reports back through `AppEvent`s;
+  `update::podcasts` holds the pure state transitions. The device-sync
+  stream handlers call the store (snapshot export and merges) inside
+  `block_in_place`, so a store busy with a large feed refresh does not hold
+  a Tokio worker's other tasks; they are never called on the UI thread. Store open failures (newer schema,
   foreign file) disable only the Podcasts tab and leave the file untouched.
 - **Sync log.** Local actions (subscribe, unsubscribe, mark played, progress)
   draw their operation stamps from the device-sync log through

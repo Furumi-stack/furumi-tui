@@ -950,3 +950,33 @@ fn podcast_payloads_are_not_written_to_the_debug_log() {
     // Music payloads are still logged in full.
     assert!(logged.contains("\"title\":\"Song\""), "{logged}");
 }
+
+/// Podcast store work done by the sync handlers does not hold a Tokio
+/// worker: another task keeps running meanwhile, even with one worker.
+#[test]
+fn podcast_store_work_in_sync_handlers_leaves_the_worker_free() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let started = std::time::Instant::now();
+        let busy = tokio::spawn(async {
+            off_worker(|| std::thread::sleep(Duration::from_millis(600)));
+            std::time::Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let other = tokio::spawn(async { std::time::Instant::now() });
+        let other_ran = other.await.unwrap();
+        let busy_done = busy.await.unwrap();
+        assert!(other_ran < busy_done, "the other task waited for the store");
+        assert!(other_ran.duration_since(started) < Duration::from_millis(400));
+    });
+    // Without a runtime (or on the blocking pool) it simply runs.
+    assert_eq!(off_worker(|| 7), 7);
+    let current = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(current.block_on(async { off_worker(|| 8) }), 8);
+}

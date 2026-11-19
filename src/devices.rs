@@ -2328,7 +2328,17 @@ impl DeviceSync {
     /// the podcast snapshot sections. Podcast merges are order-independent;
     /// operations go first so a changed progress register reaches the UI as
     /// such (it is shown in place) instead of as a generic change.
-    fn apply_received(&self, mut snapshot: SyncSnapshot, ops: Vec<SyncOpWire>) -> Result<()> {
+    fn apply_received(&self, snapshot: SyncSnapshot, ops: Vec<SyncOpWire>) -> Result<()> {
+        // Called from the async stream handlers; podcast store merges can
+        // wait on a feed refresh holding the store.
+        off_worker(|| self.apply_received_blocking(snapshot, ops))
+    }
+
+    fn apply_received_blocking(
+        &self,
+        mut snapshot: SyncSnapshot,
+        ops: Vec<SyncOpWire>,
+    ) -> Result<()> {
         let podcast = SyncSnapshot {
             podcast_subscriptions: std::mem::take(&mut snapshot.podcast_subscriptions),
             podcast_shares: std::mem::take(&mut snapshot.podcast_shares),
@@ -2593,10 +2603,12 @@ impl DeviceSync {
         let mut snapshot = self.snapshot()?;
         if music_dht::device_sync::supports_podcasts(peer_version)
             && let Some(store) = self.podcast_store()
-            && let Err(err) = store.fill_snapshot(
-                &mut snapshot,
-                music_dht::podcast::MAX_PODCAST_SNAPSHOT_BYTES,
-            )
+            && let Err(err) = off_worker(|| {
+                store.fill_snapshot(
+                    &mut snapshot,
+                    music_dht::podcast::MAX_PODCAST_SNAPSHOT_BYTES,
+                )
+            })
         {
             // Music sync goes on; podcast state comes with a later sync.
             tracing::warn!("podcast snapshot export failed: {err:#}");
@@ -4212,6 +4224,21 @@ mod wire_compat_tests;
 
 #[cfg(test)]
 mod podcast_sync_tests;
+
+/// Runs podcast store work from an async device-sync handler without
+/// stalling a Tokio worker: the store may be busy with a feed refresh (one
+/// transaction, up to about half a second for a very large feed). On the
+/// multi-thread runtime the worker hands its other tasks over while `work`
+/// runs (`block_in_place`); elsewhere (blocking pool, tests without a
+/// runtime, a current-thread runtime) it simply runs.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
 
 fn playback_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
