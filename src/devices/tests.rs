@@ -229,6 +229,7 @@ fn empty_playback_state() -> PlaybackStateWire {
         volume: 80,
         shuffle: false,
         repeat: PlaybackRepeat::Off,
+        playback_rate: None,
     }
 }
 
@@ -424,12 +425,25 @@ fn test_fed_track(content_id: &str) -> crate::federation::FedTrack {
 }
 
 #[test]
-fn base64url_round_trip_without_padding() {
-    for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
-        let encoded = base64url_encode(input);
-        assert!(!encoded.contains('='));
-        assert_eq!(base64url_decode(&encoded).unwrap(), input);
-    }
+fn invites_round_trip_through_the_shared_encoding() {
+    let invite = InviteWire {
+        v: 1,
+        ticket: "ticket".into(),
+        device_id: "dev_a".into(),
+        invite_id: "inv".into(),
+        secret: "s3cr3t".into(),
+        expires_at_ms: 10,
+        protocol_version: None,
+    };
+    let link = encode_invite(&invite).unwrap();
+    assert!(!link.contains('='));
+    assert_eq!(parse_invite(&link).unwrap(), invite);
+    assert!(
+        parse_invite("frid://x/abc")
+            .unwrap_err()
+            .to_string()
+            .contains(":connect")
+    );
 }
 
 #[test]
@@ -566,6 +580,7 @@ fn playback_command_is_targeted_and_deduplicated() {
             volume: 42,
             shuffle: false,
             repeat: PlaybackRepeat::Off,
+            playback_rate: None,
         },
         seek: false,
     };
@@ -622,6 +637,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
             volume: 42,
             shuffle: false,
             repeat: PlaybackRepeat::Off,
+            playback_rate: None,
         },
         seek: false,
     };

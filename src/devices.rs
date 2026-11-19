@@ -8,7 +8,6 @@
 use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,11 +15,18 @@ use anyhow::{Context as _, Result};
 use furumi_library::podcasts::{
     OpStamp as PodcastOpStamp, PodcastLocalOp, StampSource as PodcastStampSource,
 };
-use music_dht::device_sync::{ListenEvent, ListenTrackMetadata};
+use music_dht::device_sync::{
+    DeviceProfileWire, InviteWire, ListenEvent, ListenTrackMetadata, SnapshotLike,
+    SnapshotLikeTombstone, SnapshotPlaylist, SnapshotPlaylistItem, SnapshotPlaylistItemTombstone,
+    SnapshotPlaylistTombstone, SyncOpWire, SyncSnapshot, WireMessage, encode_invite, finish_send,
+    hash_secret, random_hex, read_msg, ticket_endpoint_id,
+};
+pub use music_dht::device_sync::{
+    PlaybackCommand, PlaybackRepeat, PlaybackSnapshot, PlaybackStateWire, PlaybackTrack,
+    SyncOpPayload, SyncedFedTrack,
+};
 use music_dht::{ByteStream, MusicDhtService, NetworkId, PeerTicket, SecretKey, StreamAcceptor};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::app::event::AppEvent;
 use crate::library::Library;
@@ -34,7 +40,6 @@ const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_LINE: usize = 8 * 1024 * 1024;
 /// Playback control is ephemeral. Keeping old full-queue commands in a new
 /// peer's catch-up batch can make the initial pairing frame arbitrarily large.
 const PLAYBACK_COMMAND_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -95,78 +100,18 @@ pub struct DeviceSync {
     playback: Arc<std::sync::Mutex<PlaybackShared>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaybackRepeat {
-    #[default]
-    Off,
-    One,
-    All,
+/// Converts queue items to and from the shared wire form
+/// ([`PlaybackTrack`]). The wire types themselves are the shared
+/// `music_dht::device_sync` definitions; this client keeps no copies.
+pub trait PlaybackTrackExt {
+    /// Wire form of a queue item. Device-local paths are never sent.
+    fn from_track(track: &TrackItem) -> Self;
+    /// Queue item for a wire track received from another device.
+    fn to_track_item(&self) -> TrackItem;
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackTrack {
-    pub id: i64,
-    pub title: String,
-    pub track_number: Option<i32>,
-    pub disc_number: Option<i32>,
-    pub duration_seconds: f64,
-    #[serde(default)]
-    pub artist_names: Vec<String>,
-    #[serde(default)]
-    pub featured_artist_names: Vec<String>,
-    pub release_id: i64,
-    pub release_title: String,
-    pub release_year: Option<i32>,
-    /// Legacy compatibility only. Paths are device-local, so playback sync
-    /// must resolve tracks from content/federation identifiers instead.
-    #[serde(default)]
-    pub file_path: String,
-    pub content_id: Option<String>,
-    pub audio_format: Option<String>,
-    pub audio_bitrate: Option<i32>,
-    pub audio_sample_rate: Option<i32>,
-    pub audio_bit_depth: Option<i32>,
-    pub file_size_bytes: Option<i64>,
-    #[serde(default)]
-    pub play_count: i64,
-    #[serde(default)]
-    pub fed: Option<SyncedFedTrack>,
-}
-
-impl PlaybackTrack {
-    fn portable_placeholder_id(&self) -> i64 {
-        let key = self
-            .content_id
-            .as_deref()
-            .and_then(music_dht::normalize_content_id)
-            .map(|content_id| format!("content:{content_id}"))
-            .or_else(|| {
-                self.fed
-                    .as_ref()
-                    .map(|fed| fed.content_id.as_str())
-                    .and_then(music_dht::normalize_content_id)
-                    .map(|content_id| format!("content:{content_id}"))
-            })
-            .or_else(|| {
-                self.fed
-                    .as_ref()
-                    .map(|fed| format!("fed:{}:{}", fed.owner, fed.item_id))
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "remote:{}:{}:{}:{}",
-                    self.id, self.title, self.release_title, self.duration_seconds
-                )
-            });
-        let hash = blake3::hash(key.as_bytes());
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&hash.as_bytes()[..8]);
-        let positive = (i64::from_be_bytes(bytes) & i64::MAX).max(1);
-        -positive
-    }
-
-    pub fn from_track(track: &TrackItem) -> Self {
+impl PlaybackTrackExt for PlaybackTrack {
+    fn from_track(track: &TrackItem) -> Self {
         if track.is_podcast() {
             return Self::private_placeholder();
         }
@@ -201,42 +146,11 @@ impl PlaybackTrack {
             file_size_bytes: track.file_size_bytes,
             play_count: track.play_count,
             fed: track.fed.as_ref().and_then(SyncedFedTrack::from_fed),
+            source: None,
         }
     }
 
-    /// What peers see in place of a podcast episode.
-    ///
-    /// This wire version (protocol 3) has no typed item source, so an
-    /// episode cannot be described without passing it off as music or
-    /// leaking its private title and URL (to Jam guests in particular). It
-    /// is sent as the shared "private item" placeholder instead: not
-    /// playable, no identity. Typed podcast items for peers that support
-    /// them come with sync protocol v4.
-    pub fn private_placeholder() -> Self {
-        Self {
-            id: 0,
-            title: music_dht::device_sync::PRIVATE_ITEM_TITLE.to_string(),
-            track_number: None,
-            disc_number: None,
-            duration_seconds: 0.0,
-            artist_names: Vec::new(),
-            featured_artist_names: Vec::new(),
-            release_id: 0,
-            release_title: String::new(),
-            release_year: None,
-            file_path: String::new(),
-            content_id: None,
-            audio_format: None,
-            audio_bitrate: None,
-            audio_sample_rate: None,
-            audio_bit_depth: None,
-            file_size_bytes: None,
-            play_count: 0,
-            fed: None,
-        }
-    }
-
-    pub fn to_track_item(&self) -> TrackItem {
+    fn to_track_item(&self) -> TrackItem {
         let refs = |names: &[String]| -> Vec<ArtistRef> {
             names
                 .iter()
@@ -247,7 +161,7 @@ impl PlaybackTrack {
                 .collect()
         };
         TrackItem {
-            id: self.portable_placeholder_id(),
+            id: portable_placeholder_id(self),
             title: self.title.clone(),
             track_number: self.track_number,
             disc_number: self.disc_number,
@@ -272,242 +186,48 @@ impl PlaybackTrack {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackStateWire {
-    #[serde(default)]
-    pub queue: Vec<PlaybackTrack>,
-    #[serde(default)]
-    pub queue_pos: usize,
-    pub playing: bool,
-    pub paused: bool,
-    #[serde(default)]
-    pub idle_since_ms: Option<i64>,
-    pub position_secs: f64,
-    #[serde(default)]
-    pub volume: u8,
-    pub shuffle: bool,
-    pub repeat: PlaybackRepeat,
+/// Process-local negative id of a music item received from another device,
+/// derived from its portable identity (content id, then federated source).
+fn portable_placeholder_id(track: &PlaybackTrack) -> i64 {
+    let key = track
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id)
+        .map(|content_id| format!("content:{content_id}"))
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .map(|fed| fed.content_id.as_str())
+                .and_then(music_dht::normalize_content_id)
+                .map(|content_id| format!("content:{content_id}"))
+        })
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .map(|fed| format!("fed:{}:{}", fed.owner, fed.item_id))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "remote:{}:{}:{}:{}",
+                track.id, track.title, track.release_title, track.duration_seconds
+            )
+        });
+    let hash = blake3::hash(key.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    let positive = (i64::from_be_bytes(bytes) & i64::MAX).max(1);
+    -positive
 }
 
-pub type PlaybackSnapshot = music_dht::playback::Snapshot<PlaybackStateWire>;
-pub type PlaybackCommand = music_dht::playback::Command<PlaybackStateWire>;
-
-#[derive(Debug, Clone, Default)]
-struct PlaybackShared {
-    engine: Option<Engine>,
-    engine_group: String,
-    local: Option<PlaybackSnapshot>,
-    remote: BTreeMap<String, PlaybackSnapshot>,
+/// Converts federated tracks to and from the synced metadata form.
+trait SyncedFedTrackExt: Sized {
+    fn from_fed(fed: &crate::federation::FedTrack) -> Option<Self>;
+    fn to_fed_track(&self) -> crate::federation::FedTrack;
 }
 
-#[derive(Debug, Clone)]
-struct LocalIdentity {
-    device_id: String,
-    group_id: String,
-    name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InviteWire {
-    v: u16,
-    #[serde(rename = "t")]
-    ticket: String,
-    #[serde(rename = "d")]
-    device_id: String,
-    #[serde(rename = "i")]
-    invite_id: String,
-    #[serde(rename = "s")]
-    secret: String,
-    #[serde(rename = "e")]
-    expires_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeviceProfileWire {
-    device_id: String,
-    name: String,
-    client_version: String,
-    protocol_version: u16,
-    endpoint_id: String,
-    endpoint_ticket: String,
-    #[serde(default)]
-    revoked: bool,
-    #[serde(default)]
-    revoke_cutoff_seq: Option<i64>,
-    #[serde(default)]
-    updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SyncOpWire {
-    op_id: String,
-    origin_device_id: String,
-    seq: i64,
-    hlc_ms: i64,
-    payload: SyncOpPayload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SyncOpPayload {
-    TrackLikeSet {
-        content_id: String,
-        liked: bool,
-        #[serde(default)]
-        fed: Option<SyncedFedTrack>,
-    },
-    PlaylistCreated {
-        playlist_id: String,
-        title: String,
-    },
-    PlaylistRenamed {
-        playlist_id: String,
-        title: String,
-    },
-    PlaylistDeleted {
-        playlist_id: String,
-    },
-    PlaylistTrackAdded {
-        playlist_id: String,
-        content_id: String,
-        position: i64,
-        #[serde(default)]
-        fed: Option<SyncedFedTrack>,
-    },
-    PlaylistTrackRemoved {
-        playlist_id: String,
-        content_id: String,
-    },
-    DeviceProfileSet {
-        name: String,
-        client_version: String,
-        endpoint_ticket: String,
-        endpoint_id: String,
-    },
-    DeviceTrusted {
-        target_device_id: String,
-    },
-    DeviceRevoked {
-        target_device_id: String,
-        target_max_seq_seen: i64,
-    },
-    PlaybackCommand {
-        target_device_id: String,
-        command: PlaybackCommand,
-        #[serde(default)]
-        authority: Option<CommandStamp>,
-    },
-    ListenRecorded {
-        event: ListenEvent,
-    },
-}
-
-impl SyncOpPayload {
-    fn is_tombstone(&self) -> bool {
-        matches!(
-            self,
-            SyncOpPayload::TrackLikeSet { liked: false, .. }
-                | SyncOpPayload::PlaylistDeleted { .. }
-                | SyncOpPayload::PlaylistTrackRemoved { .. }
-                | SyncOpPayload::DeviceRevoked { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct SyncSnapshot {
-    #[serde(default)]
-    likes: Vec<SnapshotLike>,
-    #[serde(default)]
-    unlikes: Vec<SnapshotLikeTombstone>,
-    #[serde(default)]
-    playlists: Vec<SnapshotPlaylist>,
-    #[serde(default)]
-    deleted_playlists: Vec<SnapshotPlaylistTombstone>,
-    #[serde(default)]
-    removed_playlist_items: Vec<SnapshotPlaylistItemTombstone>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotLike {
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    fed: Option<SyncedFedTrack>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotLikeTombstone {
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylist {
-    playlist_id: String,
-    title: String,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    items: Vec<SnapshotPlaylistItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistTombstone {
-    playlist_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistItem {
-    content_id: String,
-    position: i64,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    fed: Option<SyncedFedTrack>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistItemTombstone {
-    playlist_id: String,
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-enum PairAttempt {
-    Accepted(String),
-    Pending,
-    Denied(String),
-}
-
-struct PairingStatus {
-    status: String,
-    use_requester_group: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncedFedTrack {
-    item_id: String,
-    owner: String,
-    title: String,
-    #[serde(default)]
-    artist_names: Vec<String>,
-    #[serde(default)]
-    featured_artist_names: Vec<String>,
-    year: Option<i32>,
-    duration_seconds: Option<i64>,
-    content_id: String,
-    release_title: Option<String>,
-    track_number: Option<i32>,
-    disc_number: Option<i32>,
-}
-
-impl SyncedFedTrack {
+impl SyncedFedTrackExt for SyncedFedTrack {
     fn from_fed(fed: &crate::federation::FedTrack) -> Option<Self> {
         let content_id = fed
             .content_id
@@ -546,71 +266,30 @@ impl SyncedFedTrack {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WireMessage {
-    PairRequest {
-        invite_id: String,
-        secret: String,
-        profile: DeviceProfileWire,
-        #[serde(default)]
-        group_id: Option<String>,
-        #[serde(default)]
-        group_active_devices: usize,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        vector: BTreeMap<String, i64>,
-        ops: Vec<SyncOpWire>,
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    PairResponse {
-        accepted: bool,
-        #[serde(default)]
-        pending: bool,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        group_id: Option<String>,
-        #[serde(default)]
-        profile: Option<DeviceProfileWire>,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        #[serde(default)]
-        vector: BTreeMap<String, i64>,
-        #[serde(default)]
-        ops: Vec<SyncOpWire>,
-        #[serde(default)]
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    Hello {
-        group_id: String,
-        profile: DeviceProfileWire,
-        devices: Vec<DeviceProfileWire>,
-        vector: BTreeMap<String, i64>,
-        ops: Vec<SyncOpWire>,
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    SyncResponse {
-        accepted: bool,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        #[serde(default)]
-        vector: BTreeMap<String, i64>,
-        #[serde(default)]
-        ops: Vec<SyncOpWire>,
-        #[serde(default)]
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
+#[derive(Debug, Clone, Default)]
+struct PlaybackShared {
+    engine: Option<Engine>,
+    engine_group: String,
+    local: Option<PlaybackSnapshot>,
+    remote: BTreeMap<String, PlaybackSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalIdentity {
+    device_id: String,
+    group_id: String,
+    name: String,
+}
+
+enum PairAttempt {
+    Accepted(String),
+    Pending,
+    Denied(String),
+}
+
+struct PairingStatus {
+    status: String,
+    use_requester_group: bool,
 }
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -833,6 +512,7 @@ impl DeviceSync {
                 client_version: CLIENT_VERSION.to_string(),
                 endpoint_ticket: ticket.to_string(),
                 endpoint_id,
+                protocol_version: None,
             })?;
         }
         Ok(())
@@ -869,9 +549,9 @@ impl DeviceSync {
             invite_id,
             secret,
             expires_at_ms,
+            protocol_version: None,
         };
-        let bytes = serde_json::to_vec(&payload)?;
-        Ok(format!("frid://i/{}", base64url_encode(&bytes)))
+        Ok(encode_invite(&payload)?)
     }
 
     pub async fn connect_invite(
@@ -1774,6 +1454,7 @@ impl DeviceSync {
                 client_version,
                 endpoint_ticket,
                 endpoint_id,
+                ..
             } => {
                 let profile = DeviceProfileWire {
                     device_id: op.origin_device_id.clone(),
@@ -1818,6 +1499,13 @@ impl DeviceSync {
             SyncOpPayload::ListenRecorded { event } => self
                 .library
                 .apply_listen_event(event, &op.origin_device_id)?,
+            // Podcast operations (protocol v4) are kept in the log; this
+            // client does not apply or relay them yet.
+            SyncOpPayload::PodcastSubscriptionSet { .. }
+            | SyncOpPayload::PodcastShareSet { .. }
+            | SyncOpPayload::PodcastFeedAliasesAdded { .. }
+            | SyncOpPayload::PodcastProgressSet { .. }
+            | SyncOpPayload::PodcastListenRecorded { .. } => false,
         };
         Ok(changed)
     }
@@ -2568,6 +2256,7 @@ impl DeviceSync {
             playlists,
             deleted_playlists,
             removed_playlist_items,
+            ..SyncSnapshot::default()
         })
     }
 
@@ -2926,11 +2615,7 @@ impl PodcastLogStamps<'_> {
             };
             let op = op.into_wire(seq);
             let payload = serde_json::to_value(&op.payload)?;
-            let kind = payload
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("podcast_unknown")
-                .to_string();
+            let kind = payload_kind(&op.payload);
             conn.execute(
                 "INSERT OR IGNORE INTO sync_ops
                     (op_id, origin_device_id, seq, kind, payload_json, hlc_ms,
@@ -3669,6 +3354,11 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
         SyncOpPayload::DeviceRevoked { .. } => "device_revoked",
         SyncOpPayload::PlaybackCommand { .. } => "playback_command",
         SyncOpPayload::ListenRecorded { .. } => "listen_recorded",
+        SyncOpPayload::PodcastSubscriptionSet { .. } => "podcast_subscription_set",
+        SyncOpPayload::PodcastShareSet { .. } => "podcast_share_set",
+        SyncOpPayload::PodcastFeedAliasesAdded { .. } => "podcast_feed_aliases_added",
+        SyncOpPayload::PodcastProgressSet { .. } => "podcast_progress_set",
+        SyncOpPayload::PodcastListenRecorded { .. } => "podcast_listen_recorded",
     }
 }
 
@@ -3829,55 +3519,21 @@ fn peer_ack_floor_label(conn: &Connection) -> Result<String> {
 }
 
 async fn write_msg(stream: &mut ByteStream, message: &WireMessage) -> Result<()> {
-    let mut payload = serde_json::to_vec(message)?;
-    payload.push(b'\n');
-    stream.send.write_all(&payload).await?;
-    Ok(())
-}
-
-async fn finish_send(stream: &mut ByteStream) -> Result<()> {
-    stream.send.finish()?;
+    music_dht::device_sync::write_msg(stream, message).await?;
     Ok(())
 }
 
 async fn finish_response(stream: &mut ByteStream) -> Result<()> {
-    stream.send.finish()?;
-    let _ = tokio::time::timeout(RESPONSE_DRAIN_TIMEOUT, stream.send.stopped()).await;
+    music_dht::device_sync::finish_response(stream, RESPONSE_DRAIN_TIMEOUT).await?;
     Ok(())
 }
 
-async fn read_msg(stream: &mut ByteStream) -> Result<WireMessage> {
-    let line = read_line(&mut stream.recv).await?;
-    Ok(serde_json::from_slice(&line)?)
-}
-
-async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let read = reader.read(&mut byte).await?;
-        if read == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        out.push(byte[0]);
-        if out.len() > MAX_LINE {
-            anyhow::bail!("protocol line is too large");
-        }
-    }
-    Ok(out)
-}
-
 fn parse_invite(value: &str) -> Result<InviteWire> {
-    let Some(token) = value.trim().strip_prefix("frid://i/") else {
-        anyhow::bail!("usage: :connect frid://i/<invite>");
-    };
-    let bytes = base64url_decode(token)?;
-    let invite: InviteWire = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(invite.v == 1, "unsupported invite version");
-    Ok(invite)
+    anyhow::ensure!(
+        value.trim().starts_with("frid://i/"),
+        "usage: :connect frid://i/<invite>"
+    );
+    Ok(music_dht::device_sync::parse_invite(value)?)
 }
 
 pub fn invite_network_id(value: &str) -> Result<NetworkId> {
@@ -3889,26 +3545,8 @@ pub fn invite_network_id(value: &str) -> Result<NetworkId> {
     Ok(ticket.network_id)
 }
 
-fn hash_secret(secret: &str) -> String {
-    blake3::hash(secret.as_bytes()).to_hex().to_string()
-}
-
-fn random_hex(bytes: usize) -> String {
-    let key = SecretKey::generate();
-    let mut seed = key.to_bytes().to_vec();
-    while seed.len() < bytes {
-        seed.extend_from_slice(blake3::hash(&seed).as_bytes());
-    }
-    hex_encode(&seed[..bytes])
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn ticket_endpoint_id(ticket: &str) -> Option<String> {
-    let ticket = PeerTicket::from_str(ticket).ok()?;
-    Some(ticket.endpoint_id().to_string())
 }
 
 fn default_device_name(device_id: &str) -> String {
@@ -3924,65 +3562,15 @@ fn short_id(value: &str) -> String {
     value.chars().take(10).collect()
 }
 
-fn base64url_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes.get(i + 1).copied().unwrap_or(0);
-        let b2 = bytes.get(i + 2).copied().unwrap_or(0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < bytes.len() {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if i + 2 < bytes.len() {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        }
-        i += 3;
-    }
-    out
-}
-
-fn base64url_decode(value: &str) -> Result<Vec<u8>> {
-    fn val(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'-' => Some(62),
-            b'_' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes = value.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let a = val(bytes[i]).context("invalid base64url invite")?;
-        let b = val(*bytes.get(i + 1).context("truncated base64url invite")?)
-            .context("invalid base64url invite")?;
-        let c = bytes.get(i + 2).and_then(|byte| val(*byte));
-        let d = bytes.get(i + 3).and_then(|byte| val(*byte));
-        out.push((a << 2) | (b >> 4));
-        if let Some(c) = c {
-            out.push(((b & 0b0000_1111) << 4) | (c >> 2));
-            if let Some(d) = d {
-                out.push(((c & 0b0000_0011) << 6) | d);
-            }
-        }
-        i += 4;
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 #[path = "devices/tests.rs"]
 mod tests;
 
 #[cfg(test)]
 mod interop_tests;
+
+#[cfg(test)]
+mod wire_compat_tests;
 
 fn playback_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

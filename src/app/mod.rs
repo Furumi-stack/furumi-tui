@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::keymap::{KeyResolution, Keymap};
+use crate::devices::PlaybackTrackExt as _;
 use crate::library::Library;
 use crate::player;
 use crate::podcasts::playback::StartAt;
@@ -707,6 +708,7 @@ fn playback_state_from_ui(state: &AppState) -> crate::devices::PlaybackStateWire
         volume: state.player.volume,
         shuffle: state.player.shuffle,
         repeat: playback_repeat_to_wire(state.player.repeat),
+        playback_rate: None,
     }
 }
 

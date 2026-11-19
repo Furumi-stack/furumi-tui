@@ -61,7 +61,10 @@ async fn localhost_web_peer() {
             bytes.push(b'\n');
             stream.write_all(&bytes).await.unwrap();
             let response: WireMessage =
-                serde_json::from_slice(&read_line(&mut stream).await.unwrap()).unwrap();
+                serde_json::from_slice(
+                    &music_dht::device_sync::read_line(&mut stream).await.unwrap(),
+                )
+                .unwrap();
             let WireMessage::SyncResponse {
                 accepted: true,
                 playback: Some(snapshot),

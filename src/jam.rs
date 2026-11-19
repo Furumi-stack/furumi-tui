@@ -666,6 +666,7 @@ mod tests {
             volume: 73,
             shuffle: false,
             repeat: crate::devices::PlaybackRepeat::Off,
+            playback_rate: None,
         };
         host.publish_host_playback(PlaybackSnapshot {
             coordination: None,

@@ -2005,7 +2005,9 @@ mod podcast_queue {
         assert_eq!(track_content_id(&episode), None);
         assert_eq!(crate::share::track_content_id(&episode), None);
         assert_eq!(crate::share::track_share_link(&episode), None);
-        let wire = crate::devices::PlaybackTrack::from_track(&episode);
+        let wire = <crate::devices::PlaybackTrack as crate::devices::PlaybackTrackExt>::from_track(
+            &episode,
+        );
         assert_eq!(wire.title, music_dht::device_sync::PRIVATE_ITEM_TITLE);
         assert!(wire.artist_names.is_empty() && wire.release_title.is_empty());
         assert_eq!((wire.id, wire.content_id, wire.fed), (0, None, None));
