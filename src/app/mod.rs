@@ -3442,6 +3442,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
     match event {
         // Folded in by podcast_runtime::handle_event above.
         AppEvent::PodcastStoreOpened(_)
+        | AppEvent::PodcastsSynced { .. }
         | AppEvent::PodcastsLoaded(_)
         | AppEvent::PodcastSeasonsLoaded { .. }
         | AppEvent::PodcastEpisodesLoaded { .. }

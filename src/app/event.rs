@@ -208,6 +208,13 @@ pub enum AppEvent {
     JamInvite(Result<String, String>),
     /// Result of joining a Jam capability.
     JamJoined(Result<String, String>),
+    /// Received podcast operations or snapshot sections changed the podcast
+    /// store: `progress` lists changed progress registers, `changed` means
+    /// anything else (subscriptions, feeds, sessions).
+    PodcastsSynced {
+        progress: Vec<music_dht::podcast::ProgressRecord>,
+        changed: bool,
+    },
     /// The podcast store opened (with the feed client), or why it did not.
     PodcastStoreOpened(Result<crate::podcasts::refresh::Services, String>),
     /// Subscribed podcasts reloaded from the podcast store.

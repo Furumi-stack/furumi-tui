@@ -4,6 +4,14 @@
 //! byte-stream ALPN. Local state is stored as an append-only operation log plus
 //! materialized tables, so offline clients can merge likes, playlists and
 //! membership changes deterministically.
+//!
+//! The wire types are the shared `music_dht::device_sync` definitions. This
+//! client speaks protocol v4: podcast operations stay in the log, are
+//! applied to the podcast store (`furumi_library::podcasts::PodcastStore`)
+//! and are relayed; podcast snapshot sections are exported from and merged
+//! into that store. Everything sent to a peer is gated by the version that
+//! peer reported itself (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
+//! `playback_allowed_for_peer`).
 
 use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use furumi_library::podcasts::{
-    OpStamp as PodcastOpStamp, PodcastLocalOp, StampSource as PodcastStampSource,
+    ApplyOutcome as PodcastApplyOutcome, OpStamp as PodcastOpStamp, PodcastLocalOp, PodcastStore,
+    StampSource as PodcastStampSource,
 };
 use music_dht::device_sync::{
     DeviceProfileWire, InviteWire, ListenEvent, ListenTrackMetadata, SnapshotLike,
@@ -25,6 +34,7 @@ pub use music_dht::device_sync::{
     PlaybackCommand, PlaybackRepeat, PlaybackSnapshot, PlaybackStateWire, PlaybackTrack,
     SyncOpPayload, SyncedFedTrack,
 };
+use music_dht::podcast::ProgressRecord;
 use music_dht::{ByteStream, MusicDhtService, NetworkId, PeerTicket, SecretKey, StreamAcceptor};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -34,7 +44,19 @@ use crate::library::models::{ArtistRef, TrackItem};
 
 pub const SYNC_ALPN: &[u8] = b"furumi/sync/2";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Device-sync protocol version of this client.
+///
+/// Version 4 is announced because podcast operations, podcast snapshot
+/// sections and podcast queue items are applied, kept and relayed (see the
+/// module documentation). Review that support before following a newer
+/// shared protocol version.
+pub const PROTOCOL_VERSION: u16 = 4;
+const _: () = assert!(
+    PROTOCOL_VERSION == music_dht::device_sync::DEVICE_SYNC_PROTOCOL_VERSION,
+    "review device-sync support before announcing a new protocol version"
+);
+/// Lowest protocol version of a peer that speaks `furumi/sync/2`.
+const SYNC_V2_PROTOCOL_VERSION: u16 = 2;
 const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
 const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -100,6 +122,23 @@ pub struct DeviceSync {
     library: Arc<Library>,
     event_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
     playback: Arc<std::sync::Mutex<PlaybackShared>>,
+    podcasts: Arc<std::sync::Mutex<PodcastLink>>,
+}
+
+/// The podcast store as device sync sees it.
+///
+/// The store opens in the background after device sync started. Podcast
+/// operations received before that (or whose application failed) are kept
+/// in `sync_podcast_pending` and applied when the store is attached.
+#[derive(Default)]
+struct PodcastLink {
+    store: Option<Arc<PodcastStore>>,
+    /// Progress registers that received operations changed since the last
+    /// notification.
+    progress: Vec<ProgressRecord>,
+    /// Other podcast state (subscriptions, shares, feed URLs, sessions)
+    /// changed since the last notification.
+    changed: bool,
 }
 
 /// Converts queue items to and from the shared wire form
@@ -403,6 +442,7 @@ impl DeviceSync {
             library,
             event_tx: Arc::new(std::sync::Mutex::new(None)),
             playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
+            podcasts: Arc::default(),
         });
         sync.ensure_identity()?;
         sync.repair_like_order_from_sync_state()?;
@@ -569,6 +609,182 @@ impl DeviceSync {
         Ok(())
     }
 
+    /// Protocol version a device reported itself, for version gating.
+    /// Unknown devices count as the oldest protocol.
+    pub fn peer_protocol_version(&self, device_id: &str) -> Result<u16> {
+        let stored = stored_protocol_version(&lock(&self.conn), device_id)?;
+        Ok(music_dht::device_sync::profile_protocol_version(
+            None, stored,
+        ))
+    }
+
+    /// Connects the podcast store. Podcast operations received from now on
+    /// are applied to it, and those that arrived while it was unavailable
+    /// (or whose application failed) are applied first. Blocking.
+    pub fn attach_podcast_store(&self, store: Arc<PodcastStore>) -> Result<()> {
+        let pending = {
+            // Same lock order as `apply_podcast_op`: link, then log. An
+            // operation received concurrently is either in this list or
+            // sees the attached store.
+            let mut link = lock(&self.podcasts);
+            link.store = Some(Arc::clone(&store));
+            let conn = lock(&self.conn);
+            // Rows whose operation was coalesced away have nothing to apply.
+            conn.execute(
+                "DELETE FROM sync_podcast_pending
+                 WHERE op_id NOT IN (SELECT op_id FROM sync_ops)",
+                [],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT o.op_id, o.origin_device_id, o.seq, o.hlc_ms, o.payload_json
+                 FROM sync_podcast_pending p
+                 JOIN sync_ops o ON o.op_id = p.op_id
+                 ORDER BY o.hlc_ms, o.op_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut applied = 0usize;
+        for (op_id, origin_device_id, seq, hlc_ms, payload_json) in pending {
+            let op = match serde_json::from_str(&payload_json) {
+                Ok(payload) => SyncOpWire {
+                    op_id: op_id.clone(),
+                    origin_device_id,
+                    seq,
+                    hlc_ms,
+                    payload,
+                },
+                Err(err) => {
+                    tracing::warn!(%op_id, "dropping an unreadable podcast operation: {err}");
+                    lock(&self.conn).execute(
+                        "DELETE FROM sync_podcast_pending WHERE op_id = ?1",
+                        [&op_id],
+                    )?;
+                    continue;
+                }
+            };
+            match self.apply_podcast_op_to(&store, &op) {
+                Ok(()) => {
+                    applied += 1;
+                    lock(&self.conn).execute(
+                        "DELETE FROM sync_podcast_pending WHERE op_id = ?1",
+                        [&op_id],
+                    )?;
+                }
+                Err(err) => {
+                    tracing::warn!(%op_id, "podcast operation still not applied: {err:#}");
+                }
+            }
+        }
+        if applied > 0 {
+            tracing::info!(applied, "applied podcast operations received earlier");
+        }
+        self.flush_podcast_changes();
+        Ok(())
+    }
+
+    fn podcast_store(&self) -> Option<Arc<PodcastStore>> {
+        lock(&self.podcasts).store.clone()
+    }
+
+    /// Merges a received podcast operation into the podcast store, or keeps
+    /// it for [`DeviceSync::attach_podcast_store`]. A podcast store problem
+    /// never fails music sync: the operation stays in the log either way.
+    fn apply_podcast_op(&self, op: &SyncOpWire) -> Result<()> {
+        let store = {
+            let link = lock(&self.podcasts);
+            match &link.store {
+                Some(store) => Arc::clone(store),
+                None => {
+                    lock(&self.conn).execute(
+                        "INSERT OR IGNORE INTO sync_podcast_pending (op_id) VALUES (?1)",
+                        [&op.op_id],
+                    )?;
+                    return Ok(());
+                }
+            }
+        };
+        if let Err(err) = self.apply_podcast_op_to(&store, op) {
+            tracing::warn!(op_id = %op.op_id, "podcast operation not applied yet: {err:#}");
+            lock(&self.conn).execute(
+                "INSERT OR IGNORE INTO sync_podcast_pending (op_id) VALUES (?1)",
+                [&op.op_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_podcast_op_to(&self, store: &PodcastStore, op: &SyncOpWire) -> Result<()> {
+        match store.apply_remote_op(op)? {
+            PodcastApplyOutcome::Changed => {
+                let mut link = lock(&self.podcasts);
+                match op.podcast_progress() {
+                    Some(record) => link.progress.push(record),
+                    None => link.changed = true,
+                }
+            }
+            // Acknowledged anyway so the log keeps moving (FRID contract).
+            PodcastApplyOutcome::Rejected(reason) => tracing::warn!(
+                op_id = %op.op_id,
+                kind = payload_kind(&op.payload),
+                %reason,
+                "skipped an invalid podcast operation"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Merges the podcast sections of a received snapshot.
+    fn apply_podcast_snapshot(&self, snapshot: &SyncSnapshot) {
+        let Some(store) = self.podcast_store() else {
+            // Snapshots come with every sync; a later one is merged.
+            return;
+        };
+        match store.apply_snapshot(snapshot) {
+            Ok(stats) => {
+                if stats.ignored_over_limits {
+                    tracing::warn!("ignored podcast snapshot sections over the shared limits");
+                }
+                if stats.rejected > 0 {
+                    tracing::warn!(
+                        rejected = stats.rejected,
+                        "skipped invalid podcast snapshot records"
+                    );
+                }
+                if stats.changed > 0 {
+                    lock(&self.podcasts).changed = true;
+                }
+            }
+            Err(err) => tracing::warn!("podcast snapshot not merged: {err:#}"),
+        }
+    }
+
+    /// Tells the UI about podcast state that received operations or
+    /// snapshots changed (one event per batch).
+    fn flush_podcast_changes(&self) {
+        let (progress, changed) = {
+            let mut link = lock(&self.podcasts);
+            (
+                std::mem::take(&mut link.progress),
+                std::mem::take(&mut link.changed),
+            )
+        };
+        if (changed || !progress.is_empty())
+            && let Some(tx) = lock(&self.event_tx).as_ref()
+        {
+            let _ = tx.send(AppEvent::PodcastsSynced { progress, changed });
+        }
+    }
+
     pub fn status(&self) -> DeviceSyncStatus {
         match self.status_inner() {
             Ok(status) => status,
@@ -661,9 +877,11 @@ impl DeviceSync {
         let profile = self.own_profile(&own_ticket)?;
         let devices = self.device_profiles()?;
         let vector = self.vector()?;
-        let ops = self.ops_for_peer(&invite.device_id)?;
-        let snapshot = self.snapshot()?;
-        let playback = self.local_playback_snapshot();
+        // The inviter has not reported anything yet but its invite.
+        let peer_version = invite.inviter_protocol_version();
+        let ops = self.ops_for_peer(&invite.device_id, peer_version)?;
+        let snapshot = self.snapshot_for(peer_version)?;
+        let playback = self.local_playback_snapshot_for(peer_version);
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         crate::federation::record_stream_transport(
             &transport_stats,
@@ -723,8 +941,7 @@ impl DeviceSync {
                     }
                 }
                 self.apply_device_profiles(&devices, Some(&invite.device_id))?;
-                self.apply_snapshot(snapshot)?;
-                self.apply_ops(ops)?;
+                self.apply_received(snapshot, ops)?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: invite.device_id.clone(),
                 })?;
@@ -1176,9 +1393,10 @@ impl DeviceSync {
         let profile = self.own_profile(&own_ticket)?;
         let devices = self.device_profiles()?;
         let vector = self.vector()?;
-        let ops = self.ops_for_peer(&device.device_id)?;
-        let snapshot = self.snapshot()?;
-        let playback = self.local_playback_snapshot();
+        let peer_version = self.peer_protocol_version(&device.device_id)?;
+        let ops = self.ops_for_peer(&device.device_id, peer_version)?;
+        let snapshot = self.snapshot_for(peer_version)?;
+        let playback = self.local_playback_snapshot_for(peer_version);
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         crate::federation::record_stream_transport(
             &transport_stats,
@@ -1226,8 +1444,7 @@ impl DeviceSync {
                 if let Some(playback) = playback {
                     self.apply_playback_snapshot(&device.device_id, playback)?;
                 }
-                self.apply_snapshot(snapshot)?;
-                self.apply_ops(ops)?;
+                self.apply_received(snapshot, ops)?;
                 self.note_peer_vector(&device.device_id, &vector)?;
                 self.mark_seen(&device.device_id, Some(peer.to_string()))?;
                 self.set_last_sync(Some(format!("synced {}", short_id(&device.device_id))))?;
@@ -1447,6 +1664,7 @@ impl DeviceSync {
             };
             if inserted > 0 {
                 changed |= self.apply_op(&op)?;
+                coalesce_progress_ops(&lock(&self.conn), &op)?;
             }
             let conn = lock(&self.conn);
             conn.execute(
@@ -1460,6 +1678,7 @@ impl DeviceSync {
         if changed {
             self.notify_library_changed();
         }
+        self.flush_podcast_changes();
         Ok(())
     }
 
@@ -1591,13 +1810,16 @@ impl DeviceSync {
             SyncOpPayload::ListenRecorded { event } => self
                 .library
                 .apply_listen_event(event, &op.origin_device_id)?,
-            // Podcast operations (protocol v4) are kept in the log; this
-            // client does not apply or relay them yet.
+            // Podcast operations (protocol v4) stay in the log, so they are
+            // relayed, and are merged into the podcast store.
             SyncOpPayload::PodcastSubscriptionSet { .. }
             | SyncOpPayload::PodcastShareSet { .. }
             | SyncOpPayload::PodcastFeedAliasesAdded { .. }
             | SyncOpPayload::PodcastProgressSet { .. }
-            | SyncOpPayload::PodcastListenRecorded { .. } => false,
+            | SyncOpPayload::PodcastListenRecorded { .. } => {
+                self.apply_podcast_op(op)?;
+                false
+            }
         };
         Ok(changed)
     }
@@ -1983,6 +2205,28 @@ impl DeviceSync {
         Ok(visible_changed)
     }
 
+    /// Applies what a peer sent: the music snapshot, the operations, then
+    /// the podcast snapshot sections. Podcast merges are order-independent;
+    /// operations go first so a changed progress register reaches the UI as
+    /// such (it is shown in place) instead of as a generic change.
+    fn apply_received(&self, mut snapshot: SyncSnapshot, ops: Vec<SyncOpWire>) -> Result<()> {
+        let podcast = SyncSnapshot {
+            podcast_subscriptions: std::mem::take(&mut snapshot.podcast_subscriptions),
+            podcast_shares: std::mem::take(&mut snapshot.podcast_shares),
+            podcast_progress: std::mem::take(&mut snapshot.podcast_progress),
+            podcast_listen_sessions: std::mem::take(&mut snapshot.podcast_listen_sessions),
+            ..SyncSnapshot::default()
+        };
+        self.apply_snapshot(snapshot)?;
+        self.apply_ops(ops)?;
+        if podcast.has_podcast_state() {
+            self.apply_podcast_snapshot(&podcast);
+            self.flush_podcast_changes();
+        }
+        Ok(())
+    }
+
+    /// Applies the music sections of a snapshot.
     fn apply_snapshot(&self, snapshot: SyncSnapshot) -> Result<()> {
         let mut changed = false;
         for like in snapshot.likes {
@@ -2163,10 +2407,20 @@ impl DeviceSync {
         Ok(())
     }
 
-    fn ops_for_peer(&self, peer_device_id: &str) -> Result<Vec<SyncOpWire>> {
-        // Podcast operations (`podcast_*`, protocol v4) stay in the log but
-        // are not sent yet: this client still announces protocol v3 and its
-        // wire types cannot carry them. Gated sending comes with sync v4.
+    /// Operations the peer has not acknowledged and can parse.
+    ///
+    /// Kinds the peer's version does not know are excluded in SQL, so a
+    /// batch of hidden operations cannot stall the per-peer cursor;
+    /// `op_allowed_for_peer` stays the final check (playback commands that
+    /// carry podcast items). Hidden operations are never re-sent after the
+    /// peer upgrades (vectors only grow): snapshots are the recovery path.
+    fn ops_for_peer(&self, peer_device_id: &str, peer_version: u16) -> Result<Vec<SyncOpWire>> {
+        // Every peer of `furumi/sync/2` keeps listen history, even when it
+        // never reported a version (an invite without one, a device known
+        // only from `device_trusted`). Listen events are not part of
+        // snapshots, so skipping them would lose them for good.
+        let peer_version = peer_version.max(SYNC_V2_PROTOCOL_VERSION);
+        let hide_podcasts = !music_dht::device_sync::supports_podcasts(peer_version);
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT o.op_id, o.origin_device_id, o.seq, o.hlc_ms, o.payload_json
@@ -2174,7 +2428,7 @@ impl DeviceSync {
              LEFT JOIN sync_peer_acks a
                ON a.peer_device_id = ?1 AND a.origin_device_id = o.origin_device_id
              WHERE o.seq > COALESCE(a.max_seq, 0)
-               AND substr(o.kind, 1, 8) != 'podcast_'
+               AND NOT (?4 AND substr(o.kind, 1, 8) = 'podcast_')
                AND (
                     o.kind != 'playback_command'
                     OR (
@@ -2189,7 +2443,8 @@ impl DeviceSync {
             params![
                 peer_device_id,
                 now_ms().saturating_sub(PLAYBACK_COMMAND_TTL_MS),
-                MAX_OPS_PER_BATCH as i64
+                MAX_OPS_PER_BATCH as i64,
+                hide_podcasts,
             ],
             |row| {
                 let payload_json: String = row.get(4)?;
@@ -2208,9 +2463,30 @@ impl DeviceSync {
                 })
             },
         )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut ops = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        ops.retain(|op| music_dht::device_sync::op_allowed_for_peer(&op.payload, peer_version));
+        Ok(ops)
     }
 
+    /// The materialized snapshot for a peer: podcast sections (bounded by
+    /// the shared snapshot limits) only for v4 peers.
+    fn snapshot_for(&self, peer_version: u16) -> Result<SyncSnapshot> {
+        let mut snapshot = self.snapshot()?;
+        if music_dht::device_sync::supports_podcasts(peer_version)
+            && let Some(store) = self.podcast_store()
+            && let Err(err) = store.fill_snapshot(
+                &mut snapshot,
+                music_dht::podcast::MAX_PODCAST_SNAPSHOT_BYTES,
+            )
+        {
+            // Music sync goes on; podcast state comes with a later sync.
+            tracing::warn!("podcast snapshot export failed: {err:#}");
+            snapshot.strip_podcast_state();
+        }
+        Ok(snapshot.for_peer(peer_version))
+    }
+
+    /// Music sections of the materialized snapshot.
     fn snapshot(&self) -> Result<SyncSnapshot> {
         let like_rows = {
             let conn = lock(&self.conn);
@@ -2593,8 +2869,14 @@ impl DeviceSync {
         }
     }
 
-    fn local_playback_snapshot(&self) -> Option<PlaybackSnapshot> {
-        lock(&self.playback).local.clone()
+    /// The playback snapshot for a peer, or `None` when the queue has
+    /// podcast items and the peer is below v4 (`playback_allowed_for_peer`).
+    /// Episodes are never stripped to make the state fit: an old client
+    /// would forward the shortened queue and lose them for every device.
+    fn local_playback_snapshot_for(&self, peer_version: u16) -> Option<PlaybackSnapshot> {
+        lock(&self.playback).local.clone().filter(|snapshot| {
+            music_dht::device_sync::playback_allowed_for_peer(&snapshot.state, peer_version)
+        })
     }
 
     fn apply_playback_snapshot(&self, sender: &str, snapshot: PlaybackSnapshot) -> Result<()> {
@@ -2740,6 +3022,7 @@ impl PodcastLogStamps<'_> {
                     i64::from(op.payload.is_tombstone()),
                 ],
             )?;
+            coalesce_progress_ops(conn, &op)?;
             conn.execute(
                 "INSERT INTO sync_vectors (device_id, max_seq)
                  VALUES (?1, ?2)
@@ -3082,8 +3365,7 @@ async fn handle_pair_request(
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
-    sync.apply_snapshot(snapshot)?;
-    sync.apply_ops(ops)?;
+    sync.apply_received(snapshot, ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     {
         let conn = lock(&sync.conn);
@@ -3095,9 +3377,10 @@ async fn handle_pair_request(
     sync.set_last_sync(Some(format!("paired {}", short_id(&profile.device_id))))?;
     let devices = sync.device_profiles()?;
     let vector = sync.vector()?;
-    let ops = sync.ops_for_peer(&profile.device_id)?;
-    let snapshot = sync.snapshot()?;
-    let playback = sync.local_playback_snapshot();
+    let peer_version = sync.peer_protocol_version(&profile.device_id)?;
+    let ops = sync.ops_for_peer(&profile.device_id, peer_version)?;
+    let snapshot = sync.snapshot_for(peer_version)?;
+    let playback = sync.local_playback_snapshot_for(peer_version);
     write_msg(
         &mut stream,
         &WireMessage::PairResponse {
@@ -3176,8 +3459,7 @@ async fn handle_hello(
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
-    sync.apply_snapshot(snapshot)?;
-    sync.apply_ops(ops)?;
+    sync.apply_received(snapshot, ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     sync.mark_seen(&profile.device_id, Some(stream.peer_id.to_string()))?;
     sync.set_last_sync(Some(format!("synced {}", short_id(&profile.device_id))))?;
@@ -3186,9 +3468,10 @@ async fn handle_hello(
     let own_profile = sync.own_profile(&own_ticket)?;
     let devices = sync.device_profiles()?;
     let vector = sync.vector()?;
-    let ops = sync.ops_for_peer(&profile.device_id)?;
-    let snapshot = sync.snapshot()?;
-    let playback = sync.local_playback_snapshot();
+    let peer_version = sync.peer_protocol_version(&profile.device_id)?;
+    let ops = sync.ops_for_peer(&profile.device_id, peer_version)?;
+    let snapshot = sync.snapshot_for(peer_version)?;
+    let playback = sync.local_playback_snapshot_for(peer_version);
     write_msg(
         &mut stream,
         &WireMessage::SyncResponse {
@@ -3385,6 +3668,10 @@ CREATE TABLE IF NOT EXISTS sync_playback_applied (
     op_id         TEXT PRIMARY KEY,
     applied_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sync_podcast_pending (
+    op_id TEXT PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS idx_sync_ops_kind ON sync_ops(kind);
     "#,
     )?;
     ensure_column(
@@ -3463,6 +3750,30 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 
 fn delete_meta(conn: &Connection, key: &str) -> Result<()> {
     conn.execute("DELETE FROM sync_meta WHERE key = ?1", [key])?;
+    Ok(())
+}
+
+/// Keeps only the newest `podcast_progress_set` of an origin per episode in
+/// the log (the periodic checkpoints of a playing episode would grow it
+/// without bound).
+///
+/// Safe because the operations of one origin are ordered: a later one has
+/// a later `hlc_ms` and never a lower progress generation, so it wins every
+/// register comparison against the earlier ones. Peers that have not
+/// received the removed operations get the later one, and their vector
+/// skips the gap as usual.
+fn coalesce_progress_ops(conn: &Connection, op: &SyncOpWire) -> Result<()> {
+    let SyncOpPayload::PodcastProgressSet { episode_id, .. } = &op.payload else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM sync_ops
+         WHERE origin_device_id = ?1
+           AND kind = 'podcast_progress_set'
+           AND seq < ?2
+           AND json_extract(payload_json, '$.episode_id') = ?3",
+        params![op.origin_device_id, op.seq, episode_id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -3644,8 +3955,34 @@ fn peer_ack_floor_label(conn: &Connection) -> Result<String> {
 }
 
 async fn write_msg(stream: &mut ByteStream, message: &WireMessage) -> Result<()> {
-    music_dht::device_sync::write_msg(stream, message).await?;
+    let mut message = message.clone();
+    fit_podcast_snapshot(&mut message);
+    music_dht::device_sync::write_msg(stream, &message).await?;
     Ok(())
+}
+
+fn message_snapshot(message: &mut WireMessage) -> &mut SyncSnapshot {
+    match message {
+        WireMessage::PairRequest { snapshot, .. }
+        | WireMessage::PairResponse { snapshot, .. }
+        | WireMessage::Hello { snapshot, .. }
+        | WireMessage::SyncResponse { snapshot, .. } => snapshot,
+    }
+}
+
+/// Bounds the podcast snapshot sections so the whole line stays under the
+/// protocol limit (`podcast_snapshot_budget`): the operations, music
+/// snapshot and playback queue of the same message come first.
+fn fit_podcast_snapshot(message: &mut WireMessage) {
+    if !message_snapshot(message).has_podcast_state() {
+        return;
+    }
+    let podcast = message_snapshot(message).clone();
+    message_snapshot(message).strip_podcast_state();
+    let other_bytes = serde_json::to_vec(message).map_or(usize::MAX, |bytes| bytes.len());
+    let snapshot = message_snapshot(message);
+    *snapshot = podcast;
+    snapshot.bound_podcast_state_to(music_dht::device_sync::podcast_snapshot_budget(other_bytes));
 }
 
 async fn finish_response(stream: &mut ByteStream) -> Result<()> {
@@ -3696,6 +4033,9 @@ mod interop_tests;
 
 #[cfg(test)]
 mod wire_compat_tests;
+
+#[cfg(test)]
+mod podcast_sync_tests;
 
 fn playback_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

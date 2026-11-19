@@ -261,6 +261,16 @@ pub fn handle_event(
                 })
                 .inspect_err(|err| tracing::warn!("{err:#}"))
                 .ok();
+                // Device sync applies received podcast operations and
+                // snapshot sections to the store from now on (and the ones
+                // that arrived before it opened).
+                let devices = Arc::clone(&runtime.devices);
+                let store = Arc::clone(&services.store);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = devices.attach_podcast_store(store) {
+                        tracing::warn!("podcast sync: {err:#}");
+                    }
+                });
                 runtime.podcasts = Some(PodcastRuntime {
                     services,
                     refresh_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES)),
@@ -302,6 +312,14 @@ pub fn handle_event(
             .into_iter()
             .collect(),
         AppEvent::PodcastProgress(event) => progress_event(state, runtime, event),
+        AppEvent::PodcastsSynced { progress, changed } => {
+            if changed {
+                // A subscription that came from another device has no
+                // episodes here until its feed is fetched: check now.
+                let _ = runtime.event_tx.send(AppEvent::PodcastRefreshTick);
+            }
+            podcasts::synced(state, progress, changed)
+        }
         AppEvent::PodcastEpisodeStarted {
             generation,
             episode,

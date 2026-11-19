@@ -1843,6 +1843,7 @@ mod podcast_queue {
     use crate::app::podcast_fixtures::{self as fx, episode_track};
     use crate::app::state::{PODCAST_ACTION_ROWS, Popup, RepeatMode, track_content_id};
     use crate::app::update::PODCAST_NOT_MUSIC;
+    use music_dht::podcast::ProgressStatus;
 
     fn keys(queue: &[TrackItem]) -> Vec<String> {
         queue.iter().map(track_key).collect()
@@ -2146,5 +2147,50 @@ mod podcast_queue {
         assert!(items[0].progress.is_none());
         assert_eq!(items[1].resume_position_ms(), 90_000);
         assert_eq!(items[1].progress.as_ref().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn saved_progress_raises_the_generation_a_handoff_carries() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2), test_track(3)];
+        state.player.current = Some(episode_track(2));
+        let mut record = fx::episode(2, "Episode 2", Some((ProgressStatus::InProgress, 1)))
+            .progress
+            .unwrap();
+        record.generation = 7;
+        crate::app::update::podcasts::progress_saved(&mut state, record.clone());
+        let generation = |track: &TrackItem| track.podcast.as_ref().unwrap().progress_generation;
+        assert_eq!(generation(&state.player.queue[0]), None);
+        assert_eq!(generation(&state.player.queue[1]), Some(7));
+        assert_eq!(generation(state.player.current.as_ref().unwrap()), Some(7));
+        // Never lowered by an older register.
+        record.generation = 3;
+        crate::app::update::podcasts::progress_saved(&mut state, record);
+        assert_eq!(generation(&state.player.queue[1]), Some(7));
+    }
+
+    #[test]
+    fn podcast_changes_from_other_devices_reload_what_is_shown() {
+        let mut state = episodes_tab(&[None, None]);
+        let record = fx::episode(1, "Episode 1", Some((ProgressStatus::InProgress, 5_000)))
+            .progress
+            .unwrap();
+        // A progress register is shown in place; the list counts reload.
+        let effects = crate::app::update::podcasts::synced(&mut state, vec![record], false);
+        assert_eq!(effects, [Effect::PodcastsReload]);
+        let items = &state.podcasts.episodes.as_ref().unwrap().items;
+        assert_eq!(items[0].resume_position_ms(), 5_000);
+        // Anything else reloads the opened podcast too.
+        let effects = crate::app::update::podcasts::synced(&mut state, Vec::new(), true);
+        assert_eq!(effects[0], Effect::PodcastsReload);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PodcastLoadEpisodes { .. })),
+            "{effects:?}"
+        );
+        // Before the store is ready there is nothing to reload.
+        let mut opening = AppState::default();
+        assert!(crate::app::update::podcasts::synced(&mut opening, Vec::new(), true).is_empty());
     }
 }

@@ -25,6 +25,7 @@ async fn localhost_web_peer() {
             library: Arc::new(Library::open(&dir.join("interop-library.sqlite3")).unwrap()),
             event_tx: Default::default(),
             playback: Default::default(),
+            podcasts: Default::default(),
         };
         let id = sync.ensure_identity().unwrap();
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -55,7 +56,7 @@ async fn localhost_web_peer() {
                 vector: BTreeMap::new(),
                 ops: vec![],
                 snapshot: SyncSnapshot::default(),
-                playback: sync.local_playback_snapshot(),
+                playback: sync.local_playback_snapshot_for(PROTOCOL_VERSION),
             };
             let mut bytes = serde_json::to_vec(&hello).unwrap();
             bytes.push(b'\n');

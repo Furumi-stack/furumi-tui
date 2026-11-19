@@ -30,6 +30,7 @@ async fn localhost_devices_exchange_state_and_handoff() {
                 library: Arc::new(Library::open(&dir.path().join("library.sqlite3")).unwrap()),
                 event_tx: Default::default(),
                 playback: Default::default(),
+                podcasts: Default::default(),
             });
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             sync.set_event_tx(tx);
@@ -233,6 +234,121 @@ async fn localhost_devices_exchange_state_and_handoff() {
     .expect("localhost sync must complete within 30 seconds");
 }
 
+/// Podcast state over the production stream handlers: a subscription and
+/// progress from A reach B through `sync_device` → `handle_hello`, and B's
+/// start over reaches A through the response of B's own sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn localhost_devices_sync_podcasts() {
+    use super::podcast_sync_tests::{checkpoint, device_with_store, episode_ref, start, subscribe};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let network = NetworkId::from_name(&format!("podcast-sync-test-{}", random_hex(16)));
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join("network")).unwrap();
+            let config = music_dht::MusicDhtConfig::builder()
+                .data_dir(dir.path().join("network"))
+                .network_id(network)
+                .stream_protocol(SYNC_ALPN)
+                .build()
+                .unwrap();
+            let (service, _events) = MusicDhtService::start(config).await.unwrap();
+            let service = Arc::new(service);
+            let store = Arc::new(
+                furumi_library::podcasts::PodcastStore::open(&dir.path().join("podcasts.sqlite3"))
+                    .unwrap(),
+            );
+            let device = device_with_store(store, true);
+            let sync = Arc::new(device.sync.clone());
+            let stats = Arc::new(crate::federation::TransportStats::default());
+            servers.push(tokio::spawn(serve_peers(
+                service.stream_acceptor(SYNC_ALPN).unwrap(),
+                sync.clone(),
+                service.clone(),
+                stats.clone(),
+            )));
+            peers.push((device, sync, service, stats));
+        }
+        let (a, sync_a, service_a, stats_a) = &peers[0];
+        let (b, sync_b, service_b, stats_b) = &peers[1];
+        sync_b
+            .set_group_id(&sync_a.ensure_identity().unwrap().group_id)
+            .unwrap();
+        let profile_a = sync_a
+            .own_profile(&service_a.ticket().await.unwrap().to_string())
+            .unwrap();
+        let profile_b = sync_b
+            .own_profile(&service_b.ticket().await.unwrap().to_string())
+            .unwrap();
+        for (sync, profile) in [(sync_a, &profile_b), (sync_b, &profile_a)] {
+            sync.apply_device_profile(
+                profile,
+                true,
+                VersionReport::SelfReported(Some(profile.protocol_version)),
+            )
+            .unwrap();
+        }
+
+        let podcast_id = subscribe(a).podcast_id;
+        let episode = episode_ref(1);
+        let session = start(a, &episode, 0);
+        checkpoint(a, &session, 1_200_000);
+        sync_a
+            .sync_device(
+                service_a.clone(),
+                &sync_a.active_remote_devices().unwrap()[0],
+                stats_a.clone(),
+            )
+            .await
+            .unwrap();
+        let subscribed = b
+            .store
+            .list_podcasts(furumi_library::podcasts::PodcastListFilter::Subscribed)
+            .unwrap();
+        assert_eq!(subscribed.len(), 1);
+        assert_eq!(subscribed[0].podcast_id, podcast_id);
+        assert_eq!(
+            b.store.resume_position_ms(&episode.episode_id).unwrap(),
+            1_200_000
+        );
+
+        // B starts over; its next sync carries the start over to A, which
+        // then refuses A's older session.
+        let store = Arc::clone(&b.store);
+        sync_b
+            .run_podcast_action(|stamps| {
+                let write = store.restart(stamps, &episode, "restart-on-b")?;
+                Ok(((), vec![write.op]))
+            })
+            .unwrap();
+        sync_b
+            .sync_device(
+                service_b.clone(),
+                &sync_b.active_remote_devices().unwrap()[0],
+                stats_b.clone(),
+            )
+            .await
+            .unwrap();
+        let progress = a.store.progress(&episode.episode_id).unwrap().unwrap();
+        assert_eq!(progress.position_ms, 0);
+        assert_eq!(progress.session_id, "restart-on-b");
+        assert!(matches!(
+            checkpoint(a, &session, 1_230_000),
+            furumi_library::podcasts::CheckpointOutcome::Superseded { .. }
+        ));
+
+        for server in servers {
+            server.abort();
+        }
+        for (_, _, service, _) in &peers {
+            service.shutdown().await.unwrap();
+        }
+    })
+    .await
+    .expect("localhost podcast sync must complete within 30 seconds");
+}
+
 fn empty_playback_state() -> PlaybackStateWire {
     PlaybackStateWire {
         queue: vec![],
@@ -298,7 +414,7 @@ fn coordination_ignores_legacy_commands_and_wrong_snapshot_sender() {
         coordination: None,
     });
     let gossip = sync
-        .local_playback_snapshot()
+        .local_playback_snapshot_for(PROTOCOL_VERSION)
         .unwrap()
         .coordination
         .unwrap();
@@ -358,6 +474,7 @@ fn test_sync() -> DeviceSync {
         library: Arc::new(Library::open(&library_path).unwrap()),
         event_tx: Arc::new(std::sync::Mutex::new(None)),
         playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
+        podcasts: Default::default(),
     };
     sync.ensure_identity().unwrap();
     sync
@@ -479,6 +596,35 @@ fn tombstone_detection() {
         }
         .is_tombstone()
     );
+}
+
+fn music_track(id: i64, content_id: &str) -> TrackItem {
+    TrackItem {
+        id,
+        title: "Local Song".to_string(),
+        track_number: Some(1),
+        disc_number: Some(1),
+        duration_seconds: 180.0,
+        artists: vec![ArtistRef {
+            id: 1,
+            name: "Local Artist".to_string(),
+        }],
+        featured_artists: Vec::new(),
+        release_id: 2,
+        release_title: "Local Release".to_string(),
+        release_year: Some(2026),
+        file_path: format!("/music/{id}.mp3"),
+        content_id: Some(content_id.to_string()),
+        cover_path: None,
+        audio_format: Some("mp3".to_string()),
+        audio_bitrate: Some(320),
+        audio_sample_rate: Some(44_100),
+        audio_bit_depth: None,
+        file_size_bytes: Some(123_456),
+        play_count: 3,
+        fed: None,
+        podcast: None,
+    }
 }
 
 #[test]
@@ -661,7 +807,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         .unwrap();
     sync.record_playback_command("dev_other", command).unwrap();
 
-    let target_ops = sync.ops_for_peer("dev_target").unwrap();
+    let target_ops = sync.ops_for_peer("dev_target", PROTOCOL_VERSION).unwrap();
     assert_eq!(
         target_ops
             .iter()
@@ -670,7 +816,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         1
     );
     assert!(
-        sync.ops_for_peer("dev_unknown")
+        sync.ops_for_peer("dev_unknown", PROTOCOL_VERSION)
             .unwrap()
             .iter()
             .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
@@ -685,7 +831,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         )
         .unwrap();
     assert!(
-        sync.ops_for_peer("dev_target")
+        sync.ops_for_peer("dev_target", PROTOCOL_VERSION)
             .unwrap()
             .iter()
             .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
@@ -1070,7 +1216,7 @@ fn podcast_actions_are_appended_to_the_sync_log_with_their_stamps() {
 }
 
 #[test]
-fn podcast_ops_are_not_sent_to_peers_before_sync_v4() {
+fn podcast_ops_are_sent_only_to_v4_peers() {
     let sync = test_sync();
     let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
     sync.run_podcast_action(|stamps| {
@@ -1081,11 +1227,36 @@ fn podcast_ops_are_not_sent_to_peers_before_sync_v4() {
     .unwrap();
     sync.record_content_like(&format!("b3:{}", "a".repeat(64)), true)
         .unwrap();
-    // This client still speaks protocol v3; its wire types cannot carry the
-    // podcast payload, so the batch keeps only the music operation.
-    let ops = sync.ops_for_peer("dev_peer").unwrap();
+    // A v3 peer cannot parse the podcast payload (an unknown `kind` breaks
+    // its whole message), so its batch keeps only the music operation.
+    let ops = sync.ops_for_peer("dev_peer", 3).unwrap();
     assert_eq!(ops.len(), 1);
     assert!(matches!(ops[0].payload, SyncOpPayload::TrackLikeSet { .. }));
+    let ops = sync.ops_for_peer("dev_peer", 4).unwrap();
+    assert_eq!(ops.len(), 2);
+    assert!(ops[0].payload.is_podcast());
+    // Unreported versions are the oldest protocol, except that every
+    // `furumi/sync/2` peer keeps listen history.
+    let event = sync
+        .listen_event_for_track(
+            sync.new_listen_id(),
+            &music_track(7, &format!("b3:{}", "b".repeat(64))),
+            1,
+            120_000,
+            music_dht::device_sync::ListenEndReason::Finished,
+        )
+        .unwrap();
+    sync.record_listen(event).unwrap();
+    let kinds: Vec<_> = sync
+        .ops_for_peer(
+            "dev_peer",
+            music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|op| payload_kind(&op.payload))
+        .collect();
+    assert_eq!(kinds, ["track_like_set", "listen_recorded"]);
 }
 
 #[test]

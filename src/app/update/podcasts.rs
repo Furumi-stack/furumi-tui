@@ -270,7 +270,8 @@ pub fn restart_current(state: &mut AppState) -> Option<Effect> {
 }
 
 /// The progress writer saved (or found) a progress register: show it in
-/// the episode list without reloading it.
+/// the episode list without reloading it, and carry its generation in the
+/// queue items of that episode (a handoff passes it on).
 pub fn progress_saved(state: &mut AppState, record: ProgressRecord) -> Vec<Effect> {
     if let Some(list) = state.podcasts.episodes.as_mut() {
         for item in &mut list.items {
@@ -279,7 +280,44 @@ pub fn progress_saved(state: &mut AppState, record: ProgressRecord) -> Vec<Effec
             }
         }
     }
+    let player = &mut state.player;
+    for track in player.queue.iter_mut().chain(player.current.as_mut()) {
+        if let Some(episode) = track.podcast.as_mut()
+            && episode.episode_id == record.episode_id
+        {
+            episode.progress_generation = Some(
+                episode
+                    .progress_generation
+                    .unwrap_or(0)
+                    .max(record.generation),
+            );
+        }
+    }
     Vec::new()
+}
+
+/// Podcast state changed by other devices (received operations or
+/// snapshot sections): progress registers update the list in place, the
+/// rest reloads what is on screen.
+pub fn synced(state: &mut AppState, progress: Vec<ProgressRecord>, changed: bool) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for record in progress {
+        effects.extend(progress_saved(state, record));
+    }
+    if state.podcasts.store != PodcastStoreStatus::Ready {
+        return effects;
+    }
+    // Counts in the list (unplayed, in progress) follow both.
+    effects.push(Effect::PodcastsReload);
+    if changed {
+        if let Some(opened) = &state.podcasts.opened
+            && opened.season_cursor.is_some()
+        {
+            effects.push(Effect::PodcastLoadSeasons(opened.podcast_id.clone()));
+        }
+        effects.extend(reload_episodes(state));
+    }
+    effects
 }
 
 fn open_podcast(state: &mut AppState, index: usize) -> Option<Effect> {
