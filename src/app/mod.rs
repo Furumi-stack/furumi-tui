@@ -1643,19 +1643,18 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             runtime.player.stop();
             push_media_update(state, runtime, true);
         }
-        Effect::SeekBy(delta) => {
-            if let Some(reason) = podcast_runtime::seek_refusal(state, runtime) {
-                state.status_message = Some(reason);
-                return;
+        Effect::SeekBy(delta) => match podcast_runtime::seek_refusal(state, runtime) {
+            Some(reason) => state.status_message = Some(reason),
+            None => {
+                let target = (state.player.position_secs + delta as f64).max(0.0);
+                state.player.position_secs = target;
+                // An episode's new position is saved once the audio thread
+                // reports that the seek worked (`PlayerEvent::Seeked`).
+                runtime
+                    .player
+                    .seek(std::time::Duration::from_secs_f64(target));
             }
-            let target = (state.player.position_secs + delta as f64).max(0.0);
-            state.player.position_secs = target;
-            // An episode's new position is saved once the audio thread
-            // reports that the seek worked (`PlayerEvent::Seeked`).
-            runtime
-                .player
-                .seek(std::time::Duration::from_secs_f64(target));
-        }
+        },
         Effect::SetVolume(volume) => {
             runtime.player.set_volume(player::amplitude(volume));
             save_app_settings(state);
