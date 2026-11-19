@@ -21,8 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number keys.
 - Keymap files without `version` keep their tab shortcuts: `GoToTab` indices
   are remapped in memory (3 → 4 Settings, 4 → 5 Logs, and 5 → 3 Podcasts
-  from the prototype podcast build) with a one-time startup notice. The file
-  is not rewritten; `version = 2` files are used as written.
+  from the prototype podcast build) with a non-blocking startup notice. The
+  file is not rewritten; `version = 2` files are used as written. A `version`
+  key placed inside a `[[keymaps]]` entry is reported as an error instead of
+  being ignored.
+- The tab bar shortens titles, then shows only numbers (keeping the active
+  tab's full title) on terminals too narrow for all six tabs.
+- A keymap notice no longer hides a "logging disabled" startup warning; both
+  are shown.
 - The help window names the target tab for number-key shortcuts
   ("Go to Settings") instead of "Go to tab N".
 

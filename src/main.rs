@@ -65,7 +65,9 @@ fn main() -> Result<()> {
     // after local guards have been dropped and the terminal has been restored.
     let _stderr_capture = capture_stderr();
     let (keymap, keymap_warning) = config::keymap::Keymap::load();
-    let startup_warning = keymap_warning.or(startup_warning);
+    // The keymap message may be an informational notice; keep both so a
+    // logging failure is not hidden behind it.
+    let startup_warning = app::join_status_messages(keymap_warning, startup_warning);
 
     // The app (tokio + TUI) runs on a worker thread; the main thread stays
     // dedicated to the OS media-key event loop — on macOS the system only
