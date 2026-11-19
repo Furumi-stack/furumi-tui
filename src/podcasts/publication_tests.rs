@@ -86,9 +86,13 @@ impl Device {
             link: None,
             image_url: None,
         };
+        self.subscribe_meta(store, &meta)
+    }
+
+    fn subscribe_meta(&mut self, store: &PodcastStore, meta: &PodcastMeta) -> PodcastId {
         let mut id = None;
         self.act(|stamps| {
-            let outcome = store.subscribe(stamps, &meta)?;
+            let outcome = store.subscribe(stamps, meta)?;
             id = Some(outcome.podcast_id);
             Ok(outcome.ops)
         });
@@ -387,6 +391,53 @@ fn a_confirmation_does_not_outlive_a_revocation_on_another_device() {
         confirmed_here(&store, &confirmations, &fresh),
         "covers the next decision"
     );
+}
+
+#[test]
+fn cards_leave_out_artwork_and_links_that_look_private() {
+    let store = PodcastStore::open_in_memory().unwrap();
+    let mut device = Device::new("device-a");
+    let meta = |feed: &str, image: &str, link: &str| PodcastMeta {
+        feed_url: FeedUrl::parse(feed).unwrap(),
+        title: "Art Show".to_string(),
+        author: None,
+        description: None,
+        image_url: Some(image.to_string()),
+        link: Some(link.to_string()),
+    };
+    // A public feed: plain URLs stay, a signed one is left out.
+    let show = device.subscribe_meta(
+        &store,
+        &meta(
+            SHOW_URL,
+            "https://cdn.example.test/art.jpg?token=0123456789abcdef",
+            "https://rust-radio.example.test/",
+        ),
+    );
+    let card = share_card(&store, &show).unwrap().unwrap();
+    assert_eq!(
+        card.image_url, None,
+        "the signed artwork URL is not published"
+    );
+    assert_eq!(
+        card.link.as_deref(),
+        Some("https://rust-radio.example.test/")
+    );
+    assert!(card.privacy_warnings().is_empty());
+
+    // A member feed (its URL needs the dialog): artwork and page are left
+    // out whatever they look like, the dialog shows the feed URLs only.
+    let secret = device.subscribe_meta(
+        &store,
+        &meta(
+            SECRET_URL,
+            "https://cdn.example.test/members-art.jpg",
+            "https://members.example.test/show",
+        ),
+    );
+    let card = share_card(&store, &secret).unwrap().unwrap();
+    assert!(!card.privacy_warnings().is_empty());
+    assert_eq!((card.image_url, card.link), (None, None));
 }
 
 #[test]

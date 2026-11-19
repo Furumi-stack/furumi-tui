@@ -46,6 +46,7 @@ use furumi_library::podcasts::{PodcastListFilter, PodcastStore, PodcastSummary};
 use music_dht::podcast::{FeedUrl, PodcastId, ShareRecord, SubscriptionRecord, effective_share};
 use music_dht::podcast_dht::{
     FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastShareState,
+    feed_url_privacy_warning,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
@@ -345,6 +346,11 @@ pub fn confirmations_path(db_path: &Path) -> PathBuf {
 /// counters from the local catalog (refreshed from the feed), `feed_url` the
 /// URL this device fetches, `id_feed_url` the origin URL the podcast id was
 /// derived from. Bounded to the card limits.
+///
+/// The artwork and web page URLs are left out when they look private
+/// themselves (`feed_url_privacy_warning`) or when the feed URLs do: member
+/// feeds serve signed artwork and item links, and the share dialog shows
+/// the feed URLs only.
 fn catalog_card(
     summary: &PodcastSummary,
     subscription: &SubscriptionRecord,
@@ -356,7 +362,7 @@ fn catalog_card(
         .clone()
         .unwrap_or_else(|| derived.feed_url.clone());
     let meta = &summary.meta;
-    let card = PodcastCardSpec {
+    let mut card = PodcastCardSpec {
         podcast_id: subscription.podcast_id.clone(),
         feed_url: meta.feed_url.clone(),
         id_feed_url: Some(origin),
@@ -369,10 +375,23 @@ fn catalog_card(
         categories: Vec::new(),
         episode_count: Some(u32::try_from(summary.episode_count).unwrap_or(u32::MAX)),
         latest_episode_at_ms: summary.latest_published_at_ms,
+    };
+    let private_feed = !card.privacy_warnings().is_empty();
+    for url in [&mut card.image_url, &mut card.link] {
+        if private_feed || url.as_deref().is_some_and(looks_private) {
+            *url = None;
+        }
     }
-    .bounded();
+    let card = card.bounded();
     card.validate()?;
     Ok(card)
+}
+
+/// An artwork or web page URL that must not be published: it carries what
+/// looks like an access key (the feed URL rules), or it is not a plain
+/// http(s) URL those rules can check.
+fn looks_private(url: &str) -> bool {
+    FeedUrl::parse(url).map_or(true, |url| feed_url_privacy_warning(&url).is_some())
 }
 
 /// The card [`share_states`] would publish for `podcast_id` (whether or not
