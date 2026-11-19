@@ -28,6 +28,8 @@ pub(super) struct Route {
     pub cut_after: Option<usize>,
     /// ...for this many requests; later requests are served in full.
     pub fail_times: usize,
+    /// Wait this long before answering (a hanging server).
+    pub stall: Option<Duration>,
 }
 
 impl Route {
@@ -44,7 +46,14 @@ impl Route {
             send_length: true,
             cut_after: None,
             fail_times: 0,
+            stall: None,
         }
+    }
+
+    /// Answer only after `delay`.
+    pub fn stall(mut self, delay: Duration) -> Route {
+        self.stall = Some(delay);
+        self
     }
 
     /// A server that ignores `Range` and always answers 200 with the file.
@@ -206,6 +215,9 @@ fn handle(stream: TcpStream, state: &Mutex<ServerState>) {
         (route, cut)
     };
     let mut out = stream;
+    if let Some(delay) = route.as_ref().and_then(|route| route.stall) {
+        std::thread::sleep(delay);
+    }
     let Some(route) = route else {
         let _ = out
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");

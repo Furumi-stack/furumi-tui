@@ -29,6 +29,12 @@ pub const MAX_REDIRECTS: usize = 10;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Whole request, including the body, per hop.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A whole feed or cover fetch, all redirect hops and the body included, so
+/// a slow server holds one of the few refresh slots for at most this long.
+#[cfg(not(test))]
+pub const FETCH_DEADLINE: Duration = Duration::from_secs(120);
+#[cfg(test)]
+pub const FETCH_DEADLINE: Duration = Duration::from_secs(3);
 /// Sent with every podcast request.
 pub const USER_AGENT: &str = concat!("furumi/", env!("CARGO_PKG_VERSION"), " (podcast reader)");
 
@@ -117,6 +123,14 @@ impl Fetcher {
         url: &FeedUrl,
         validators: Validators<'_>,
     ) -> Result<FeedResponse> {
+        within_deadline("feed", self.fetch_feed_unbounded(url, validators)).await
+    }
+
+    async fn fetch_feed_unbounded(
+        &self,
+        url: &FeedUrl,
+        validators: Validators<'_>,
+    ) -> Result<FeedResponse> {
         let Followed {
             response,
             url: final_url,
@@ -167,6 +181,17 @@ impl Fetcher {
 
     /// Downloads a cover image into the covers directory; returns its path.
     pub async fn fetch_cover(&self, podcast_id: &PodcastId, image_url: &str) -> Result<PathBuf> {
+        let body = within_deadline("cover image", self.download_cover(image_url)).await?;
+        let format = image::guess_format(&body).context("the cover is not a supported image")?;
+        let extension = format.extensions_str().first().copied().unwrap_or("img");
+        let name = cover_file_name(podcast_id, image_url, extension);
+        let dir = self.covers_dir.clone();
+        tokio::task::spawn_blocking(move || write_atomically(&dir, &name, &body))
+            .await
+            .map_err(|err| anyhow!("cover writer task failed: {err}"))?
+    }
+
+    async fn download_cover(&self, image_url: &str) -> Result<Vec<u8>> {
         let response = self
             .get_following(image_url, None, Validators::default())
             .await?
@@ -175,14 +200,7 @@ impl Fetcher {
         if !status.is_success() {
             return Err(status_error(status, response.headers()).into());
         }
-        let body = read_capped(response, MAX_COVER_BYTES, "cover image").await?;
-        let format = image::guess_format(&body).context("the cover is not a supported image")?;
-        let extension = format.extensions_str().first().copied().unwrap_or("img");
-        let name = cover_file_name(podcast_id, image_url, extension);
-        let dir = self.covers_dir.clone();
-        tokio::task::spawn_blocking(move || write_atomically(&dir, &name, &body))
-            .await
-            .map_err(|err| anyhow!("cover writer task failed: {err}"))?
+        read_capped(response, MAX_COVER_BYTES, "cover image").await
     }
 
     /// GET following up to [`MAX_REDIRECTS`] http(s) redirects by hand.
@@ -257,6 +275,18 @@ impl Fetcher {
             current = next;
         }
     }
+}
+
+/// Fails `fetch` once [`FETCH_DEADLINE`] has passed.
+async fn within_deadline<T>(what: &str, fetch: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(FETCH_DEADLINE, fetch)
+        .await
+        .unwrap_or_else(|_| {
+            bail!(
+                "the {what} took longer than {} seconds",
+                FETCH_DEADLINE.as_secs()
+            )
+        })
 }
 
 struct Followed {

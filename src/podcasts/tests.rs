@@ -12,6 +12,7 @@ use music_dht::device_sync::{SyncOpPayload, SyncOpWire};
 use music_dht::podcast::{FeedUrl, PodcastId};
 
 use super::OpLog;
+use super::fetch::{FETCH_DEADLINE, MAX_COVER_BYTES, MAX_FEED_BYTES, MAX_REDIRECTS, Validators};
 use super::refresh::{
     FAILURE_BACKOFF_BASE, FAILURE_BACKOFF_MAX, REFRESH_INTERVAL, Services,
     next_check_after_failure, next_check_after_success, refresh, subscribe,
@@ -740,4 +741,177 @@ async fn imported_podcasts_get_their_seasons_on_the_first_check() {
         services.store.fetch_state(&id).unwrap().etag.as_deref(),
         Some("\"e1\"")
     );
+}
+
+fn feed_url(f: &Fixture, path: &str) -> FeedUrl {
+    FeedUrl::parse(&f.server.url(path)).unwrap()
+}
+
+#[tokio::test]
+async fn feeds_over_the_size_limit_are_refused_with_or_without_a_length() {
+    let f = fixture();
+    f.server.set(
+        "/feed.xml",
+        Route::new(rss(&[("a", "Pilot")]), "application/rss+xml"),
+    );
+    let url = feed_url(&f, "/feed.xml");
+    let id = subscribe(&f.services, url.as_str(), NOW)
+        .await
+        .unwrap()
+        .podcast_id;
+    let mut huge = rss(&[("a", "Pilot"), ("b", "Second")]);
+    huge.resize(MAX_FEED_BYTES + 1, b' ');
+    let store = &f.services.store;
+    for (attempt, route) in [
+        Route::new(huge.clone(), "application/rss+xml"),
+        Route::new(huge, "application/rss+xml").no_length(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let failures = attempt as u32 + 1;
+        f.server.set("/feed.xml", route);
+        let now = NOW + i64::from(failures);
+        let err = refresh(&f.services, &id, &url, now).await.unwrap_err();
+        assert!(format!("{err:#}").contains("too large"), "{err:#}");
+        let state = store.fetch_state(&id).unwrap();
+        assert_eq!(state.consecutive_failures, failures);
+        assert!(state.last_error.unwrap().contains("too large"));
+        assert_eq!(
+            state.next_check_at_ms,
+            Some(next_check_after_failure(now, failures, None))
+        );
+        assert_eq!(episode_count(store, &id), 1, "the catalog is kept");
+    }
+}
+
+#[tokio::test]
+async fn redirect_chains_are_bounded_and_lead_only_to_http() {
+    let f = fixture();
+    let fetch = |path: &'static str| {
+        let url = feed_url(&f, path);
+        let fetcher = std::sync::Arc::clone(&f.services.fetcher);
+        async move { fetcher.fetch_feed(&url, Validators::default()).await }
+    };
+    for n in 0..=MAX_REDIRECTS {
+        f.server.set(
+            &format!("/r{n}.xml"),
+            Route::redirect(302, &format!("/r{}.xml", n + 1)),
+        );
+    }
+    f.server.set(
+        &format!("/r{}.xml", MAX_REDIRECTS + 1),
+        Route::new(rss(&[("a", "Pilot")]), "application/rss+xml"),
+    );
+    // MAX_REDIRECTS hops are followed, one more is refused.
+    let followed = fetch("/r1.xml").await.unwrap();
+    assert_eq!(followed.redirects, MAX_REDIRECTS);
+    let err = fetch("/r0.xml").await.unwrap_err();
+    assert!(format!("{err:#}").contains("too many redirects"), "{err:#}");
+    // A loop ends the same way.
+    f.server.set("/a.xml", Route::redirect(301, "/b.xml"));
+    f.server.set("/b.xml", Route::redirect(301, "/a.xml"));
+    let err = fetch("/a.xml").await.unwrap_err();
+    assert!(format!("{err:#}").contains("too many redirects"), "{err:#}");
+    assert_eq!(f.server.requests("/a.xml").len(), MAX_REDIRECTS / 2 + 1);
+    // Only http(s) is followed.
+    f.server.set(
+        "/ftp.xml",
+        Route::redirect(302, "ftp://example.test/feed.xml"),
+    );
+    let err = fetch("/ftp.xml").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("unsupported URL scheme"),
+        "{err:#}"
+    );
+    // Subscribing through any of them stores nothing.
+    for path in ["/r0.xml", "/a.xml", "/ftp.xml"] {
+        assert!(
+            subscribe(&f.services, &f.server.url(path), NOW)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        f.services
+            .store
+            .list_podcasts(PodcastListFilter::All)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_server_fails_the_check_at_the_deadline() {
+    let f = fixture();
+    f.server.set(
+        "/feed.xml",
+        Route::new(rss(&[("a", "Pilot")]), "application/rss+xml"),
+    );
+    let url = feed_url(&f, "/feed.xml");
+    let id = subscribe(&f.services, url.as_str(), NOW)
+        .await
+        .unwrap()
+        .podcast_id;
+    f.server.set(
+        "/feed.xml",
+        Route::new(rss(&[("a", "Pilot")]), "application/rss+xml")
+            .stall(FETCH_DEADLINE + Duration::from_secs(5)),
+    );
+    let started = std::time::Instant::now();
+    let err = refresh(&f.services, &id, &url, NOW + 1).await.unwrap_err();
+    assert!(format!("{err:#}").contains("took longer than"), "{err:#}");
+    assert!(started.elapsed() < FETCH_DEADLINE + Duration::from_secs(2));
+    let state = f.services.store.fetch_state(&id).unwrap();
+    assert_eq!(state.consecutive_failures, 1);
+    assert_eq!(episode_count(&f.services.store, &id), 1);
+}
+
+#[tokio::test]
+async fn covers_must_be_images_within_the_limit_and_are_written_whole() {
+    let f = fixture();
+    let png = {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 2)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    };
+    f.server
+        .set("/cover.png", Route::new(png.clone(), "image/png"));
+    f.server.set(
+        "/page.png",
+        Route::new("<html>not an image</html>", "image/png"),
+    );
+    f.server.set(
+        "/huge.png",
+        Route::new(vec![0u8; MAX_COVER_BYTES + 1], "image/png"),
+    );
+    let id = PodcastId::from_feed_url(&feed_url(&f, "/feed.xml"));
+    let fetcher = &f.services.fetcher;
+    let path = fetcher
+        .fetch_cover(&id, &f.server.url("/cover.png"))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), png);
+    assert_eq!(path.extension().unwrap(), "png");
+    let err = fetcher
+        .fetch_cover(&id, &f.server.url("/page.png"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a supported image"),
+        "{err:#}"
+    );
+    let err = fetcher
+        .fetch_cover(&id, &f.server.url("/huge.png"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("too large"), "{err:#}");
+    // Only the one finished file: nothing partial, no temporary files.
+    let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files, [path]);
 }
