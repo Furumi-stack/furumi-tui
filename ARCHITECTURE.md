@@ -398,6 +398,27 @@ The TUI owns what the contract leaves to clients:
   one within the completion window, completes the episode and moves the
   queue on; otherwise the last seen position is saved and playback stops on
   the episode (`playback::played_to_the_end`).
+- **Public discovery.** The federation node runs FRID's signed podcast
+  overlay (`music_dht::podcast_dht`, ALPN `furumi-fd/podcast-dht/1`, cache
+  `federation/podcast-dht.sqlite3`) next to the similarity overlay: it
+  serves the overlay, bootstraps, republishes and expires records, hands
+  every peer capability manifest to `note_peer_capabilities`, and advertises
+  `podcast_dht` in its own manifest only while the overlay runs. A cache
+  that cannot be opened is logged and only turns discovery off. What this
+  device publishes is decided by `podcasts::publication`: after local share
+  and unsubscribe actions, received podcast operations, feed refreshes,
+  every overlay (re)start and every 5 minutes it builds one
+  `PodcastShareState` per subscription (merged registers, a card from the
+  catalog for shared podcasts only, the local privacy confirmation) and
+  calls the declarative `PodcastDht::sync_shares`, which publishes what is
+  shared and tombstones every other own card. The share decision is the
+  synced `podcast_share_set` register, so share-off or unsubscribe on any
+  trusted device revokes every device's card and a stale device cannot
+  republish. Publication runs from each device's own identity. Privacy
+  confirmations of feed URLs that look private are device-local
+  (`podcast-share-confirmations.json`, mode 0600) and bound to the exact
+  URLs. Without a readable podcast store this device revokes all its own
+  cards. Logs carry counts only.
 - **Progress.** `podcasts::progress` runs one writer thread so every
   progress write of this device is ordered. The app tick follows the
   position and actual listening time and sends: an explicit start (or
@@ -541,6 +562,8 @@ Furumi stores different kinds of state according to their lifetime:
 | --- | --- | --- |
 | Library, playlists, likes, history | SQLite | Durable local source of truth |
 | Podcast subscriptions, episodes, progress | SQLite (`podcasts.sqlite3`, FRID store) | Durable personal state (synced with trusted devices) and a refreshable episode catalog |
+| Podcast share confirmations | JSON next to `podcasts.sqlite3` | Device-local consent to publish feed URLs that look private |
+| Public podcast cards (own and replicas) | SQLite (`federation/podcast-dht.sqlite3`) | Discovery overlay cache; replaceable |
 | Device operation log and replicas | SQLite | Offline synchronization |
 | Versioned track embeddings | SQLite | Durable, locally rebuildable similarity data |
 | Federation catalog cache | SQLite/cache | Faster network browsing |
@@ -580,8 +603,8 @@ The source tree follows the architectural responsibilities:
 - `federation/` owns DHT-facing search, peer catalogs, and audio exchange;
 - `podcasts/` owns feed HTTP (conditional requests, redirects, limits),
   refresh scheduling policy, the episode stream reader and the progress
-  writer; the podcast model, identity, merge rules and SQLite store come
-  from FRID;
+  writer, and the publication of shared podcasts; the podcast model,
+  identity, merge rules, SQLite store and discovery overlay come from FRID;
 - `devices.rs` owns trusted-device replication and playback coordination;
 - `app/` owns state transitions and runtime orchestration;
 - `ui/` renders the TUI;

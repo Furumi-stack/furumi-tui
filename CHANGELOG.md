@@ -45,7 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is cancelled at the next start or stop; pause pressed while an episode
   connects is kept; seeks that do not move the audio are not saved.
 - Podcast key bindings in the `podcasts` context: `o`, `/`, `Shift+R`,
-  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`, `b`.
+  `Ctrl+R`, `Shift+S`, `f`, `m`, `Shift+U`, `b`, `Shift+F`.
+- Sharing a podcast in the federation (`Shift+F`, off by default): the
+  synced share decision makes each device publish a signed public card of
+  the podcast in the FRID discovery overlay (`podcast_dht`, advertised in
+  the capability manifest); share-off and unsubscribe revoke it with a
+  tombstone. Feed URLs that look private are published only after a
+  confirmation on that device. The list and side panel show whether a
+  podcast is shared and whether this device publishes it.
 - An optional top-level `version` in `keymap.toml`; the current format is
   `version = 2`, and a `podcasts` binding context.
 

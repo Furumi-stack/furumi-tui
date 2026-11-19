@@ -65,7 +65,10 @@ update it only when dependencies change.
   stream reader (HTTP Range, bounded buffer) and the ordered progress writer;
   podcast identity, merge rules and the SQLite store come from FRID
   (`music_dht::podcast`, `furumi_library::podcasts`) and must not be
-  re-derived here. Queue items are identified by `state::track_key` /
+  re-derived here. Public podcast cards are published only through
+  `podcasts::publication` (`PodcastDht::sync_shares` over the merged
+  registers): never publish a podcast directly, never log feed URLs or ids
+  of podcasts that are not shared. Queue items are identified by `state::track_key` /
   `TrackItem::key`, never by numeric id (every episode has the same sentinel
   id); music-only code must skip `TrackItem::is_podcast()` items.
 - `src/devices.rs` owns trusted-device replication, membership, and playback
