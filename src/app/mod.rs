@@ -1644,12 +1644,17 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             push_media_update(state, runtime, true);
         }
         Effect::SeekBy(delta) => {
+            if let Some(reason) = podcast_runtime::seek_refusal(state, runtime) {
+                state.status_message = Some(reason);
+                return;
+            }
             let target = (state.player.position_secs + delta as f64).max(0.0);
             state.player.position_secs = target;
+            // An episode's new position is saved once the audio thread
+            // reports that the seek worked (`PlayerEvent::Seeked`).
             runtime
                 .player
                 .seek(std::time::Duration::from_secs_f64(target));
-            podcast_runtime::seeked(state, runtime, target);
         }
         Effect::SetVolume(volume) => {
             runtime.player.set_volume(player::amplitude(volume));
@@ -3378,12 +3383,15 @@ fn handle_playback_command(
                 push_media_metadata(state, runtime);
             } else {
                 if seek {
-                    runtime.player.seek(std::time::Duration::from_secs_f64(
-                        state.player.position_secs,
-                    ));
-                    // A seek from a controlling device is the user's
-                    // explicit action too (podcast progress generation).
-                    podcast_runtime::seeked(state, runtime, state.player.position_secs);
+                    match podcast_runtime::seek_refusal(state, runtime) {
+                        Some(reason) => state.status_message = Some(reason),
+                        // A seek from a controlling device is the user's
+                        // explicit action too (podcast progress
+                        // generation), saved once the seek worked.
+                        None => runtime.player.seek(std::time::Duration::from_secs_f64(
+                            state.player.position_secs,
+                        )),
+                    }
                 }
                 if state.player.paused && !old_paused {
                     runtime.player.pause();
@@ -4231,6 +4239,15 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             };
             state.art.insert(key, entry);
         }
+        AppEvent::Player(player::PlayerEvent::Seeked {
+            generation,
+            position,
+            result,
+        }) => {
+            if !state.device_playback.is_control() {
+                podcast_runtime::seek_done(state, runtime, generation, position, result);
+            }
+        }
         AppEvent::Player(event) if state.device_playback.is_control() => {
             runtime.player_start_pending = false;
             // A background decoder may finish after ownership was handed off.
@@ -4245,8 +4262,15 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             runtime.player_start_pending = false;
         }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
-            // An episode that played to the end is complete.
-            podcast_runtime::finished(runtime);
+            // An episode that played to the end is complete; one whose
+            // stream broke off stops where it was, without moving on.
+            if let podcast_runtime::Finished::Interrupted(message) =
+                podcast_runtime::finished(state, runtime)
+            {
+                state.status_message = Some(message);
+                push_media_update(state, runtime, true);
+                return;
+            }
             // The finished track gets a full-duration, completed entry.
             if let Some(finished) = state.player.current.clone() {
                 report_history(

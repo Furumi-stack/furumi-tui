@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use furumi_library::podcasts::PodcastStore;
-use music_dht::podcast::PodcastEpisodeRef;
+use music_dht::podcast::{PodcastEpisodeRef, reaches_completion};
 use rodio::Source as _;
 
 use super::blocking;
 use super::refresh::{self, Services};
-use super::stream::{self, StreamStatusError};
+use super::stream::{self, CancelToken, Cancelled, StreamEnd, StreamProbe, StreamStatusError};
 use crate::player::{DecodedSource, decode_source_with};
 
 /// Where playback of an episode starts.
@@ -44,6 +44,10 @@ pub struct PreparedEpisode {
     pub start_ms: i64,
     /// Duration from the decoder, else the one the feed announced.
     pub duration_ms: Option<i64>,
+    /// The server allows seeking (it sent the file size).
+    pub seekable: bool,
+    /// How the stream ended, once it did.
+    pub probe: StreamProbe,
 }
 
 impl std::fmt::Debug for PreparedEpisode {
@@ -111,10 +115,31 @@ pub fn resolve(
     Ok((episode, start_ms))
 }
 
+/// Whether the end of an episode's stream means it was played to the end:
+/// a stream that failed (connection lost, URL expired, outage) only counts
+/// when it failed within the shared completion window, and a stream of
+/// unknown size (where a closed connection looks like the end) only when
+/// the position is there too or nothing else is known.
+pub fn played_to_the_end(end: StreamEnd, position_ms: i64, duration_ms: Option<i64>) -> bool {
+    let near_end = duration_ms.is_some() && reaches_completion(position_ms, duration_ms);
+    match end {
+        StreamEnd::Complete => true,
+        StreamEnd::Unknown => duration_ms.is_none() || near_end,
+        StreamEnd::Failed => near_end,
+    }
+}
+
 /// Opens, decodes and positions the audio of `episode`. Blocking (network).
-pub fn open_at(episode: &PodcastEpisodeRef, start_ms: i64) -> Result<PreparedEpisode> {
-    let opened = stream::open(&episode.audio_url)?;
+/// Stops with [`Cancelled`] once `cancel` fires: a superseded resume does
+/// not keep downloading up to its offset.
+pub fn open_at(
+    episode: &PodcastEpisodeRef,
+    start_ms: i64,
+    cancel: &CancelToken,
+) -> Result<PreparedEpisode> {
+    let opened = stream::open_with(&episode.audio_url, cancel.clone())?;
     let seekable = opened.seekable;
+    let probe = opened.probe.clone();
     // Coarse seeking maps a time to a byte offset (one Range request)
     // instead of decoding everything before it.
     let coarse_seek = seekable && opened.byte_len.is_some();
@@ -126,7 +151,13 @@ pub fn open_at(episode: &PodcastEpisodeRef, start_ms: i64) -> Result<PreparedEpi
         seekable,
         coarse_seek,
     )
-    .map_err(|err| anyhow!("cannot decode the episode audio: {err}"))?;
+    .map_err(|err| {
+        if cancel.is_cancelled() {
+            anyhow!(Cancelled)
+        } else {
+            anyhow!("cannot decode the episode audio: {err}")
+        }
+    })?;
     if start_ms > 0 {
         if !seekable {
             return Err(CannotResume {
@@ -136,6 +167,9 @@ pub fn open_at(episode: &PodcastEpisodeRef, start_ms: i64) -> Result<PreparedEpi
         }
         let target = Duration::from_millis(start_ms as u64);
         if let Err(err) = source.try_seek(target) {
+            if cancel.is_cancelled() {
+                return Err(Cancelled.into());
+            }
             tracing::warn!(%err, "seeking a podcast stream failed");
             return Err(CannotResume {
                 position_ms: start_ms,
@@ -153,6 +187,8 @@ pub fn open_at(episode: &PodcastEpisodeRef, start_ms: i64) -> Result<PreparedEpi
         source,
         start_ms,
         duration_ms,
+        seekable,
+        probe,
     })
 }
 
@@ -163,6 +199,7 @@ pub async fn prepare(
     queued: PodcastEpisodeRef,
     start: StartAt,
     now_ms: i64,
+    cancel: CancelToken,
 ) -> Result<PreparedEpisode> {
     let store = services
         .as_ref()
@@ -170,10 +207,14 @@ pub async fn prepare(
     let lookup = queued.clone();
     let (episode, start_ms) = blocking(move || resolve(store.as_deref(), &lookup, start)).await?;
     let attempt = episode.clone();
-    let error = match blocking(move || open_at(&attempt, start_ms)).await {
+    let attempt_cancel = cancel.clone();
+    let error = match blocking(move || open_at(&attempt, start_ms, &attempt_cancel)).await {
         Ok(prepared) => return Ok(prepared),
         Err(error) => error,
     };
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
     let stale = error
         .downcast_ref::<StreamStatusError>()
         .is_some_and(|status| status.url_is_stale());
@@ -205,12 +246,18 @@ pub async fn prepare(
     if fresh.audio_url == episode.audio_url {
         return Err(error).context("the feed lists the same audio address");
     }
-    blocking(move || open_at(&fresh, start_ms)).await
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
+    blocking(move || open_at(&fresh, start_ms, &cancel)).await
 }
 
 /// Message for a failed start; the URL never appears (it may carry a
 /// private token).
 pub fn describe_failure(err: &anyhow::Error) -> String {
+    if err.downcast_ref::<Cancelled>().is_some() {
+        return Cancelled.to_string();
+    }
     if let Some(cannot) = err.downcast_ref::<CannotResume>() {
         return cannot.to_string();
     }

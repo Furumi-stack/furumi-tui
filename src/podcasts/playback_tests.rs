@@ -13,6 +13,7 @@ use music_dht::podcast::{
 use super::playback::{self, CannotResume, StartAt};
 use super::progress::{ProgressCommand, ProgressEvent, ProgressWriter};
 use super::refresh::{Services, refresh, subscribe};
+use super::stream::{CancelToken, StreamEnd};
 use super::test_server::{Route, WAV_RATE, wav};
 use super::tests::{Fixture, NOW, fixture, rss};
 
@@ -350,6 +351,7 @@ async fn play_resumes_at_the_saved_position_with_a_range_request() {
         episode.clone(),
         StartAt::Resume,
         NOW,
+        CancelToken::never(),
     )
     .await
     .unwrap();
@@ -370,9 +372,15 @@ async fn play_resumes_at_the_saved_position_with_a_range_request() {
     );
 
     // "Start over" ignores the saved position.
-    let restarted = playback::prepare(Some(f.services.clone()), episode, StartAt::Restart, NOW)
-        .await
-        .unwrap();
+    let restarted = playback::prepare(
+        Some(f.services.clone()),
+        episode,
+        StartAt::Restart,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
     assert_eq!(restarted.start_ms, 0);
     let mut source = restarted.source;
     assert_eq!(second_marker(&mut source), 0);
@@ -384,9 +392,15 @@ async fn a_server_without_range_support_still_resumes_at_the_right_place() {
     let (_, episode) = subscribed(&f).await;
     serve_audio(&f, Route::no_ranges, 30);
     save_position(&f.services, &episode, 20_000).await;
-    let prepared = playback::prepare(Some(f.services.clone()), episode, StartAt::Resume, NOW)
-        .await
-        .unwrap();
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode,
+        StartAt::Resume,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.start_ms, 20_000);
     let mut source = prepared.source;
     assert_starts_at(&mut source, 20);
@@ -411,6 +425,7 @@ async fn an_unseekable_stream_does_not_pretend_to_resume() {
         episode.clone(),
         StartAt::Resume,
         NOW,
+        CancelToken::never(),
     )
     .await
     .expect_err("cannot resume");
@@ -427,9 +442,15 @@ async fn an_unseekable_stream_does_not_pretend_to_resume() {
         store.resume_position_ms(&episode.episode_id).unwrap(),
         20_000
     );
-    let prepared = playback::prepare(Some(f.services.clone()), episode, StartAt::Restart, NOW)
-        .await
-        .unwrap();
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode,
+        StartAt::Restart,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.start_ms, 0);
 }
 
@@ -465,6 +486,7 @@ async fn the_audio_url_comes_from_the_feed_at_play_time() {
         queued.clone(),
         StartAt::Resume,
         NOW,
+        CancelToken::never(),
     )
     .await
     .unwrap();
@@ -495,6 +517,7 @@ async fn a_stale_audio_url_refreshes_the_feed_once_and_retries() {
         queued.clone(),
         StartAt::Resume,
         NOW,
+        CancelToken::never(),
     )
     .await
     .unwrap();
@@ -511,9 +534,15 @@ async fn a_stale_audio_url_refreshes_the_feed_once_and_retries() {
         "/audio/a-v3.mp3",
         Route::new("gone", "text/plain").status(410),
     );
-    let err = playback::prepare(Some(f.services.clone()), queued, StartAt::Resume, NOW)
-        .await
-        .expect_err("still unavailable");
+    let err = playback::prepare(
+        Some(f.services.clone()),
+        queued,
+        StartAt::Resume,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .expect_err("still unavailable");
     assert!(format!("{err:#}").contains("410"), "{err:#}");
     assert_eq!(f.server.requests("/feed.xml").len(), 3);
 }
@@ -524,7 +553,7 @@ async fn without_a_store_the_queued_reference_plays_from_the_start() {
     let (_, episode) = subscribed(&f).await;
     serve_audio(&f, |route| route, 5);
     save_position(&f.services, &episode, 3_000).await;
-    let prepared = playback::prepare(None, episode, StartAt::Resume, NOW)
+    let prepared = playback::prepare(None, episode, StartAt::Resume, NOW, CancelToken::never())
         .await
         .unwrap();
     assert_eq!(prepared.start_ms, 0);
@@ -541,4 +570,177 @@ impl PipeReplace for Vec<u8> {
             .replace(from, to)
             .into_bytes()
     }
+}
+
+/// Decodes `source` to its end, as the audio thread would; returns the
+/// position reached (mono samples of `test_server::wav`).
+fn play_out(source: &mut crate::player::DecodedSource) -> i64 {
+    let mut samples = 0i64;
+    while source.next().is_some() {
+        samples += 1;
+    }
+    samples * 1_000 / i64::from(WAV_RATE)
+}
+
+/// Byte offset of second `second` in `test_server::wav`.
+fn wav_offset(second: u32) -> usize {
+    44 + (second * WAV_RATE * 2) as usize
+}
+
+#[tokio::test]
+async fn a_lost_connection_does_not_complete_the_episode_and_keeps_its_position() {
+    let f = fixture();
+    let (_, episode) = subscribed(&f).await;
+    // Two minutes of audio; the server stops sending after 30 s for good.
+    serve_audio(&f, |route| route.cut(wav_offset(30), usize::MAX), 120);
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode.clone(),
+        StartAt::Resume,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
+    let writer = Writer::spawn(&f.services);
+    writer.send(begin(1, &episode, 0, false));
+    writer.saved();
+
+    let mut source = prepared.source;
+    // The decoder ends once the stalled read gives up (STARVE_TIMEOUT).
+    let position_ms = play_out(&mut source);
+    assert!(
+        (29_000..=30_500).contains(&position_ms),
+        "stopped at {position_ms} ms"
+    );
+    assert_eq!(prepared.probe.end(), StreamEnd::Failed);
+    assert_eq!(prepared.duration_ms, Some(120_000));
+    assert!(!playback::played_to_the_end(
+        prepared.probe.end(),
+        position_ms,
+        prepared.duration_ms
+    ));
+
+    // What the runtime then saves: the last position, not a completion.
+    writer.send(ProgressCommand::End {
+        playback: 1,
+        position_ms,
+        listened_ms: position_ms,
+        now_ms: NOW + 1,
+    });
+    while !matches!(writer.next(), ProgressEvent::Ended { .. }) {}
+    writer.close();
+    let store = &f.services.store;
+    assert_eq!(
+        resume(store, &episode.episode_id),
+        (position_ms, ProgressStatus::InProgress)
+    );
+    assert_eq!(
+        store.completed_listen_count(&episode.episode_id).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_stream_of_unknown_length_that_closes_early_is_not_the_end() {
+    let f = fixture();
+    let (_, episode) = subscribed(&f).await;
+    serve_audio(
+        &f,
+        |route| route.no_length().cut(wav_offset(30), usize::MAX),
+        120,
+    );
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode.clone(),
+        StartAt::Restart,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
+    let mut source = prepared.source;
+    let position_ms = play_out(&mut source);
+    assert!((29_000..=30_500).contains(&position_ms), "{position_ms} ms");
+    // A closed connection looks like the end of the file here...
+    assert_eq!(prepared.probe.end(), StreamEnd::Unknown);
+    // ...but the duration says otherwise.
+    assert!(!playback::played_to_the_end(
+        StreamEnd::Unknown,
+        position_ms,
+        Some(120_000)
+    ));
+    assert!(playback::played_to_the_end(
+        StreamEnd::Unknown,
+        119_000,
+        Some(120_000)
+    ));
+
+    // A whole file with a size is played to its end.
+    serve_audio(&f, |route| route, 3);
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode,
+        StartAt::Restart,
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
+    let mut source = prepared.source;
+    assert_eq!(play_out(&mut source), 3_000);
+    assert_eq!(prepared.probe.end(), StreamEnd::Complete);
+    assert!(playback::played_to_the_end(
+        StreamEnd::Complete,
+        3_000,
+        prepared.duration_ms
+    ));
+    // A failure in the last seconds still counts as the end.
+    assert!(playback::played_to_the_end(
+        StreamEnd::Failed,
+        119_500,
+        Some(120_000)
+    ));
+}
+
+#[test]
+fn a_superseded_resume_stops_reading_up_to_its_offset() {
+    let f = fixture();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_, episode) = rt.block_on(subscribed(&f));
+    // No Range support: resuming at 60 s means reading and discarding
+    // everything before it (while positioning, or on the first reads after
+    // it, depending on the format), and this server stalls after 10 s.
+    serve_audio(
+        &f,
+        |route| route.no_ranges().cut(wav_offset(10), usize::MAX),
+        120,
+    );
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&superseded);
+    let cancel = CancelToken::new(move || flag.load(std::sync::atomic::Ordering::SeqCst));
+    let started = std::time::Instant::now();
+    let starting = std::thread::spawn(move || {
+        let prepared = playback::open_at(&episode, 60_000, &cancel)?;
+        let mut source = prepared.source;
+        Ok::<_, anyhow::Error>((source.next(), prepared.probe))
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    superseded.store(true, std::sync::atomic::Ordering::SeqCst);
+    match starting.join().unwrap() {
+        Err(err) => assert!(
+            err.downcast_ref::<super::stream::Cancelled>().is_some(),
+            "{err:#}"
+        ),
+        Ok((sample, probe)) => {
+            assert_eq!(sample, None, "nothing plays after the cancel");
+            assert_eq!(probe.end(), StreamEnd::Failed);
+        }
+    }
+    // Well before a stalled read would give up by itself.
+    assert!(
+        started.elapsed() < super::stream::STARVE_TIMEOUT / 2,
+        "{:?}",
+        started.elapsed()
+    );
 }

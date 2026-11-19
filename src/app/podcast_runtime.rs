@@ -20,6 +20,7 @@ use crate::podcasts::progress::{
     CHECKPOINT_INTERVAL, ProgressCommand, ProgressEvent, ProgressWriter,
 };
 use crate::podcasts::refresh::{self, Services};
+use crate::podcasts::stream::{CancelToken, StreamEnd, StreamProbe};
 
 /// How often the scheduler asks the store which feeds are due. Each feed's
 /// own due time (success interval or failure back-off) lives in the store.
@@ -60,6 +61,22 @@ pub struct EpisodePlayback {
     last_checkpoint: Instant,
     paused: bool,
     completed: bool,
+    /// The server allows seeking in the stream.
+    seekable: bool,
+    /// How the stream ended, once the episode started.
+    probe: Option<StreamProbe>,
+}
+
+/// What the end of the current source meant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Finished {
+    /// Not an episode that was playing here.
+    NotEpisode,
+    /// The episode played to its end (completed).
+    Completed,
+    /// The stream stopped before the end (connection lost, URL expired):
+    /// the last position is saved and the queue must not move on.
+    Interrupted(String),
 }
 
 fn now_ms() -> i64 {
@@ -326,15 +343,21 @@ pub fn handle_event(
             start_ms,
             duration_ms,
             restart,
+            seekable,
+            probe,
         } => {
             episode_started(
                 state,
                 runtime,
                 generation,
                 *episode,
-                start_ms,
-                duration_ms,
-                restart,
+                Started {
+                    start_ms,
+                    duration_ms,
+                    restart,
+                    seekable,
+                    probe,
+                },
             );
             Vec::new()
         }
@@ -415,6 +438,8 @@ pub(crate) fn start_episode(
     end_playback(runtime);
     runtime.player.stop();
     let generation = runtime.player.source_generation();
+    // Pause and resume pressed while the stream connects update this.
+    runtime.player.expect_source(paused);
     runtime.podcast_playback = Some(EpisodePlayback {
         generation,
         episode: queued.clone(),
@@ -427,6 +452,8 @@ pub(crate) fn start_episode(
         last_checkpoint: Instant::now(),
         paused,
         completed: false,
+        seekable: false,
+        probe: None,
     });
     if runtime.podcasts.is_none() {
         tracing::warn!("podcast store unavailable: this episode plays without saving progress");
@@ -437,8 +464,11 @@ pub(crate) fn start_episode(
     let tx = runtime.event_tx.clone();
     let volume = crate::player::amplitude(state.player.volume);
     let restart = start == StartAt::Restart;
+    // Another start or stop cancels the connection, a resume still reading
+    // up to its offset, and later reads of this stream.
+    let cancel = CancelToken::new(controller.superseded_check(generation));
     tokio::spawn(async move {
-        let prepared = playback::prepare(services, queued, start, now_ms()).await;
+        let prepared = playback::prepare(services, queued, start, now_ms(), cancel).await;
         // A newer start or stop happened meanwhile: neither play nor report.
         if controller.source_generation() != generation {
             return;
@@ -446,13 +476,15 @@ pub(crate) fn start_episode(
         match prepared {
             Ok(prepared) => {
                 let start = Duration::from_millis(prepared.start_ms.max(0) as u64);
-                controller.play_source(prepared.source, volume, start, paused, generation);
+                controller.play_source(prepared.source, volume, start, generation);
                 let _ = tx.send(AppEvent::PodcastEpisodeStarted {
                     generation,
                     episode: Box::new(prepared.episode),
                     start_ms: prepared.start_ms,
                     duration_ms: prepared.duration_ms,
                     restart,
+                    seekable: prepared.seekable,
+                    probe: prepared.probe,
                 });
             }
             Err(err) => {
@@ -467,15 +499,29 @@ pub(crate) fn start_episode(
     });
 }
 
+/// What [`AppEvent::PodcastEpisodeStarted`] reports about the stream.
+struct Started {
+    start_ms: i64,
+    duration_ms: Option<i64>,
+    restart: bool,
+    seekable: bool,
+    probe: StreamProbe,
+}
+
 fn episode_started(
     state: &mut AppState,
     runtime: &mut Runtime,
     generation: u64,
     episode: PodcastEpisodeRef,
-    start_ms: i64,
-    duration_ms: Option<i64>,
-    restart: bool,
+    started: Started,
 ) {
+    let Started {
+        start_ms,
+        duration_ms,
+        restart,
+        seekable,
+        probe,
+    } = started;
     let Some(playback) = runtime
         .podcast_playback
         .as_mut()
@@ -484,6 +530,8 @@ fn episode_started(
         return;
     };
     playback.started = true;
+    playback.seekable = seekable;
+    playback.probe = Some(probe);
     playback.position_ms = start_ms;
     playback.duration_ms = duration_ms;
     playback.last_tick = Instant::now();
@@ -530,9 +578,18 @@ fn episode_failed(state: &mut AppState, runtime: &mut Runtime, generation: u64, 
     }
     runtime.podcast_playback = None;
     runtime.player_start_pending = false;
+    stop_on_episode(state);
+    state.status_message = Some(format!("podcast: {message}"));
+}
+
+/// Leaves the queue on the current episode, stopped: Play starts it again
+/// (from its saved position).
+fn stop_on_episode(state: &mut AppState) {
     state.player.playing = false;
     state.player.paused = false;
-    state.status_message = Some(format!("podcast: {message}"));
+    state.player.current = None;
+    state.player.listen_id = None;
+    state.player.prefetched_pos = None;
 }
 
 fn format_clock(ms: i64) -> String {
@@ -566,6 +623,43 @@ pub(crate) fn end_playback(runtime: &mut Runtime) {
 }
 
 impl EpisodePlayback {
+    /// Why this episode cannot be seeked now, if it cannot.
+    fn seek_refusal(&self) -> Option<&'static str> {
+        if !self.started {
+            Some("podcast: the episode is still connecting; seek once it plays")
+        } else if !self.seekable {
+            Some("podcast: the publisher's server does not allow seeking in this episode")
+        } else {
+            None
+        }
+    }
+
+    /// The stream ended by itself (`end`). Completes the episode only if it
+    /// was played to the end (`playback::played_to_the_end`); otherwise the
+    /// last seen position stays what is saved. Returns the commands to send
+    /// and whether it was played to the end.
+    fn finish(&mut self, end: StreamEnd, now_ms: i64) -> (Vec<ProgressCommand>, bool) {
+        if !playback::played_to_the_end(end, self.position_ms, self.duration_ms) {
+            return (Vec::new(), false);
+        }
+        let position_ms = self
+            .duration_ms
+            .unwrap_or(self.position_ms)
+            .max(self.position_ms);
+        self.position_ms = position_ms;
+        let mut commands = Vec::new();
+        if !self.completed {
+            self.completed = true;
+            commands.push(ProgressCommand::Complete {
+                playback: self.generation,
+                position_ms,
+                listened_ms: self.listened_ms,
+                now_ms,
+            });
+        }
+        (commands, true)
+    }
+
     /// Folds one player observation in and returns what to save: counts
     /// actual listening time (not pauses, seeks or stalls), saves on pause,
     /// every [`CHECKPOINT_INTERVAL`] while playing, and completes the
@@ -660,15 +754,55 @@ pub(crate) fn tick(state: &AppState, runtime: &mut Runtime) {
     }
 }
 
-/// The user seeked the playing episode to `target_secs`: an explicit action.
-pub(crate) fn seeked(state: &AppState, runtime: &mut Runtime, target_secs: f64) {
+/// Why the current episode cannot be seeked now, if it cannot: it is still
+/// connecting, or its server does not allow seeking. Callers skip the seek
+/// and show the reason.
+pub(crate) fn seek_refusal(state: &AppState, runtime: &Runtime) -> Option<String> {
+    let playback = runtime.podcast_playback.as_ref()?;
+    if !still_current(state, playback) {
+        return None;
+    }
+    playback.seek_refusal().map(str::to_string)
+}
+
+/// The audio thread handled a seek of the source started under
+/// `generation`. Only a seek that moved the episode is saved, as an
+/// explicit action at the position actually reached.
+pub(crate) fn seek_done(
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    generation: u64,
+    position: Duration,
+    result: Result<(), String>,
+) {
+    if runtime
+        .podcast_playback
+        .as_ref()
+        .is_none_or(|playback| playback.generation != generation)
+    {
+        return;
+    }
+    match result {
+        Ok(()) => seeked(state, runtime, position.as_secs_f64()),
+        Err(err) => {
+            state.status_message = Some(format!("podcast: cannot seek in this episode ({err})"));
+        }
+    }
+}
+
+/// The playing episode moved to `target_secs` by the user: an explicit action.
+fn seeked(state: &AppState, runtime: &mut Runtime, target_secs: f64) {
     let Some(playback) = runtime.podcast_playback.as_mut() else {
         return;
     };
     if !playback.started || !still_current(state, playback) {
         return;
     }
-    let position_ms = (target_secs.max(0.0) * 1_000.0).round() as i64;
+    let mut position_ms = (target_secs.max(0.0) * 1_000.0).round() as i64;
+    // rodio stops a seek at the end of a source of known length.
+    if let Some(duration_ms) = playback.duration_ms {
+        position_ms = position_ms.min(duration_ms);
+    }
     playback.position_ms = position_ms;
     playback.last_tick = Instant::now();
     playback.last_checkpoint = Instant::now();
@@ -682,31 +816,38 @@ pub(crate) fn seeked(state: &AppState, runtime: &mut Runtime, target_secs: f64) 
     send_progress(runtime, command);
 }
 
-/// The stream of the current episode ended by itself: the end of the stream
-/// always completes the episode.
-pub(crate) fn finished(runtime: &mut Runtime) {
+/// The source of the current episode ended by itself. Completes the
+/// episode when its stream reached the end; a stream that broke off (lost
+/// connection, expired URL) keeps the last position, and the caller must
+/// stop on the episode instead of moving on.
+pub(crate) fn finished(state: &mut AppState, runtime: &mut Runtime) -> Finished {
     let Some(playback) = runtime.podcast_playback.as_mut() else {
-        return;
+        return Finished::NotEpisode;
     };
     if !playback.started {
-        return;
+        return Finished::NotEpisode;
     }
-    let position_ms = playback
-        .duration_ms
-        .unwrap_or(playback.position_ms)
-        .max(playback.position_ms);
-    playback.position_ms = position_ms;
-    if !playback.completed {
-        playback.completed = true;
-        let command = ProgressCommand::Complete {
-            playback: playback.generation,
-            position_ms,
-            listened_ms: playback.listened_ms,
-            now_ms: now_ms(),
-        };
+    let end = playback
+        .probe
+        .as_ref()
+        .map_or(StreamEnd::Complete, StreamProbe::end);
+    let (commands, reached) = playback.finish(end, now_ms());
+    let position_ms = playback.position_ms;
+    for command in commands {
         send_progress(runtime, command);
     }
     end_playback(runtime);
+    if reached {
+        return Finished::Completed;
+    }
+    tracing::warn!(?end, position_ms, "podcast stream stopped before the end");
+    runtime.player_start_pending = false;
+    stop_on_episode(state);
+    Finished::Interrupted(format!(
+        "podcast: the audio stopped at {} (the publisher's server stopped sending it); \
+         the position is saved, press play to continue",
+        format_clock(position_ms)
+    ))
 }
 
 /// The audio thread failed while an episode played or started.
@@ -778,6 +919,8 @@ mod tests {
             last_checkpoint: start,
             paused: false,
             completed: false,
+            seekable: true,
+            probe: None,
         };
         (playback, start)
     }
@@ -833,6 +976,60 @@ mod tests {
             [ProgressCommand::Checkpoint { playback: 7, position_ms }] if *position_ms == position
         ));
         assert_eq!(playback.listened_ms, 10_000 + interval as i64);
+    }
+
+    #[test]
+    fn a_stream_that_broke_off_keeps_the_episode_in_progress() {
+        let (mut playback, start) = tracked(Some(3_600_000));
+        playback.observe(600_000, false, at(start, 250), 0);
+        // Connection lost far from the end: nothing is completed; the
+        // caller ends the session at the last seen position.
+        let (commands, reached) = playback.finish(StreamEnd::Failed, 1);
+        assert!(commands.is_empty() && !reached);
+        assert_eq!(playback.position_ms, 600_000);
+        assert!(!playback.completed);
+        // Same for a stream without a size that closed early.
+        let (commands, reached) = playback.finish(StreamEnd::Unknown, 1);
+        assert!(commands.is_empty() && !reached);
+        // A failure within the completion window, or a real end, completes.
+        playback.observe(3_590_000, false, at(start, 500), 0);
+        playback.completed = false;
+        let (commands, reached) = playback.finish(StreamEnd::Failed, 2);
+        assert!(reached);
+        assert!(matches!(
+            commands.as_slice(),
+            [ProgressCommand::Complete {
+                position_ms: 3_600_000,
+                ..
+            }]
+        ));
+        let (mut ended, start) = tracked(Some(3_600_000));
+        ended.observe(1_000, false, at(start, 250), 0);
+        let (commands, reached) = ended.finish(StreamEnd::Complete, 3);
+        assert!(reached);
+        assert_eq!(commands.len(), 1);
+        // Without a size or a duration, the end of the stream is all there is.
+        let (mut unknown, start) = tracked(None);
+        unknown.observe(1_000, false, at(start, 250), 0);
+        assert!(unknown.finish(StreamEnd::Unknown, 4).1);
+    }
+
+    #[test]
+    fn seeks_are_refused_while_connecting_and_without_range_support() {
+        let (mut playback, _) = tracked(Some(3_600_000));
+        assert_eq!(playback.seek_refusal(), None);
+        playback.seekable = false;
+        assert!(
+            playback
+                .seek_refusal()
+                .is_some_and(|reason| reason.contains("does not allow seeking"))
+        );
+        playback.started = false;
+        assert!(
+            playback
+                .seek_refusal()
+                .is_some_and(|reason| reason.contains("still connecting"))
+        );
     }
 
     #[test]

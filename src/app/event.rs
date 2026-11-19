@@ -252,6 +252,10 @@ pub enum AppEvent {
         start_ms: i64,
         duration_ms: Option<i64>,
         restart: bool,
+        /// The server allows seeking in the stream.
+        seekable: bool,
+        /// How the stream ended, once it does.
+        probe: crate::podcasts::stream::StreamProbe,
     },
     /// Starting an episode failed (network, decoding, cannot resume).
     PodcastEpisodeFailed {

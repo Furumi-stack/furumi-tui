@@ -41,6 +41,18 @@
 //! body, and long episodes are fine. The request-level
 //! `RequestBuilder::timeout` (which *is* a total timeout) is never used.
 //!
+//! Cancellation: a stream belongs to one playback start ([`CancelToken`]).
+//! Once that start is superseded (another item, stop, restart), every read,
+//! including one blocked waiting for data inside the audio callback, fails
+//! within [`CANCEL_POLL`], and the downloader thread stops. So a stalled
+//! stream never holds the audio thread past the user's next choice, and a
+//! superseded resume (which may be reading and discarding up to its offset)
+//! stops downloading.
+//!
+//! End of playback: [`StreamProbe::end`] tells whether the reader saw the
+//! file end the way the server described it or stopped on an error, so an
+//! episode whose connection was lost is not taken as played to the end.
+//!
 //! Decoder note for the player integration: symphonia's MP3 demuxer in
 //! accurate seek mode never seeks by byte offset (a backward seek re-parses
 //! from the first frame), which would re-download the episode. Build rodio
@@ -91,9 +103,89 @@ const STARVED_BACKOFF: Duration = Duration::from_secs(1);
 pub const STARVE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const STARVE_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often a blocked read or an idle downloader checks its
+/// [`CancelToken`].
+pub const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// Tells a stream that the playback start it belongs to was superseded.
+#[derive(Clone)]
+pub struct CancelToken(Option<Arc<dyn Fn() -> bool + Send + Sync>>);
+
+impl CancelToken {
+    /// A stream that is only closed by dropping it.
+    #[cfg(test)]
+    pub fn never() -> CancelToken {
+        CancelToken(None)
+    }
+
+    /// `cancelled` becomes true once the start is superseded; it is polled.
+    pub fn new(cancelled: impl Fn() -> bool + Send + Sync + 'static) -> CancelToken {
+        CancelToken(Some(Arc::new(cancelled)))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(|cancelled| cancelled())
+    }
+}
+
+/// The playback start was superseded while the stream was opened or read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the episode start was superseded")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+fn cancelled_error() -> io::Error {
+    io::Error::other(Cancelled)
+}
+
+/// How the reader's last read ended, for telling a finished episode from a
+/// lost connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// No read failed and the server announced the file size, so the
+    /// decoder ended at the end the server described.
+    Complete,
+    /// No read failed, but the server sent no size: a connection closed
+    /// early looks exactly like the end of the file.
+    Unknown,
+    /// The last read failed (outage longer than [`STARVE_TIMEOUT`], a client
+    /// error such as an expired URL, or cancellation).
+    Failed,
+}
+
+/// Read-only view of a stream's state that outlives handing the reader to
+/// the decoder.
+#[derive(Clone)]
+pub struct StreamProbe(Arc<Shared>);
+
+impl std::fmt::Debug for StreamProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StreamProbe").field(&self.end()).finish()
+    }
+}
+
+impl StreamProbe {
+    pub fn end(&self) -> StreamEnd {
+        let state = self.0.lock();
+        if state.read_failed {
+            StreamEnd::Failed
+        } else if state.declared_total {
+            StreamEnd::Complete
+        } else {
+            StreamEnd::Unknown
+        }
+    }
+}
 
 pub struct OpenedStream {
     pub reader: HttpStream,
+    pub probe: StreamProbe,
     pub byte_len: Option<u64>,
     pub mime_type: Option<String>,
     pub seekable: bool,
@@ -107,6 +199,7 @@ pub struct HttpStream {
 
 struct Shared {
     state: Mutex<State>,
+    cancel: CancelToken,
     /// Signalled when data, EOF, an error or downloader exit is available to
     /// the reader.
     data_ready: Condvar,
@@ -129,6 +222,11 @@ struct State {
     /// Last position the reader consumed from the window.
     reader_pos: u64,
     total: Option<u64>,
+    /// `total` comes from the server (`Content-Length` / `Content-Range`),
+    /// not from a connection that closed.
+    declared_total: bool,
+    /// The reader's last read returned an error (cleared by data).
+    read_failed: bool,
     ranges: bool,
     /// The current generation reached the end of the body.
     done: bool,
@@ -190,12 +288,19 @@ impl Shared {
     }
 }
 
+/// [`open_with`] without cancellation.
+#[cfg(test)]
+pub fn open(url: &str) -> Result<OpenedStream> {
+    open_with(url, CancelToken::never())
+}
+
 /// Opens a remote audio file for streaming playback. Blocking: call it from
 /// `spawn_blocking` or a plain thread, never directly on a Tokio worker.
 ///
 /// Only http(s) URLs are accepted. Errors never contain the URL's query,
-/// which may hold a private token.
-pub fn open(url: &str) -> Result<OpenedStream> {
+/// which may hold a private token. Fails with [`Cancelled`] when `cancel`
+/// fires before the stream is ready.
+pub fn open_with(url: &str, cancel: CancelToken) -> Result<OpenedStream> {
     let parsed = Url::parse(url).context("the episode audio URL is invalid")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("unsupported audio URL scheme {:?}", parsed.scheme());
@@ -228,6 +333,9 @@ pub fn open(url: &str) -> Result<OpenedStream> {
         .send()
         .map_err(|err| anyhow!(err.without_url()))
         .with_context(|| format!("requesting {shown}"))?;
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
     let opened = classify(&response, 0).with_context(|| format!("requesting {shown}"))?;
     let mime_type = response
         .headers()
@@ -248,6 +356,8 @@ pub fn open(url: &str) -> Result<OpenedStream> {
             head: Vec::with_capacity(HEAD_KEEP),
             reader_pos: 0,
             total: opened.total,
+            declared_total: opened.total.is_some(),
+            read_failed: false,
             ranges: opened.ranges,
             done: false,
             failed: false,
@@ -260,6 +370,7 @@ pub fn open(url: &str) -> Result<OpenedStream> {
             peak_buffered: 0,
             peak_capacity,
         }),
+        cancel,
         data_ready: Condvar::new(),
         space_ready: Condvar::new(),
     });
@@ -274,6 +385,7 @@ pub fn open(url: &str) -> Result<OpenedStream> {
         .spawn(move || downloader.run(response))
         .context("spawning the podcast stream thread")?;
     Ok(OpenedStream {
+        probe: StreamProbe(Arc::clone(&shared)),
         reader: HttpStream { pos: 0, shared },
         byte_len: opened.total,
         mime_type,
@@ -429,7 +541,11 @@ impl Downloader {
             let Some(body) = response.as_mut() else {
                 continue;
             };
-            match body.read(&mut buf) {
+            let read = body.read(&mut buf);
+            if self.shared.cancel.is_cancelled() {
+                return;
+            }
+            match read {
                 Ok(0) => {
                     response = None;
                     let total = self.shared.lock().total;
@@ -471,7 +587,7 @@ impl Downloader {
     ) -> bool {
         let mut state = self.shared.lock();
         loop {
-            if state.closed {
+            if state.closed || self.shared.cancel.is_cancelled() {
                 return false;
             }
             if state.generation != *generation {
@@ -499,8 +615,9 @@ impl Downloader {
             state = self
                 .shared
                 .space_ready
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+                .wait_timeout(state, CANCEL_POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -532,8 +649,9 @@ impl Downloader {
             // The server stopped honouring Range: read from 0 and discard.
             state.ranges = false;
         }
-        if state.total.is_none() {
+        if state.total.is_none() && classified.total.is_some() {
             state.total = classified.total;
+            state.declared_total = true;
         }
         Ok(Some((response, classified.start)))
     }
@@ -583,7 +701,7 @@ impl Downloader {
         // Wakes early when the reader goes away, seeks elsewhere or starts
         // waiting for data (which shortens the delay).
         loop {
-            if state.closed {
+            if state.closed || self.shared.cancel.is_cancelled() {
                 return false;
             }
             if state.generation != generation {
@@ -601,7 +719,7 @@ impl Downloader {
             state = self
                 .shared
                 .space_ready
-                .wait_timeout(state, limit - elapsed)
+                .wait_timeout(state, (limit - elapsed).min(CANCEL_POLL))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -655,6 +773,11 @@ impl Read for HttpStream {
         let state = shared.lock();
         let (mut state, result) = read_locked(shared, &mut self.pos, state, buf);
         state.reader_waiting = false;
+        match &result {
+            Ok(0) => {}
+            Ok(_) => state.read_failed = false,
+            Err(_) => state.read_failed = true,
+        }
         result
     }
 }
@@ -670,6 +793,9 @@ fn read_locked<'a>(
     // When this read started waiting, and the download progress then.
     let mut starved: Option<(Instant, u64)> = None;
     loop {
+        if shared.cancel.is_cancelled() {
+            return (state, Err(cancelled_error()));
+        }
         if state.total.is_some_and(|total| *pos >= total) {
             return (state, Ok(0));
         }
@@ -743,7 +869,7 @@ fn read_locked<'a>(
             }
             state = shared
                 .data_ready
-                .wait_timeout(state, STARVE_TIMEOUT - waited)
+                .wait_timeout(state, (STARVE_TIMEOUT - waited).min(CANCEL_POLL))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
             continue;

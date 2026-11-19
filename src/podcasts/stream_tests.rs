@@ -349,3 +349,57 @@ fn http_stream_is_send_and_sync() {
     fn check<T: Send + Sync + std::io::Read + std::io::Seek>() {}
     check::<stream::HttpStream>();
 }
+
+/// A read blocked on a stalled server (inside the audio callback, in the
+/// player) returns as soon as its playback is superseded, instead of after
+/// `STARVE_TIMEOUT`, and the downloader stops; the stream then reports a
+/// failed end.
+#[test]
+fn a_blocked_read_fails_as_soon_as_its_playback_is_superseded() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let body = noise(4 * MIB, 10);
+    let (_server, url) = serve(Route::new(body.clone(), "audio/mpeg").cut(MIB, usize::MAX));
+    let superseded = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&superseded);
+    let opened = stream::open_with(
+        &url,
+        stream::CancelToken::new(move || flag.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    let probe = opened.probe.clone();
+    let mut reader = opened.reader;
+    let exited = reader.exit_probe();
+    assert_eq!(read_n(&mut reader, MIB), body[..MIB]);
+    assert_eq!(probe.end(), stream::StreamEnd::Complete);
+
+    let reading = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let started = Instant::now();
+        let result = reader.read(&mut buf);
+        (result, started.elapsed(), reader)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    superseded.store(true, Ordering::SeqCst);
+    let (result, waited, mut reader) = reading.join().unwrap();
+    let err = result.expect_err("superseded");
+    assert!(
+        err.get_ref()
+            .is_some_and(|inner| inner.is::<stream::Cancelled>()),
+        "{err}"
+    );
+    assert!(
+        waited < stream::STARVE_TIMEOUT / 2,
+        "blocked for {waited:?}"
+    );
+    assert_eq!(probe.end(), stream::StreamEnd::Failed);
+    // Later reads fail at once, even from buffered data.
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    assert!(reader.read(&mut [0u8; 16]).is_err());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !exited() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(exited(), "downloader thread did not stop");
+}
