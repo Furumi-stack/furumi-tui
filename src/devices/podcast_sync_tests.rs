@@ -612,3 +612,177 @@ fn podcast_snapshot_sections_shrink_to_fit_the_line_limit() {
     // The music part is never cut for podcast state.
     assert_eq!(message_snapshot(&mut message).likes.len(), 70_000);
 }
+
+fn state_with(queue: Vec<PlaybackTrack>, position_secs: f64) -> PlaybackStateWire {
+    PlaybackStateWire {
+        queue,
+        queue_pos: 0,
+        playing: true,
+        paused: true,
+        idle_since_ms: None,
+        position_secs,
+        volume: 80,
+        shuffle: false,
+        repeat: PlaybackRepeat::Off,
+        playback_rate: None,
+    }
+}
+
+fn publish(device: &Device, state: PlaybackStateWire) {
+    device.sync.publish_playback(PlaybackSnapshot {
+        device_id: device.id.clone(),
+        device_name: "A".into(),
+        active: true,
+        updated_at_ms: now_ms(),
+        state,
+        coordination: None,
+    });
+}
+
+fn music_wire() -> PlaybackTrack {
+    let mut track = PlaybackTrack::private_placeholder();
+    track.title = "Song".into();
+    track.content_id = Some(format!("b3:{}", "d".repeat(64)));
+    track.source = None;
+    track
+}
+
+#[test]
+fn a_handoff_between_v4_devices_carries_the_episode_and_its_position() {
+    let a = device();
+    let mut b = device();
+    pair(&a, &b);
+    subscribe(&a);
+    let episode = episode_ref(6);
+    let session = start(&a, &episode, 0);
+    checkpoint(&a, &session, 1_000_000);
+    let mut queued = TrackItem::podcast_episode(episode.clone());
+    queued.podcast.as_mut().unwrap().progress_generation = Some(session.generation);
+    let state = state_with(
+        vec![PlaybackTrack::from_track(&queued), music_wire()],
+        1_000.5,
+    );
+    a.sync
+        .ensure_playback_supported_by(&b.id, &state)
+        .expect("B speaks v4");
+    a.sync.claim_playback(&a.id).unwrap();
+    a.sync
+        .record_playback_command(
+            &b.id,
+            PlaybackCommand::ActiveChanged {
+                active_device_id: b.id.clone(),
+                active_device_name: "B".into(),
+                state,
+            },
+        )
+        .unwrap();
+    deliver(&a, &b);
+    let mut handed = None;
+    while let Ok(event) = b.events.try_recv() {
+        if let AppEvent::PlaybackCommand {
+            command: PlaybackCommand::ActiveChanged { state, .. },
+            ..
+        } = event
+        {
+            handed = Some(state);
+        }
+    }
+    let handed = handed.expect("the handoff reaches B's player");
+    assert_eq!(handed.position_secs, 1_000.5);
+    assert!(handed.paused);
+    assert_eq!(handed.playback_rate, None);
+    let items = track_items_from_wire(&handed.queue, PlaybackTrack::to_track_item);
+    let item = items[0].podcast_episode_ref().expect("still an episode");
+    assert_eq!(item.episode_id, episode.episode_id);
+    assert_eq!(item.audio_url, episode.audio_url);
+    assert_eq!(item.progress_generation, Some(session.generation));
+    assert!(!items[1].is_podcast());
+}
+
+#[test]
+fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
+    let mut a = device();
+    a.sync.apply_device_trusted("dev_old", 1).unwrap();
+    a.sync
+        .apply_device_profile(
+            &DeviceProfileWire {
+                device_id: "dev_old".into(),
+                name: "Old laptop".into(),
+                client_version: "0.3.5".into(),
+                protocol_version: 3,
+                endpoint_id: String::new(),
+                endpoint_ticket: String::new(),
+                revoked: false,
+                revoke_cutoff_seq: None,
+                updated_at_ms: 1,
+            },
+            false,
+            VersionReport::SelfReported(Some(3)),
+        )
+        .unwrap();
+    let with_episode = state_with(
+        vec![music_wire(), PlaybackTrack::podcast_episode(episode_ref(7))],
+        12.0,
+    );
+    // Handoff to it: refused with the reason, before ownership changes.
+    let error = a
+        .sync
+        .ensure_playback_supported_by("dev_old", &with_episode)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Old laptop needs a Furumi update"),
+        "{error}"
+    );
+    a.sync
+        .ensure_playback_supported_by("dev_old", &state_with(vec![music_wire()], 0.0))
+        .expect("music-only queues go anywhere");
+
+    // Its handoff to itself while this queue has an episode is ignored.
+    let mut old = Engine::new(
+        "dev_old".into(),
+        PlaybackConfig::default(),
+        Default::default(),
+        0,
+    );
+    old.transfer("dev_old", 0);
+    let stamp = old.stamp().unwrap();
+    let take_over = PlaybackCommand::ActiveChanged {
+        active_device_id: "dev_old".into(),
+        active_device_name: "Old laptop".into(),
+        state: state_with(vec![music_wire()], 0.0),
+    };
+    a.sync.claim_playback(&a.id).unwrap();
+    publish(&a, with_episode);
+    a.sync
+        .apply_playback_command(&a.id, &take_over, Some(&stamp), "dev_old", "dev_old:5")
+        .unwrap();
+    let mut commands = 0;
+    let mut messages = Vec::new();
+    while let Ok(event) = a.events.try_recv() {
+        match event {
+            AppEvent::PlaybackCommand { .. } => commands += 1,
+            AppEvent::StatusMessage(message) => messages.push(message),
+            _ => {}
+        }
+    }
+    assert_eq!(commands, 0);
+    assert!(messages[0].contains("Old laptop"), "{messages:?}");
+    assert_eq!(
+        a.sync
+            .with_playback_engine(|engine| engine.owner().map(str::to_owned))
+            .unwrap()
+            .as_deref(),
+        Some(a.id.as_str())
+    );
+
+    // Without episodes in the queue it is an ordinary handoff.
+    publish(&a, state_with(vec![music_wire()], 0.0));
+    a.sync
+        .apply_playback_command(&a.id, &take_over, Some(&stamp), "dev_old", "dev_old:6")
+        .unwrap();
+    assert!(
+        std::iter::from_fn(|| a.events.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::PlaybackCommand { .. }))
+    );
+}

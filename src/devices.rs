@@ -144,16 +144,91 @@ struct PodcastLink {
 /// Converts queue items to and from the shared wire form
 /// ([`PlaybackTrack`]). The wire types themselves are the shared
 /// `music_dht::device_sync` definitions; this client keeps no copies.
+///
+/// A podcast episode travels with its explicit source
+/// (`PlaybackSource::PodcastEpisode`), never as a music item. Peers below
+/// protocol v4 do not get such a queue at all (`playback_allowed_for_peer`).
 pub trait PlaybackTrackExt {
     /// Wire form of a queue item. Device-local paths are never sent.
     fn from_track(track: &TrackItem) -> Self;
-    /// Queue item for a wire track received from another device.
+    /// Queue item for a wire track received from another device. A Jam
+    /// private placeholder becomes [`private_track_item`]`(0)`; callers
+    /// that keep a queue number them ([`track_items_from_wire`]).
     fn to_track_item(&self) -> TrackItem;
+}
+
+/// Ids of the "private item" queue entries that stand for a Jam host's
+/// podcast episodes on a guest: `PRIVATE_ITEM_ID_BASE - k` for the k-th, so
+/// each has its own queue key. Process-local; never sent (they go back on
+/// the wire as `PlaybackSource::Private`).
+const PRIVATE_ITEM_ID_BASE: i64 = -(1 << 62);
+const PRIVATE_ITEM_ID_SPAN: i64 = 1 << 32;
+
+/// Queue entry for the k-th Jam private placeholder: no title but
+/// [`music_dht::device_sync::PRIVATE_ITEM_TITLE`], no URL, not playable.
+pub fn private_track_item(k: usize) -> TrackItem {
+    TrackItem {
+        id: PRIVATE_ITEM_ID_BASE - (k as i64 % PRIVATE_ITEM_ID_SPAN),
+        title: music_dht::device_sync::PRIVATE_ITEM_TITLE.to_string(),
+        track_number: None,
+        disc_number: None,
+        duration_seconds: 0.0,
+        artists: Vec::new(),
+        featured_artists: Vec::new(),
+        release_id: TrackItem::NOT_A_LIBRARY_ROW,
+        release_title: String::new(),
+        release_year: None,
+        file_path: String::new(),
+        content_id: None,
+        cover_path: None,
+        audio_format: None,
+        audio_bitrate: None,
+        audio_sample_rate: None,
+        audio_bit_depth: None,
+        file_size_bytes: None,
+        play_count: 0,
+        fed: None,
+        podcast: None,
+    }
+}
+
+/// Whether a queue entry is a Jam private placeholder.
+pub fn is_private_track_item(track: &TrackItem) -> bool {
+    track.podcast.is_none()
+        && track.fed.is_none()
+        && track.content_id.is_none()
+        && track.id <= PRIVATE_ITEM_ID_BASE
+        && track.id > PRIVATE_ITEM_ID_BASE - PRIVATE_ITEM_ID_SPAN
+        && track.title == music_dht::device_sync::PRIVATE_ITEM_TITLE
+}
+
+/// Queue entries for a received queue, with `resolve_music` deciding music
+/// items (a library copy, for example). Podcast episodes keep their typed
+/// reference; Jam private placeholders are numbered in queue order.
+pub fn track_items_from_wire(
+    queue: &[PlaybackTrack],
+    mut resolve_music: impl FnMut(&PlaybackTrack) -> TrackItem,
+) -> Vec<TrackItem> {
+    let mut private = 0;
+    queue
+        .iter()
+        .map(|track| match TrackItem::from_playback_track(track) {
+            furumi_library::models::PlaybackItem::Music => resolve_music(track),
+            furumi_library::models::PlaybackItem::PodcastEpisode(item) => *item,
+            furumi_library::models::PlaybackItem::Private => {
+                private += 1;
+                private_track_item(private - 1)
+            }
+        })
+        .collect()
 }
 
 impl PlaybackTrackExt for PlaybackTrack {
     fn from_track(track: &TrackItem) -> Self {
-        if track.is_podcast() {
+        if let Some(episode) = &track.podcast {
+            return Self::podcast_episode(episode.clone());
+        }
+        if is_private_track_item(track) {
             return Self::private_placeholder();
         }
         Self {
@@ -192,6 +267,11 @@ impl PlaybackTrackExt for PlaybackTrack {
     }
 
     fn to_track_item(&self) -> TrackItem {
+        match TrackItem::from_playback_track(self) {
+            furumi_library::models::PlaybackItem::Music => {}
+            furumi_library::models::PlaybackItem::PodcastEpisode(item) => return *item,
+            furumi_library::models::PlaybackItem::Private => return private_track_item(0),
+        }
         let refs = |names: &[String]| -> Vec<ArtistRef> {
             names
                 .iter()
@@ -1838,6 +1918,31 @@ impl DeviceSync {
         let Some(authority) = authority else {
             return Ok(());
         };
+        // A peer below v4 does not know podcast items: while this queue has
+        // any, its state would silently drop them. Checked before the
+        // ownership engine sees the command.
+        let peer_version = self.peer_protocol_version(origin)?;
+        let local = lock(&self.playback)
+            .local
+            .as_ref()
+            .map(|snapshot| snapshot.state.clone());
+        if let Some(local) = local
+            && !music_dht::device_sync::playback_command_allowed_from_peer(&local, peer_version)
+        {
+            tracing::info!(
+                origin = %short_id(origin),
+                peer_version,
+                "ignored a playback command from a device without podcast support"
+            );
+            if let Some(tx) = lock(&self.event_tx).as_ref() {
+                let _ = tx.send(AppEvent::StatusMessage(format!(
+                    "ignored playback control from {}: it needs a Furumi update to keep the \
+                     podcast episodes in this queue",
+                    self.device_label(origin)
+                )));
+            }
+            return Ok(());
+        }
         let handoff = matches!(command, PlaybackCommand::ActiveChanged { .. });
         if !handoff && target_device_id != identity.device_id {
             return Ok(());
@@ -2873,6 +2978,39 @@ impl DeviceSync {
     /// podcast items and the peer is below v4 (`playback_allowed_for_peer`).
     /// Episodes are never stripped to make the state fit: an old client
     /// would forward the shortened queue and lose them for every device.
+    /// Refuses to hand a queue with podcast items to a device below v4
+    /// ("that device needs an update"), before ownership changes.
+    pub fn ensure_playback_supported_by(
+        &self,
+        device_id: &str,
+        state: &PlaybackStateWire,
+    ) -> Result<()> {
+        let version = self.peer_protocol_version(device_id)?;
+        anyhow::ensure!(
+            music_dht::device_sync::playback_allowed_for_peer(state, version),
+            "{} needs a Furumi update to play podcast episodes (device sync v{}); update \
+             Furumi there, or remove the episodes from the queue",
+            self.device_label(device_id),
+            music_dht::device_sync::PODCAST_PROTOCOL_VERSION
+        );
+        Ok(())
+    }
+
+    /// Display name of a device, or a short id.
+    fn device_label(&self, device_id: &str) -> String {
+        lock(&self.conn)
+            .query_row(
+                "SELECT name FROM sync_devices WHERE device_id = ?1",
+                [device_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| short_id(device_id))
+    }
+
     fn local_playback_snapshot_for(&self, peer_version: u16) -> Option<PlaybackSnapshot> {
         lock(&self.playback).local.clone().filter(|snapshot| {
             music_dht::device_sync::playback_allowed_for_peer(&snapshot.state, peer_version)

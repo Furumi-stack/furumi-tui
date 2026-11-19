@@ -2000,8 +2000,8 @@ mod podcast_queue {
         assert!(state.popup.is_none(), "episode metadata is not editable");
         assert_eq!(update(&mut state, Action::DownloadSelected), None);
 
-        // No content id, no share link, no music history, private on the
-        // v3 wire.
+        // No content id, no share link, no music history; on the wire an
+        // explicit podcast source, never a music item.
         let episode = episode_track(1);
         assert_eq!(track_content_id(&episode), None);
         assert_eq!(crate::share::track_content_id(&episode), None);
@@ -2009,8 +2009,8 @@ mod podcast_queue {
         let wire = <crate::devices::PlaybackTrack as crate::devices::PlaybackTrackExt>::from_track(
             &episode,
         );
-        assert_eq!(wire.title, music_dht::device_sync::PRIVATE_ITEM_TITLE);
-        assert!(wire.artist_names.is_empty() && wire.release_title.is_empty());
+        assert_eq!(wire.podcast_episode_ref(), episode.podcast_episode_ref());
+        assert!(wire.file_path.is_empty());
         assert_eq!((wire.id, wire.content_id, wire.fed), (0, None, None));
 
         // Shift-J opens the podcast instead of a music release.
@@ -2103,7 +2103,7 @@ mod podcast_queue {
     }
 
     #[test]
-    fn episodes_can_be_queued_but_not_while_another_device_plays() {
+    fn episodes_are_queued_for_v4_outputs_only() {
         let mut state = episodes_tab(&[None, None]);
         assert_eq!(
             update(&mut state, Action::QueueAddLast),
@@ -2118,16 +2118,42 @@ mod podcast_queue {
             keys(&[episode_track(1), episode_track(2)])
         );
 
+        // Controlling a device that has not reported sync v4.
         state.device_playback.role = crate::app::state::DevicePlaybackRole::Control;
+        state.device_playback.active_device_id = Some("dev_old".into());
+        state.device_playback.active_device_name = Some("Old laptop".into());
+        let row = |version| crate::devices::DeviceStatusRow {
+            device_id: "dev_old".into(),
+            name: "Old laptop".into(),
+            protocol_version: version,
+            ..Default::default()
+        };
+        state.federation.devices = Some(crate::devices::DeviceSyncStatus {
+            devices: vec![row(3)],
+            ..Default::default()
+        });
         assert_eq!(update(&mut state, Action::QueueAddNext), None);
         assert_eq!(update(&mut state, Action::Select), None);
         assert_eq!(state.player.queue.len(), 2);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("podcasts: Old laptop needs a Furumi update to play podcast episodes")
+        );
+        // Once it reports v4, the queue goes there with the episodes.
+        state.federation.devices.as_mut().unwrap().devices = vec![row(4)];
+        assert!(update(&mut state, Action::QueueAddNext).is_some());
+        assert_eq!(state.player.queue.len(), 3);
+
+        // A Jam guest never adds episodes to the host's queue.
+        state.device_playback.role = crate::app::state::DevicePlaybackRole::Jam;
+        state.device_playback.jam_host = false;
+        assert_eq!(update(&mut state, Action::QueueAddNext), None);
         assert!(
             state
                 .status_message
                 .as_deref()
                 .unwrap()
-                .contains("another device")
+                .contains("Jam guests")
         );
     }
 

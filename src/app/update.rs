@@ -1500,8 +1500,14 @@ pub fn playlist_tracks(state: &AppState, id: i64) -> Option<Vec<&TrackItem>> {
     }
 }
 
+/// Whether the library source mode lets a queue item stay in a received
+/// queue. Only pending federated music depends on it: podcast episodes
+/// (streamed from their publisher) and Jam private placeholders are never
+/// dropped, or a received queue would lose them.
 pub(crate) fn track_allowed_by_source_mode(state: &AppState, track: &TrackItem) -> bool {
-    state.global.filters.source_mode.includes_network() || !track.is_fed_pending()
+    track.is_podcast()
+        || state.global.filters.source_mode.includes_network()
+        || !track.is_fed_pending()
 }
 
 /// A *release* under the cursor (artist-view tile/row or a search release).

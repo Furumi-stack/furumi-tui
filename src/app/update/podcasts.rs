@@ -168,19 +168,43 @@ fn select(state: &mut AppState) -> Option<Effect> {
 // ---------------------------------------------------------------------------
 // Playback
 
-/// Episodes play on this device only for now: a device that controls
-/// another one would hand them over as private placeholders (sync protocol
-/// v3 cannot carry them). Says so and returns `false` in that case.
+/// Whether podcast episodes may be added to the queue that plays.
+///
+/// On this device, always. A device controlling another one sends the
+/// queue there, so that device must speak sync v4 (an older one would drop
+/// the episodes). A Jam guest never adds episodes to the host's queue.
+/// Says why and returns `false` otherwise.
 pub fn episodes_play_here(state: &mut AppState) -> bool {
-    if state.device_playback.is_control() {
-        state.status_message = Some(
-            "podcasts: playback is on another device; episodes play only on this device \
-             (take playback over here first)"
-                .into(),
-        );
-        return false;
+    use crate::app::state::DevicePlaybackRole;
+    match state.device_playback.role {
+        DevicePlaybackRole::Jam if !state.device_playback.jam_host => {
+            state.status_message =
+                Some("podcasts: Jam guests cannot add podcast episodes to the host's queue".into());
+            false
+        }
+        DevicePlaybackRole::Control => {
+            let target = state.device_playback.active_device_id.clone();
+            let version = target.as_deref().and_then(|target| {
+                state
+                    .federation
+                    .devices
+                    .as_ref()?
+                    .devices
+                    .iter()
+                    .find(|row| row.device_id == target)
+                    .map(|row| row.protocol_version)
+            });
+            if version.is_some_and(music_dht::device_sync::supports_podcasts) {
+                return true;
+            }
+            state.status_message = Some(format!(
+                "podcasts: {} needs a Furumi update to play podcast episodes",
+                state.device_playback.active_label()
+            ));
+            false
+        }
+        _ => true,
     }
-    true
 }
 
 /// Enter on an episode: play it now, right after the current item, keeping

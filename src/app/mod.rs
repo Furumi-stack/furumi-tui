@@ -712,7 +712,8 @@ fn playback_state_from_ui(state: &AppState) -> crate::devices::PlaybackStateWire
     }
 }
 
-fn playback_track_to_ui(
+/// A received music item, resolved to the library copy when there is one.
+fn music_track_to_ui(
     wire: &crate::devices::PlaybackTrack,
     library: Option<&Library>,
 ) -> crate::library::models::TrackItem {
@@ -733,11 +734,11 @@ fn apply_playback_state_to_ui(
     wire: &crate::devices::PlaybackStateWire,
     library: Option<&Library>,
 ) {
-    let queue: Vec<_> = wire
-        .queue
-        .iter()
-        .map(|track| playback_track_to_ui(track, library))
-        .collect();
+    // Podcast episodes keep their explicit source; Jam private placeholders
+    // stay placeholders (numbered, so each has its own queue key).
+    let queue = crate::devices::track_items_from_wire(&wire.queue, |track| {
+        music_track_to_ui(track, library)
+    });
     let queue_pos = queue
         .iter()
         .take(wire.queue_pos)
@@ -775,22 +776,6 @@ fn apply_playback_state_to_ui(
         .queue_tab
         .cursor
         .min(state.player.queue.len().saturating_sub(1));
-}
-
-/// Shown when a queue with podcast episodes would be handed to a device.
-const PODCAST_HANDOFF_UNSUPPORTED: &str = "device handoff: the queue has podcast episodes, which \
-     other devices cannot receive with this build yet (needs sync protocol v4)";
-/// Shown when another device tries to change a queue that has episodes.
-const PODCAST_REMOTE_CONTROL_UNSUPPORTED: &str = "remote control ignored: the queue has podcast \
-     episodes, which other devices cannot see with this build yet";
-
-fn queue_has_podcast_episodes(state: &AppState) -> bool {
-    state.player.queue.iter().any(|track| track.is_podcast())
-        || state
-            .player
-            .current
-            .as_ref()
-            .is_some_and(|track| track.is_podcast())
 }
 
 fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
@@ -915,12 +900,7 @@ pub(crate) fn become_active_device(state: &mut AppState, runtime: &mut Runtime, 
     state.device_playback.last_remote_snapshot = None;
     state.device_playback.local_idle_since_ms = None;
     if was_control && start_audio && state.player.playing {
-        start_current_audio(
-            state,
-            runtime,
-            state.player.position_secs,
-            state.player.paused,
-        );
+        start_current_audio_from(state, runtime, remote_start(state), state.player.paused);
     }
     publish_playback_snapshot(state, runtime);
 }
@@ -951,7 +931,7 @@ pub(crate) fn transfer_active_to_this_device(state: &mut AppState, runtime: &mut
     }
     become_active_device(state, runtime, false);
     if should_start && state.player.current.is_some() {
-        start_current_audio(state, runtime, state.player.position_secs, false);
+        start_current_audio_from(state, runtime, remote_start(state), false);
         push_media_metadata(state, runtime);
         push_media_update(state, runtime, true);
     }
@@ -972,11 +952,13 @@ pub(crate) fn transfer_active_to_remote_device(
         transfer_active_to_this_device(state, runtime);
         return;
     }
-    if queue_has_podcast_episodes(state) {
-        // Protocol 3 cannot carry episodes (they travel as private
-        // placeholders), so the other device could neither play nor keep
-        // them: refuse before ownership changes.
-        state.status_message = Some(PODCAST_HANDOFF_UNSUPPORTED.into());
+    // A device below sync v4 could neither play nor keep podcast episodes:
+    // refuse before ownership changes (never strip them from the queue).
+    if let Err(error) = runtime
+        .devices
+        .ensure_playback_supported_by(&target_device_id, &playback_state_from_ui(state))
+    {
+        state.status_message = Some(format!("device handoff: {error}"));
         return;
     }
     if let Err(error) = runtime.devices.claim_playback(&target_device_id) {
@@ -2243,6 +2225,27 @@ fn start_current_audio(
     start_current_audio_from(state, runtime, StartAt::Position { ms }, paused);
 }
 
+/// Where the current item starts when another device decided it (a
+/// handoff, a command of a controlling device, taking playback over here).
+///
+/// A podcast episode at position 0 resumes from its saved position: a
+/// controlling device sends 0 for an ordinary Play, and the saved position
+/// is at least as fresh. Any other position is the live position of the
+/// handoff or seek.
+fn remote_start(state: &AppState) -> StartAt {
+    let ms = (state.player.position_secs.max(0.0) * 1_000.0).round() as i64;
+    let episode = state
+        .player
+        .queue
+        .get(state.player.queue_pos)
+        .is_some_and(crate::library::models::TrackItem::is_podcast);
+    if episode && ms == 0 {
+        StartAt::Resume
+    } else {
+        StartAt::Position { ms }
+    }
+}
+
 fn start_current_audio_from(
     state: &mut AppState,
     runtime: &mut Runtime,
@@ -3352,14 +3355,8 @@ fn handle_playback_command(
 ) {
     match command {
         crate::devices::PlaybackCommand::SetState { state: wire, seek } => {
-            if queue_has_podcast_episodes(state) {
-                // The sender saw our episodes as private placeholders;
-                // applying its queue would replace them. Keep ours.
-                tracing::info!("ignored a remote playback command: the queue has podcast episodes");
-                state.status_message = Some(PODCAST_REMOTE_CONTROL_UNSUPPORTED.into());
-                publish_playback_snapshot(state, runtime);
-                return;
-            }
+            // Commands from devices below sync v4 never reach this point
+            // while the queue has podcast items (`DeviceSync`).
             let old_current_key = state.player.current.as_ref().map(track_playback_key);
             let old_playing = state.player.playing;
             let old_paused = state.player.paused;
@@ -3377,12 +3374,7 @@ fn handle_playback_command(
             }
             let current_key = state.player.current.as_ref().map(track_playback_key);
             if !old_playing || old_current_key != current_key {
-                start_current_audio(
-                    state,
-                    runtime,
-                    state.player.position_secs,
-                    state.player.paused,
-                );
+                start_current_audio_from(state, runtime, remote_start(state), state.player.paused);
                 push_media_metadata(state, runtime);
             } else {
                 if seek {
@@ -3432,6 +3424,82 @@ fn handle_playback_command(
                 state.status_message = Some("active playback moved to another device".into());
             }
         }
+    }
+}
+
+/// Shown when a Jam guest's change would drop, add or reveal the host's
+/// private items.
+const JAM_PRIVATE_ITEMS_KEPT: &str =
+    "Jam: ignored a guest's change that would remove or add podcast episodes";
+
+/// A Jam guest's queue state mapped back onto this host's queue.
+///
+/// Guests see the host's podcast episodes as private placeholders
+/// (`redact_for_jam`). Their placeholders become the host's episodes again
+/// (`restore_jam_private_items`); a state that drops, duplicates or adds
+/// private items is refused (`None`). Guests cannot seek in a private item:
+/// while it stays current, the host's position is kept. The host keeps its
+/// own volume.
+fn jam_participant_state(
+    state: &AppState,
+    wire: crate::devices::PlaybackStateWire,
+    seek: bool,
+) -> Option<(crate::devices::PlaybackStateWire, bool)> {
+    let host = playback_state_from_ui(state);
+    if !music_dht::device_sync::jam_command_allowed(&crate::devices::PlaybackCommand::SetState {
+        state: wire.clone(),
+        seek,
+    }) {
+        return None;
+    }
+    let mut restored = music_dht::device_sync::restore_jam_private_items(&host, wire)?;
+    restored.volume = state.player.volume;
+    let private_current = restored
+        .queue
+        .get(restored.queue_pos)
+        .filter(|track| track.requires_podcast_support());
+    let same_current = private_current.is_some()
+        && restored.queue.get(restored.queue_pos) == host.queue.get(host.queue_pos);
+    if same_current {
+        restored.position_secs = host.position_secs;
+        return Some((restored, false));
+    }
+    Some((restored, seek))
+}
+
+/// Removes Jam private placeholders from the queue (a guest leaving).
+fn drop_private_items(state: &mut AppState) {
+    let player = &mut state.player;
+    let before = player
+        .queue
+        .iter()
+        .take(player.queue_pos)
+        .filter(|track| crate::devices::is_private_track_item(track))
+        .count();
+    let current_private = player
+        .queue
+        .get(player.queue_pos)
+        .is_some_and(crate::devices::is_private_track_item);
+    player
+        .queue
+        .retain(|track| !crate::devices::is_private_track_item(track));
+    player.queue_pos = player
+        .queue_pos
+        .saturating_sub(before)
+        .min(player.queue.len().saturating_sub(1));
+    player.play_next_end = None;
+    player.original_order = None;
+    player.prefetched_pos = None;
+    if current_private
+        || player
+            .current
+            .as_ref()
+            .is_some_and(crate::devices::is_private_track_item)
+    {
+        player.current = None;
+        player.playing = false;
+        player.paused = false;
+        player.position_secs = 0.0;
     }
 }
 
@@ -3636,6 +3704,11 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
                 }
                 crate::jam::JamRole::None => {
                     if state.device_playback.role == state::DevicePlaybackRole::Jam {
+                        if !state.device_playback.jam_host {
+                            // The host's private placeholders are not this
+                            // device's queue items.
+                            drop_private_items(state);
+                        }
                         state.device_playback.role = state::DevicePlaybackRole::Active;
                         state.device_playback.jam_host = false;
                     }
@@ -3655,12 +3728,16 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::JamCommand(command) => {
             let command = match command {
-                crate::devices::PlaybackCommand::SetState {
-                    state: mut wire,
-                    seek,
-                } => {
-                    wire.volume = state.player.volume;
-                    crate::devices::PlaybackCommand::SetState { state: wire, seek }
+                crate::devices::PlaybackCommand::SetState { state: wire, seek } => {
+                    match jam_participant_state(state, wire, seek) {
+                        Some((wire, seek)) => {
+                            crate::devices::PlaybackCommand::SetState { state: wire, seek }
+                        }
+                        None => {
+                            state.status_message = Some(JAM_PRIVATE_ITEMS_KEPT.into());
+                            return;
+                        }
+                    }
                 }
                 crate::devices::PlaybackCommand::ActiveChanged { .. } => {
                     state.status_message =
@@ -4675,5 +4752,162 @@ mod status_message_tests {
             Some("only")
         );
         assert_eq!(join_status_messages(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod playback_bridge_tests {
+    use super::*;
+    use crate::app::podcast_fixtures::episode_track;
+    use crate::devices::{PlaybackStateWire, PlaybackTrack, PlaybackTrackExt};
+    use crate::library::models::TrackItem;
+    use music_dht::device_sync::PlaybackSource;
+
+    fn music(id: i64) -> TrackItem {
+        TrackItem {
+            id,
+            title: format!("song {id}"),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 200.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id: 1,
+            release_title: "release".into(),
+            release_year: None,
+            cover_path: None,
+            file_path: format!("/music/{id}"),
+            content_id: Some(format!("b3:{id:064x}")),
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+            podcast: None,
+        }
+    }
+
+    fn mixed_state() -> AppState {
+        let mut state = AppState::default();
+        state.player.queue = vec![music(1), episode_track(1), music(2), episode_track(2)];
+        state.player.queue_pos = 1;
+        state.player.current = Some(episode_track(1));
+        state.player.playing = true;
+        state.player.paused = true;
+        state.player.position_secs = 754.5;
+        state
+    }
+
+    fn keys(queue: &[TrackItem]) -> Vec<String> {
+        queue.iter().map(state::track_key).collect()
+    }
+
+    #[test]
+    fn a_mixed_queue_crosses_the_wire_with_its_episodes_position_and_pause() {
+        let sender = mixed_state();
+        let wire = playback_state_from_ui(&sender);
+        assert_eq!(wire.playback_rate, None);
+        assert!(matches!(
+            wire.queue[1].source,
+            Some(PlaybackSource::PodcastEpisode(_))
+        ));
+        assert_eq!(wire.queue[0].source, None, "music stays untyped (v3 shape)");
+        let json = serde_json::to_string(&wire).unwrap();
+        let received: PlaybackStateWire = serde_json::from_str(&json).unwrap();
+
+        let mut receiver = AppState::default();
+        // Even a local-only source mode never drops episodes.
+        receiver.global.filters.source_mode = crate::config::settings::LibrarySourceMode::Local;
+        apply_playback_state_to_ui(&mut receiver, &received, None);
+        assert_eq!(keys(&receiver.player.queue), keys(&sender.player.queue));
+        assert_eq!(receiver.player.queue_pos, 1);
+        assert_eq!(
+            receiver.player.current.as_ref().map(state::track_key),
+            Some(state::track_key(&episode_track(1)))
+        );
+        assert!(receiver.player.paused);
+        assert_eq!(receiver.player.position_secs, 754.5);
+        assert_eq!(
+            receiver.player.queue[1].podcast_episode_ref(),
+            episode_track(1).podcast_episode_ref()
+        );
+        // Taken over there, the episode continues at the handed-off
+        // position; an episode handed over at 0 resumes its saved one.
+        assert_eq!(remote_start(&receiver), StartAt::Position { ms: 754_500 });
+        receiver.player.position_secs = 0.0;
+        assert_eq!(remote_start(&receiver), StartAt::Resume);
+        receiver.player.queue_pos = 0;
+        assert_eq!(remote_start(&receiver), StartAt::Position { ms: 0 });
+    }
+
+    #[test]
+    fn jam_guests_see_placeholders_and_their_commands_keep_the_hosts_episodes() {
+        let host = mixed_state();
+        let published = music_dht::device_sync::redact_for_jam(playback_state_from_ui(&host));
+        let json = serde_json::to_string(&published).unwrap();
+        for secret in ["Episode 1", "Episode 2", "example.test", "Show"] {
+            assert!(!json.contains(secret), "{secret} leaked to Jam: {json}");
+        }
+
+        // The guest shows (and sends back) numbered private items.
+        let mut guest = AppState::default();
+        apply_playback_state_to_ui(&mut guest, &published, None);
+        assert!(crate::devices::is_private_track_item(
+            &guest.player.queue[1]
+        ));
+        assert_ne!(
+            state::track_key(&guest.player.queue[1]),
+            state::track_key(&guest.player.queue[3])
+        );
+        // It moves a placeholder and skips to the last item.
+        guest.player.queue.swap(2, 3);
+        guest.player.queue_pos = 3;
+        let command = playback_state_from_ui(&guest);
+        assert!(command.queue[2].is_private_placeholder());
+        let (restored, _) = jam_participant_state(&host, command.clone(), true).unwrap();
+        assert_eq!(
+            restored.queue[2].podcast_episode_ref(),
+            episode_track(2).podcast_episode_ref()
+        );
+        assert_eq!(
+            restored.queue[3].content_id.as_deref(),
+            music(2).content_id.as_deref()
+        );
+
+        // Dropping, adding or duplicating private items is refused.
+        let mut dropped = command.clone();
+        dropped.queue.remove(1);
+        assert!(jam_participant_state(&host, dropped, false).is_none());
+        let mut injected = command.clone();
+        injected
+            .queue
+            .push(PlaybackTrack::from_track(&episode_track(9)));
+        assert!(jam_participant_state(&host, injected, false).is_none());
+        let mut duplicated = command;
+        duplicated.queue.push(PlaybackTrack::private_placeholder());
+        assert!(jam_participant_state(&host, duplicated, false).is_none());
+
+        // Guests cannot seek in the host's private episode.
+        let mut seek = published.clone();
+        seek.position_secs = 3.0;
+        let (restored, seek) = jam_participant_state(&host, seek, true).unwrap();
+        assert!(!seek);
+        assert_eq!(restored.position_secs, host.player.position_secs);
+    }
+
+    #[test]
+    fn a_guest_leaving_a_jam_drops_the_hosts_placeholders() {
+        let mut guest = AppState::default();
+        let published =
+            music_dht::device_sync::redact_for_jam(playback_state_from_ui(&mixed_state()));
+        apply_playback_state_to_ui(&mut guest, &published, None);
+        guest.player.queue_pos = 2;
+        guest.player.current = guest.player.queue.get(2).cloned();
+        drop_private_items(&mut guest);
+        assert_eq!(keys(&guest.player.queue), keys(&[music(1), music(2)]));
+        assert_eq!(guest.player.queue_pos, 1);
+        assert!(guest.player.current.is_some());
     }
 }
