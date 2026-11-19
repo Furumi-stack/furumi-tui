@@ -543,9 +543,20 @@ fn a_v3_peer_gets_no_podcast_state_and_catches_up_from_the_snapshot_after_upgrad
         panic!("expected a hello");
     };
     assert!(!json.contains("podcast"), "{json}");
+    assert!(!json.contains(&episode.audio_url), "{json}");
     assert_eq!(ops.len(), 1, "only the like: {ops:?}");
     assert_eq!(snapshot.likes.len(), 1);
-    assert!(playback.is_none());
+    // The playback snapshot comes for its coordination, with the episode
+    // redacted to an opaque placeholder.
+    let playback = playback.expect("coordination for the old engine");
+    assert!(playback.coordination.is_some());
+    assert_eq!(playback.state.queue.len(), 1);
+    assert_eq!(
+        playback.state.queue[0].title,
+        music_dht::device_sync::PRIVATE_ITEM_TITLE
+    );
+    assert_eq!(playback.state.queue[0].id, 0);
+    assert_eq!(playback.state.position_secs, 300.0);
     // The old peer acknowledges everything it was sent.
     a.sync.note_peer_vector(&old.id, &vector).unwrap();
 
@@ -699,9 +710,8 @@ fn a_handoff_between_v4_devices_carries_the_episode_and_its_position() {
     assert!(!items[1].is_podcast());
 }
 
-#[test]
-fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
-    let mut a = device();
+/// Trusts `dev_old`, a furumi-tui 0.3.x device ("Old laptop", sync v3).
+fn trust_old_device(a: &Device) {
     a.sync.apply_device_trusted("dev_old", 1).unwrap();
     a.sync
         .apply_device_profile(
@@ -720,6 +730,12 @@ fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
             VersionReport::SelfReported(Some(3)),
         )
         .unwrap();
+}
+
+#[test]
+fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
+    let mut a = device();
+    trust_old_device(&a);
     let with_episode = state_with(
         vec![music_wire(), PlaybackTrack::podcast_episode(episode_ref(7))],
         12.0,
@@ -785,6 +801,94 @@ fn a_podcast_queue_is_not_handed_to_or_replaced_by_a_v3_device() {
         std::iter::from_fn(|| a.events.try_recv().ok())
             .any(|event| matches!(event, AppEvent::PlaybackCommand { .. }))
     );
+}
+
+/// A 0.3.x device runs the shared engine with the default configuration:
+/// automatic failover once the owner has not been heard from for
+/// `owner_timeout_ms`. While this device owns a queue with an episode, the
+/// old device must keep hearing from it (redacted queue, real coordination)
+/// so that it never takes over by itself and replaces the queue.
+#[test]
+fn an_old_device_keeps_hearing_from_a_podcast_queue_owner_and_never_fails_over() {
+    use super::wire_compat_tests::legacy;
+
+    let a = device();
+    trust_old_device(&a);
+    a.sync.claim_playback(&a.id).unwrap();
+    let episode = episode_ref(8);
+    let mut state = state_with(
+        vec![
+            music_wire(),
+            PlaybackTrack::podcast_episode(episode.clone()),
+        ],
+        12.0,
+    );
+    state.queue_pos = 1;
+    state.paused = false;
+
+    let config = PlaybackConfig::default();
+    assert!(config.automatic_failover);
+    let start_engine = || {
+        let mut engine = Engine::new("dev_old".into(), config.clone(), Default::default(), 0);
+        engine.set_output(true, false);
+        engine
+    };
+    // Without announcements the old engine takes over after the timeout:
+    // this is what a missing playback snapshot used to cause.
+    let mut starved = start_engine();
+    let mut now = 0;
+    let first = serde_json::from_str::<legacy::WireMessage>(&{
+        a.sync.playback_tick(true, true).unwrap();
+        publish(&a, state.clone());
+        hello_json(&a, "dev_old")
+    })
+    .unwrap();
+    let legacy::WireMessage::Hello {
+        playback: Some(first),
+        ..
+    } = first
+    else {
+        panic!("the old device gets a playback snapshot");
+    };
+    starved.observe(&a.id, first.coordination.as_ref().unwrap(), now);
+    while now <= config.owner_timeout_ms + 2 * config.discovery_ms {
+        now += 1_000;
+        starved.heartbeat(now);
+        starved.tick(now);
+    }
+    assert_eq!(starved.owner(), Some("dev_old"));
+
+    // With the redacted snapshots of every sync round it never does.
+    let mut old = start_engine();
+    let mut now = 0;
+    while now <= 3 * config.owner_timeout_ms {
+        a.sync.playback_tick(true, true).unwrap();
+        publish(&a, state.clone());
+        let json = hello_json(&a, "dev_old");
+        assert!(!json.contains(&episode.audio_url), "{json}");
+        assert!(!json.contains(&episode.episode_title), "{json}");
+        let legacy::WireMessage::Hello {
+            playback: Some(snapshot),
+            ..
+        } = serde_json::from_str(&json).unwrap()
+        else {
+            panic!("the old device gets a playback snapshot");
+        };
+        assert_eq!(snapshot.state.queue.len(), 2, "no item is stripped");
+        assert_eq!(snapshot.state.queue[0].title, "Song");
+        assert_eq!(
+            snapshot.state.queue[1].title,
+            music_dht::device_sync::PRIVATE_ITEM_TITLE
+        );
+        old.observe(&a.id, snapshot.coordination.as_ref().unwrap(), now);
+        old.heartbeat(now);
+        old.tick(now);
+        assert_eq!(old.owner(), Some(a.id.as_str()), "at {now} ms");
+        now += 2_000;
+    }
+    // The queue this device keeps is unchanged.
+    let local = lock(&a.sync.playback).local.clone().unwrap();
+    assert!(local.state.queue[1].podcast_episode_ref().is_some());
 }
 
 /// Feed and audio URLs may carry private tokens; the debug log (shown in

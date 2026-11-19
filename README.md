@@ -251,7 +251,12 @@ Podcasts and your connected devices:
   playing, even if that device is not subscribed. Devices that run an older
   Furumi (device sync before v4) cannot keep episodes: handing such a queue
   to them is refused with "needs a Furumi update", their remote control is
-  ignored while the queue has episodes, and they get no podcast data.
+  ignored while the queue has episodes, and they get no podcast data: they
+  see such a queue with "Private item" in place of each episode, so they
+  keep seeing this device as the playing one. An older device still takes
+  over when you choose it as the output (Play on it) or when it starts while
+  this device is paused (`take_paused_on_startup`); this device then shows
+  that device's queue, without the episodes (their saved positions stay).
 - **Audio from the publisher.** Every device streams the episode from the
   publisher's server itself. Furumi peers never pass podcast audio to each
   other, and nothing is kept after playback.

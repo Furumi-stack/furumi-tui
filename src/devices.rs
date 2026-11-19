@@ -11,7 +11,8 @@
 //! and are relayed; podcast snapshot sections are exported from and merged
 //! into that store. Everything sent to a peer is gated by the version that
 //! peer reported itself (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
-//! `playback_allowed_for_peer`).
+//! `playback_allowed_for_peer`; a queue with podcast items reaches an older
+//! peer only redacted, for its ownership engine).
 
 use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
@@ -147,7 +148,9 @@ struct PodcastLink {
 ///
 /// A podcast episode travels with its explicit source
 /// (`PlaybackSource::PodcastEpisode`), never as a music item. Peers below
-/// protocol v4 do not get such a queue at all (`playback_allowed_for_peer`).
+/// protocol v4 never get the episodes (`playback_allowed_for_peer`): they
+/// see the queue redacted to "Private item" placeholders, only so that their
+/// ownership engine keeps hearing from the owner.
 pub trait PlaybackTrackExt {
     /// Wire form of a queue item. Device-local paths are never sent.
     fn from_track(track: &TrackItem) -> Self;
@@ -2985,10 +2988,6 @@ impl DeviceSync {
         }
     }
 
-    /// The playback snapshot for a peer, or `None` when the queue has
-    /// podcast items and the peer is below v4 (`playback_allowed_for_peer`).
-    /// Episodes are never stripped to make the state fit: an old client
-    /// would forward the shortened queue and lose them for every device.
     /// Refuses to hand a queue with podcast items to a device below v4
     /// ("that device needs an update"), before ownership changes.
     pub fn ensure_playback_supported_by(
@@ -3022,10 +3021,27 @@ impl DeviceSync {
             .unwrap_or_else(|| short_id(device_id))
     }
 
+    /// The playback snapshot for a peer.
+    ///
+    /// A peer below v4 cannot carry a queue with podcast items
+    /// (`playback_allowed_for_peer`), but it still needs the coordination
+    /// envelope: an engine renews the owner's liveness only from the
+    /// owner's own announcements, so an old device that hears nothing takes
+    /// playback over by automatic failover after `owner_timeout_ms` (two
+    /// minutes by default) and this device would then adopt its queue,
+    /// losing the episodes. Such a peer therefore gets the announcement with
+    /// the queue redacted like for Jam (`redact_for_jam`: every episode
+    /// becomes an opaque "Private item", order and transport kept). The
+    /// episodes are never stripped, and the commands the peer derives from
+    /// that state are refused (`playback_command_allowed_from_peer`).
+    /// FRID's PLAYBACK_PROTOCOL.md rule 1 still says "send `None`"; this is
+    /// reported as a contract gap.
     fn local_playback_snapshot_for(&self, peer_version: u16) -> Option<PlaybackSnapshot> {
-        lock(&self.playback).local.clone().filter(|snapshot| {
-            music_dht::device_sync::playback_allowed_for_peer(&snapshot.state, peer_version)
-        })
+        let mut snapshot = lock(&self.playback).local.clone()?;
+        if !music_dht::device_sync::playback_allowed_for_peer(&snapshot.state, peer_version) {
+            snapshot.state = music_dht::device_sync::redact_for_jam(snapshot.state);
+        }
+        Some(snapshot)
     }
 
     fn apply_playback_snapshot(&self, sender: &str, snapshot: PlaybackSnapshot) -> Result<()> {

@@ -242,7 +242,14 @@ travels as `PlaybackSource::PodcastEpisode` with the reference needed to play
 it (the receiving device streams it from the publisher at the handed-off
 position, with or without a subscription). A queue with episodes is not handed
 to a device below protocol v4, and playback commands from such a device are
-ignored while the local queue has episodes.
+ignored while the local queue has episodes. Such a device still gets the
+playback snapshot with its coordination envelope, but with every episode
+replaced by an opaque "Private item" (`redact_for_jam`): an engine renews the
+owner's liveness only from the owner's own announcements, so an old device
+that heard nothing would take over by automatic failover after
+`owner_timeout_ms` and replace the queue. This departs from FRID's
+`PLAYBACK_PROTOCOL.md` rule 1 ("otherwise send `None`") and is reported to
+FRID as a contract gap.
 
 Active-device leases and idle timing prevent stale snapshots from immediately
 taking control after a device reconnects. This provides practical coordination

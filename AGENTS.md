@@ -173,7 +173,9 @@ When changing it:
   go only to v4 peers (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
   `playback_allowed_for_peer`), a podcast queue is never handed to an older
   device and its playback commands are ignored while the queue has episodes;
-  never strip episodes from a queue to make it fit an old peer;
+  never strip episodes from a queue to make it fit an old peer; an older
+  peer still gets the playback coordination, with the queue redacted
+  (`redact_for_jam`), so its engine does not fail over;
 - apply podcast operations and snapshot sections only through
   `PodcastStore` (`apply_remote_op`, `apply_snapshot`); never call the
   podcast store while holding the sync-log connection;
