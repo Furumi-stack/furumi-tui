@@ -213,6 +213,16 @@ mod tests {
         let screen = render(&state, 110, 30);
         assert!(screen.contains("held back"), "{screen}");
 
+        // Restarted with other devices in the group: not published before
+        // a sync with one of them.
+        state.podcasts.publication.podcasts.insert(
+            podcast_fixtures::podcast_id(),
+            Publication::WaitingForDevices,
+        );
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("waiting for a sync"), "{screen}");
+        assert!(!screen.contains("published from"), "{screen}");
+
         state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
         let screen = render(&state, 110, 30);
         assert!(screen.contains("not published:"), "{screen}");

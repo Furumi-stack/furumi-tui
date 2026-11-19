@@ -111,7 +111,10 @@ pub(super) fn receive(to: &DeviceSync, json: &str) {
         to.apply_playback_snapshot(&profile.device_id, playback)
             .unwrap();
     }
+    let store_attached = to.podcast_store().is_some();
     to.apply_received(snapshot, ops).unwrap();
+    to.podcast_exchange_applied(&profile.device_id, store_attached)
+        .unwrap();
     to.note_peer_vector(&profile.device_id, &vector).unwrap();
 }
 
@@ -439,6 +442,83 @@ fn operations_received_before_the_store_opens_are_applied_when_it_does() {
         })
         .unwrap();
     assert_eq!(pending, 0);
+}
+
+/// Trusts `b` on `a` and the other way round like [`pair`], with an
+/// address for each, so either can sync with the other.
+fn pair_reachable(a: &Device, b: &Device) {
+    b.sync
+        .set_group_id(&a.sync.ensure_identity().unwrap().group_id)
+        .unwrap();
+    for (left, right) in [(a, b), (b, a)] {
+        let mut profile = right.sync.own_profile("").unwrap();
+        profile.endpoint_ticket = format!("ticket-of-{}", right.id);
+        left.sync
+            .apply_device_profile(
+                &profile,
+                true,
+                VersionReport::SelfReported(Some(profile.protocol_version)),
+            )
+            .unwrap();
+    }
+}
+
+fn current(registers: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *registers.borrow()
+}
+
+/// Interop scenario 7c (a device restarted with a "share" decision another
+/// device revoked meanwhile): the publication reconciler waits for
+/// `podcast_registers_current`, which needs a sync with a device of the
+/// group that syncs podcasts, unless there is none to wait for.
+#[test]
+fn podcast_registers_are_current_after_a_sync_with_the_group() {
+    // A device alone: current as soon as its store is attached.
+    let alone = device_with_store(Arc::new(PodcastStore::open_in_memory().unwrap()), false);
+    let registers = alone.sync.podcast_registers_current();
+    assert!(!current(&registers), "not before the store is attached");
+    alone
+        .sync
+        .attach_podcast_store(Arc::clone(&alone.store))
+        .unwrap();
+    assert!(current(&registers));
+
+    // Only an older device (v3) in the group: it never brings podcast
+    // decisions, so it is not waited for.
+    let with_old = device_with_store(Arc::new(PodcastStore::open_in_memory().unwrap()), false);
+    trust_old_device(&with_old);
+    with_old
+        .sync
+        .attach_podcast_store(Arc::clone(&with_old.store))
+        .unwrap();
+    assert!(current(&with_old.sync.podcast_registers_current()));
+
+    // B restarts in a group with A: it waits for a sync with A.
+    let a = device();
+    let b = device_with_store(Arc::new(PodcastStore::open_in_memory().unwrap()), false);
+    pair_reachable(&a, &b);
+    let registers = b.sync.podcast_registers_current();
+    // A sync that reaches B before its store is attached leaves the
+    // podcast snapshot sections out: it does not count.
+    deliver(&a, &b);
+    b.sync.attach_podcast_store(Arc::clone(&b.store)).unwrap();
+    assert!(!current(&registers), "A can be reached: B waits for it");
+    b.sync.check_podcast_registers_without_peers().unwrap();
+    assert!(!current(&registers));
+    // A's sync with B (`handle_hello`; B's own `sync_device` does the same
+    // with A's response) now merges A's decisions into the store.
+    deliver(&a, &b);
+    assert!(current(&registers));
+
+    // A device of the group removed meanwhile is no longer waited for.
+    let d = device_with_store(Arc::new(PodcastStore::open_in_memory().unwrap()), false);
+    pair_reachable(&a, &d);
+    d.sync.attach_podcast_store(Arc::clone(&d.store)).unwrap();
+    let registers = d.sync.podcast_registers_current();
+    assert!(!current(&registers));
+    d.sync.revoke_device(&a.id).unwrap();
+    d.sync.check_podcast_registers_without_peers().unwrap();
+    assert!(current(&registers));
 }
 
 #[test]

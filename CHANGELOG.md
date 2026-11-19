@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artwork and web links with an access key in the query or a member-feed
   host (random-looking path parts of public CDNs are fine), and both for a
   feed whose URL looks private.
+- A device with other devices in its group publishes its cards only after
+  it synced with one of them since it started (or once none is left that
+  syncs podcasts), so a device that was closed while sharing was turned off
+  elsewhere does not send that card again; until then it only revokes, and
+  the side panel says it waits for a sync.
 - Search (`/`, with the federation running) also finds public podcast cards.
   They are listed after the music results under "Podcasts · public cards" with
   a `[podcast]` marker, the number of publishing devices, and "✓ subscribed"

@@ -132,7 +132,9 @@ fn spawn_scheduler(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
 }
 
 /// Starts the publication reconciler. Without a store every own public
-/// card is revoked (see `publication::reconcile`).
+/// card is revoked (see `publication::reconcile`). Nothing is published
+/// before device sync says the share registers are current
+/// (`DeviceSync::podcast_registers_current`).
 fn spawn_publication(
     runtime: &Runtime,
     store: Option<Arc<PodcastStore>>,
@@ -141,6 +143,7 @@ fn spawn_publication(
     let tx = runtime.event_tx.clone();
     publication::spawn(
         runtime.federation.podcast_dht(),
+        runtime.devices.podcast_registers_current(),
         store,
         confirmations,
         move |report| {

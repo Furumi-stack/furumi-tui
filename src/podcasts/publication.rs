@@ -22,7 +22,10 @@
 //!   share-off and unsubscribe actions (quitting waits for those,
 //!   [`Reconciler::flush`]), after other local share actions, received
 //!   podcast operations and feed refreshes (card metadata), when the overlay
-//!   (re)starts, and periodically.
+//!   (re)starts, and periodically. Until the device synced with another
+//!   device of its group after starting, a pass only revokes
+//!   ([`revoke_unshared`]): its registers may still hold a "share" decision
+//!   revoked there meanwhile, and `sync_shares` would send that card again.
 //! * [`ShareConfirmations`] remembers, on this device only, that the user
 //!   confirmed publishing feed URLs that look private
 //!   (`PodcastCardSpec::privacy_warnings`). FRID leaves this confirmation to
@@ -51,7 +54,7 @@ use furumi_library::podcasts::{PodcastListFilter, PodcastStore, PodcastSummary};
 use music_dht::podcast::{FeedUrl, PodcastId, ShareRecord, SubscriptionRecord, effective_share};
 use music_dht::podcast_dht::{
     FeedUrlPrivacyWarning, PodcastCardSpec, PodcastDht, PodcastDhtSyncStats, PodcastPrivacyHold,
-    PodcastShareState, feed_url_privacy_warning,
+    PodcastShareState, PodcastSyncFailure, feed_url_privacy_warning,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
@@ -641,6 +644,10 @@ pub enum Publication {
     /// Shared, but not yet published here (for example the overlay has not
     /// accepted it yet).
     Pending,
+    /// Shared as far as this device knows, but not published from it until
+    /// it synced with another device of its group: the decision may have
+    /// been revoked there meanwhile (see [`spawn`]).
+    WaitingForDevices,
     /// Shared, but held back on this device until its user confirms the
     /// feed URLs that look private.
     HeldBack(Vec<FeedUrlPrivacyWarning>),
@@ -705,33 +712,8 @@ pub async fn reconcile(
         },
         ..PublicationReport::default()
     };
-    // Why every own card is revoked, when the registers are unknown.
-    let mut revoke_all: Option<String> = None;
-    let SharePlan { states, held } = match store {
-        Some(store) => {
-            match tokio::task::spawn_blocking(move || share_plan(&store, &confirmations)).await {
-                Ok(Ok(plan)) => plan,
-                Ok(Err(err)) => {
-                    revoke_all = Some(format!("cannot read share decisions ({err:#})"));
-                    SharePlan::default()
-                }
-                Err(err) => {
-                    revoke_all = Some(format!("cannot read share decisions ({err})"));
-                    SharePlan::default()
-                }
-            }
-        }
-        None => {
-            revoke_all = Some("the podcast database is unavailable".into());
-            SharePlan::default()
-        }
-    };
-    let shared: Vec<PodcastId> = states
-        .iter()
-        .filter(|state| state.is_shared())
-        .map(|state| state.subscription.podcast_id.clone())
-        .chain(held.keys().cloned())
-        .collect();
+    let (SharePlan { states, held }, revoke_all) = read_plan(store, confirmations).await;
+    let shared = shared_ids(&states, &held);
     let stats = match dht.sync_shares(states).await {
         Ok(mut stats) => {
             stats
@@ -767,6 +749,145 @@ pub async fn reconcile(
             "podcast publications reconciled"
         );
     }
+    finish_pass(dht, &mut report, revoke_all, shared, stats).await;
+    report
+}
+
+/// A pass before this device's share registers are current
+/// ([`crate::devices::DeviceSync::podcast_registers_current`]): it has
+/// other devices in its group and has not synced with one since it started,
+/// so a "share" decision it holds may have been revoked there meanwhile.
+///
+/// Such a pass only revokes. Every own card of a podcast that the local
+/// registers no longer share (or every own card, when the registers cannot
+/// be read) is unpublished on its own (`PodcastDht::unpublish`); nothing is
+/// published and `PodcastDht::sync_shares` is not called, so FRID keeps the
+/// cards an earlier session published out of its republishing and its
+/// answers until the first full [`reconcile`]. Shared podcasts are reported
+/// as [`Publication::WaitingForDevices`] (or held back, or failed).
+pub async fn revoke_unshared(
+    dht: &PodcastDht,
+    store: Option<Arc<PodcastStore>>,
+    confirmations: Arc<ShareConfirmations>,
+) -> PublicationReport {
+    let mut report = PublicationReport {
+        discovery: Discovery::Running {
+            peers: dht.known_peers(),
+        },
+        ..PublicationReport::default()
+    };
+    let (SharePlan { states, held }, revoke_all) = read_plan(store, confirmations).await;
+    let shared = shared_ids(&states, &held);
+    let desired: BTreeSet<&PodcastId> = states
+        .iter()
+        .filter(|state| state.is_shared())
+        .map(|state| &state.subscription.podcast_id)
+        .collect();
+    let own = match dht.published().await {
+        Ok(own) => own,
+        Err(err) => {
+            tracing::warn!("podcast publication failed: {err}");
+            report.error = Some(format!("cannot read own publications: {err}"));
+            for podcast_id in shared {
+                report
+                    .podcasts
+                    .insert(podcast_id, Publication::Failed(err.to_string()));
+            }
+            return report;
+        }
+    };
+    let mut stats = PodcastDhtSyncStats::default();
+    for publication in own {
+        if !publication.active || desired.contains(&publication.podcast_id) {
+            continue;
+        }
+        match dht.unpublish(&publication.podcast_id).await {
+            Ok(push) => {
+                stats.unpublished += 1;
+                stats.push.records += push.records;
+                stats.push.remote_nodes = stats.push.remote_nodes.max(push.remote_nodes);
+            }
+            Err(err) => stats.failed.push(PodcastSyncFailure {
+                podcast_id: publication.podcast_id,
+                error: err.to_string(),
+            }),
+        }
+    }
+    stats.held_back.extend(
+        held.into_iter()
+            .map(|(podcast_id, warnings)| PodcastPrivacyHold {
+                podcast_id,
+                warnings,
+            }),
+    );
+    if stats.unpublished + stats.failed.len() > 0 {
+        tracing::info!(
+            unpublished = stats.unpublished,
+            failed = stats.failed.len(),
+            remote_nodes = stats.push.remote_nodes,
+            "podcast publications revoked before the first device sync"
+        );
+    }
+    finish_pass(dht, &mut report, revoke_all, shared, stats).await;
+    // Nothing is sent for a shared podcast yet (a card of an earlier
+    // session stays withheld by FRID).
+    for publication in report.podcasts.values_mut() {
+        if matches!(publication, Publication::Published | Publication::Pending) {
+            *publication = Publication::WaitingForDevices;
+        }
+    }
+    report
+}
+
+/// The share plan of `store`, and why every own card is revoked when the
+/// registers are unknown (no store, or they cannot be read).
+async fn read_plan(
+    store: Option<Arc<PodcastStore>>,
+    confirmations: Arc<ShareConfirmations>,
+) -> (SharePlan, Option<String>) {
+    let Some(store) = store else {
+        return (
+            SharePlan::default(),
+            Some("the podcast database is unavailable".into()),
+        );
+    };
+    match tokio::task::spawn_blocking(move || share_plan(&store, &confirmations)).await {
+        Ok(Ok(plan)) => (plan, None),
+        Ok(Err(err)) => (
+            SharePlan::default(),
+            Some(format!("cannot read share decisions ({err:#})")),
+        ),
+        Err(err) => (
+            SharePlan::default(),
+            Some(format!("cannot read share decisions ({err})")),
+        ),
+    }
+}
+
+/// The shared podcasts of a plan: those it publishes and those it holds
+/// back.
+fn shared_ids(
+    states: &[PodcastShareState],
+    held: &BTreeMap<PodcastId, Vec<FeedUrlPrivacyWarning>>,
+) -> Vec<PodcastId> {
+    states
+        .iter()
+        .filter(|state| state.is_shared())
+        .map(|state| state.subscription.podcast_id.clone())
+        .chain(held.keys().cloned())
+        .collect()
+}
+
+/// Logs the failures of a pass, reports a revocation of every own card
+/// (`revoke_all`: why), and folds the result and this device's active
+/// publications into `report` ([`summarize`]).
+async fn finish_pass(
+    dht: &PodcastDht,
+    report: &mut PublicationReport,
+    revoke_all: Option<String>,
+    shared: Vec<PodcastId>,
+    stats: PodcastDhtSyncStats,
+) {
     for failure in &stats.failed {
         // Failures may concern revoked (now private) podcasts: no ids.
         tracing::warn!(error = %failure.error, "podcast publication step failed");
@@ -794,8 +915,7 @@ pub async fn reconcile(
             BTreeSet::new()
         }
     };
-    summarize(&mut report, shared, stats, &active);
-    report
+    summarize(report, shared, stats, &active);
 }
 
 /// Folds one `sync_shares` result and the set of this device's active
@@ -1005,8 +1125,15 @@ async fn still_private(
 /// here meanwhile (`Reconciler::revoke_now`): they are revoked once the
 /// overlay runs again. Between passes the overlay's peer count is
 /// refreshed every [`PEER_REFRESH_INTERVAL`].
+///
+/// `registers` says whether the share registers are current
+/// ([`crate::devices::DeviceSync::podcast_registers_current`]). Until it
+/// turns `true` a pass only revokes ([`revoke_unshared`]): a device that
+/// comes back with a "share" decision another device revoked meanwhile does
+/// not publish it again. A pass runs as soon as it turns `true`.
 pub fn spawn(
     mut dht: watch::Receiver<Option<Arc<PodcastDht>>>,
+    mut registers: watch::Receiver<bool>,
     store: Option<Arc<PodcastStore>>,
     confirmations: Arc<ShareConfirmations>,
     report: impl Fn(PublicationReport) + Send + 'static,
@@ -1026,6 +1153,8 @@ pub fn spawn(
     };
     tokio::spawn(async move {
         let mut last = PublicationReport::default();
+        // The registers watch stays as it is once its sender is gone.
+        let mut registers_open = true;
         let mut peers = tokio::time::interval(PEER_REFRESH_INTERVAL);
         peers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         peers.reset();
@@ -1036,10 +1165,14 @@ pub fn spawn(
             let revoked_here =
                 std::mem::take(&mut *revoked.lock().unwrap_or_else(PoisonError::into_inner));
             let current = dht.borrow_and_update().clone();
+            let registers_current = *registers.borrow_and_update();
             last = match current {
                 // The pass sees this device's own publications: it revokes
                 // and reports exactly what is still live.
-                Some(dht) => reconcile(&dht, store.clone(), Arc::clone(&confirmations)).await,
+                Some(dht) if registers_current => {
+                    reconcile(&dht, store.clone(), Arc::clone(&confirmations)).await
+                }
+                Some(dht) => revoke_unshared(&dht, store.clone(), Arc::clone(&confirmations)).await,
                 None => {
                     let mut unrevoked = std::mem::take(&mut last.unrevoked);
                     unrevoked.extend(revoked_here);
@@ -1072,6 +1205,13 @@ pub fn spawn(
                     changed = dht.changed() => {
                         if changed.is_err() {
                             return;
+                        }
+                        break;
+                    }
+                    changed = registers.changed(), if registers_open => {
+                        if changed.is_err() {
+                            registers_open = false;
+                            continue;
                         }
                         break;
                     }

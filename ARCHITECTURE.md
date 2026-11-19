@@ -415,7 +415,13 @@ The TUI owns what the contract leaves to clients:
   shared and tombstones every other own card. The share decision is the
   synced `podcast_share_set` register, so share-off or unsubscribe on any
   trusted device revokes every device's card and a stale device cannot
-  republish. Publication runs from each device's own identity. Privacy
+  republish: until `DeviceSync::podcast_registers_current` turns true (a
+  sync exchange applied with a v4 device of the group after the podcast
+  store was attached, or no reachable v4 device in the group) a pass only
+  unpublishes the own cards its registers no longer share
+  (`publication::revoke_unshared`) and never calls `sync_shares`, whose
+  first call would re-send the cards FRID withholds from an earlier
+  session. Publication runs from each device's own identity. Privacy
   confirmations of feed URLs that look private are device-local
   (`podcast-share-confirmations.json`, mode 0600) and bound to the exact
   URLs and to the share decision (the share register's operation): a newer

@@ -22,6 +22,7 @@ use super::publication::{
 const SHOW_URL: &str = "https://feeds.example.test/rust-radio.xml";
 const SECRET_URL: &str = "https://feeds.example.test/members.xml?token=0123456789abcdef";
 const PRIVATE_URL: &str = "https://feeds.example.test/diary.xml";
+const NEWS_URL: &str = "https://feeds.example.test/crab-news.xml";
 
 /// Stamps of one device's local actions; keeps the operations they emit.
 pub(super) struct Device {
@@ -929,9 +930,11 @@ async fn reconciler_lifecycle() {
     device.set_shared(&store, &show, true);
 
     let (overlay, watched) = tokio::sync::watch::channel(None);
+    let (_registers, current) = tokio::sync::watch::channel(true);
     let (tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
     let reconciler = spawn(
         watched,
+        current,
         Some(Arc::clone(&store)),
         confirmations,
         move |report| {
@@ -1060,5 +1063,151 @@ async fn reconciler_lifecycle() {
     assert!(reports.recv().await.is_none(), "the reconciler stopped");
 
     a.stop().await;
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_device_publishes_only_after_syncing_with_its_group() {
+    tokio::time::timeout(Duration::from_secs(240), restart_before_device_sync())
+        .await
+        .unwrap();
+}
+
+/// Interop scenario 7c: device B was closed while another device of its
+/// group turned sharing of a podcast off. Restarted with that stale "share"
+/// decision, B does not send the card again while it waits for device sync
+/// (`DeviceSync::podcast_registers_current`), still revokes what its own
+/// registers no longer share, and publishes once its registers are current.
+async fn restart_before_device_sync() {
+    use super::publication::spawn;
+
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("furumi-tui-podcast-restart-test");
+    let store = Arc::new(PodcastStore::open_in_memory().unwrap());
+    let confirmations = Arc::new(ShareConfirmations::in_memory());
+    let mut device = Device::new("device-b");
+    let show = device.subscribe(&store, SHOW_URL, "Rust Radio Weekly");
+    let news = device.subscribe(&store, NEWS_URL, "Crab News");
+    let diary = device.subscribe(&store, PRIVATE_URL, "Ferris Diary");
+    for id in [&show, &news, &diary] {
+        device.set_shared(&store, id, true);
+    }
+
+    // The earlier session, alone: the three cards are published (and kept
+    // only in B's own cache).
+    let b = Node::start(&temp.path().join("b"), network).await;
+    let report = reconcile(&b.dht, Some(Arc::clone(&store)), Arc::clone(&confirmations)).await;
+    for id in [&show, &news, &diary] {
+        assert_eq!(publication(&report, id), Some(Publication::Published));
+    }
+    b.stop().await;
+
+    // While B is closed, device A turns sharing of `news` off.
+    let other = PodcastStore::open_in_memory().unwrap();
+    for op in &device.ops {
+        other.apply_remote_op(op).unwrap();
+    }
+    let share_off = Device::new("device-a").set_shared(&other, &news, false);
+
+    // B starts again from the same directory, next to a stranger C.
+    let b = Node::start(&temp.path().join("b"), network).await;
+    let c = Node::start(&temp.path().join("c"), network).await;
+    c.service
+        .connect(b.service.ticket().await.unwrap())
+        .await
+        .unwrap();
+    wait_for("overlay contacts", async || {
+        b.dht.bootstrap().await.ok()?;
+        c.dht.bootstrap().await.ok()?;
+        (b.dht.known_peers() >= 1 && c.dht.known_peers() >= 1).then_some(())
+    })
+    .await;
+
+    let (_overlay, watched) = tokio::sync::watch::channel(Some(Arc::clone(&b.dht)));
+    let (registers, current) = tokio::sync::watch::channel(false);
+    let (tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let reconciler = spawn(
+        watched,
+        current,
+        Some(Arc::clone(&store)),
+        Arc::clone(&confirmations),
+        move |report| {
+            let _ = tx.send(report);
+        },
+    );
+    let mut next = async |what: &str, check: &dyn Fn(&PublicationReport) -> bool| loop {
+        let report = tokio::time::timeout(Duration::from_secs(30), reports.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .expect("a report");
+        if check(&report) {
+            return report;
+        }
+    };
+
+    // Before device sync: nothing is published or sent, not even by the
+    // overlay's own republishing.
+    let report = next("the first pass", &|report| {
+        matches!(report.discovery, Discovery::Running { .. })
+    })
+    .await;
+    for id in [&show, &news, &diary] {
+        assert!(!found(&c, id).await, "a card was sent before device sync");
+    }
+    assert_eq!(b.dht.republish().await.unwrap().records, 0);
+    for id in [&show, &news, &diary] {
+        assert!(
+            !found(&c, id).await,
+            "a card was republished before device sync"
+        );
+        assert_eq!(
+            publication(&report, id),
+            Some(Publication::WaitingForDevices)
+        );
+    }
+    assert!(report.unrevoked.is_empty());
+
+    // Sharing turned off here is revoked at once all the same.
+    device.set_shared(&store, &diary, false);
+    reconciler.revoke_now(Some(&diary));
+    assert!(reconciler.flush(Duration::from_secs(20)).await);
+    let report = next("the revocation", &|report| {
+        !report.podcasts.contains_key(&diary)
+    })
+    .await;
+    assert!(report.unrevoked.is_empty());
+    assert_eq!(
+        publication(&report, &news),
+        Some(Publication::WaitingForDevices)
+    );
+    assert!(
+        b.dht
+            .published()
+            .await
+            .unwrap()
+            .iter()
+            .any(|publication| publication.podcast_id == diary && !publication.active)
+    );
+
+    // Device sync brings A's share-off, then the registers are current:
+    // `news` is revoked, `show` published.
+    for op in &share_off {
+        store.apply_remote_op(op).unwrap();
+    }
+    registers.send_replace(true);
+    let report = next("the full pass", &|report| {
+        report.podcasts.get(&show) == Some(&Publication::Published)
+    })
+    .await;
+    assert_eq!(publication(&report, &news), None);
+    assert!(report.unrevoked.is_empty());
+    wait_for("the shared card", async || {
+        found(&c, &show).await.then_some(())
+    })
+    .await;
+    assert!(!found(&c, &news).await);
+    assert!(!found(&c, &diary).await);
+
+    b.stop().await;
     c.stop().await;
 }

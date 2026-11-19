@@ -322,7 +322,14 @@ Sharing a podcast (public discovery):
   federation runs. Until then, and for a copy that missed the removal, the
   card can still be found until it expires (at most 12 hours). Removing your card never touches other
   people's subscriptions. An older device that comes back with the earlier
-  "share" decision does not publish it again.
+  "share" decision does not publish it again: after starting, a device with
+  other devices in its group publishes nothing until it has synced with one
+  of them (the side panel says "waiting for a sync with your other
+  devices"); it still revokes at once what its own decisions no longer
+  share. Devices of your group that still run Furumi 0.3 (they do not sync
+  podcasts) and devices without an address are not waited for; remove a
+  device you no longer use under Connected Devices so this one stops
+  waiting for it.
 - A device that left your device group, or was removed from it, no longer
   receives your share decisions: it keeps publishing the podcasts it shares
   until you turn sharing off (or unsubscribe) on that device itself.

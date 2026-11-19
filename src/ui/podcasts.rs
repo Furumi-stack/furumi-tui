@@ -351,6 +351,10 @@ pub(crate) fn share_status_line(state: &AppState, podcast: &PodcastRow) -> Line<
             "shared · published from this device".to_string(),
             theme::accent_for(state),
         ),
+        (_, Some(Publication::WaitingForDevices)) => (
+            "shared · not published yet: waiting for a sync with your other devices".to_string(),
+            theme::dim(),
+        ),
         (Discovery::Starting, _) | (_, Some(Publication::Pending) | None) => {
             return loading_line(state, "shared · publishing…");
         }
