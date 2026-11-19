@@ -223,6 +223,19 @@ mod tests {
         assert!(screen.contains("12:34 / 45:00"), "{screen}");
         assert!(screen.contains("● 2024-06-15  S1E3 Third"), "{screen}");
         assert!(screen.contains("Notes for Pilot."), "{screen}");
+
+        // The episode playing here shows its live position.
+        let mut state = state;
+        let mut playing = podcast_fixtures::episode_track(3);
+        playing.title = "Third".into();
+        state.player.queue = vec![playing.clone()];
+        state.player.current = Some(playing);
+        state.player.playing = true;
+        state.player.position_secs = 61.0;
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("▶ 2024-06-15  S1E3 Third"), "{screen}");
+        assert!(screen.contains("1:01 / 45:00"), "{screen}");
+        assert!(screen.contains("◐ 2024-06-15  S1E2 Second"), "{screen}");
     }
 
     #[test]

@@ -547,6 +547,62 @@ pub(crate) fn end_playback(runtime: &mut Runtime) {
     );
 }
 
+impl EpisodePlayback {
+    /// Folds one player observation in and returns what to save: counts
+    /// actual listening time (not pauses, seeks or stalls), saves on pause,
+    /// every [`CHECKPOINT_INTERVAL`] while playing, and completes the
+    /// episode once the position reaches the shared completion criterion.
+    fn observe(
+        &mut self,
+        position_ms: i64,
+        paused: bool,
+        now: Instant,
+        now_ms: i64,
+    ) -> Vec<ProgressCommand> {
+        let mut commands = Vec::new();
+        let elapsed_ms = now.saturating_duration_since(self.last_tick).as_millis() as i64;
+        if !paused && !self.paused {
+            let advanced = position_ms - self.position_ms;
+            if advanced >= 0 && advanced <= elapsed_ms + 1_000 {
+                self.listened_ms += advanced;
+            }
+        }
+        self.position_ms = position_ms;
+        self.last_tick = now;
+        if paused != self.paused {
+            self.paused = paused;
+            if paused {
+                commands.push(ProgressCommand::Pause {
+                    playback: self.generation,
+                    position_ms,
+                    listened_ms: self.listened_ms,
+                    now_ms,
+                });
+            }
+            self.last_checkpoint = now;
+        }
+        if paused {
+            return commands;
+        }
+        if !self.completed && reaches_completion(position_ms, self.duration_ms) {
+            self.completed = true;
+            commands.push(ProgressCommand::Complete {
+                playback: self.generation,
+                position_ms,
+                listened_ms: self.listened_ms,
+                now_ms,
+            });
+        } else if now.saturating_duration_since(self.last_checkpoint) >= CHECKPOINT_INTERVAL {
+            self.last_checkpoint = now;
+            commands.push(ProgressCommand::Checkpoint {
+                playback: self.generation,
+                position_ms,
+            });
+        }
+        commands
+    }
+}
+
 /// Whether `state` still plays the tracked episode on this device.
 fn still_current(state: &AppState, playback: &EpisodePlayback) -> bool {
     state.device_playback.is_audio_owner()
@@ -576,47 +632,11 @@ pub(crate) fn tick(state: &AppState, runtime: &mut Runtime) {
     }
     let position_ms = (state.player.position_secs * 1_000.0).round() as i64;
     let paused = state.player.paused;
-    let now = Instant::now();
-    let mut commands = Vec::new();
-    let playback = runtime.podcast_playback.as_mut().expect("checked above");
-    let elapsed_ms = now.duration_since(playback.last_tick).as_millis() as i64;
-    if !paused && !playback.paused {
-        let advanced = position_ms - playback.position_ms;
-        // Pauses, seeks and stalls do not count as listening.
-        if advanced >= 0 && advanced <= elapsed_ms + 1_000 {
-            playback.listened_ms += advanced;
-        }
-    }
-    playback.position_ms = position_ms;
-    playback.last_tick = now;
-    let generation = playback.generation;
-    if paused != playback.paused {
-        playback.paused = paused;
-        if paused {
-            commands.push(ProgressCommand::Pause {
-                playback: generation,
-                position_ms,
-                listened_ms: playback.listened_ms,
-                now_ms: now_ms(),
-            });
-        }
-        playback.last_checkpoint = now;
-    }
-    if !paused && !playback.completed && reaches_completion(position_ms, playback.duration_ms) {
-        playback.completed = true;
-        commands.push(ProgressCommand::Complete {
-            playback: generation,
-            position_ms,
-            listened_ms: playback.listened_ms,
-            now_ms: now_ms(),
-        });
-    } else if !paused && now.duration_since(playback.last_checkpoint) >= CHECKPOINT_INTERVAL {
-        playback.last_checkpoint = now;
-        commands.push(ProgressCommand::Checkpoint {
-            playback: generation,
-            position_ms,
-        });
-    }
+    let commands = runtime
+        .podcast_playback
+        .as_mut()
+        .expect("checked above")
+        .observe(position_ms, paused, Instant::now(), now_ms());
     for command in commands {
         send_progress(runtime, command);
     }
@@ -634,7 +654,9 @@ pub(crate) fn seeked(state: &AppState, runtime: &mut Runtime, target_secs: f64) 
     playback.position_ms = position_ms;
     playback.last_tick = Instant::now();
     playback.last_checkpoint = Instant::now();
-    playback.completed = reaches_completion(position_ms, playback.duration_ms);
+    // The next tick completes it again if the seek went into the last
+    // seconds; a seek back makes it "in progress" (the writer agrees).
+    playback.completed = false;
     let command = ProgressCommand::Seek {
         playback: playback.generation,
         position_ms,
@@ -716,4 +738,112 @@ pub(crate) async fn shutdown(runtime: &mut Runtime) {
         return;
     };
     let _ = tokio::task::spawn_blocking(move || progress.close(Duration::from_secs(3))).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tracked(duration_ms: Option<i64>) -> (EpisodePlayback, Instant) {
+        let track = crate::app::podcast_fixtures::episode_track(1);
+        let episode = track.podcast_episode_ref().unwrap().clone();
+        let start = Instant::now();
+        let playback = EpisodePlayback {
+            generation: 7,
+            key: super::super::state::track_key(&track),
+            episode,
+            started: true,
+            duration_ms,
+            position_ms: 0,
+            listened_ms: 0,
+            last_tick: start,
+            last_checkpoint: start,
+            paused: false,
+            completed: false,
+        };
+        (playback, start)
+    }
+
+    fn at(start: Instant, ms: u64) -> Instant {
+        start + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn listening_time_skips_jumps_and_pauses_and_checkpoints_every_interval() {
+        let (mut playback, start) = tracked(Some(3_600_000));
+        let mut commands = Vec::new();
+        // Ten seconds of ordinary playback, observed every 250 ms.
+        for step in 1..=40u64 {
+            commands.extend(playback.observe(step as i64 * 250, false, at(start, step * 250), 0));
+        }
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(playback.listened_ms, 10_000);
+        // A forward jump (a seek) is not listening time.
+        playback.observe(600_000, false, at(start, 10_250), 0);
+        assert_eq!(playback.listened_ms, 10_000);
+        // Pausing saves once; time while paused is not counted.
+        let paused = playback.observe(600_000, true, at(start, 10_500), 1);
+        assert!(matches!(
+            paused.as_slice(),
+            [ProgressCommand::Pause {
+                playback: 7,
+                position_ms: 600_000,
+                listened_ms: 10_000,
+                now_ms: 1,
+            }]
+        ));
+        assert!(
+            playback
+                .observe(600_000, true, at(start, 60_000), 2)
+                .is_empty()
+        );
+        assert!(
+            playback
+                .observe(600_000, false, at(start, 60_250), 3)
+                .is_empty()
+        );
+        // The next periodic save comes one interval after the resume.
+        let interval = CHECKPOINT_INTERVAL.as_millis() as u64;
+        let mut saved = Vec::new();
+        let mut position = 600_000;
+        for step in 1..=(interval / 250) {
+            position += 250;
+            saved.extend(playback.observe(position, false, at(start, 60_250 + step * 250), 4));
+        }
+        assert!(matches!(
+            saved.as_slice(),
+            [ProgressCommand::Checkpoint { playback: 7, position_ms }] if *position_ms == position
+        ));
+        assert_eq!(playback.listened_ms, 10_000 + interval as i64);
+    }
+
+    #[test]
+    fn the_end_of_an_episode_completes_it_once() {
+        let (mut playback, start) = tracked(Some(2_700_000));
+        assert!(
+            playback
+                .observe(2_669_000, false, at(start, 250), 0)
+                .is_empty()
+        );
+        let completed = playback.observe(2_670_500, false, at(start, 500), 0);
+        assert!(matches!(
+            completed.as_slice(),
+            [ProgressCommand::Complete {
+                position_ms: 2_670_500,
+                ..
+            }]
+        ));
+        assert!(
+            playback
+                .observe(2_671_000, false, at(start, 750), 0)
+                .is_empty()
+        );
+        // Without a known duration only the end of the stream completes.
+        let (mut unknown, start) = tracked(None);
+        assert!(
+            unknown
+                .observe(10_000_000, false, at(start, 250), 0)
+                .is_empty()
+        );
+    }
 }
