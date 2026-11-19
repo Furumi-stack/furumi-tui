@@ -95,6 +95,20 @@ fn duration_ms(duration: Duration) -> i64 {
 /// saved progress and history. The subscription is private.
 pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<SubscribeReport> {
     let url = FeedUrl::from_user_input(input).map_err(|err| anyhow!("{err}"))?;
+    subscribe_url(services, url, now_ms).await
+}
+
+/// Subscribes to `url` exactly as given (see [`subscribe`]).
+///
+/// Subscribing from a public card passes the card's origin URL here
+/// (`podcasts::discovery::subscribe_from_hit`): the id then matches the
+/// card's `podcast_id` unless this device already knows the URL as an alias
+/// of another podcast, and everything stored comes from the feed itself.
+pub async fn subscribe_url(
+    services: &Services,
+    url: FeedUrl,
+    now_ms: i64,
+) -> Result<SubscribeReport> {
     let store = Arc::clone(&services.store);
     let lookup = url.clone();
     let existing = blocking(move || {
@@ -326,7 +340,7 @@ async fn fetch_and_apply(
 
 /// Parses a feed document on the blocking pool; relative URLs resolve
 /// against where the document was served from.
-async fn parse(body: Vec<u8>, base: &FeedUrl) -> Result<ParsedFeed> {
+pub(crate) async fn parse(body: Vec<u8>, base: &FeedUrl) -> Result<ParsedFeed> {
     let base = base.as_str().to_string();
     blocking(move || {
         parse_feed_with_base(&body, Some(&base)).map_err(|err| anyhow!("unusable feed: {err}"))
