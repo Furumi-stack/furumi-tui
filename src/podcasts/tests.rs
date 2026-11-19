@@ -254,6 +254,70 @@ async fn permanent_redirect_becomes_an_alias_and_the_new_fetch_url() {
     assert_eq!(again.podcast_id, report.podcast_id);
 }
 
+/// A feed that moved (301) to a host that answers through a temporary
+/// redirect (302, a CDN or tracker) moves to the permanent target only; the
+/// following checks start there and are conditional again.
+#[tokio::test]
+async fn a_permanent_move_behind_a_temporary_redirect_still_moves_the_feed() {
+    let f = fixture();
+    f.server.set(
+        "/old.xml",
+        Route::redirect(301, &f.server.url("/moved.xml")),
+    );
+    f.server
+        .set("/moved.xml", Route::redirect(302, "/cdn/feed.xml"));
+    f.server.set(
+        "/cdn/feed.xml",
+        Route::new(rss(&[("a", "Pilot")]), "application/rss+xml").etag("\"v1\""),
+    );
+    let old = FeedUrl::parse(&f.server.url("/old.xml")).unwrap();
+    let moved = FeedUrl::parse(&f.server.url("/moved.xml")).unwrap();
+    let report = subscribe(&f.services, old.as_str(), NOW).await.unwrap();
+    let store = &f.services.store;
+    let summary = store.podcast(&report.podcast_id).unwrap().unwrap();
+    assert_eq!(
+        summary.meta.feed_url, moved,
+        "the permanent target, not the CDN"
+    );
+    assert!(
+        store
+            .feed_aliases(&report.podcast_id)
+            .unwrap()
+            .contains(&moved)
+    );
+    // Relative enclosures resolve against the document's own address.
+    let episodes = store
+        .episodes(&EpisodeQuery::new(report.podcast_id.clone()))
+        .unwrap();
+    assert_eq!(episodes[0].episode.audio_url, f.server.url("/audio/a.mp3"));
+
+    // The next check starts at the new address and keeps its validators
+    // through the temporary hop.
+    let checked = refresh(&f.services, &report.podcast_id, &moved, NOW + 1)
+        .await
+        .unwrap();
+    assert!(checked.not_modified);
+    assert_eq!(f.server.requests("/old.xml").len(), 1);
+    let cdn = f.server.requests("/cdn/feed.xml");
+    assert_eq!(cdn.len(), 2);
+    assert_eq!(
+        cdn[1].get("if-none-match").map(String::as_str),
+        Some("\"v1\"")
+    );
+
+    // A temporary hop first never moves the feed, whatever follows it.
+    f.server.set(
+        "/tracked.xml",
+        Route::redirect(302, &f.server.url("/old.xml")),
+    );
+    let tracked = FeedUrl::parse(&f.server.url("/tracked.xml")).unwrap();
+    let other = subscribe(&f.services, tracked.as_str(), NOW + 2)
+        .await
+        .unwrap();
+    let summary = store.podcast(&other.podcast_id).unwrap().unwrap();
+    assert_eq!(summary.meta.feed_url, tracked);
+}
+
 #[tokio::test]
 async fn temporary_redirect_keeps_the_feed_url() {
     let f = fixture();

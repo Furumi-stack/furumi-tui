@@ -127,20 +127,22 @@ pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<
     };
     let final_url = response.final_url;
     let feed = parse(body, &final_url).await?;
+    // The feed's own address: where its permanent redirects lead.
+    let moved_permanently = response.moved_permanently_to.is_some();
+    let landed = response.moved_permanently_to.unwrap_or(final_url);
 
     let store = Arc::clone(&services.store);
     let log = Arc::clone(&services.log);
-    let moved_permanently = response.moved_permanently;
     let image_url = feed.image_url.clone();
     let report = blocking(move || {
         // Identity comes from the URL of the first subscription. Reuse a
         // podcast this device already knows under the typed or the final
         // URL; otherwise the typed URL defines the id and a permanent
         // redirect becomes an alias below.
-        let identity_url = if knows(&store, &url)? || !knows(&store, &final_url)? {
+        let identity_url = if knows(&store, &url)? || !knows(&store, &landed)? {
             url.clone()
         } else {
-            final_url.clone()
+            landed.clone()
         };
         let meta = feed.to_podcast_meta(identity_url);
         let mut subscribed = None;
@@ -159,7 +161,7 @@ pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<
                 &FeedRefresh {
                     podcast_id: &podcast_id,
                     feed: &feed,
-                    fetched_from: &final_url,
+                    fetched_from: &landed,
                     moved_permanently,
                 },
             )?;
@@ -252,7 +254,7 @@ async fn fetch_and_apply(
     tracing::debug!(
         podcast = %podcast_id,
         redirects = response.redirects,
-        moved_permanently = response.moved_permanently,
+        moved_permanently = response.moved_permanently_to.is_some(),
         not_modified = matches!(response.body, FeedBody::NotModified),
         "podcast feed checked"
     );
@@ -275,21 +277,25 @@ async fn fetch_and_apply(
     };
     let final_url = response.final_url;
     let feed = parse(body, &final_url).await?;
+    let moved_permanently = response.moved_permanently_to.is_some();
+    let landed = response.moved_permanently_to.unwrap_or(final_url);
     let image_url = feed.image_url.clone();
     let store = Arc::clone(&services.store);
     let log = Arc::clone(&services.log);
     let id = podcast_id.clone();
     let previous_url = url.clone();
-    let moved_permanently = response.moved_permanently;
     let report = blocking(move || {
         let mut refreshed = None;
         log.record(&mut |stamps| {
             let outcome = store.apply_feed(
                 stamps,
+                // `fetched_from` is the address the permanent redirects led
+                // to; the document itself may come from a temporary hop
+                // behind it (parsed against that URL above).
                 &FeedRefresh {
                     podcast_id: &id,
                     feed: &feed,
-                    fetched_from: &final_url,
+                    fetched_from: &landed,
                     moved_permanently,
                 },
             )?;

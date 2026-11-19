@@ -320,10 +320,14 @@ registers (subscription, share, progress) and listening sessions in
 The TUI owns what the contract leaves to clients:
 
 - **Fetching.** Feeds are fetched with conditional requests (ETag,
-  Last-Modified), bounded size and time, and redirects followed by hand so the
-  store learns whether every hop was permanent; only then does the new URL
-  become a feed alias and the fetch URL. Validators are dropped after a
-  permanent redirect because they belong to the old address.
+  Last-Modified), bounded size and time, and redirects followed by hand. The
+  address that the leading permanent hops (301/308) lead to becomes a feed
+  alias and the fetch URL, even when a temporary hop (CDN, tracker) follows
+  it; a chain that starts with a temporary hop never moves the feed.
+  Validators are dropped after a permanent redirect because they belong to
+  the old address. The prototype database's validators are dropped once at
+  import, so the first check parses the feed (seasons and episode numbers
+  were not stored by the prototype).
 - **Scheduling.** The store keeps each feed's local fetch state (validators,
   last error, consecutive failures, next check). A timer asks it which
   subscriptions are due; feeds are checked at most a few at a time, a success

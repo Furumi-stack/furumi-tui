@@ -1,8 +1,10 @@
 //! HTTP for podcast feeds and cover images.
 //!
 //! Redirects are followed by hand so the caller learns where the feed
-//! really lives and whether every hop was permanent (301/308): only then
-//! does the store record the new URL as a feed alias. Conditional requests
+//! really lives: the address reached by the leading permanent (301/308)
+//! hops is where the feed moved, and the store records it as the new fetch
+//! URL (the old one becomes an alias). Temporary hops after it (a CDN or a
+//! tracking prefix) do not move the feed further. Conditional requests
 //! (`If-None-Match` / `If-Modified-Since`), response size caps, timeouts and
 //! the user agent are fixed here; parsing and storage happen elsewhere.
 
@@ -57,12 +59,14 @@ pub enum FeedBody {
 #[derive(Debug)]
 pub struct FeedResponse {
     pub body: FeedBody,
-    /// URL that finally answered, canonicalized.
+    /// URL that finally answered, canonicalized; the base for relative
+    /// URLs in the document.
     pub final_url: FeedUrl,
-    /// At least one redirect was followed and every one of them was
-    /// permanent (301/308). Temporary redirects (tracking prefixes, CDNs)
-    /// never move a feed.
-    pub moved_permanently: bool,
+    /// Where the leading permanent redirects (301/308, one or more, before
+    /// any temporary one) lead: the feed's new address. `None` when the
+    /// first hop was temporary or there was none. Temporary redirects
+    /// (tracking prefixes, CDNs) never move a feed.
+    pub moved_permanently_to: Option<FeedUrl>,
     /// Redirect hops followed.
     pub redirects: usize,
 }
@@ -116,7 +120,7 @@ impl Fetcher {
         let Followed {
             response,
             url: final_url,
-            moved_permanently,
+            moved_permanently_to,
             redirects,
             conditional,
         } = self
@@ -128,6 +132,9 @@ impl Fetcher {
                 redact(&final_url)
             )
         })?;
+        // An address that is not a valid feed URL is not worth moving to.
+        let moved_permanently_to =
+            moved_permanently_to.and_then(|url| FeedUrl::parse(url.as_str()).ok());
         let status = response.status();
         if status == StatusCode::NOT_MODIFIED {
             if !conditional {
@@ -136,7 +143,7 @@ impl Fetcher {
             return Ok(FeedResponse {
                 body: FeedBody::NotModified,
                 final_url,
-                moved_permanently,
+                moved_permanently_to,
                 redirects,
             });
         }
@@ -153,7 +160,7 @@ impl Fetcher {
                 last_modified,
             },
             final_url,
-            moved_permanently,
+            moved_permanently_to,
             redirects,
         })
     }
@@ -187,7 +194,9 @@ impl Fetcher {
     ) -> Result<Followed> {
         let mut current = Url::parse(url).with_context(|| format!("invalid URL {url:?}"))?;
         check_scheme(&current)?;
-        let mut all_permanent = true;
+        // Still in the leading run of permanent hops.
+        let mut permanent_run = true;
+        let mut moved_permanently_to = None;
         let mut send_validators = true;
         let mut hops = 0;
         loop {
@@ -216,7 +225,7 @@ impl Fetcher {
                 return Ok(Followed {
                     response,
                     url: current,
-                    moved_permanently: hops > 0 && all_permanent,
+                    moved_permanently_to,
                     redirects: hops,
                     conditional,
                 });
@@ -238,7 +247,10 @@ impl Fetcher {
                 status,
                 StatusCode::MOVED_PERMANENTLY | StatusCode::PERMANENT_REDIRECT
             );
-            all_permanent &= permanent;
+            permanent_run &= permanent;
+            if permanent_run {
+                moved_permanently_to = Some(next.clone());
+            }
             if permanent {
                 send_validators = false;
             }
@@ -251,8 +263,8 @@ struct Followed {
     response: reqwest::Response,
     /// URL that answered.
     url: Url,
-    /// At least one hop and all of them permanent.
-    moved_permanently: bool,
+    /// Target of the leading permanent hops.
+    moved_permanently_to: Option<Url>,
     redirects: usize,
     /// The final request carried validators.
     conditional: bool,
