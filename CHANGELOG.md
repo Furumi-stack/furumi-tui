@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit. Completion and listening sessions follow the shared FRID rules. A
   stale audio URL triggers one feed check for the episode's new address. A
   lost connection stops playback at the saved position (the episode is not
-  completed and the queue does not move on); a superseded or stalled stream
+  completed and the queue does not move on). Without a file size from the
+  server, a closed stream counts as the end within the completion window of
+  the duration the audio file states, or past 80 % of a duration only the
+  feed announced; a superseded or stalled stream
   is cancelled at the next start or stop; pause pressed while an episode
   connects is kept; seeks that do not move the audio are not saved.
 - Podcast key bindings in the `podcasts` context: `o`, `/`, `Shift+R`,

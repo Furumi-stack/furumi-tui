@@ -53,6 +53,9 @@ pub struct EpisodePlayback {
     /// The stream plays; until then nothing is written.
     started: bool,
     duration_ms: Option<i64>,
+    /// `duration_ms` was measured by the decoder, not only announced by
+    /// the feed (`PreparedEpisode::duration_measured`).
+    duration_measured: bool,
     /// Last position seen while this playback was current.
     position_ms: i64,
     /// Actual listening time (no pauses, no seeks).
@@ -342,6 +345,7 @@ pub fn handle_event(
             episode,
             start_ms,
             duration_ms,
+            duration_measured,
             restart,
             seekable,
             probe,
@@ -354,6 +358,7 @@ pub fn handle_event(
                 Started {
                     start_ms,
                     duration_ms,
+                    duration_measured,
                     restart,
                     seekable,
                     probe,
@@ -446,6 +451,7 @@ pub(crate) fn start_episode(
         key: super::state::track_key(track),
         started: false,
         duration_ms: queued.duration_ms,
+        duration_measured: false,
         position_ms: 0,
         listened_ms: 0,
         last_tick: Instant::now(),
@@ -482,6 +488,7 @@ pub(crate) fn start_episode(
                     episode: Box::new(prepared.episode),
                     start_ms: prepared.start_ms,
                     duration_ms: prepared.duration_ms,
+                    duration_measured: prepared.duration_measured,
                     restart,
                     seekable: prepared.seekable,
                     probe: prepared.probe,
@@ -503,6 +510,7 @@ pub(crate) fn start_episode(
 struct Started {
     start_ms: i64,
     duration_ms: Option<i64>,
+    duration_measured: bool,
     restart: bool,
     seekable: bool,
     probe: StreamProbe,
@@ -518,6 +526,7 @@ fn episode_started(
     let Started {
         start_ms,
         duration_ms,
+        duration_measured,
         restart,
         seekable,
         probe,
@@ -534,6 +543,7 @@ fn episode_started(
     playback.probe = Some(probe);
     playback.position_ms = start_ms;
     playback.duration_ms = duration_ms;
+    playback.duration_measured = duration_measured;
     playback.last_tick = Instant::now();
     playback.last_checkpoint = Instant::now();
     playback.episode = episode.clone();
@@ -639,7 +649,12 @@ impl EpisodePlayback {
     /// last seen position stays what is saved. Returns the commands to send
     /// and whether it was played to the end.
     fn finish(&mut self, end: StreamEnd, now_ms: i64) -> (Vec<ProgressCommand>, bool) {
-        if !playback::played_to_the_end(end, self.position_ms, self.duration_ms) {
+        if !playback::played_to_the_end(
+            end,
+            self.position_ms,
+            self.duration_ms,
+            self.duration_measured,
+        ) {
             return (Vec::new(), false);
         }
         let position_ms = self
@@ -833,6 +848,7 @@ pub(crate) fn finished(state: &mut AppState, runtime: &mut Runtime) -> Finished 
         .map_or(StreamEnd::Complete, StreamProbe::end);
     let (commands, reached) = playback.finish(end, now_ms());
     let position_ms = playback.position_ms;
+    let seekable = playback.seekable;
     for command in commands {
         send_progress(runtime, command);
     }
@@ -843,11 +859,26 @@ pub(crate) fn finished(state: &mut AppState, runtime: &mut Runtime) -> Finished 
     tracing::warn!(?end, position_ms, "podcast stream stopped before the end");
     runtime.player_start_pending = false;
     stop_on_episode(state);
-    Finished::Interrupted(format!(
-        "podcast: the audio stopped at {} (the publisher's server stopped sending it); \
-         the position is saved, press play to continue",
-        format_clock(position_ms)
-    ))
+    Finished::Interrupted(interrupted_message(position_ms, seekable))
+}
+
+/// Status for an episode whose stream stopped before its end. Without
+/// seeking (no file size from the server) Play cannot continue there, so
+/// the way out is to start over or mark it played.
+fn interrupted_message(position_ms: i64, seekable: bool) -> String {
+    let at = format_clock(position_ms);
+    if seekable {
+        format!(
+            "podcast: the audio stopped at {at} (the publisher's server stopped sending it); \
+             the position is saved, press play to continue"
+        )
+    } else {
+        format!(
+            "podcast: the audio stopped at {at} (the publisher's server stopped sending it); \
+             the position is saved, but this server does not allow continuing there: start it \
+             over (b) or mark it played (m) in Podcasts"
+        )
+    }
 }
 
 /// The audio thread failed while an episode played or started.
@@ -913,6 +944,7 @@ mod tests {
             episode,
             started: true,
             duration_ms,
+            duration_measured: duration_ms.is_some(),
             position_ms: 0,
             listened_ms: 0,
             last_tick: start,
@@ -1012,6 +1044,55 @@ mod tests {
         let (mut unknown, start) = tracked(None);
         unknown.observe(1_000, false, at(start, 250), 0);
         assert!(unknown.finish(StreamEnd::Unknown, 4).1);
+    }
+
+    /// A stream without a size whose decoder could not measure it (CBR MP3
+    /// without a Xing header, say) only has the feed's `itunes:duration`,
+    /// which may be longer than the audio by more than the completion
+    /// window. Played to its real end, it completes and the queue moves on.
+    #[test]
+    fn a_stream_shorter_than_its_feed_duration_completes_at_its_end() {
+        // The feed says 60 min; the audio ends at 55 min (more than the
+        // 30 s completion window earlier).
+        let (mut feed_only, start) = tracked(Some(3_600_000));
+        feed_only.duration_measured = false;
+        feed_only.observe(3_300_000, false, at(start, 250), 0);
+        let (commands, reached) = feed_only.finish(StreamEnd::Unknown, 1);
+        assert!(reached, "the clean close is the end");
+        assert!(matches!(
+            commands.as_slice(),
+            [ProgressCommand::Complete {
+                position_ms: 3_600_000,
+                ..
+            }]
+        ));
+        // An early close (a fifth of the announced length) is still not.
+        let (mut early, start) = tracked(Some(3_600_000));
+        early.duration_measured = false;
+        early.observe(600_000, false, at(start, 250), 0);
+        assert!(!early.finish(StreamEnd::Unknown, 2).1);
+        // A duration the decoder measured keeps the strict window.
+        let (mut measured, start) = tracked(Some(3_600_000));
+        measured.observe(3_300_000, false, at(start, 250), 0);
+        assert!(!measured.finish(StreamEnd::Unknown, 3).1);
+        // A failed read never counts outside the window.
+        let (mut failed, start) = tracked(Some(3_600_000));
+        failed.duration_measured = false;
+        failed.observe(3_300_000, false, at(start, 250), 0);
+        assert!(!failed.finish(StreamEnd::Failed, 4).1);
+    }
+
+    #[test]
+    fn an_interrupted_stream_without_seeking_says_how_to_move_on() {
+        let message = interrupted_message(65_000, true);
+        assert!(
+            message.contains("1:05") && message.contains("press play"),
+            "{message}"
+        );
+        let message = interrupted_message(65_000, false);
+        assert!(!message.contains("press play"), "{message}");
+        assert!(message.contains("start it over (b)"), "{message}");
+        assert!(message.contains("mark it played (m)"), "{message}");
     }
 
     #[test]

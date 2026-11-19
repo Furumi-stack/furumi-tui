@@ -251,6 +251,8 @@ pub enum AppEvent {
         episode: Box<music_dht::podcast::PodcastEpisodeRef>,
         start_ms: i64,
         duration_ms: Option<i64>,
+        /// The decoder measured `duration_ms` (else the feed announced it).
+        duration_measured: bool,
         restart: bool,
         /// The server allows seeking in the stream.
         seekable: bool,

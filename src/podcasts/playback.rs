@@ -44,6 +44,10 @@ pub struct PreparedEpisode {
     pub start_ms: i64,
     /// Duration from the decoder, else the one the feed announced.
     pub duration_ms: Option<i64>,
+    /// `duration_ms` was measured by the decoder (container header, frame
+    /// count or file size); otherwise it is only the feed's announcement,
+    /// which is often off (rounded `itunes:duration`, inserted ads).
+    pub duration_measured: bool,
     /// The server allows seeking (it sent the file size).
     pub seekable: bool,
     /// How the stream ended, once it did.
@@ -115,17 +119,39 @@ pub fn resolve(
     Ok((episode, start_ms))
 }
 
+/// Share of a feed-announced duration (percent) that a stream of unknown
+/// size must have played before its clean close counts as its end.
+const FEED_DURATION_END_PERCENT: i64 = 80;
+
 /// Whether the end of an episode's stream means it was played to the end:
-/// a stream that failed (connection lost, URL expired, outage) only counts
-/// when it failed within the shared completion window, and a stream of
-/// unknown size (where a closed connection looks like the end) only when
-/// the position is there too or nothing else is known.
-pub fn played_to_the_end(end: StreamEnd, position_ms: i64, duration_ms: Option<i64>) -> bool {
+///
+/// * a stream that ended where the server said it would is the end;
+/// * a stream that failed (connection lost, URL expired, outage) only
+///   counts when it failed within the shared completion window;
+/// * a stream of unknown size that closed cleanly (where an early close
+///   looks like the end) counts when the position is within the completion
+///   window of a duration the decoder measured. A duration that only the
+///   feed announced is a hint: then reaching [`FEED_DURATION_END_PERCENT`]
+///   of it is enough, and with no duration at all the close is the end.
+pub fn played_to_the_end(
+    end: StreamEnd,
+    position_ms: i64,
+    duration_ms: Option<i64>,
+    duration_measured: bool,
+) -> bool {
     let near_end = duration_ms.is_some() && reaches_completion(position_ms, duration_ms);
     match end {
         StreamEnd::Complete => true,
-        StreamEnd::Unknown => duration_ms.is_none() || near_end,
         StreamEnd::Failed => near_end,
+        StreamEnd::Unknown => match duration_ms {
+            None => true,
+            Some(_) if duration_measured => near_end,
+            Some(ms) => {
+                near_end
+                    || position_ms.saturating_mul(100)
+                        >= ms.saturating_mul(FEED_DURATION_END_PERCENT)
+            }
+        },
     }
 }
 
@@ -177,16 +203,16 @@ pub fn open_at(
             .into());
         }
     }
-    let duration_ms = source
+    let measured = source
         .total_duration()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .filter(|ms| *ms > 0)
-        .or(episode.duration_ms);
+        .filter(|ms| *ms > 0);
     Ok(PreparedEpisode {
         episode: episode.clone(),
         source,
         start_ms,
-        duration_ms,
+        duration_ms: measured.or(episode.duration_ms),
+        duration_measured: measured.is_some(),
         seekable,
         probe,
     })

@@ -228,6 +228,14 @@ Episodes play in the same queue as music:
   the episode is not marked played and the queue does not move on; play
   continues from that position. A pause pressed while an episode is still
   connecting is kept when the audio arrives.
+- Some servers send episodes without a file size. There a closed connection
+  looks like the end of the file, so Furumi compares the position with the
+  episode's duration: the one the audio file states, or else the
+  `itunes:duration` of the feed. Feed durations are often a little off, so
+  reaching 80 % of one is enough; an episode that stops earlier is treated as
+  a lost connection. Such servers do not allow seeking either, so play cannot
+  continue in the middle: start the episode over (`b`) or mark it played
+  (`m`).
 - The position is saved every 20 seconds while playing and on pause, seek,
   stop, track change and exit. An episode counts as played within the last
   30 seconds (or 5 %) or when its stream reaches its end; a listen enters the episode's

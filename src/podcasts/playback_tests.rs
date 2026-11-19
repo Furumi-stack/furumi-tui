@@ -618,7 +618,8 @@ async fn a_lost_connection_does_not_complete_the_episode_and_keeps_its_position(
     assert!(!playback::played_to_the_end(
         prepared.probe.end(),
         position_ms,
-        prepared.duration_ms
+        prepared.duration_ms,
+        prepared.duration_measured
     ));
 
     // What the runtime then saves: the last position, not a completion.
@@ -664,16 +665,35 @@ async fn a_stream_of_unknown_length_that_closes_early_is_not_the_end() {
     assert!((29_000..=30_500).contains(&position_ms), "{position_ms} ms");
     // A closed connection looks like the end of the file here...
     assert_eq!(prepared.probe.end(), StreamEnd::Unknown);
-    // ...but the duration says otherwise.
+    // ...but the duration the decoder read from the header says otherwise.
+    assert_eq!(prepared.duration_ms, Some(120_000));
+    assert!(prepared.duration_measured);
     assert!(!playback::played_to_the_end(
         StreamEnd::Unknown,
         position_ms,
-        Some(120_000)
+        Some(120_000),
+        true
     ));
     assert!(playback::played_to_the_end(
         StreamEnd::Unknown,
         119_000,
-        Some(120_000)
+        Some(120_000),
+        true
+    ));
+    // A duration only the feed announced is a hint: an audio file that ends
+    // more than the completion window before it still ends there...
+    assert!(playback::played_to_the_end(
+        StreamEnd::Unknown,
+        100_000,
+        Some(120_000),
+        false
+    ));
+    // ...while a close at a quarter of it is still a lost connection.
+    assert!(!playback::played_to_the_end(
+        StreamEnd::Unknown,
+        position_ms,
+        Some(120_000),
+        false
     ));
 
     // A whole file with a size is played to its end.
@@ -693,13 +713,83 @@ async fn a_stream_of_unknown_length_that_closes_early_is_not_the_end() {
     assert!(playback::played_to_the_end(
         StreamEnd::Complete,
         3_000,
-        prepared.duration_ms
+        prepared.duration_ms,
+        prepared.duration_measured
     ));
-    // A failure in the last seconds still counts as the end.
+    // A failure in the last seconds still counts as the end, whatever
+    // announced the duration; earlier it never does.
+    for measured in [true, false] {
+        assert!(playback::played_to_the_end(
+            StreamEnd::Failed,
+            119_500,
+            Some(120_000),
+            measured
+        ));
+        assert!(!playback::played_to_the_end(
+            StreamEnd::Failed,
+            100_000,
+            Some(120_000),
+            measured
+        ));
+    }
+}
+
+/// About `seconds` of silent MPEG-1 Layer III (mono, 44.1 kHz, 128 kbit/s)
+/// frames with no Xing/Info header: sent without a size, the decoder
+/// cannot measure its duration.
+fn mp3_without_header(seconds: u32) -> Vec<u8> {
+    const FRAME_LEN: usize = 417; // 144 * 128_000 / 44_100
+    let frames = (u64::from(seconds) * 44_100 / 1_152) as usize;
+    let mut frame = vec![0u8; FRAME_LEN];
+    frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0xC0]);
+    frame.repeat(frames)
+}
+
+/// Decodes `source` to its end; returns the position reached.
+fn play_out_any(source: &mut crate::player::DecodedSource) -> i64 {
+    let per_second = i64::from(source.sample_rate().get()) * i64::from(source.channels().get());
+    let mut samples = 0i64;
+    while source.next().is_some() {
+        samples += 1;
+    }
+    samples * 1_000 / per_second
+}
+
+/// Without a size from the server and a duration the decoder could
+/// measure, only the feed's duration is known, and it may be longer than
+/// the audio by more than the completion window. The clean end of the
+/// stream then still completes the episode.
+#[tokio::test]
+async fn a_stream_shorter_than_the_feed_says_completes_at_its_end() {
+    let f = fixture();
+    let (_, mut episode) = subscribed(&f).await;
+    f.server.set(
+        "/audio/a.mp3",
+        Route::new(mp3_without_header(100), "audio/mpeg").no_length(),
+    );
+    // The feed announces two minutes, 20 s more than the audio.
+    episode.duration_ms = Some(120_000);
+    let prepared =
+        tokio::task::spawn_blocking(move || playback::open_at(&episode, 0, &CancelToken::never()))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(!prepared.seekable);
+    assert!(!prepared.duration_measured, "{:?}", prepared.duration_ms);
+    assert_eq!(prepared.duration_ms, Some(120_000));
+    let mut source = prepared.source;
+    let position_ms = play_out_any(&mut source);
+    assert!(
+        (99_000..=100_100).contains(&position_ms),
+        "{position_ms} ms"
+    );
+    assert_eq!(prepared.probe.end(), StreamEnd::Unknown);
+    assert!(!reaches_completion(position_ms, Some(120_000)));
     assert!(playback::played_to_the_end(
-        StreamEnd::Failed,
-        119_500,
-        Some(120_000)
+        prepared.probe.end(),
+        position_ms,
+        prepared.duration_ms,
+        prepared.duration_measured
     ));
 }
 
