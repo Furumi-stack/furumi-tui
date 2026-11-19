@@ -20,12 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panel show whether a podcast is shared and whether this device publishes
   it.
 - Turning sharing off or unsubscribing revokes this device's card at once,
-  and quitting waits up to 4 s for that; the side panel says when a
-  private podcast's card is not revoked yet (pending, failed or federation
-  off). A privacy confirmation covers one share decision: turning sharing
-  off (or on again after that) on any trusted device asks again. Cards
-  leave out artwork and web links that look like they carry an access key,
-  and both for a feed whose URL looks private.
+  and quitting waits up to 4 s for that (also for a change still being
+  saved); the side panel says when a private podcast's card is not revoked
+  yet (pending or failed) or may not be (federation off: a card of an
+  earlier session cannot be ruled out). A privacy confirmation covers one
+  share decision: turning sharing off (or on again after that) on any
+  trusted device asks again, and until then this device holds the podcast
+  back and revokes the card it published for the earlier decision. A
+  confirmation whose decision could not be saved is dropped. Cards leave out
+  artwork and web links with an access key in the query or a member-feed
+  host (random-looking path parts of public CDNs are fine), and both for a
+  feed whose URL looks private.
 - Search (`/`, with the federation running) also finds public podcast cards.
   They are listed after the music results under "Podcasts · public cards" with
   a `[podcast]` marker, the number of publishing devices, and "✓ subscribed"

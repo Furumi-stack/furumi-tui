@@ -293,8 +293,10 @@ Sharing a podcast (public discovery):
   description, artwork and web links, the number of episodes and the date of
   the newest one. The card never contains your progress, history, play
   counts, device names or anything from podcasts you did not share. Artwork
-  and web links that look like they carry an access key are left out, and
-  so are both for a feed whose own URL looks private.
+  and web links that look like they carry an access key (a token, key or
+  signature in the query, a member-feed host) are left out, and so are both
+  for a feed whose own URL looks private. Random-looking parts of their
+  path alone do not count: public podcast hosts name artwork that way.
 - If the feed URL looks private (a token, key or signature in its query, a
   member-feed host such as Patreon, a long random-looking part), Furumi asks
   first and lists why (in Russian). Anyone who finds the card can read the
@@ -304,17 +306,21 @@ Sharing a podcast (public discovery):
   yours asks again before it publishes, and so does this one if the feed
   moves or if sharing is turned off (or turned on again after that) on any
   of your devices. Until then the side panel says the publication is held
-  back; press `Shift+F` there to confirm (or `x` in the dialog to stop
-  sharing).
+  back, and a card this device published for the earlier decision is
+  revoked; press `Shift+F` there to confirm (or `x` in the dialog to stop
+  sharing). A confirmation whose decision could not be saved is dropped.
 - `Shift+F` on a shared podcast, or unsubscribing, makes it private again on
   every device in your group: each device replaces its card with a signed
   removal record. This device sends its removal right away, and quitting
-  waits for it (up to 4 seconds). While the removal is not sent yet (or
-  could not be sent, or the federation is off), the side panel says the
+  waits for it (up to 4 seconds, also when you quit before the change is
+  saved) and logs a warning when a card may still be live. While the
+  removal is not sent yet (or could not be sent), the side panel says the
   public card is not revoked yet instead of just "private". With the
-  federation off, the removal is sent the next time it runs; until then,
-  and for a copy that missed the removal, the card can still be found until
-  it expires (at most 12 hours). Removing your card never touches other
+  federation off this device cannot tell whether a card of an earlier
+  session is still live, so for a podcast that was shared the panel says
+  the card may not be revoked yet; the removal is sent the next time the
+  federation runs. Until then, and for a copy that missed the removal, the
+  card can still be found until it expires (at most 12 hours). Removing your card never touches other
   people's subscriptions. An older device that comes back with the earlier
   "share" decision does not publish it again.
 - A device that left your device group, or was removed from it, no longer
