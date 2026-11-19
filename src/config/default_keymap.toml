@@ -4,12 +4,22 @@
 # (~/.config/furumi/keymap.toml on Linux/macOS). A user binding replaces the
 # default binding with the same key sequence and context.
 #
+# version: keymap format version; put `version = 2` at the top of your file,
+# before the first [[keymaps]] entry. Version 2 numbers tabs in this order:
+#   GoToTab = 0 Library, 1 Playlists, 2 Queue, 3 Podcasts, 4 Settings, 5 Logs.
+# A file without `version` is treated as the older layout and its GoToTab
+# indices are adapted in memory (3 -> 4 Settings, 4 -> 5 Logs, and 5 -> 3
+# Podcasts from the prototype podcast build); the file itself is never
+# rewritten. With `version = 2` indices are used exactly as written.
+#
 # key_sequence: space-separated chords, e.g. "g g" or "ctrl-a x".
 #   Modifiers: ctrl-, alt-, shift-, cmd-. Uppercase letters: "shift-g".
 # command: an Action name, optionally with parameters:
 #   command = { SeekForward = { seconds = 30 } }
 # context: optional view filter — global (default), library, search,
-#   playlists, queue, logs.
+#   playlists, queue, podcasts, settings, logs.
+
+version = 2
 
 [[keymaps]]
 key_sequence = "q"
@@ -50,6 +60,10 @@ command = { GoToTab = 3 }
 [[keymaps]]
 key_sequence = "5"
 command = { GoToTab = 4 }
+
+[[keymaps]]
+key_sequence = "6"
+command = { GoToTab = 5 }
 
 [[keymaps]]
 key_sequence = "y"

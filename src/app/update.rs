@@ -1016,7 +1016,7 @@ fn current_track_list_context(state: &AppState) -> Option<(TrackSelectionScope, 
             state.queue_tab.cursor,
             state.player.queue.len(),
         )),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Podcasts | Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -1070,7 +1070,7 @@ fn current_track_list(state: &AppState) -> Option<(TrackSelectionScope, usize, V
             state.queue_tab.cursor,
             state.player.queue.clone(),
         )),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Podcasts | Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -1371,7 +1371,7 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 .map(|track| (*track).clone())
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
-        Tab::Federation | Tab::Logs => None,
+        Tab::Podcasts | Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -3250,7 +3250,7 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.logs.follow = true;
             state.logs.selected_seq = None;
         }
-        Tab::Queue => {}
+        Tab::Queue | Tab::Podcasts => {}
     }
 }
 

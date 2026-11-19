@@ -1467,15 +1467,20 @@ pub enum Tab {
     Global,
     Playlists,
     Queue,
+    Podcasts,
     Federation,
     Logs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    /// Display, Tab/Shift+Tab and `GoToTab` index order (`1`..`6`). Changing
+    /// it changes what `GoToTab(n)` means in users' keymap files: bump
+    /// `config::keymap::KEYMAP_VERSION` and remap older files in memory.
+    pub const ALL: [Tab; 6] = [
         Tab::Global,
         Tab::Playlists,
         Tab::Queue,
+        Tab::Podcasts,
         Tab::Federation,
         Tab::Logs,
     ];
@@ -1485,6 +1490,7 @@ impl Tab {
             Tab::Global => "Library",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
+            Tab::Podcasts => "Podcasts",
             Tab::Federation => "Settings",
             Tab::Logs => "Logs",
         }
@@ -1511,6 +1517,7 @@ impl Tab {
             Tab::Global => KeyContext::Library,
             Tab::Playlists => KeyContext::Playlists,
             Tab::Queue => KeyContext::Queue,
+            Tab::Podcasts => KeyContext::Podcasts,
             Tab::Federation => KeyContext::Federation,
             Tab::Logs => KeyContext::Logs,
         }

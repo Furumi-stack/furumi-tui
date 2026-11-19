@@ -170,7 +170,10 @@ impl Action {
             Action::Quit => "Quit".into(),
             Action::NextTab => "Next tab".into(),
             Action::PrevTab => "Previous tab".into(),
-            Action::GoToTab(i) => format!("Go to tab {}", i + 1),
+            Action::GoToTab(i) => match crate::app::state::Tab::from_index(*i) {
+                Some(tab) => format!("Go to {}", tab.title()),
+                None => format!("Go to tab {}", i + 1),
+            },
             Action::MoveUp => "Move up".into(),
             Action::MoveDown => "Move down".into(),
             Action::MoveLeft => "Move left".into(),

@@ -4,6 +4,7 @@ mod federation;
 pub(crate) mod global;
 mod logs;
 mod playlists;
+mod podcasts;
 mod popup;
 #[cfg(test)]
 mod status_tests;
@@ -50,6 +51,62 @@ mod tests {
         assert_eq!(label, "●");
         assert_eq!(style, client_style);
     }
+
+    fn render(state: &AppState, width: u16, height: u16) -> String {
+        let keymap = Keymap::defaults();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, state, &keymap)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tab_bar_numbers_tabs_in_the_new_order() {
+        let screen = render(&AppState::default(), 120, 10);
+        let bar = screen.lines().next().unwrap();
+        let positions: Vec<usize> = [
+            "1 Library",
+            "2 Playlists",
+            "3 Queue",
+            "4 Podcasts",
+            "5 Settings",
+            "6 Logs",
+        ]
+        .iter()
+        .map(|title| {
+            bar.find(title)
+                .unwrap_or_else(|| panic!("{title} in {bar:?}"))
+        })
+        .collect();
+        assert!(positions.is_sorted(), "{bar:?}");
+    }
+
+    #[test]
+    fn podcasts_tab_shows_placeholder() {
+        let mut state = AppState::default();
+        state.active_tab = Tab::Podcasts;
+        let screen = render(&state, 100, 12);
+        assert!(screen.contains(podcasts::UNAVAILABLE), "{screen}");
+    }
+
+    #[test]
+    fn help_lists_tab_names_for_digit_shortcuts() {
+        let mut state = AppState::default();
+        state.help_visible = true;
+        let screen = render(&state, 160, 80);
+        for title in ["Go to Podcasts", "Go to Settings", "Go to Logs"] {
+            assert!(screen.contains(title), "{title} missing:\n{screen}");
+        }
+        assert!(!screen.contains("Go to tab"), "{screen}");
+    }
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
@@ -73,6 +130,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Global => global::draw(frame, main_area, state),
         Tab::Playlists => playlists::draw(frame, main_area, state),
         Tab::Queue => draw_queue(frame, main_area, state),
+        Tab::Podcasts => podcasts::draw(frame, main_area, state),
         Tab::Federation => federation::draw(frame, main_area, state),
         Tab::Logs => logs::draw(frame, main_area, state),
     }
