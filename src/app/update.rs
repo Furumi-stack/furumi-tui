@@ -386,7 +386,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             let mut local_tracks: Vec<TrackItem> = Vec::new();
             let mut fed_tracks: Vec<crate::federation::FedTrack> = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            let mut episodes = 0usize;
             for track in tracks {
+                // Likes are music library state; episodes have their own
+                // "played" progress instead.
+                if track.is_podcast() {
+                    episodes += 1;
+                    continue;
+                }
                 if !seen.insert(track_key(&track)) {
                     continue;
                 }
@@ -399,7 +406,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 }
             }
             if local_tracks.is_empty() && fed_tracks.is_empty() {
-                state.status_message = Some("no track selected".into());
+                state.status_message = Some(if episodes > 0 {
+                    PODCAST_NOT_MUSIC.into()
+                } else {
+                    "no track selected".into()
+                });
                 None
             } else {
                 let should_like = local_tracks.iter().any(|track| !state.track_liked(track))
@@ -445,6 +456,9 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::GoToRelease => {
             let track = selected_track(state).or_else(|| state.player.current.clone());
             match track {
+                Some(track) if track.is_podcast() => {
+                    return podcasts::reveal_episode_podcast(state, &track);
+                }
                 Some(track) => open_release_for_track(state, &track),
                 None => state.status_message = Some("no track selected".into()),
             }
@@ -452,12 +466,17 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::AddToPlaylist => {
             let target = selected_playlist_target(state, true);
+            let target = without_podcast_episodes(state, target);
             match target {
                 Some(target) => {
                     state.popup = Some(super::state::Popup::AddToPlaylist { target, cursor: 0 });
                     state.track_selection.clear();
                 }
-                None => state.status_message = Some("no track selected".into()),
+                None => {
+                    state
+                        .status_message
+                        .get_or_insert_with(|| "no track selected".into());
+                }
             }
             None
         }
@@ -476,7 +495,8 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
         }
         Action::NewPlaylist => {
-            let for_target = selected_playlist_target(state, false);
+            let for_target =
+                without_podcast_episodes(state, selected_playlist_target(state, false));
             state.popup = Some(super::state::Popup::NewPlaylist {
                 for_target,
                 input: crate::app::input::LineEdit::default(),
@@ -537,7 +557,9 @@ fn current_track_for_info(state: &AppState) -> Option<TrackItem> {
     queued_at_position
         .filter(|queued| {
             super::state::track_key(queued) == current_key
-                || queued.id == current.id
+                // Podcast episodes share the sentinel id; only their key
+                // identifies them.
+                || (!current.is_podcast() && !queued.is_podcast() && queued.id == current.id)
                 || current.is_fed_pending()
         })
         .or_else(|| {
@@ -587,6 +609,36 @@ fn open_track_info(
     } else {
         state.status_message = Some("federation: fetching track metadata…".to_string());
         Some(Effect::FedFetchTrackInfo { tracks: fed_tracks })
+    }
+}
+
+/// Status text when a music-only action meets a podcast episode.
+pub const PODCAST_NOT_MUSIC: &str =
+    "podcast episodes are not music: likes, playlists and library actions do not apply";
+
+/// Playlists hold music only: drops podcast episodes from a local target
+/// (and says so when nothing is left).
+fn without_podcast_episodes(
+    state: &mut AppState,
+    target: Option<super::state::PlaylistAddTarget>,
+) -> Option<super::state::PlaylistAddTarget> {
+    use super::state::PlaylistAddTarget;
+    match target {
+        Some(PlaylistAddTarget::Local(tracks)) => {
+            let total = tracks.len();
+            let music: Vec<TrackItem> = tracks
+                .into_iter()
+                .filter(|track| !track.is_podcast())
+                .collect();
+            if music.is_empty() {
+                if total > 0 {
+                    state.status_message = Some(PODCAST_NOT_MUSIC.into());
+                }
+                return None;
+            }
+            Some(PlaylistAddTarget::Local(music))
+        }
+        other => other,
     }
 }
 
@@ -677,6 +729,10 @@ fn open_edit_popup(state: &mut AppState) {
         return;
     }
     if let Some(track) = selected_track(state).or_else(|| state.player.current.clone()) {
+        if track.is_podcast() {
+            state.status_message = Some("podcast details come from the RSS feed".into());
+            return;
+        }
         state.popup = Some(track_edit_popup(&track));
         return;
     }

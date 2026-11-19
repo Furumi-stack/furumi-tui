@@ -769,6 +769,22 @@ fn apply_playback_state_to_ui(
         .min(state.player.queue.len().saturating_sub(1));
 }
 
+/// Shown when a queue with podcast episodes would be handed to a device.
+const PODCAST_HANDOFF_UNSUPPORTED: &str = "device handoff: the queue has podcast episodes, which \
+     other devices cannot receive with this build yet (needs sync protocol v4)";
+/// Shown when another device tries to change a queue that has episodes.
+const PODCAST_REMOTE_CONTROL_UNSUPPORTED: &str = "remote control ignored: the queue has podcast \
+     episodes, which other devices cannot see with this build yet";
+
+fn queue_has_podcast_episodes(state: &AppState) -> bool {
+    state.player.queue.iter().any(|track| track.is_podcast())
+        || state
+            .player
+            .current
+            .as_ref()
+            .is_some_and(|track| track.is_podcast())
+}
+
 fn publish_playback_snapshot(state: &mut AppState, runtime: &Runtime) {
     if !state.device_playback.is_audio_owner() {
         return;
@@ -945,6 +961,13 @@ pub(crate) fn transfer_active_to_remote_device(
         || target_device_id == state.device_playback.self_device_id
     {
         transfer_active_to_this_device(state, runtime);
+        return;
+    }
+    if queue_has_podcast_episodes(state) {
+        // Protocol 3 cannot carry episodes (they travel as private
+        // placeholders), so the other device could neither play nor keep
+        // them: refuse before ownership changes.
+        state.status_message = Some(PODCAST_HANDOFF_UNSUPPORTED.into());
         return;
     }
     if let Err(error) = runtime.devices.claim_playback(&target_device_id) {
@@ -2434,6 +2457,11 @@ fn report_history(
     listened_ms: i64,
     ended_reason: music_dht::device_sync::ListenEndReason,
 ) {
+    // Podcast episodes are not music history (no content id); their
+    // listening sessions go to the podcast store (`podcast_runtime`).
+    if track.is_podcast() {
+        return;
+    }
     let Some(listen_id) = listen_id else {
         return;
     };
@@ -3068,6 +3096,12 @@ fn reset_artist_pagination(state: &mut AppState) {
     global.reloading = false;
 }
 
+/// A row of the local music library (not a podcast episode, not a pending
+/// federated placeholder).
+fn is_library_row(track: &crate::library::models::TrackItem) -> bool {
+    !track.is_podcast() && track.id >= 0
+}
+
 /// Preserve the queue position while refreshing library-backed entries.
 ///
 /// A playback key identifies a track, not a queue occurrence: the same track
@@ -3081,7 +3115,7 @@ fn queue_position_after_refresh(
     let removed_before_current = queue
         .iter()
         .take(queue_pos)
-        .filter(|track| track.id >= 0 && !refreshed_ids.contains(&track.id))
+        .filter(|track| is_library_row(track) && !refreshed_ids.contains(&track.id))
         .count();
     queue_pos.saturating_sub(removed_before_current)
 }
@@ -3103,9 +3137,22 @@ fn apply_queue_refresh(
         .cloned()
         .map(|track| (track_playback_key(&track), track))
         .collect();
-    let current_id = state.player.current.as_ref().map(|track| track.id);
+    // A current podcast episode (sentinel id) is never a deleted library
+    // row; it takes the "not a library row" branch below.
+    let current_id = state.player.current.as_ref().map(|track| {
+        if track.is_podcast() {
+            crate::library::models::TrackItem::NOT_A_LIBRARY_ROW
+        } else {
+            track.id
+        }
+    });
     let current_key = state.player.current.as_ref().map(track_playback_key);
     for track in &mut state.player.queue {
+        // Podcast episodes are not library rows: their sentinel id matches
+        // nothing and they are never refreshed from the library.
+        if track.is_podcast() {
+            continue;
+        }
         if let Some(fresh) = by_id.get(&track.id) {
             *track = fresh.clone();
         } else if let Some(fresh) = by_key.get(&track_playback_key(track)) {
@@ -3116,12 +3163,12 @@ fn apply_queue_refresh(
         .player
         .queue
         .iter()
-        .any(|track| track.id >= 0 && !by_id.contains_key(&track.id));
+        .any(|track| is_library_row(track) && !by_id.contains_key(&track.id));
     if had_missing {
         state
             .player
             .queue
-            .retain(|track| track.id < 0 || by_id.contains_key(&track.id));
+            .retain(|track| !is_library_row(track) || by_id.contains_key(&track.id));
         state.player.prefetched_pos = None;
     }
     if state.player.queue.is_empty() {
@@ -3254,6 +3301,14 @@ fn handle_playback_command(
 ) {
     match command {
         crate::devices::PlaybackCommand::SetState { state: wire, seek } => {
+            if queue_has_podcast_episodes(state) {
+                // The sender saw our episodes as private placeholders;
+                // applying its queue would replace them. Keep ours.
+                tracing::info!("ignored a remote playback command: the queue has podcast episodes");
+                state.status_message = Some(PODCAST_REMOTE_CONTROL_UNSUPPORTED.into());
+                publish_playback_snapshot(state, runtime);
+                return;
+            }
             let old_current_key = state.player.current.as_ref().map(track_playback_key);
             let old_playing = state.player.playing;
             let old_paused = state.player.paused;

@@ -1835,3 +1835,186 @@ mod podcast_tab {
         ));
     }
 }
+
+/// Podcast episodes in the shared queue: identity by episode id (never the
+/// shared sentinel id) and music-only actions that must skip them.
+mod podcast_queue {
+    use super::*;
+    use crate::app::podcast_fixtures::{self as fx, episode_track};
+    use crate::app::state::{PODCAST_ACTION_ROWS, Popup, RepeatMode, track_content_id};
+    use crate::app::update::PODCAST_NOT_MUSIC;
+
+    fn keys(queue: &[TrackItem]) -> Vec<String> {
+        queue.iter().map(track_key).collect()
+    }
+
+    #[test]
+    fn episodes_are_keyed_by_episode_id_not_by_the_sentinel_id() {
+        let (one, two) = (episode_track(1), episode_track(2));
+        assert_eq!(one.id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert_eq!(one.id, two.id);
+        assert!(track_key(&one).starts_with("ep:ep1"), "{}", track_key(&one));
+        assert_ne!(track_key(&one), track_key(&two));
+        assert_eq!(track_key(&one), track_key(&episode_track(1)));
+        // Music keeps its content-first key; a library row without a
+        // content id is keyed by its row, never as `local:` / an episode.
+        assert!(track_key(&test_track(5)).starts_with("content:"));
+        let mut bare = test_track(5);
+        bare.content_id = None;
+        assert_eq!(track_key(&bare), "lib:5");
+    }
+
+    #[test]
+    fn removing_an_episode_keeps_the_other_episode_current() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), test_track(7), episode_track(2)];
+        state.player.queue_pos = 2;
+        state.player.current = Some(episode_track(2));
+        state.player.playing = true;
+        state.active_tab = Tab::Queue;
+        state.queue_tab.cursor = 0;
+        let effect = update(&mut state, Action::RemoveFromQueue);
+        assert_eq!(
+            effect,
+            Some(Effect::RemoveQueueIndices {
+                indices: vec![0],
+                restart_paused: None,
+                stop: false,
+            })
+        );
+        assert_eq!(state.player.queue_pos, 1);
+        assert_eq!(
+            state.player.current.as_ref().map(track_key),
+            Some(track_key(&episode_track(2)))
+        );
+    }
+
+    #[test]
+    fn removing_the_playing_episode_moves_to_the_next_item_not_another_episode() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2), test_track(7)];
+        state.player.queue_pos = 0;
+        state.player.current = Some(episode_track(1));
+        state.player.playing = true;
+        state.active_tab = Tab::Queue;
+        state.queue_tab.cursor = 0;
+        let effect = update(&mut state, Action::RemoveFromQueue);
+        assert!(matches!(
+            effect,
+            Some(Effect::RemoveQueueIndices {
+                restart_paused: Some(false),
+                ..
+            })
+        ));
+        assert_eq!(
+            state.player.current.as_ref().map(track_key),
+            Some(track_key(&episode_track(2)))
+        );
+    }
+
+    #[test]
+    fn shuffle_and_repeat_keep_a_mixed_queue_intact() {
+        let mut state = AppState::default();
+        let queue = vec![
+            test_track(1),
+            episode_track(1),
+            episode_track(2),
+            test_track(2),
+            episode_track(3),
+            test_track(3),
+        ];
+        let original = keys(&queue);
+        state.player.queue = queue;
+        state.player.current = Some(test_track(1));
+        state.player.playing = true;
+        for _ in 0..8 {
+            update(&mut state, Action::ToggleShuffle);
+            let mut shuffled = keys(&state.player.queue);
+            shuffled.sort();
+            let mut expected = original.clone();
+            expected.sort();
+            assert_eq!(shuffled, expected, "no item lost or duplicated");
+            update(&mut state, Action::ToggleShuffle);
+            assert_eq!(keys(&state.player.queue), original);
+        }
+        // Next/previous step through episodes like any other item, and
+        // repeat-all wraps around.
+        state.player.repeat = RepeatMode::All;
+        state.player.queue_pos = 4;
+        state.player.current = Some(episode_track(3));
+        assert_eq!(
+            update(&mut state, Action::NextTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 5);
+        assert_eq!(
+            update(&mut state, Action::NextTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 0);
+        assert_eq!(
+            update(&mut state, Action::PrevTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 0);
+    }
+
+    #[test]
+    fn current_track_info_finds_the_playing_episode_among_episodes() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2)];
+        // The queue position points at another episode (same sentinel id).
+        state.player.queue_pos = 0;
+        state.player.current = Some(episode_track(2));
+        state.player.playing = true;
+        update(&mut state, Action::OpenCurrentTrackInfo);
+        let Some(Popup::TrackInfo { tracks, .. }) = &state.popup else {
+            panic!("track info expected");
+        };
+        assert_eq!(track_key(&tracks[0]), track_key(&episode_track(2)));
+    }
+
+    #[test]
+    fn music_only_actions_skip_episodes() {
+        let mut state = fx::ready_state(vec![fx::row("Show", 1, 2, 0)]);
+        state.active_tab = Tab::Queue;
+        state.player.queue = vec![episode_track(1)];
+        state.player.current = Some(episode_track(1));
+        state.player.playing = true;
+
+        assert_eq!(update(&mut state, Action::ToggleLike), None);
+        assert_eq!(state.status_message.as_deref(), Some(PODCAST_NOT_MUSIC));
+        assert_eq!(update(&mut state, Action::AddToPlaylist), None);
+        assert!(state.popup.is_none());
+        assert_eq!(state.status_message.as_deref(), Some(PODCAST_NOT_MUSIC));
+        update(&mut state, Action::NewPlaylist);
+        assert!(matches!(
+            state.popup.take(),
+            Some(Popup::NewPlaylist {
+                for_target: None,
+                ..
+            })
+        ));
+        update(&mut state, Action::EditSelected);
+        assert!(state.popup.is_none(), "episode metadata is not editable");
+        assert_eq!(update(&mut state, Action::DownloadSelected), None);
+
+        // No content id, no share link, no music history, private on the
+        // v3 wire.
+        let episode = episode_track(1);
+        assert_eq!(track_content_id(&episode), None);
+        assert_eq!(crate::share::track_content_id(&episode), None);
+        assert_eq!(crate::share::track_share_link(&episode), None);
+        let wire = crate::devices::PlaybackTrack::from_track(&episode);
+        assert_eq!(wire.title, music_dht::device_sync::PRIVATE_ITEM_TITLE);
+        assert!(wire.artist_names.is_empty() && wire.release_title.is_empty());
+        assert_eq!((wire.id, wire.content_id, wire.fed), (0, None, None));
+
+        // Shift-J opens the podcast instead of a music release.
+        let effect = update(&mut state, Action::GoToRelease);
+        assert_eq!(state.active_tab, Tab::Podcasts);
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS);
+        assert!(state.podcasts.opened.is_some());
+        assert!(matches!(effect, Some(Effect::PodcastLoadEpisodes { .. })));
+    }
+}

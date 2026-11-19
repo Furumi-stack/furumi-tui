@@ -14,7 +14,7 @@ use crate::app::action::Action;
 use crate::app::input::LineEdit;
 use crate::app::state::{
     AppState, EpisodeList, FedInputField, Loadable, OpenedPodcast, PODCAST_ACTION_ROWS,
-    PODCAST_EPISODE_PAGE, PodcastListRow, PodcastRow, PodcastStoreStatus, Popup, SeasonRow,
+    PODCAST_EPISODE_PAGE, PodcastListRow, PodcastRow, PodcastStoreStatus, Popup, SeasonRow, Tab,
 };
 use crate::podcasts::refresh::{RefreshReport, SubscribeReport};
 
@@ -181,6 +181,51 @@ fn open_podcast(state: &mut AppState, index: usize) -> Option<Effect> {
         Some(Effect::PodcastLoadSeasons(podcast_id))
     } else {
         Some(load_episodes(state, None))
+    }
+}
+
+/// Shift-J (or the info popup's artist jump) on a podcast episode: opens its
+/// podcast on the Podcasts tab instead of a music release or artist.
+pub fn reveal_episode_podcast(
+    state: &mut AppState,
+    track: &crate::library::models::TrackItem,
+) -> Option<Effect> {
+    let episode = track.podcast_episode_ref()?;
+    let podcast_id = episode.podcast_id.clone();
+    let title = episode.podcast_title.clone();
+    state.active_tab = Tab::Podcasts;
+    state.help_visible = false;
+    state.track_selection.clear();
+    state.jump_origin = None;
+    if !store_ready(state) {
+        return None;
+    }
+    if state
+        .podcasts
+        .opened
+        .as_ref()
+        .is_some_and(|opened| opened.podcast_id == podcast_id)
+    {
+        return None;
+    }
+    close(state);
+    match state
+        .podcasts
+        .podcasts()
+        .iter()
+        .position(|row| *row.id() == podcast_id)
+    {
+        Some(index) => {
+            state.podcasts.selected = index + PODCAST_ACTION_ROWS;
+            open_podcast(state, index)
+        }
+        None => {
+            state.status_message = Some(format!(
+                "podcasts: {} is not subscribed on this device",
+                display_title(&title)
+            ));
+            None
+        }
     }
 }
 

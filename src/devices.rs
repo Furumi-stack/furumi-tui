@@ -167,6 +167,9 @@ impl PlaybackTrack {
     }
 
     pub fn from_track(track: &TrackItem) -> Self {
+        if track.is_podcast() {
+            return Self::private_placeholder();
+        }
         Self {
             id: track.id,
             title: track.title.clone(),
@@ -198,6 +201,38 @@ impl PlaybackTrack {
             file_size_bytes: track.file_size_bytes,
             play_count: track.play_count,
             fed: track.fed.as_ref().and_then(SyncedFedTrack::from_fed),
+        }
+    }
+
+    /// What peers see in place of a podcast episode.
+    ///
+    /// This wire version (protocol 3) has no typed item source, so an
+    /// episode cannot be described without passing it off as music or
+    /// leaking its private title and URL (to Jam guests in particular). It
+    /// is sent as the shared "private item" placeholder instead: not
+    /// playable, no identity. Typed podcast items for peers that support
+    /// them come with sync protocol v4.
+    pub fn private_placeholder() -> Self {
+        Self {
+            id: 0,
+            title: music_dht::device_sync::PRIVATE_ITEM_TITLE.to_string(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 0.0,
+            artist_names: Vec::new(),
+            featured_artist_names: Vec::new(),
+            release_id: 0,
+            release_title: String::new(),
+            release_year: None,
+            file_path: String::new(),
+            content_id: None,
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
         }
     }
 
@@ -1203,6 +1238,11 @@ impl DeviceSync {
         listened_ms: i64,
         ended_reason: music_dht::device_sync::ListenEndReason,
     ) -> Option<ListenEvent> {
+        // Music listening history only: episodes record podcast listening
+        // sessions in the podcast store instead.
+        if track.is_podcast() {
+            return None;
+        }
         let content_id = track
             .content_id
             .as_deref()

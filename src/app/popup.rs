@@ -1065,6 +1065,21 @@ fn handle_track_info(
     let len = tracks.len();
     match key.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {}
+        // An episode's "artist" is its podcast title: never look it up as a
+        // federated artist (that would send a private title to the
+        // network); open the podcast instead.
+        KeyCode::Char('a')
+            if tracks
+                .get(cursor.min(len.saturating_sub(1)))
+                .is_some_and(TrackItem::is_podcast) =>
+        {
+            let track = tracks[cursor.min(len.saturating_sub(1))].clone();
+            if let Some(effect) =
+                crate::app::update::podcasts::reveal_episode_podcast(state, &track)
+            {
+                super::perform_effect(state, runtime, effect);
+            }
+        }
         KeyCode::Char('a') => {
             let artists = tracks
                 .get(cursor.min(len.saturating_sub(1)))
@@ -1126,6 +1141,10 @@ fn handle_track_info(
         KeyCode::Char('c') => {
             if let Some(track) = tracks.get(cursor.min(len.saturating_sub(1))) {
                 match crate::share::track_share_link(track) {
+                    None if track.is_podcast() => {
+                        state.status_message =
+                            Some("podcast episodes have no track share link".into())
+                    }
                     Some(link) => {
                         state.popup = Some(Popup::FedCopyText {
                             title: "Track share link".into(),
@@ -1155,7 +1174,7 @@ fn handle_track_info(
                     cursor,
                     scroll,
                 });
-            } else if track.id < 0 || track.file_path.is_empty() {
+            } else if track.is_podcast() || track.id < 0 || track.file_path.is_empty() {
                 state.status_message = Some("similarity search starts from a local track".into());
                 state.popup = Some(Popup::TrackInfo {
                     tracks,

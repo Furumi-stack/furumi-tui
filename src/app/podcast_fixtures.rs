@@ -126,3 +126,13 @@ pub fn seasons() -> Vec<SeasonSummary> {
         },
     ]
 }
+
+/// Queue item for episode `n` of the fixture podcast ("Show").
+pub fn episode_track(n: u32) -> crate::library::models::TrackItem {
+    let meta = row("Show", 0, 0, 0).summary.meta;
+    crate::library::models::TrackItem::podcast_episode(
+        episode(n, &format!("Episode {n}"), None)
+            .episode
+            .to_ref(&meta),
+    )
+}

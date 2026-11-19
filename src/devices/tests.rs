@@ -1070,3 +1070,19 @@ fn failed_podcast_actions_append_nothing() {
     assert!(result.is_err());
     assert!(logged_ops(&sync).is_empty());
 }
+
+#[test]
+fn podcast_episodes_never_enter_music_listening_history() {
+    let sync = test_sync();
+    let episode = crate::app::podcast_fixtures::episode_track(1);
+    assert!(
+        sync.listen_event_for_track(
+            "listen-1".into(),
+            &episode,
+            1_000,
+            120_000,
+            music_dht::device_sync::ListenEndReason::Finished,
+        )
+        .is_none()
+    );
+}

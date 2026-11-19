@@ -1400,7 +1400,7 @@ impl SimilaritySearchHit {
             Self::Local { track, .. } => track
                 .content_id
                 .clone()
-                .unwrap_or_else(|| format!("local:{}", track.id)),
+                .unwrap_or_else(|| track.key().to_string()),
             Self::Federated { track, .. } => track
                 .content_id
                 .clone()
@@ -2382,7 +2382,13 @@ fn fed_release_slot_availability(
     }
 }
 
+/// Audio content id of a music track (library or federated). Podcast
+/// episodes have none: they are never content-addressed, resolved by hash
+/// or fetched from peers.
 pub fn track_content_id(track: &TrackItem) -> Option<String> {
+    if track.is_podcast() {
+        return None;
+    }
     track
         .content_id
         .as_deref()
@@ -2396,12 +2402,24 @@ pub fn track_content_id(track: &TrackItem) -> Option<String> {
         })
 }
 
+/// Identity of a queue item for matching it across queue edits, shuffle,
+/// resolution and playback state.
+///
+/// Podcast episodes are keyed by their episode id only (`ep:…`, from
+/// `TrackItem::key`): all of them share the sentinel numeric id, which must
+/// never identify anything. Music is keyed content-first (a pending
+/// federated item and its library copy are the same track), then by its
+/// federated source, then by `TrackItem::key` (`lib:<row id>` for library
+/// rows, `tmp:<id>` for process-local placeholders).
 pub fn track_key(track: &TrackItem) -> String {
+    if track.is_podcast() {
+        return track.key().to_string();
+    }
     if let Some(content_id) = track_content_id(track) {
         return format!("content:{content_id}");
     }
     if let Some(fed) = &track.fed {
         return format!("fed:{}:{}", fed.owner, fed.item_id);
     }
-    format!("local:{}", track.id)
+    track.key().to_string()
 }
