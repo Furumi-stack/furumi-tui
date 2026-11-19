@@ -206,4 +206,39 @@ pub enum AppEvent {
     JamInvite(Result<String, String>),
     /// Result of joining a Jam capability.
     JamJoined(Result<String, String>),
+    /// The podcast store opened (with the feed client), or why it did not.
+    PodcastStoreOpened(Result<crate::podcasts::refresh::Services, String>),
+    /// Subscribed podcasts reloaded from the podcast store.
+    PodcastsLoaded(Result<Vec<crate::app::state::PodcastRow>, String>),
+    PodcastSeasonsLoaded {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<Vec<furumi_library::podcasts::SeasonSummary>, String>,
+    },
+    /// One page of episodes; `seq` drops results of older requests.
+    PodcastEpisodesLoaded {
+        seq: u64,
+        offset: usize,
+        result: Result<Vec<furumi_library::podcasts::EpisodeListItem>, String>,
+    },
+    PodcastSubscribed(Result<crate::podcasts::refresh::SubscribeReport, String>),
+    /// One feed check finished.
+    PodcastRefreshed {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<crate::podcasts::refresh::RefreshReport, String>,
+        /// Asked by the user (status bar), not the background scheduler.
+        manual: bool,
+    },
+    PodcastUnsubscribed {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        result: Result<(), String>,
+    },
+    PodcastPlayedSet {
+        played: bool,
+        result: Result<(), String>,
+    },
+    /// Scheduler timer: ask the store which feeds are due.
+    PodcastRefreshTick,
+    /// Feeds due for a background refresh.
+    PodcastsDue(Result<Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>, String>),
 }

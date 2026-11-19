@@ -57,6 +57,22 @@ pub enum Action {
     OpenSearch,
     EditSelected,
     DeleteSelected,
+    /// Podcasts: subscribe to an RSS feed URL.
+    AddPodcast,
+    /// Podcasts: search the episodes of the opened podcast.
+    SearchEpisodes,
+    /// Podcasts: check the selected or opened podcast for new episodes.
+    RefreshPodcast,
+    /// Podcasts: check every subscription for new episodes.
+    RefreshAllPodcasts,
+    /// Podcasts: cycle the episode order.
+    CycleEpisodeSort,
+    /// Podcasts: cycle the played-state filter.
+    CycleEpisodeFilter,
+    /// Podcasts: mark the selected episode played / unplayed.
+    ToggleEpisodePlayed,
+    /// Podcasts: unsubscribe (progress and history are kept).
+    UnsubscribePodcast,
 }
 
 /// Help-window sections, in display order.
@@ -66,16 +82,18 @@ pub enum Category {
     Queue,
     Library,
     Navigation,
+    Podcasts,
     Search,
     System,
 }
 
 impl Category {
-    pub const ALL: [Category; 6] = [
+    pub const ALL: [Category; 7] = [
         Category::Playback,
         Category::Queue,
         Category::Library,
         Category::Navigation,
+        Category::Podcasts,
         Category::Search,
         Category::System,
     ];
@@ -86,6 +104,7 @@ impl Category {
             Category::Queue => "Queue & playlists",
             Category::Library => "Library",
             Category::Navigation => "Navigation",
+            Category::Podcasts => "Podcasts",
             Category::Search => "Search & commands",
             Category::System => "System",
         }
@@ -139,6 +158,14 @@ impl Action {
             | Action::DeleteSelected
             | Action::CycleSourceMode
             | Action::OpenLibraryFilters => Category::Library,
+            Action::AddPodcast
+            | Action::SearchEpisodes
+            | Action::RefreshPodcast
+            | Action::RefreshAllPodcasts
+            | Action::CycleEpisodeSort
+            | Action::CycleEpisodeFilter
+            | Action::ToggleEpisodePlayed
+            | Action::UnsubscribePodcast => Category::Podcasts,
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
             Action::ToggleHelp | Action::Quit => Category::System,
         }
@@ -218,6 +245,14 @@ impl Action {
             Action::OpenSearch => "Search artists, releases, tracks".into(),
             Action::EditSelected => "Edit the selected item".into(),
             Action::DeleteSelected => "Delete the selected item".into(),
+            Action::AddPodcast => "Add podcast (RSS URL)".into(),
+            Action::SearchEpisodes => "Search episodes".into(),
+            Action::RefreshPodcast => "Check podcast for new episodes".into(),
+            Action::RefreshAllPodcasts => "Check all podcasts".into(),
+            Action::CycleEpisodeSort => "Episode order".into(),
+            Action::CycleEpisodeFilter => "Filter: all/unplayed/played".into(),
+            Action::ToggleEpisodePlayed => "Mark played / unplayed".into(),
+            Action::UnsubscribePodcast => "Unsubscribe (keeps progress)".into(),
         }
     }
 }

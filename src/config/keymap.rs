@@ -891,6 +891,43 @@ mod tests {
     }
 
     #[test]
+    fn default_podcast_keys_resolve_only_in_the_podcasts_context() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        let shift = |c| KeyCombination::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let cases = [
+            (key!(o), Action::AddPodcast),
+            (key!('/'), Action::SearchEpisodes),
+            (shift('R'), Action::RefreshPodcast),
+            (key!(ctrl - r), Action::RefreshAllPodcasts),
+            (shift('S'), Action::CycleEpisodeSort),
+            (key!(f), Action::CycleEpisodeFilter),
+            (key!(m), Action::ToggleEpisodePlayed),
+            (shift('U'), Action::UnsubscribePodcast),
+        ];
+        for (key, action) in cases {
+            assert_eq!(
+                km.resolve(key, KeyContext::Podcasts),
+                KeyResolution::Action(action.clone()),
+                "{action:?}"
+            );
+            assert_ne!(
+                km.resolve(key, KeyContext::Library),
+                KeyResolution::Action(action.clone()),
+                "{action:?} leaks into the library"
+            );
+        }
+        // Playback keys keep working on the Podcasts tab.
+        assert_eq!(
+            km.resolve(key!(space), KeyContext::Podcasts),
+            KeyResolution::Action(Action::PlayPause)
+        );
+        assert_eq!(
+            km.resolve(key!(n), KeyContext::Podcasts),
+            KeyResolution::Action(Action::NextTrack)
+        );
+    }
+
+    #[test]
     fn default_listening_history_key_resolves() {
         let mut km = keymap_from(DEFAULT_KEYMAP);
         assert_eq!(

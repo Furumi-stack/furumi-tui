@@ -101,7 +101,7 @@ pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<
             .subscription(&id)?
             .is_some_and(|record| record.subscribed);
         let title = store.podcast(&id)?.map(|summary| summary.meta.title);
-        Ok(subscribed.then(|| (id, title)))
+        Ok(subscribed.then_some((id, title)))
     })
     .await?;
     if let Some((podcast_id, title)) = existing {

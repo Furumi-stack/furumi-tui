@@ -106,6 +106,32 @@ pub enum Effect {
     },
     /// Load qualified listening history without blocking the UI thread.
     LoadListenHistory,
+    /// Reload the subscribed podcasts with their fetch state.
+    PodcastsReload,
+    /// Load the season groups of a podcast.
+    PodcastLoadSeasons(music_dht::podcast::PodcastId),
+    /// Load one page of episodes; `seq` drops stale results.
+    PodcastLoadEpisodes {
+        seq: u64,
+        query: furumi_library::podcasts::EpisodeQuery,
+    },
+    /// Fetch a feed the user typed and subscribe to it.
+    PodcastSubscribe(String),
+    /// Check feeds for new episodes (`manual`: asked by the user).
+    PodcastRefresh {
+        targets: Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>,
+        manual: bool,
+    },
+    /// Unsubscribe; progress and history are kept.
+    PodcastUnsubscribe {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+    },
+    /// Mark an episode played or unplayed (an explicit progress action).
+    PodcastSetPlayed {
+        episode_id: music_dht::podcast::EpisodeId,
+        played: bool,
+    },
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -115,6 +141,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         .take()
         .is_some_and(|deadline| Instant::now() <= deadline);
     state.status_message = None;
+    if state.active_tab == Tab::Podcasts
+        && !state.help_visible
+        && !state.visualizer.active
+        && !state.additional_settings_open
+        && let Some(effect) = podcasts::handle(state, &action)
+    {
+        return effect;
+    }
     if state.additional_settings_open
         && !matches!(
             action,
@@ -475,6 +509,20 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::DeleteSelected => delete_selected(state),
+        Action::AddPodcast
+        | Action::SearchEpisodes
+        | Action::RefreshPodcast
+        | Action::RefreshAllPodcasts
+        | Action::CycleEpisodeSort
+        | Action::CycleEpisodeFilter
+        | Action::ToggleEpisodePlayed
+        | Action::UnsubscribePodcast => {
+            state.status_message = Some(format!(
+                "open the Podcasts tab ({}) for this command",
+                Tab::Podcasts.index() + 1
+            ));
+            None
+        }
     }
 }
 
@@ -3250,13 +3298,16 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.logs.follow = true;
             state.logs.selected_seq = None;
         }
-        Tab::Queue | Tab::Podcasts => {}
+        Tab::Queue => {}
+        Tab::Podcasts => podcasts::close(state),
     }
 }
 
 fn not_yet(state: &mut AppState, what: &str) {
     state.status_message = Some(format!("{what}: coming in a later milestone"));
 }
+
+pub(crate) mod podcasts;
 
 #[cfg(test)]
 #[path = "update_tests.rs"]

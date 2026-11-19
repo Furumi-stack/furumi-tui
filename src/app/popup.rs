@@ -115,6 +115,15 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         Popup::ConfirmDelete { target, label } => {
             handle_confirm_delete(state, runtime, target, label, key);
         }
+        Popup::ConfirmPodcastUnsubscribe { podcast_id, title } => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => super::perform_effect(
+                state,
+                runtime,
+                crate::app::update::Effect::PodcastUnsubscribe { podcast_id, title },
+            ),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
+            _ => state.popup = Some(Popup::ConfirmPodcastUnsubscribe { podcast_id, title }),
+        },
         Popup::SimilarityPrivacyConsent { enable_federation } => match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
                 state.similarity.settings.federation_consent = true;
@@ -557,10 +566,31 @@ fn handle_fed_input(
     key: KeyEvent,
 ) {
     match key.code {
-        KeyCode::Esc => {}
+        KeyCode::Esc => {
+            // Esc in the episode search clears it.
+            if field == FedInputField::PodcastSearch
+                && let Some(effect) = crate::app::update::podcasts::set_search(state, String::new())
+            {
+                super::perform_effect(state, runtime, effect);
+            }
+        }
         KeyCode::Enter => {
             let value = input.trim().to_string();
             match field {
+                FedInputField::PodcastFeedUrl => {
+                    if let Some(effect) =
+                        crate::app::update::podcasts::submit_feed_url(state, &value)
+                    {
+                        super::perform_effect(state, runtime, effect);
+                    }
+                }
+                // The search is applied while typing; Enter keeps it.
+                FedInputField::PodcastSearch => {
+                    let search = input.to_string();
+                    if let Some(effect) = crate::app::update::podcasts::set_search(state, search) {
+                        super::perform_effect(state, runtime, effect);
+                    }
+                }
                 FedInputField::NetworkId => {
                     state.federation.settings.network_id = value;
                     // An empty id turns federation off rather than leaving a
@@ -666,7 +696,13 @@ fn handle_fed_input(
         }
         _ => {
             input.handle_key(key);
+            let search = (field == FedInputField::PodcastSearch).then(|| input.to_string());
             state.popup = Some(Popup::FedInput { field, input });
+            if let Some(search) = search
+                && let Some(effect) = crate::app::update::podcasts::set_search(state, search)
+            {
+                super::perform_effect(state, runtime, effect);
+            }
         }
     }
 }
@@ -785,17 +821,28 @@ fn handle_device_leave(state: &mut AppState, runtime: &mut Runtime, key: KeyEven
 }
 
 /// Pasted text goes into the focused text field when one is open.
-pub fn handle_paste(state: &mut AppState, pasted: &str) {
+pub fn handle_paste(state: &mut AppState, runtime: &mut Runtime, pasted: &str) {
     let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
+    let mut search = None;
     match &mut state.popup {
         Some(Popup::NewPlaylist { input, busy, .. }) if !*busy => input.insert_str(&cleaned),
-        Some(Popup::FedInput { input, .. }) => input.insert_str(&cleaned),
+        Some(Popup::FedInput { field, input }) => {
+            input.insert_str(&cleaned);
+            if *field == FedInputField::PodcastSearch {
+                search = Some(input.to_string());
+            }
+        }
         Some(Popup::Edit { fields, focus, .. }) => {
             if let Some(field) = fields.get_mut(*focus) {
                 field.value.insert_str(&cleaned);
             }
         }
         _ => {}
+    }
+    if let Some(search) = search
+        && let Some(effect) = crate::app::update::podcasts::set_search(state, search)
+    {
+        super::perform_effect(state, runtime, effect);
     }
 }
 

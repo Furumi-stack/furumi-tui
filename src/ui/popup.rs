@@ -25,6 +25,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..
         }) => draw_edit(frame, state, title, fields, *focus, error.as_deref()),
         Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, state, label),
+        Some(Popup::ConfirmPodcastUnsubscribe { title, .. }) => {
+            draw_confirm_podcast_unsubscribe(frame, state, title)
+        }
         Some(Popup::SimilarityPrivacyConsent { .. }) => {
             draw_similarity_privacy_consent(frame, state)
         }
@@ -43,7 +46,12 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         }) => draw_track_artists(frame, state, tracks, *cursor, *selected),
         Some(Popup::LogDetail(entry)) => draw_log_detail(frame, state, entry),
         Some(Popup::FedInput { field, input }) => {
-            draw_fed_input(frame, state, field.title(), field.help(), input)
+            let keys = if *field == crate::app::state::FedInputField::PodcastSearch {
+                "enter: keep · esc: clear"
+            } else {
+                "enter: apply · esc: cancel"
+            };
+            draw_fed_input(frame, state, field.title(), field.help(), keys, input)
         }
         Some(Popup::FedText { title, text }) => draw_fed_text(frame, state, title, text),
         Some(Popup::FedCopyText {
@@ -891,6 +899,7 @@ fn draw_fed_input(
     state: &AppState,
     title: &str,
     help: &str,
+    keys: &str,
     input: &crate::app::input::LineEdit,
 ) {
     let area = centered(frame.area(), 72, 8);
@@ -916,8 +925,7 @@ fn draw_fed_input(
     let spans = super::line_edit_spans(input, usize::from(entry_area.width.saturating_sub(1)));
     frame.render_widget(Paragraph::new(Line::from(spans)), entry_area);
     frame.render_widget(
-        Paragraph::new(Line::styled("enter: apply · esc: cancel", theme::dim()))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::styled(keys.to_string(), theme::dim())).alignment(Alignment::Center),
         hint_area,
     );
 }
@@ -1262,6 +1270,50 @@ fn draw_confirm_delete(frame: &mut Frame, state: &AppState, label: &str) {
     frame.render_widget(
         Paragraph::new(Line::styled("enter/y delete · esc/n cancel", theme::dim()))
             .alignment(Alignment::Center),
+        footer,
+    );
+}
+
+/// Text of the unsubscribe confirmation: unsubscribing keeps progress and
+/// listening history, so subscribing again continues where the user left off.
+pub(crate) const PODCAST_UNSUBSCRIBE_NOTE: &str = "Listening progress and history are kept: \
+     subscribe again later to continue where you left off.";
+
+fn draw_confirm_podcast_unsubscribe(frame: &mut Frame, state: &AppState, title: &str) {
+    let width = 66.min(frame.area().width.saturating_sub(4)).max(30);
+    let area = centered(frame.area(), width, 9);
+    let block = Block::bordered()
+        .title(" Unsubscribe? ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [question, note, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(format!("Unsubscribe from \"{title}\"?"))
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Center),
+        question,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(PODCAST_UNSUBSCRIBE_NOTE, theme::dim()))
+            .wrap(Wrap { trim: true })
+            .alignment(Alignment::Center),
+        note,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "enter/y unsubscribe · esc/n cancel",
+            theme::dim(),
+        ))
+        .alignment(Alignment::Center),
         footer,
     );
 }

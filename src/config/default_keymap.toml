@@ -271,3 +271,45 @@ command = "OpenCommandLine"
 [[keymaps]]
 key_sequence = "/"
 command = "OpenSearch"
+
+# Podcasts tab. Enter opens a podcast, its seasons and episodes; Esc goes
+# back. Shift-D also unsubscribes here.
+[[keymaps]]
+key_sequence = "o"
+command = "AddPodcast"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "/"
+command = "SearchEpisodes"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "shift-r"
+command = "RefreshPodcast"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "ctrl-r"
+command = "RefreshAllPodcasts"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "shift-s"
+command = "CycleEpisodeSort"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "f"
+command = "CycleEpisodeFilter"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "m"
+command = "ToggleEpisodePlayed"
+context = "podcasts"
+
+[[keymaps]]
+key_sequence = "shift-u"
+command = "UnsubscribePodcast"
+context = "podcasts"

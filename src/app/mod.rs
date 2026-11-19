@@ -4,6 +4,9 @@ pub mod command;
 mod enrichment;
 pub mod event;
 pub mod input;
+#[cfg(test)]
+pub(crate) mod podcast_fixtures;
+pub(crate) mod podcast_runtime;
 pub(crate) mod popup;
 pub mod state;
 pub mod update;
@@ -77,6 +80,9 @@ pub struct Runtime {
     pub last_media_push: Option<std::time::Instant>,
     pub status_publisher: crate::status::Publisher,
     pub status_visualizer: crate::visualizer::status::Renderer,
+    /// Podcast store and feed client; `None` until opened (or if opening
+    /// failed, which only disables the Podcasts tab).
+    pub podcasts: Option<podcast_runtime::PodcastRuntime>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -482,8 +488,10 @@ pub async fn run(
         last_media_push: None,
         status_publisher: crate::status::Publisher::spawn(),
         status_visualizer: crate::visualizer::status::Renderer::default(),
+        podcasts: None,
     };
     spawn_content_id_backfill(&runtime);
+    podcast_runtime::spawn_open(&runtime);
     if state.similarity.settings.enabled {
         runtime.similarity.start();
     }
@@ -1314,6 +1322,9 @@ fn maintenance(state: &mut AppState, runtime: &mut Runtime) {
             }
         }
     }
+    if let Some(path) = podcast_runtime::wanted_cover(state) {
+        wanted.push((path, header.0, header.1));
+    }
     for (path, width, height) in wanted {
         let key = crate::art::cache_key(&path, width, height);
         if state.art.contains_key(&key) {
@@ -1563,6 +1574,9 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
         perform_control_playback_effect(state, runtime, effect);
         return;
     }
+    let Some(effect) = podcast_runtime::perform(state, runtime, effect) else {
+        return;
+    };
     match effect {
         Effect::CheckUpdate => {
             let tx = runtime.event_tx.clone();
@@ -1686,6 +1700,14 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
                 }
             });
         }
+        // Executed by podcast_runtime::perform above.
+        Effect::PodcastsReload
+        | Effect::PodcastLoadSeasons(_)
+        | Effect::PodcastLoadEpisodes { .. }
+        | Effect::PodcastSubscribe(_)
+        | Effect::PodcastRefresh { .. }
+        | Effect::PodcastUnsubscribe { .. }
+        | Effect::PodcastSetPlayed { .. } => {}
         Effect::LoadListenHistory => {
             let library = Arc::clone(&runtime.library);
             let devices = Arc::clone(&runtime.devices);
@@ -2832,7 +2854,7 @@ fn handle_terminal_event(
         }
         TermEvent::Paste(pasted) => {
             if state.popup.is_some() {
-                popup::handle_paste(state, &pasted);
+                popup::handle_paste(state, runtime, &pasted);
             } else if state.cmdline.active {
                 cmdline::handle_paste(state, runtime, &pasted);
             }
@@ -3305,7 +3327,21 @@ fn handle_playback_command(
 }
 
 fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent) {
+    let Some(event) = podcast_runtime::handle_event(state, runtime, event) else {
+        return;
+    };
     match event {
+        // Folded in by podcast_runtime::handle_event above.
+        AppEvent::PodcastStoreOpened(_)
+        | AppEvent::PodcastsLoaded(_)
+        | AppEvent::PodcastSeasonsLoaded { .. }
+        | AppEvent::PodcastEpisodesLoaded { .. }
+        | AppEvent::PodcastSubscribed(_)
+        | AppEvent::PodcastRefreshed { .. }
+        | AppEvent::PodcastUnsubscribed { .. }
+        | AppEvent::PodcastPlayedSet { .. }
+        | AppEvent::PodcastRefreshTick
+        | AppEvent::PodcastsDue(_) => {}
         AppEvent::StatusVisualizationReady(ready) => {
             runtime.status_visualizer.busy = false;
             state.status_visualizer.apply(ready);
