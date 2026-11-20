@@ -15,7 +15,7 @@ use ratatui::buffer::Buffer;
 
 pub mod status;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Clear, Paragraph};
 use rhai::{AST, Array, Dynamic, Engine, FLOAT, INT, Map, Scope};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,13 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         display_name: "Morphing cube",
         version: 6,
         source: include_str!("visualizations/morphing_cube.rhai"),
+    },
+    BundledScript {
+        id: "vfd_panel",
+        file_name: "vfd_panel.rhai",
+        display_name: "VFD panel",
+        version: 1,
+        source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
 
@@ -118,6 +125,12 @@ impl VisualizerState {
     pub fn open(&mut self) {
         self.active = true;
         self.started_at = Some(Instant::now());
+        // Every opening is a new session for the script: empty state, frame
+        // 0 and dt 0, just as `time` restarts.
+        self.runtime
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset_session();
     }
 
     pub fn close(&mut self) {
@@ -344,7 +357,134 @@ fn input_map_with_features(area: Rect, state: &AppState, features: AudioFeatures
         .unwrap_or_else(|| ("".to_string(), "".to_string()));
     input.insert("track_title".into(), title.into());
     input.insert("track_artist".into(), artist.into());
+    insert_meter(&mut input, &state.player.audio_analysis);
+    insert_track_details(&mut input, state);
     input
+}
+
+/// Analyzer meter fields (protocol v3). They report the decoded signal as a
+/// level meter would, so unlike `energy`/`bass`/... they are not scaled by
+/// the output volume; while paused or stopped they fall on their own.
+fn insert_meter(input: &mut Map, analysis: &crate::player::AudioAnalysisSnapshot) {
+    let floats = |values: &[f64]| -> Dynamic {
+        values
+            .iter()
+            .map(|value| Dynamic::from_float(*value as FLOAT))
+            .collect::<Array>()
+            .into()
+    };
+    let bands = crate::player::BAND_CENTERS_HZ.len();
+    let spectrum = if analysis.spectrum.len() == bands {
+        analysis.spectrum.clone()
+    } else {
+        vec![0.0; bands]
+    };
+    let peaks = if analysis.spectrum_peaks.len() == bands {
+        analysis.spectrum_peaks.clone()
+    } else {
+        vec![0.0; bands]
+    };
+    input.insert("spectrum".into(), floats(&spectrum));
+    input.insert("spectrum_peaks".into(), floats(&peaks));
+    input.insert(
+        "spectrum_hz".into(),
+        floats(
+            &crate::player::BAND_CENTERS_HZ
+                .iter()
+                .map(|hz| f64::from(*hz))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    insert_float(
+        input,
+        "spectrum_floor_db",
+        f64::from(crate::player::FLOOR_DB),
+    );
+    insert_float(input, "level_l", analysis.level_l);
+    insert_float(input, "level_r", analysis.level_r);
+    insert_float(input, "peak_l", analysis.peak_l);
+    insert_float(input, "peak_r", analysis.peak_r);
+    insert_int(input, "sample_rate", i64::from(analysis.sample_rate));
+}
+
+/// Track, queue and transport details for front-panel style displays.
+/// Unknown numbers are 0 and unknown strings empty.
+fn insert_track_details(input: &mut Map, state: &AppState) {
+    let player = &state.player;
+    let track = player.current.as_ref();
+    let number = |value: Option<i32>| i64::from(value.unwrap_or(0).max(0));
+    insert_float(
+        input,
+        "duration",
+        track.map_or(0.0, |track| track.duration_seconds.max(0.0)),
+    );
+    insert_int(
+        input,
+        "track_number",
+        number(track.and_then(|t| t.track_number)),
+    );
+    insert_int(
+        input,
+        "disc_number",
+        number(track.and_then(|t| t.disc_number)),
+    );
+    insert_int(input, "year", number(track.and_then(|t| t.release_year)));
+    input.insert(
+        "release_title".into(),
+        track
+            .map_or_else(String::new, |t| t.release_title.clone())
+            .into(),
+    );
+    input.insert(
+        "audio_format".into(),
+        track
+            .and_then(|t| t.audio_format.clone())
+            .unwrap_or_default()
+            .into(),
+    );
+    insert_int(
+        input,
+        "audio_bitrate",
+        number(track.and_then(|t| t.audio_bitrate)),
+    );
+    insert_int(
+        input,
+        "audio_sample_rate",
+        number(track.and_then(|t| t.audio_sample_rate)),
+    );
+    insert_int(
+        input,
+        "audio_bit_depth",
+        number(track.and_then(|t| t.audio_bit_depth)),
+    );
+    let source = match track {
+        None => "",
+        Some(track) if track.is_podcast() => "podcast",
+        Some(track) if track.fed.is_some() => "federated",
+        Some(_) => "local",
+    };
+    input.insert("source".into(), source.into());
+    input.insert(
+        "playing".into(),
+        (player.playing && track.is_some() && !player.paused).into(),
+    );
+    let (index, length) = if track.is_some() && !player.queue.is_empty() {
+        (
+            i64::try_from(player.queue_pos + 1).unwrap_or(i64::MAX),
+            i64::try_from(player.queue.len()).unwrap_or(i64::MAX),
+        )
+    } else {
+        (0, i64::try_from(player.queue.len()).unwrap_or(i64::MAX))
+    };
+    insert_int(input, "queue_index", index);
+    insert_int(input, "queue_length", length);
+    input.insert("shuffle".into(), player.shuffle.into());
+    let repeat = match player.repeat {
+        crate::app::state::RepeatMode::Off => "off",
+        crate::app::state::RepeatMode::One => "one",
+        crate::app::state::RepeatMode::All => "all",
+    };
+    input.insert("repeat".into(), repeat.into());
 }
 
 fn features_from_state(state: &AppState, scale_output: bool) -> AudioFeatures {
@@ -432,7 +572,17 @@ struct ScriptRuntime {
     cached_path: Option<PathBuf>,
     cached_modified: Option<SystemTime>,
     ast: Option<AST>,
+    /// Value the script returned as `state`, handed back as `input.state` on
+    /// the next frame. Reset whenever the script is (re)loaded and whenever
+    /// the visualizer opens.
+    script_state: Dynamic,
+    last_render: Option<Instant>,
+    frame: u64,
 }
+
+/// Longest `input.dt` a script sees, so a long pause does not make one frame
+/// jump a whole animation.
+const MAX_FRAME_DT_SECS: f64 = 1.0;
 
 impl Default for ScriptRuntime {
     fn default() -> Self {
@@ -464,21 +614,66 @@ impl Default for ScriptRuntime {
             cached_path: None,
             cached_modified: None,
             ast: None,
+            script_state: Dynamic::UNIT,
+            last_render: None,
+            frame: 0,
         }
     }
 }
 
 impl ScriptRuntime {
-    fn render(&mut self, path: &Path, input: Map) -> std::result::Result<Vec<DrawCommand>, String> {
+    /// Runs the script's `render(input)`. A script returns either an array of
+    /// draw commands, or `#{ commands: [...], state: ... }` to keep `state`
+    /// for the next frame (`input.state`, an empty map at first).
+    fn render(
+        &mut self,
+        path: &Path,
+        mut input: Map,
+    ) -> std::result::Result<Vec<DrawCommand>, String> {
         self.load(path)?;
         let Some(ast) = &self.ast else {
             return Err("script did not compile".to_string());
         };
+        let now = Instant::now();
+        let dt = self.last_render.map_or(0.0, |last| {
+            now.saturating_duration_since(last)
+                .as_secs_f64()
+                .min(MAX_FRAME_DT_SECS)
+        });
+        self.last_render = Some(now);
+        insert_float(&mut input, "dt", dt);
+        insert_int(
+            &mut input,
+            "frame",
+            i64::try_from(self.frame).unwrap_or(i64::MAX),
+        );
+        self.frame = self.frame.wrapping_add(1);
+        let state = if self.script_state.is_unit() {
+            Dynamic::from_map(Map::new())
+        } else {
+            self.script_state.clone()
+        };
+        input.insert("state".into(), state);
+
         let mut scope = Scope::new();
-        let output = self
+        let returned = self
             .engine
-            .call_fn::<Array>(&mut scope, ast, "render", (input,))
+            .call_fn::<Dynamic>(&mut scope, ast, "render", (input,))
             .map_err(|err| err.to_string())?;
+        let output = if returned.is_array() {
+            returned.cast::<Array>()
+        } else if let Some(mut map) = returned.try_cast::<Map>() {
+            let commands = map
+                .remove("commands")
+                .and_then(|value| value.try_cast::<Array>())
+                .ok_or_else(|| "render returned a map without a commands array".to_string())?;
+            if let Some(state) = map.remove("state") {
+                self.script_state = state;
+            }
+            commands
+        } else {
+            return Err("render must return an array or #{ commands, state }".to_string());
+        };
         let mut commands = Vec::with_capacity(output.len());
         for (index, value) in output.into_iter().enumerate() {
             commands.push(
@@ -508,7 +703,15 @@ impl ScriptRuntime {
         self.cached_path = Some(path.to_path_buf());
         self.cached_modified = modified;
         self.ast = Some(ast);
+        self.reset_session();
         Ok(())
+    }
+
+    /// Forgets the script's retained state and frame clock.
+    fn reset_session(&mut self) {
+        self.script_state = Dynamic::UNIT;
+        self.frame = 0;
+        self.last_render = None;
     }
 }
 
@@ -523,6 +726,7 @@ enum DrawCommand {
         ch: String,
         fg: Color,
         bg: Color,
+        mods: Modifier,
     },
     HLine {
         x: u16,
@@ -531,6 +735,7 @@ enum DrawCommand {
         ch: String,
         fg: Color,
         bg: Color,
+        mods: Modifier,
     },
     VLine {
         x: u16,
@@ -539,6 +744,7 @@ enum DrawCommand {
         ch: String,
         fg: Color,
         bg: Color,
+        mods: Modifier,
     },
     Rect {
         x: u16,
@@ -548,6 +754,7 @@ enum DrawCommand {
         ch: String,
         fg: Color,
         bg: Color,
+        mods: Modifier,
     },
     Trace {
         x: u16,
@@ -557,6 +764,7 @@ enum DrawCommand {
         fg: Color,
         line_fg: Color,
         bg: Color,
+        mods: Modifier,
     },
     Text {
         x: u16,
@@ -564,6 +772,26 @@ enum DrawCommand {
         text: String,
         fg: Color,
         bg: Color,
+        mods: Modifier,
+    },
+    /// Braille dots: each cell holds 2 x 4 dots, so `points` are in dot
+    /// coordinates (x 0..2*width, y 0..4*height). Dots merge with braille
+    /// already drawn in the same cell.
+    Dots {
+        points: Vec<(u16, u16)>,
+        fg: Color,
+        bg: Color,
+        mods: Modifier,
+    },
+    /// A thin straight line of braille dots between two dot coordinates.
+    Line {
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        fg: Color,
+        bg: Color,
+        mods: Modifier,
     },
 }
 
@@ -577,6 +805,7 @@ impl DrawCommand {
             .ok_or_else(|| "missing op".to_string())?;
         let fg = map_color(&map, "fg").unwrap_or(Color::White);
         let bg = map_color(&map, "bg").unwrap_or(Color::Black);
+        let mods = map_modifiers(&map);
         match op.as_str() {
             "clear" => Ok(DrawCommand::Clear { bg }),
             "cell" => Ok(DrawCommand::Cell {
@@ -585,6 +814,7 @@ impl DrawCommand {
                 ch: map_string(&map, "ch").unwrap_or_else(|| " ".to_string()),
                 fg,
                 bg,
+                mods,
             }),
             "hline" => Ok(DrawCommand::HLine {
                 x: map_u16(&map, "x").ok_or_else(|| "hline.x must be an integer".to_string())?,
@@ -593,6 +823,7 @@ impl DrawCommand {
                 ch: map_string(&map, "ch").unwrap_or_else(|| " ".to_string()),
                 fg,
                 bg,
+                mods,
             }),
             "vline" => Ok(DrawCommand::VLine {
                 x: map_u16(&map, "x").ok_or_else(|| "vline.x must be an integer".to_string())?,
@@ -601,6 +832,7 @@ impl DrawCommand {
                 ch: map_string(&map, "ch").unwrap_or_else(|| " ".to_string()),
                 fg,
                 bg,
+                mods,
             }),
             "rect" => Ok(DrawCommand::Rect {
                 x: map_u16(&map, "x").ok_or_else(|| "rect.x must be an integer".to_string())?,
@@ -610,6 +842,7 @@ impl DrawCommand {
                 ch: map_string(&map, "ch").unwrap_or_else(|| " ".to_string()),
                 fg,
                 bg,
+                mods,
             }),
             "trace" => Ok(DrawCommand::Trace {
                 x: map_u16(&map, "x").unwrap_or(0),
@@ -620,6 +853,7 @@ impl DrawCommand {
                 fg,
                 line_fg: map_color(&map, "line_fg").unwrap_or(fg),
                 bg,
+                mods,
             }),
             "text" => Ok(DrawCommand::Text {
                 x: map_u16(&map, "x").ok_or_else(|| "text.x must be an integer".to_string())?,
@@ -627,6 +861,34 @@ impl DrawCommand {
                 text: map_string(&map, "text").unwrap_or_default(),
                 fg,
                 bg,
+                mods,
+            }),
+            "dots" => {
+                let flat = map_u16_array(&map, "points")
+                    .ok_or_else(|| "dots.points must be an integer array".to_string())?;
+                if flat.len() % 2 != 0 {
+                    return Err("dots.points must hold x, y pairs".to_string());
+                }
+                Ok(DrawCommand::Dots {
+                    points: flat
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|[x, y]| (*x, *y))
+                        .collect(),
+                    fg,
+                    bg,
+                    mods,
+                })
+            }
+            "line" => Ok(DrawCommand::Line {
+                x0: map_u16(&map, "x0").ok_or_else(|| "line.x0 must be an integer".to_string())?,
+                y0: map_u16(&map, "y0").ok_or_else(|| "line.y0 must be an integer".to_string())?,
+                x1: map_u16(&map, "x1").ok_or_else(|| "line.x1 must be an integer".to_string())?,
+                y1: map_u16(&map, "y1").ok_or_else(|| "line.y1 must be an integer".to_string())?,
+                fg,
+                bg,
+                mods,
             }),
             _ => Err(format!("unknown op {op:?}")),
         }
@@ -638,11 +900,32 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
 }
 
 fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCommand]) {
+    // Each command sets the cell's whole attribute set, so a plain command
+    // drawn over a bold or dim one does not inherit its attributes.
+    let styled = |fg: Color, bg: Color, mods: Modifier| {
+        Style::new()
+            .fg(fg)
+            .bg(bg)
+            .add_modifier(mods)
+            .remove_modifier(Modifier::all().difference(mods))
+    };
     for command in commands {
         match command {
-            DrawCommand::Clear { bg } => fill_rect(buffer, area, " ", Style::new().bg(*bg)),
-            DrawCommand::Cell { x, y, ch, fg, bg } => {
-                write_cell(buffer, area, *x, *y, ch, Style::new().fg(*fg).bg(*bg));
+            DrawCommand::Clear { bg } => fill_rect(
+                buffer,
+                area,
+                " ",
+                Style::new().bg(*bg).remove_modifier(Modifier::all()),
+            ),
+            DrawCommand::Cell {
+                x,
+                y,
+                ch,
+                fg,
+                bg,
+                mods,
+            } => {
+                write_cell(buffer, area, *x, *y, ch, styled(*fg, *bg, *mods));
             }
             DrawCommand::HLine {
                 x,
@@ -651,8 +934,9 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 ch,
                 fg,
                 bg,
+                mods,
             } => {
-                let style = Style::new().fg(*fg).bg(*bg);
+                let style = styled(*fg, *bg, *mods);
                 for offset in 0..(*w).min(area.width.saturating_sub(*x)) {
                     write_cell(buffer, area, x.saturating_add(offset), *y, ch, style);
                 }
@@ -664,8 +948,9 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 ch,
                 fg,
                 bg,
+                mods,
             } => {
-                let style = Style::new().fg(*fg).bg(*bg);
+                let style = styled(*fg, *bg, *mods);
                 for offset in 0..(*h).min(area.height.saturating_sub(*y)) {
                     write_cell(buffer, area, *x, y.saturating_add(offset), ch, style);
                 }
@@ -678,8 +963,9 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 ch,
                 fg,
                 bg,
+                mods,
             } => {
-                let style = Style::new().fg(*fg).bg(*bg);
+                let style = styled(*fg, *bg, *mods);
                 for row in 0..(*h).min(area.height.saturating_sub(*y)) {
                     for col in 0..(*w).min(area.width.saturating_sub(*x)) {
                         write_cell(
@@ -701,9 +987,10 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 fg,
                 line_fg,
                 bg,
+                mods,
             } => {
-                let line_style = Style::new().fg(*line_fg).bg(*bg);
-                let point_style = Style::new().fg(*fg).bg(*bg);
+                let line_style = styled(*line_fg, *bg, *mods);
+                let point_style = styled(*fg, *bg, *mods);
                 let mut previous_y: Option<u16> = None;
                 for (index, y) in ys
                     .iter()
@@ -726,7 +1013,14 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                     previous_y = Some(y);
                 }
             }
-            DrawCommand::Text { x, y, text, fg, bg } => {
+            DrawCommand::Text {
+                x,
+                y,
+                text,
+                fg,
+                bg,
+                mods,
+            } => {
                 for (offset, ch) in text
                     .chars()
                     .take(usize::from(area.width.saturating_sub(*x)))
@@ -741,12 +1035,137 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                         x.saturating_add(offset),
                         *y,
                         &ch.to_string(),
-                        Style::new().fg(*fg).bg(*bg),
+                        styled(*fg, *bg, *mods),
                     );
                 }
             }
+            DrawCommand::Dots {
+                points,
+                fg,
+                bg,
+                mods,
+            } => {
+                let style = styled(*fg, *bg, *mods);
+                for (dot_x, dot_y) in points {
+                    plot_dot(buffer, area, *dot_x, *dot_y, style);
+                }
+            }
+            DrawCommand::Line {
+                x0,
+                y0,
+                x1,
+                y1,
+                fg,
+                bg,
+                mods,
+            } => {
+                let style = styled(*fg, *bg, *mods);
+                draw_dot_line(buffer, area, (*x0, *y0), (*x1, *y1), style);
+            }
         }
     }
+}
+
+/// Braille dot bits by (row, column) inside a cell.
+const BRAILLE_BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+const BRAILLE_BASE: u32 = 0x2800;
+
+fn plot_dot(buffer: &mut Buffer, area: Rect, dot_x: u16, dot_y: u16, style: Style) {
+    let (x, y) = (dot_x / 2, dot_y / 4);
+    if x >= area.width || y >= area.height {
+        return;
+    }
+    let bit = BRAILLE_BITS[usize::from(dot_y % 4)][usize::from(dot_x % 2)];
+    let Some(cell) = buffer.cell_mut((area.x.saturating_add(x), area.y.saturating_add(y))) else {
+        return;
+    };
+    let existing = cell
+        .symbol()
+        .chars()
+        .next()
+        .map(u32::from)
+        .filter(|code| (BRAILLE_BASE..=BRAILLE_BASE + 0xff).contains(code))
+        .map_or(0, |code| code - BRAILLE_BASE);
+    let symbol = char::from_u32(BRAILLE_BASE + (existing | bit)).unwrap_or(' ');
+    cell.set_symbol(&symbol.to_string()).set_style(style);
+}
+
+/// Bresenham between two dot coordinates. The segment is first clipped to the
+/// area's dot grid, so the work is bounded by the area, not by how far away a
+/// script puts the endpoints.
+fn draw_dot_line(buffer: &mut Buffer, area: Rect, from: (u16, u16), to: (u16, u16), style: Style) {
+    let max_x = f64::from(area.width) * 2.0 - 1.0;
+    let max_y = f64::from(area.height) * 4.0 - 1.0;
+    if max_x < 0.0 || max_y < 0.0 {
+        return;
+    }
+    let Some(((x0, y0), (x1, y1))) = clip_segment(
+        (f64::from(from.0), f64::from(from.1)),
+        (f64::from(to.0), f64::from(to.1)),
+        max_x,
+        max_y,
+    ) else {
+        return;
+    };
+    let (mut x, mut y) = (x0.round() as i32, y0.round() as i32);
+    let (x1, y1) = (x1.round() as i32, y1.round() as i32);
+    let dx = (x1 - x).abs();
+    let dy = -(y1 - y).abs();
+    let step_x = if x < x1 { 1 } else { -1 };
+    let step_y = if y < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        if let (Ok(dot_x), Ok(dot_y)) = (u16::try_from(x), u16::try_from(y)) {
+            plot_dot(buffer, area, dot_x, dot_y, style);
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let doubled = 2 * error;
+        if doubled >= dy {
+            error += dy;
+            x += step_x;
+        }
+        if doubled <= dx {
+            error += dx;
+            y += step_y;
+        }
+    }
+}
+
+/// Liang-Barsky clip of a segment to `[0, max_x] x [0, max_y]`.
+fn clip_segment(
+    from: (f64, f64),
+    to: (f64, f64),
+    max_x: f64,
+    max_y: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let (mut enter, mut leave) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, from.0),
+        (dx, max_x - from.0),
+        (-dy, from.1),
+        (dy, max_y - from.1),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                enter = enter.max(t);
+            } else {
+                leave = leave.min(t);
+            }
+        }
+    }
+    if enter > leave {
+        return None;
+    }
+    let at = |t: f64| (from.0 + dx * t, from.1 + dy * t);
+    Some((at(enter), at(leave)))
 }
 
 fn fill_rect(buffer: &mut Buffer, area: Rect, symbol: &'static str, style: Style) {
@@ -791,6 +1210,30 @@ fn map_u16_array(map: &Map, key: &str) -> Option<Vec<u16>> {
         .into_iter()
         .map(|value| u16::try_from(value.try_cast::<INT>()?).ok())
         .collect()
+}
+
+/// Optional text attributes on any command: `bold`, `dim`, `italic`,
+/// `underline`, `reversed` (booleans). Terminals render bold as a heavier or
+/// brighter glyph and dim as a fainter one.
+fn map_modifiers(map: &Map) -> Modifier {
+    let flag = |key: &str| {
+        map.get(key)
+            .and_then(|value| value.clone().try_cast::<bool>())
+            .unwrap_or(false)
+    };
+    let mut mods = Modifier::empty();
+    for (key, modifier) in [
+        ("bold", Modifier::BOLD),
+        ("dim", Modifier::DIM),
+        ("italic", Modifier::ITALIC),
+        ("underline", Modifier::UNDERLINED),
+        ("reversed", Modifier::REVERSED),
+    ] {
+        if flag(key) {
+            mods |= modifier;
+        }
+    }
+    mods
 }
 
 fn map_color(map: &Map, key: &str) -> Option<Color> {
@@ -971,6 +1414,8 @@ mod tests {
         input.insert("clock".into(), "12:34:56".into());
         input.insert("track_title".into(), "track".into());
         input.insert("track_artist".into(), "artist".into());
+        insert_meter(&mut input, &crate::player::AudioAnalysisSnapshot::default());
+        insert_track_details(&mut input, &AppState::default());
         input
     }
 
@@ -1311,5 +1756,337 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn script_file(name: &str, source: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("furumi-test-{}-{name}.rhai", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn rendered_text(commands: &[DrawCommand]) -> String {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn script_state_round_trips_and_resets_on_reload() {
+        let source = r#"
+            fn render(input) {
+                let n = if "n" in input.state { input.state.n } else { 0 };
+                #{
+                    commands: [#{ op: "text", x: 0, y: 0, text: "" + n + "/" + input.frame }],
+                    state: #{ n: n + 1 }
+                }
+            }
+        "#;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), source).unwrap();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        file.as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        let mut runtime = ScriptRuntime::default();
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            last = runtime.render(file.path(), test_input()).unwrap();
+        }
+        assert_eq!(rendered_text(&last), "2/2");
+
+        // An edited script starts from an empty state again.
+        std::fs::write(file.path(), format!("{source}\n// edited")).unwrap();
+        file.as_file()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(base + std::time::Duration::from_secs(10)),
+            )
+            .unwrap();
+        let reloaded = runtime.render(file.path(), test_input()).unwrap();
+        assert_eq!(rendered_text(&reloaded), "0/0");
+
+        // So does reopening the visualizer.
+        runtime.render(file.path(), test_input()).unwrap();
+        runtime.reset_session();
+        let reopened = runtime.render(file.path(), test_input()).unwrap();
+        assert_eq!(rendered_text(&reopened), "0/0");
+    }
+
+    #[test]
+    fn map_results_need_a_commands_array() {
+        let path = script_file("no-commands", "fn render(input) { #{ state: 1 } }");
+        let err = ScriptRuntime::default()
+            .render(&path, test_input())
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("commands"), "{err}");
+    }
+
+    #[test]
+    fn dots_and_lines_merge_into_braille_cells() {
+        let commands = [
+            DrawCommand::from_dynamic(Dynamic::from_map(
+                [
+                    ("op".into(), "line".into()),
+                    ("x0".into(), Dynamic::from_int(0)),
+                    ("y0".into(), Dynamic::from_int(0)),
+                    ("x1".into(), Dynamic::from_int(3)),
+                    ("y1".into(), Dynamic::from_int(0)),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+            .unwrap(),
+            DrawCommand::from_dynamic(Dynamic::from_map(
+                [
+                    ("op".into(), "dots".into()),
+                    (
+                        "points".into(),
+                        vec![Dynamic::from_int(0), Dynamic::from_int(3)].into(),
+                    ),
+                    ("fg".into(), Dynamic::from_int(0x33ffee)),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+            .unwrap(),
+        ];
+        let area = Rect::new(0, 0, 3, 1);
+        let mut buffer = Buffer::empty(area);
+        render_commands_to_buffer(&mut buffer, area, &commands);
+        // Cell 0 holds dots (0,0), (1,0) and (0,3); cell 1 holds (2,0), (3,0).
+        assert_eq!(buffer[(0, 0)].symbol(), "\u{2849}");
+        assert_eq!(buffer[(1, 0)].symbol(), "\u{2809}");
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0x33, 0xff, 0xee));
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn odd_dot_lists_and_off_screen_lines_are_handled() {
+        let odd = Dynamic::from_map(
+            [
+                ("op".into(), "dots".into()),
+                ("points".into(), vec![Dynamic::from_int(1)].into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(DrawCommand::from_dynamic(odd).is_err());
+
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buffer = Buffer::empty(area);
+        let line = DrawCommand::Line {
+            x0: 0,
+            y0: 0,
+            x1: 400,
+            y1: 900,
+            fg: Color::White,
+            bg: Color::Black,
+            mods: Modifier::empty(),
+        };
+        render_commands_to_buffer(&mut buffer, area, &[line]);
+        assert_eq!(buffer[(0, 0)].symbol().chars().count(), 1);
+    }
+
+    #[test]
+    fn far_line_endpoints_are_clipped_to_the_area() {
+        let area = Rect::new(0, 0, 4, 2);
+        let line = |x0, y0, x1, y1| DrawCommand::Line {
+            x0,
+            y0,
+            x1,
+            y1,
+            fg: Color::White,
+            bg: Color::Black,
+            mods: Modifier::empty(),
+        };
+        let mut far = Buffer::empty(area);
+        let started = Instant::now();
+        render_commands_to_buffer(
+            &mut far,
+            area,
+            &[
+                line(0, 0, u16::MAX, u16::MAX),
+                line(u16::MAX, 0, u16::MAX, u16::MAX),
+            ],
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        // Same dots as the line drawn only to the area's last dot.
+        let mut near = Buffer::empty(area);
+        render_commands_to_buffer(&mut near, area, &[line(0, 0, 7, 7)]);
+        assert_eq!(far, near);
+    }
+
+    #[test]
+    fn attributes_do_not_leak_into_later_commands() {
+        let text = |bold: bool| {
+            DrawCommand::from_dynamic(Dynamic::from_map(
+                [
+                    ("op".into(), "text".into()),
+                    ("x".into(), Dynamic::from_int(0)),
+                    ("y".into(), Dynamic::from_int(0)),
+                    ("text".into(), "A".into()),
+                    ("bold".into(), bold.into()),
+                    ("reversed".into(), bold.into()),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+            .unwrap()
+        };
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        render_commands_to_buffer(&mut buffer, area, &[text(true), text(false)]);
+        assert!(buffer[(0, 0)].modifier.is_empty());
+        render_commands_to_buffer(
+            &mut buffer,
+            area,
+            &[text(true), DrawCommand::Clear { bg: Color::Black }],
+        );
+        assert!(buffer[(0, 0)].modifier.is_empty());
+    }
+
+    #[test]
+    fn vfd_panel_renders_in_bounds_for_many_situations() {
+        let script = BUNDLED_SCRIPTS
+            .iter()
+            .find(|script| script.id == "vfd_panel")
+            .unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), script.source).unwrap();
+        let sizes = [
+            (20, 6),
+            (40, 12),
+            (80, 24),
+            (119, 33),
+            (120, 34),
+            (160, 45),
+            (300, 90),
+        ];
+        let variants: [(&str, i64, &str, i64, f64); 4] = [
+            ("", 0, "", 0, 0.0),
+            (
+                "A very long title that keeps going for a while — on and on",
+                3,
+                "local",
+                128,
+                1.0,
+            ),
+            ("Episode", 1, "podcast", 1500, 0.0),
+            ("Remote", 2, "federated", 7, 0.55),
+        ];
+        for (width, height) in sizes {
+            for (title, number, source, queue, volume) in variants {
+                let mut runtime = ScriptRuntime::default();
+                for frame in 0..3 {
+                    let mut input = test_input();
+                    insert_int(&mut input, "width", width);
+                    insert_int(&mut input, "height", height);
+                    input.insert("track_title".into(), title.into());
+                    input.insert("source".into(), source.into());
+                    insert_int(&mut input, "track_number", number * 41);
+                    insert_int(&mut input, "queue_index", number);
+                    insert_int(&mut input, "queue_length", queue);
+                    insert_float(&mut input, "volume", volume);
+                    insert_float(&mut input, "position", 600.0 + f64::from(frame) * 7.0);
+                    input.insert("paused".into(), (frame == 1).into());
+                    let commands = runtime
+                        .render(file.path(), input)
+                        .unwrap_or_else(|err| panic!("{width}x{height} {title:?}: {err}"));
+                    let area = Rect::new(0, 0, width as u16, height as u16);
+                    let mut buffer = Buffer::empty(area);
+                    render_commands_to_buffer(&mut buffer, area, &commands);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_modifiers_reach_the_buffer() {
+        let command = DrawCommand::from_dynamic(Dynamic::from_map(
+            [
+                ("op".into(), "text".into()),
+                ("x".into(), Dynamic::from_int(0)),
+                ("y".into(), Dynamic::from_int(0)),
+                ("text".into(), "A".into()),
+                ("bold".into(), true.into()),
+                ("dim".into(), false.into()),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .unwrap();
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        render_commands_to_buffer(&mut buffer, area, &[command]);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(0, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn meter_and_track_details_reach_scripts() {
+        let mut state = AppState::default();
+        let track = crate::library::models::TrackItem {
+            id: 7,
+            title: "Even Flow".into(),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_seconds: 293.0,
+            artists: vec![],
+            featured_artists: vec![],
+            release_id: 1,
+            release_title: "Ten".into(),
+            release_year: Some(1991),
+            cover_path: None,
+            file_path: "/music/even-flow.flac".into(),
+            content_id: None,
+            audio_format: Some("flac".into()),
+            audio_bitrate: Some(900),
+            audio_sample_rate: Some(44_100),
+            audio_bit_depth: Some(16),
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+            podcast: None,
+        };
+        state.player.queue = vec![track.clone(), track.clone()];
+        state.player.queue_pos = 1;
+        state.player.current = Some(track);
+        state.player.playing = true;
+        state.player.audio_analysis.spectrum = vec![0.5; crate::player::BAND_CENTERS_HZ.len()];
+        state.player.audio_analysis.level_l = 0.25;
+        state.player.audio_analysis.sample_rate = 44_100;
+
+        let input = input_map(Rect::new(0, 0, 80, 24), &state);
+        let int = |key: &str| input[key].as_int().unwrap();
+        let float = |key: &str| input[key].as_float().unwrap();
+        let text = |key: &str| input[key].clone().into_string().unwrap();
+        assert_eq!(int("queue_index"), 2);
+        assert_eq!(int("queue_length"), 2);
+        assert_eq!(int("track_number"), 3);
+        assert_eq!(int("year"), 1991);
+        assert_eq!(int("audio_bitrate"), 900);
+        assert_eq!(int("sample_rate"), 44_100);
+        assert_eq!(text("source"), "local");
+        assert_eq!(text("repeat"), "off");
+        assert_eq!(text("audio_format"), "flac");
+        assert!(input["playing"].as_bool().unwrap());
+        assert_eq!(float("level_l"), 0.25);
+        assert_eq!(float("spectrum_floor_db"), -60.0);
+        let spectrum = input["spectrum"].clone().into_array().unwrap();
+        let hz = input["spectrum_hz"].clone().into_array().unwrap();
+        assert_eq!(spectrum.len(), hz.len());
+        assert_eq!(spectrum[0].as_float().unwrap(), 0.5);
+
+        // Without analysis the arrays keep their length and read silence.
+        let empty = input_map(Rect::new(0, 0, 80, 24), &AppState::default());
+        let peaks = empty["spectrum_peaks"].clone().into_array().unwrap();
+        assert_eq!(peaks.len(), crate::player::BAND_CENTERS_HZ.len());
+        assert_eq!(empty["source"].clone().into_string().unwrap(), "");
+        assert_eq!(empty["queue_index"].as_int().unwrap(), 0);
     }
 }

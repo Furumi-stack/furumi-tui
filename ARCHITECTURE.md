@@ -481,6 +481,9 @@ rodio source
      │
      v
 audio analyzer ──> normalized features + scope samples
+     │  (PCM history, channel levels)
+     v
+display meter ───> third-octave spectrum, L/R levels, peak hold
                                       │
                                       v
                               Rhai render(input)
@@ -498,6 +501,35 @@ volume, pause state, track metadata, time, and terminal dimensions. Each
 script implements `render(input)` and returns declarative commands such as
 clear, cell, line, rectangle, trace, and text. Scripts never receive the
 ratatui frame or audio engine directly.
+
+Protocol v3 adds what front-panel displays need: a third-octave spectrum
+(31 bands, 20 Hz to 20 kHz, nominal ISO labels with exact base-2 edges that
+partition the FFT bins) with per-band peak hold, left/right RMS and held
+sample peaks, the analyzed sample rate, and track, queue and transport
+details (format, bit depth, bitrate, track number, queue position, repeat,
+shuffle, source). The audio thread only appends mono samples to a lock-free
+ring and accumulates per-window channel levels; the FFT (an ~85 ms window
+whose length follows the sample rate) and all ballistics run when the UI
+takes a snapshot, under a mutex the audio thread never touches. Ballistics
+are time-based (fast attack, steady fall, hold then fall): they advance with
+the clock rather than per snapshot. Audio arrives in device-callback bursts,
+so a snapshot that sees no new samples reuses the last measurement; only when
+the PCM write counter stays still for longer than a few callbacks (pause,
+stop) does the meter fall to the floor instead of freezing. In the control
+role, and briefly when a track starts, the host passes an empty analysis, so
+the meter reads zero. Meter values report the decoded signal on a fixed dBFS
+scale and are therefore not scaled by the output volume, unlike the v2
+energy features. Scripts choose their own display range within that scale.
+
+v3 also lets a script keep state: `render` may return
+`#{ commands, state }`, and the host passes `state` back with `dt` and a frame
+counter on the next frame. State lives in the host's script runtime, is reset
+whenever the script is recompiled or the visualizer is opened, and is subject
+to the same sandbox size limits as any other value. Thin drawing comes from braille `dots` and `line`
+commands in a 2 x 4 dot grid per cell (dots merge with braille already in the
+cell; lines are clipped to the area first, so far endpoints cost nothing) and
+from optional bold/dim/italic/underline/reversed attributes, which each
+command sets for its cells rather than adding to what was drawn before.
 
 This command boundary is intentional:
 
@@ -538,8 +570,8 @@ is not a plugin mechanism for accessing the library, network, or player
 controls.
 
 Fullscreen execution currently happens synchronously during UI drawing, with a fresh
-Rhai scope for each frame; scripts should derive motion from time and the
-already-smoothed audio features rather than rely on retained mutable state.
+Rhai scope for each frame; retained state is limited to the explicit `state`
+value described above, and motion should still be derived from time and `dt`.
 The 50 ms animation timer gives a nominal 20 FPS cadence (other events can
 also trigger redraws). Operation limits are not wall-clock deadlines. The
 host also checks the script modification time during drawing, so slow script
