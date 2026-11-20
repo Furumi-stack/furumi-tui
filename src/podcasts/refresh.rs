@@ -30,6 +30,8 @@ pub struct Services {
     pub store: Arc<PodcastStore>,
     pub fetcher: Arc<Fetcher>,
     pub log: Arc<dyn OpLog>,
+    /// Device-local privacy confirmations for sharing (never synced).
+    pub confirmations: Arc<super::publication::ShareConfirmations>,
 }
 
 impl std::fmt::Debug for Services {
@@ -93,24 +95,22 @@ fn duration_ms(duration: Duration) -> i64 {
 /// saved progress and history. The subscription is private.
 pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<SubscribeReport> {
     let url = FeedUrl::from_user_input(input).map_err(|err| anyhow!("{err}"))?;
-    let store = Arc::clone(&services.store);
-    let lookup = url.clone();
-    let existing = blocking(move || {
-        let id = store.resolve_podcast_id(&lookup)?;
-        let subscribed = store
-            .subscription(&id)?
-            .is_some_and(|record| record.subscribed);
-        let title = store.podcast(&id)?.map(|summary| summary.meta.title);
-        Ok(subscribed.then_some((id, title)))
-    })
-    .await?;
-    if let Some((podcast_id, title)) = existing {
-        return Ok(SubscribeReport {
-            podcast_id,
-            title: title.unwrap_or_default(),
-            already_subscribed: true,
-            new_episodes: 0,
-        });
+    subscribe_url(services, url, now_ms).await
+}
+
+/// Subscribes to `url` exactly as given (see [`subscribe`]).
+///
+/// Subscribing from a public card passes the card's origin URL here
+/// (`podcasts::discovery::subscribe_from_hit`): the id then matches the
+/// card's `podcast_id` unless this device already knows the URL as an alias
+/// of another podcast, and everything stored comes from the feed itself.
+pub async fn subscribe_url(
+    services: &Services,
+    url: FeedUrl,
+    now_ms: i64,
+) -> Result<SubscribeReport> {
+    if let Some(report) = already_subscribed(services, &url).await? {
+        return Ok(report);
     }
 
     let response = services
@@ -130,6 +130,18 @@ pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<
     // The feed's own address: where its permanent redirects lead.
     let moved_permanently = response.moved_permanently_to.is_some();
     let landed = response.moved_permanently_to.unwrap_or(final_url);
+    // An older address of a feed this device follows under the newer one it
+    // announces (`itunes:new-feed-url`, no redirect): the same podcast, not
+    // a second subscription. Nothing is written.
+    if let Some(announced) = feed
+        .new_feed_url
+        .as_deref()
+        .and_then(|announced| FeedUrl::parse(announced).ok())
+        .filter(|announced| *announced != url && *announced != landed)
+        && let Some(report) = already_subscribed(services, &announced).await?
+    {
+        return Ok(report);
+    }
 
     let store = Arc::clone(&services.store);
     let log = Arc::clone(&services.log);
@@ -189,6 +201,38 @@ pub async fn subscribe(services: &Services, input: &str, now_ms: i64) -> Result<
         update_cover(services, &report.podcast_id, &image_url).await;
     }
     Ok(report)
+}
+
+/// The subscription `url` belongs to on this device (directly or as a
+/// known feed alias), as an "already subscribed" report.
+async fn already_subscribed(services: &Services, url: &FeedUrl) -> Result<Option<SubscribeReport>> {
+    let store = Arc::clone(&services.store);
+    let lookup = url.clone();
+    blocking(move || {
+        let Some(podcast_id) = subscribed_podcast(&store, &lookup)? else {
+            return Ok(None);
+        };
+        let title = store
+            .podcast(&podcast_id)?
+            .map(|summary| summary.meta.title);
+        Ok(Some(SubscribeReport {
+            podcast_id,
+            title: title.unwrap_or_default(),
+            already_subscribed: true,
+            new_episodes: 0,
+        }))
+    })
+    .await
+}
+
+/// The podcast `url` resolves to on this device (feed aliases included),
+/// when it is subscribed. Blocking.
+pub(crate) fn subscribed_podcast(store: &PodcastStore, url: &FeedUrl) -> Result<Option<PodcastId>> {
+    let id = store.resolve_podcast_id(url)?;
+    let subscribed = store
+        .subscription(&id)?
+        .is_some_and(|record| record.subscribed);
+    Ok(subscribed.then_some(id))
 }
 
 fn knows(store: &PodcastStore, url: &FeedUrl) -> Result<bool> {
@@ -324,7 +368,7 @@ async fn fetch_and_apply(
 
 /// Parses a feed document on the blocking pool; relative URLs resolve
 /// against where the document was served from.
-async fn parse(body: Vec<u8>, base: &FeedUrl) -> Result<ParsedFeed> {
+pub(crate) async fn parse(body: Vec<u8>, base: &FeedUrl) -> Result<ParsedFeed> {
     let base = base.as_str().to_string();
     blocking(move || {
         parse_feed_with_base(&body, Some(&base)).map_err(|err| anyhow!("unusable feed: {err}"))

@@ -208,6 +208,10 @@ never imported into the music library or offered to other peers.
 - `Shift+U` (or `Shift+D`) unsubscribes after a confirmation. Listening
   progress and history are kept, so subscribing again continues where you
   left off.
+- `Shift+F` shares the selected (or opened) podcast in the federation, or
+  makes it private again. The list marks shared podcasts with `shared`, and
+  the side panel says whether this device publishes the card (see
+  "Sharing a podcast" below).
 
 Episodes play in the same queue as music:
 
@@ -251,8 +255,7 @@ Podcasts and your connected devices:
   history are personal. They are synchronized only between your trusted
   devices (Connected Devices), never published to the federation: no DHT
   record, public catalog or search result contains them. Publishing a
-  podcast for discovery is a separate, explicit choice that this version
-  does not offer yet.
+  podcast for discovery is a separate, explicit choice (`Shift+F`, below).
 - **Synchronized between trusted devices.** A podcast you subscribe to on
   one device appears on the others without typing its URL again; each
   device then checks the feed itself. Unsubscribing, "played", the saved
@@ -280,6 +283,94 @@ Podcasts and your connected devices:
 - **Jam.** Guests see the host's episodes as "Private item" (no title, feed
   or address), cannot add episodes to the host's queue and cannot seek in a
   private item. They can still reorder the queue and skip.
+
+Sharing a podcast (public discovery):
+
+- `Shift+F` turns "share in the federation" on for one podcast. The choice is
+  synchronized to your trusted devices like a subscription; each of your
+  devices that runs the federation then publishes a small public card of the
+  podcast under its own device key: the feed URL, title, author,
+  description, artwork and web links, the number of episodes and the date of
+  the newest one. The card never contains your progress, history, play
+  counts, device names or anything from podcasts you did not share. Artwork
+  and web links that look like they carry an access key (a token, key or
+  signature in the query, a member-feed host) are left out, and so are both
+  for a feed whose own URL looks private. Random-looking parts of their
+  path alone do not count: public podcast hosts name artwork that way.
+- If the feed URL looks private (a token, key or signature in its query, a
+  member-feed host such as Patreon, a long random-looking part), Furumi asks
+  first and lists why (in Russian). Anyone who finds the card can read the
+  feed at that URL. The confirmation is stored only on this device
+  (`podcast-share-confirmations.json` next to `podcasts.sqlite3`) and covers
+  exactly the URLs shown and this one decision to share: another device of
+  yours asks again before it publishes, and so does this one if the feed
+  moves or if sharing is turned off (or turned on again after that) on any
+  of your devices. Until then the side panel says the publication is held
+  back, and a card this device published for the earlier decision is
+  revoked; press `Shift+F` there to confirm (or `x` in the dialog to stop
+  sharing). A confirmation whose decision could not be saved is dropped.
+- `Shift+F` on a shared podcast, or unsubscribing, makes it private again on
+  every device in your group: each device replaces its card with a signed
+  removal record. This device sends its removal right away, and quitting
+  waits for it (up to 4 seconds, also when you quit before the change is
+  saved) and logs a warning when a card may still be live. While the
+  removal is not sent yet (or could not be sent), the side panel says the
+  public card is not revoked yet instead of just "private". With the
+  federation off this device cannot tell whether a card of an earlier
+  session is still live, so for a podcast that was shared the panel says
+  the card may not be revoked yet; the removal is sent the next time the
+  federation runs. Until then, and for a copy that missed the removal, the
+  card can still be found until it expires (at most 12 hours). Removing your card never touches other
+  people's subscriptions. An older device that comes back with the earlier
+  "share" decision does not publish it again: after starting, a device with
+  other devices in its group publishes nothing until it has synced with one
+  of them (the side panel says "waiting for a sync with your other
+  devices"); it still revokes at once what its own decisions no longer
+  share. Devices of your group that still run Furumi 0.3 (they do not sync
+  podcasts) and devices without an address are not waited for; remove a
+  device you no longer use under Connected Devices so this one stops
+  waiting for it.
+- A device that left your device group, or was removed from it, no longer
+  receives your share decisions: it keeps publishing the podcasts it shares
+  until you turn sharing off (or unsubscribe) on that device itself.
+- The card is signed with this device's federation key, which is also the
+  key of its public music library, so a shared podcast can be linked to
+  that library and to the device's network address.
+- Publishing needs the federation to be running; the side panel shows
+  "not published" with the reason otherwise.
+
+Finding public podcasts:
+
+- The search (`/` outside the Podcasts tab, with the federation
+  running) also looks for public podcast cards. They are listed after the
+  music results under "Podcasts · public cards", each marked `[podcast]`,
+  with the number of devices that publish the card (devices, not
+  subscribers; anyone can create devices, so it is not a sign of trust) or
+  "✓ subscribed" when this device already follows the podcast, also when
+  you subscribed under an older address of the same feed that moved to the
+  card's address. When you follow the feed under a newer address than the
+  card's, the list cannot tell yet; the card can once its episodes are read
+  (`e`), and «Подписаться» never adds a second subscription for it. Your
+  query words go to the discovery peers, as they do for music search. The
+  podcast search runs apart from the music search (music results never wait
+  for it) and gives up after 15 seconds. With the federation off, search
+  stays local and shows no podcasts.
+- Enter opens the card (in Russian): what its publishers claim (title,
+  author, categories, description, number of episodes and date of the
+  newest one), the feed URL, and addresses some publishers claim the feed
+  moved to, shown as unverified and never used. `e` reads the feed itself
+  and lists its seasons and episodes without subscribing; this is a request
+  to the podcast's own server, not to the publisher.
+- «Подписаться» (Enter) subscribes with the card's feed URL, the address
+  the podcast's id is derived from, so the podcast is the same one the
+  publisher shares. Furumi then reads the feed from its own server and
+  stores only what the feed says; the publisher does not need to stay
+  online, and nothing from the card is kept. The new subscription is
+  private like any other: it is not shared until you press `Shift+F`, and
+  your progress is your own. «Уже подписан» means this device is already
+  subscribed (under the card's address, an older one, or — once the feed
+  was read — the newer address the feed moved to); Enter then opens the
+  podcast in the Podcasts tab.
 
 Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
 same file the earlier podcast test build used; it is upgraded in place). If

@@ -10,6 +10,7 @@ use music_dht::capabilities::{
     CAPABILITIES_PROTOCOL_VERSION, CapabilityManifest, CapabilityMessage, read_message,
     write_message,
 };
+use music_dht::podcast_dht::PodcastDht;
 use music_dht::{ByteStream, EndpointId, MusicDhtService, StreamAcceptor};
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -30,8 +31,10 @@ pub struct NewerProtocol {
 }
 
 impl ProtocolVersions {
-    pub fn snapshot(observed: &ObservedVersions) -> Self {
-        let local = local_manifest().protocols;
+    /// `podcast_dht`: whether this node runs the podcast-discovery overlay
+    /// (it is advertised only then).
+    pub fn snapshot(observed: &ObservedVersions, podcast_dht: bool) -> Self {
+        let local = local_manifest(podcast_dht).protocols;
         let observed_versions = lock(&observed.versions).clone();
         let newer = observed_versions
             .iter()
@@ -59,27 +62,35 @@ pub struct ObservedVersions {
     peers: Mutex<BTreeMap<String, String>>,
 }
 
-fn local_manifest() -> CapabilityManifest {
-    CapabilityManifest::frid("furumi", env!("CARGO_PKG_VERSION"))
-        .with_protocol("audio", super::audio::AUDIO_PROTOCOL_VERSION)
+/// This node's manifest. The podcast-discovery overlay is opt-in in FRID:
+/// it is advertised only when this node serves it (`podcast_dht`), so
+/// peers never dial an overlay that failed to open here.
+fn local_manifest(podcast_dht: bool) -> CapabilityManifest {
+    let manifest = CapabilityManifest::frid("furumi", env!("CARGO_PKG_VERSION"))
+        .with_protocol("audio", super::audio::AUDIO_PROTOCOL_VERSION);
+    if podcast_dht {
+        manifest.with_podcast_dht()
+    } else {
+        manifest
+    }
 }
 
-pub async fn serve(mut acceptor: StreamAcceptor) {
+pub async fn serve(mut acceptor: StreamAcceptor, podcast_dht: bool) {
     while let Some(stream) = acceptor.accept().await {
         tokio::spawn(async move {
-            if let Err(error) = serve_one(stream).await {
+            if let Err(error) = serve_one(stream, podcast_dht).await {
                 tracing::debug!("capability stream failed: {error:#}");
             }
         });
     }
 }
 
-async fn serve_one(mut stream: ByteStream) -> Result<()> {
+async fn serve_one(mut stream: ByteStream, podcast_dht: bool) -> Result<()> {
     let response = match read_message(&mut stream).await? {
         CapabilityMessage::Get {
             version: CAPABILITIES_PROTOCOL_VERSION,
         } => CapabilityMessage::Manifest {
-            manifest: local_manifest(),
+            manifest: local_manifest(podcast_dht),
         },
         CapabilityMessage::Get { version } => CapabilityMessage::Error {
             message: format!("unsupported capability protocol {version}"),
@@ -94,7 +105,14 @@ async fn serve_one(mut stream: ByteStream) -> Result<()> {
     Ok(())
 }
 
-pub async fn probe_loop(service: Arc<MusicDhtService>, observed: Arc<ObservedVersions>) {
+/// Polls the manifests of known peers. With the podcast-discovery overlay
+/// running, every manifest is handed to `PodcastDht::note_peer_capabilities`,
+/// which stops dialing peers that do not serve the overlay.
+pub async fn probe_loop(
+    service: Arc<MusicDhtService>,
+    observed: Arc<ObservedVersions>,
+    podcast_dht: Option<Arc<PodcastDht>>,
+) {
     let mut interval = tokio::time::interval(PROBE_INTERVAL);
     loop {
         interval.tick().await;
@@ -109,7 +127,8 @@ pub async fn probe_loop(service: Arc<MusicDhtService>, observed: Arc<ObservedVer
             )
             .collect::<std::collections::BTreeSet<_>>();
         for peer in peers {
-            if let Err(error) = probe_peer(&service, peer, &observed).await {
+            if let Err(error) = probe_peer(&service, peer, &observed, podcast_dht.as_deref()).await
+            {
                 tracing::trace!(%peer, "peer capability probe unavailable: {error:#}");
             }
         }
@@ -120,6 +139,7 @@ async fn probe_peer(
     service: &MusicDhtService,
     peer: EndpointId,
     observed: &ObservedVersions,
+    podcast_dht: Option<&PodcastDht>,
 ) -> Result<()> {
     let mut stream = service.open_stream(peer, CAPABILITIES_ALPN).await?;
     write_message(
@@ -137,6 +157,11 @@ async fn probe_peer(
         anyhow::bail!("peer did not return a capability manifest");
     };
     manifest.validate()?;
+    if let Some(podcast_dht) = podcast_dht
+        && let Err(error) = podcast_dht.note_peer_capabilities(peer, &manifest).await
+    {
+        tracing::debug!(%peer, "podcast DHT capability note failed: {error:#}");
+    }
     {
         let mut versions = lock(&observed.versions);
         for (id, version) in manifest.protocols {
@@ -162,7 +187,7 @@ mod tests {
 
     #[test]
     fn local_manifest_lists_every_player_protocol() {
-        let manifest = local_manifest();
+        let manifest = local_manifest(true);
         for id in [
             "federation_net",
             "ticket",
@@ -174,10 +199,31 @@ mod tests {
             "similarity_dht",
             "device_sync",
             "jam",
+            "podcast_dht",
         ] {
             assert!(manifest.protocols.contains_key(id), "missing {id}");
         }
         manifest.validate().unwrap();
+        assert!(manifest.supports_podcast_dht());
+    }
+
+    #[test]
+    fn podcast_discovery_is_advertised_only_when_it_runs() {
+        let manifest = local_manifest(false);
+        assert!(!manifest.supports_podcast_dht());
+        assert!(!manifest.protocols.contains_key("podcast_dht"));
+        manifest.validate().unwrap();
+        let observed = ObservedVersions::default();
+        assert!(
+            !ProtocolVersions::snapshot(&observed, false)
+                .local
+                .contains_key("podcast_dht")
+        );
+        assert!(
+            ProtocolVersions::snapshot(&observed, true)
+                .local
+                .contains_key("podcast_dht")
+        );
     }
 
     #[test]
@@ -185,7 +231,7 @@ mod tests {
         let observed = ObservedVersions::default();
         lock(&observed.versions).insert("music_dht".to_string(), 99);
         lock(&observed.versions).insert("jam".to_string(), crate::jam::PROTOCOL_VERSION);
-        let snapshot = ProtocolVersions::snapshot(&observed);
+        let snapshot = ProtocolVersions::snapshot(&observed, true);
         assert_eq!(snapshot.newer.len(), 1);
         assert_eq!(snapshot.newer[0].id, "music_dht");
     }

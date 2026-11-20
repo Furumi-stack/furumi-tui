@@ -947,12 +947,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
     let empty_results = SearchResults::default();
     let results = match &search.results {
         Some(results) => results,
-        None if !state.search.fed_tracks.is_empty()
-            || !state.search.fed_artists.is_empty()
-            || state.search.fed_loading =>
-        {
-            &empty_results
-        }
+        None if state.search.has_federated() => &empty_results,
         None => {
             let hint = if search.query.is_empty() {
                 "type to search artists, releases and tracks"
@@ -967,11 +962,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             return centered_line(frame, inner, line);
         }
     };
-    if results.is_empty()
-        && state.search.fed_tracks.is_empty()
-        && state.search.fed_artists.is_empty()
-        && !state.search.fed_loading
-    {
+    if results.is_empty() && !state.search.has_federated() {
         return centered_line(frame, inner, Line::styled("nothing found", theme::dim()));
     }
 
@@ -1037,15 +1028,12 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         }
     }
     // Federated section: artists whose card can be assembled, then tracks
-    // (both marked with the owning peers).
-    if !state.search.fed_tracks.is_empty()
-        || !state.search.fed_artists.is_empty()
-        || state.search.fed_loading
-    {
+    // (both marked with the owning peers), then public podcast cards.
+    if state.search.has_federated() {
         if !rows.is_empty() {
             rows.push((Line::default(), None, None));
         }
-        let header = if state.search.fed_loading {
+        let header = if state.search.fed_loading || state.search.fed_podcasts_loading {
             "Federation · searching…"
         } else {
             "Federation"
@@ -1100,6 +1088,23 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
             ));
             index += 1;
         }
+        // Podcasts carry an explicit type marker: they are not music and
+        // Enter opens their public card, never plays anything.
+        if !state.search.fed_podcasts.is_empty() {
+            rows.push((
+                Line::styled("Podcasts · public cards", theme::header_for(state)),
+                None,
+                None,
+            ));
+        }
+        for hit in &state.search.fed_podcasts {
+            rows.push((
+                podcast_hit_line(state, hit),
+                Some(podcast_hit_meta(state, hit)),
+                Some(index),
+            ));
+            index += 1;
+        }
     }
 
     // Absolute cursor indices covered by an active Shift-V range in the
@@ -1143,6 +1148,47 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {
         }
         draw_row(frame, rect, state, line, right, row_cursor == Some(cursor));
     }
+}
+
+/// One public podcast in the search results: the `podcast` type marker,
+/// the title and the claimed author.
+fn podcast_hit_line(
+    state: &AppState,
+    hit: &crate::podcasts::discovery::PodcastHit,
+) -> Line<'static> {
+    let card = &hit.hit.card;
+    let mut detail = String::from("  ");
+    if let Some(author) = &card.author {
+        detail.push_str(author);
+        detail.push_str(" · ");
+    }
+    detail.push_str("open the card");
+    Line::from(vec![
+        Span::styled(
+            format!("[{}] ", hit.hit.kind().as_str()),
+            theme::accent_for(state),
+        ),
+        Span::raw(card.title.clone()),
+        Span::styled(detail, theme::dim()),
+    ])
+}
+
+/// Right column of a podcast hit: subscribed here, or how many devices
+/// publish the card (not a subscriber count).
+fn podcast_hit_meta(state: &AppState, hit: &crate::podcasts::discovery::PodcastHit) -> String {
+    if state.podcasts.subscribed_to(hit) {
+        return "✓ subscribed".to_string();
+    }
+    let mut meta = match hit.hit.card.episode_count {
+        Some(count) => format!("{count} ep · "),
+        None => String::new(),
+    };
+    let publishers = hit.hit.publishers.len();
+    meta.push_str(&format!(
+        "{publishers} publisher{}",
+        if publishers == 1 { "" } else { "s" }
+    ));
+    meta
 }
 
 fn draw_similarity_search(frame: &mut Frame, area: Rect, state: &AppState, cursor: usize) {

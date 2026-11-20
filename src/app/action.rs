@@ -75,6 +75,9 @@ pub enum Action {
     UnsubscribePodcast,
     /// Podcasts: play the selected (or playing) episode from the beginning.
     RestartEpisode,
+    /// Podcasts: turn "share in the federation" on or off for the selected
+    /// or opened podcast (asks first when its feed URL looks private).
+    TogglePodcastShare,
 }
 
 /// Help-window sections, in display order.
@@ -168,7 +171,8 @@ impl Action {
             | Action::CycleEpisodeFilter
             | Action::ToggleEpisodePlayed
             | Action::UnsubscribePodcast
-            | Action::RestartEpisode => Category::Podcasts,
+            | Action::RestartEpisode
+            | Action::TogglePodcastShare => Category::Podcasts,
             Action::OpenSearch | Action::OpenCommandLine => Category::Search,
             Action::ToggleHelp | Action::Quit => Category::System,
         }
@@ -245,7 +249,7 @@ impl Action {
             Action::CycleSourceMode => "Cycle source mode: Local / My / Global".into(),
             Action::OpenLibraryFilters => "Library filters…".into(),
             Action::OpenCommandLine => "Command line (:help for commands)".into(),
-            Action::OpenSearch => "Search artists, releases, tracks".into(),
+            Action::OpenSearch => "Search artists, releases, tracks, public podcasts".into(),
             Action::EditSelected => "Edit the selected item".into(),
             Action::DeleteSelected => "Delete the selected item".into(),
             Action::AddPodcast => "Add podcast (RSS URL)".into(),
@@ -257,6 +261,7 @@ impl Action {
             Action::ToggleEpisodePlayed => "Mark played / unplayed".into(),
             Action::UnsubscribePodcast => "Unsubscribe (keeps progress)".into(),
             Action::RestartEpisode => "Play episode from the start".into(),
+            Action::TogglePodcastShare => "Share podcast in the federation on/off".into(),
         }
     }
 }

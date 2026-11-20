@@ -18,18 +18,29 @@
 //!   bounded HTTP Range reader, and [`playback`] resolves the current audio
 //!   URL and resume position, opens and positions it;
 //! * [`progress`] writes resume positions, completions and listening
-//!   sessions in order on its own thread.
+//!   sessions in order on its own thread;
+//! * [`publication`] publishes the podcasts the user chose to share to the
+//!   public discovery overlay (`music_dht::podcast_dht`) and revokes them;
+//! * [`discovery`] handles public cards found by search: their order, the
+//!   "already subscribed" mark, an episode preview read from the feed and
+//!   subscribing from a card.
 //!
 //! Only RSS metadata is stored. Audio stays on the publisher's server.
 
+pub mod discovery;
 pub mod fetch;
 pub mod playback;
 pub mod progress;
+pub mod publication;
 pub mod refresh;
 pub mod stream;
 
 #[cfg(test)]
+mod discovery_tests;
+#[cfg(test)]
 mod playback_tests;
+#[cfg(test)]
+mod publication_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
@@ -111,10 +122,13 @@ pub fn open_services(db_path: &Path, covers_dir: PathBuf, log: Arc<dyn OpLog>) -
         Ok(_) => {}
         Err(err) => tracing::debug!("reading the podcast import quarantine failed: {err:#}"),
     }
+    let confirmations =
+        publication::ShareConfirmations::open(publication::confirmations_path(db_path));
     Ok(Services {
         store: Arc::new(store),
         fetcher: Arc::new(Fetcher::new(covers_dir)?),
         log,
+        confirmations: Arc::new(confirmations),
     })
 }
 

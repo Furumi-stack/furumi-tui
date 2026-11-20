@@ -138,6 +138,13 @@ pub enum AppEvent {
         seq: u64,
         result: Result<crate::federation::FedSearchResults, String>,
     },
+    /// Public podcast cards for the same live search (`seq`), delivered on
+    /// their own so the music results never wait for the overlay. Already
+    /// resolved against the podcast store.
+    FedPodcastsLoaded {
+        seq: u64,
+        hits: Vec<crate::podcasts::discovery::PodcastHit>,
+    },
     /// A federated artist card finished assembling.
     FedArtistLoaded {
         name: String,
@@ -268,4 +275,24 @@ pub enum AppEvent {
     PodcastRefreshTick,
     /// Feeds due for a background refresh.
     PodcastsDue(Result<Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>, String>),
+    /// What sharing a podcast would publish (`Effect::PodcastPrepareShare`).
+    PodcastSharePrepared {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        result: Result<crate::podcasts::publication::ShareCheck, String>,
+    },
+    /// The share decision was written (`Effect::PodcastSetShared`).
+    PodcastShareSet {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        shared: bool,
+        result: Result<(), String>,
+    },
+    /// The publication reconciler finished a pass.
+    PodcastPublication(crate::podcasts::publication::PublicationReport),
+    /// A public card's feed was read for a preview (`Effect::PodcastPreview`).
+    PodcastPreviewLoaded {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<Box<crate::podcasts::discovery::FeedPreview>, String>,
+    },
 }

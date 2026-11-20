@@ -768,6 +768,32 @@ pub enum Popup {
         podcast_id: music_dht::podcast::PodcastId,
         title: String,
     },
+    /// Sharing a podcast whose feed URL looks private: the user confirms
+    /// publishing exactly `urls`. Enter/y publishes, Esc/n cancels; when the
+    /// podcast is already shared (publication held back on this device),
+    /// `x` turns sharing off.
+    ConfirmPodcastShare {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        urls: crate::podcasts::publication::ConfirmedUrls,
+        /// Russian descriptions of the privacy warnings.
+        warnings: Vec<String>,
+        already_shared: bool,
+    },
+    /// A public podcast card from the search results: its claims, an
+    /// optional episode preview read from the feed, and "Подписаться" (or
+    /// "Уже подписан" when this device is subscribed under any of its ids).
+    PodcastCard {
+        hit: Box<crate::podcasts::discovery::PodcastHit>,
+        /// `None` until the user asks for the episodes (`e`).
+        preview: Option<Loadable<crate::podcasts::discovery::FeedPreview>>,
+        /// First body line shown.
+        scroll: u16,
+        /// Largest useful `scroll` at the last draw (the wrapped body
+        /// height minus the visible rows); scroll keys stop there.
+        /// `u16::MAX` until the card was drawn.
+        max_scroll: std::cell::Cell<u16>,
+    },
     /// Enabling network similarity reveals an embedding query to peers.
     SimilarityPrivacyConsent { enable_federation: bool },
     /// Derived data is safe to recreate but potentially expensive.
@@ -1420,7 +1446,14 @@ pub struct SearchState {
     /// Artists a federated card can be opened for — from artist records and
     /// from the artist names of matching tracks.
     pub fed_artists: Vec<crate::federation::FedArtistHit>,
+    /// Public podcast cards (type `podcast`), listed after the federated
+    /// tracks; Enter opens the card.
+    pub fed_podcasts: Vec<crate::podcasts::discovery::PodcastHit>,
+    /// The federated music search is running.
     pub fed_loading: bool,
+    /// The podcast search in the discovery overlay is running (separately,
+    /// so the music results never wait for it).
+    pub fed_podcasts_loading: bool,
     /// Present only for a track-seeded search; text-search refreshes must not
     /// replace this page with a title query.
     pub similarity_source: Option<i64>,
@@ -1433,6 +1466,24 @@ pub struct SearchState {
 }
 
 impl SearchState {
+    /// Rows the cursor can reach in a text search: local artists, releases
+    /// and tracks, then federated artists, tracks and podcasts.
+    pub fn total_len(&self) -> usize {
+        self.results.as_ref().map_or(0, SearchResults::len)
+            + self.fed_artists.len()
+            + self.fed_tracks.len()
+            + self.fed_podcasts.len()
+    }
+
+    /// Something federated is shown (or still loading).
+    pub fn has_federated(&self) -> bool {
+        !self.fed_tracks.is_empty()
+            || !self.fed_artists.is_empty()
+            || !self.fed_podcasts.is_empty()
+            || self.fed_loading
+            || self.fed_podcasts_loading
+    }
+
     pub fn similarity_len(&self) -> usize {
         usize::from(self.similarity_source_track.is_some()) + self.similarity_tracks.len()
     }
@@ -1796,6 +1847,10 @@ pub struct PodcastsTab {
     pub pending_select: Option<music_dht::podcast::PodcastId>,
     /// Last episode request sequence handed out.
     pub episode_seq: u64,
+    /// This device's public discovery publications (last reconciler pass).
+    pub publication: crate::podcasts::publication::PublicationReport,
+    /// A share check or share decision is being written.
+    pub share_busy: HashSet<music_dht::podcast::PodcastId>,
 }
 
 impl PodcastsTab {
@@ -1808,6 +1863,13 @@ impl PodcastsTab {
 
     pub fn podcast(&self, id: &music_dht::podcast::PodcastId) -> Option<&PodcastRow> {
         self.podcasts().iter().find(|row| row.id() == id)
+    }
+
+    /// This device is subscribed to the podcast of a public card: under the
+    /// card's id or under the id its origin URL resolves to here (a feed
+    /// alias of a podcast subscribed earlier).
+    pub fn subscribed_to(&self, hit: &crate::podcasts::discovery::PodcastHit) -> bool {
+        hit.ids().into_iter().any(|id| self.podcast(id).is_some())
     }
 
     pub fn list_rows(&self) -> Vec<PodcastListRow> {

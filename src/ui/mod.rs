@@ -4,6 +4,7 @@ mod federation;
 pub(crate) mod global;
 mod logs;
 mod playlists;
+mod podcast_card;
 mod podcasts;
 mod popup;
 #[cfg(test)]
@@ -179,6 +180,297 @@ mod tests {
             assert!(screen.contains("last check failed"), "{screen}");
             assert!(screen.contains("503"), "{screen}");
         }
+    }
+
+    #[test]
+    fn podcast_share_state_is_shown_in_the_list_and_details() {
+        use crate::podcasts::publication::{Discovery, Publication};
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 3, 0)]);
+        state.podcasts.selected = crate::app::state::PODCAST_ACTION_ROWS;
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private (not shared"), "{screen}");
+        assert!(!screen.contains("shared · 3 ep"), "{screen}");
+
+        let mut row = podcast_fixtures::row("Test Show", 0, 3, 0);
+        row.summary.shared = true;
+        let mut state = podcast_fixtures::ready_state(vec![row]);
+        state.podcasts.selected = crate::app::state::PODCAST_ACTION_ROWS;
+        state.podcasts.publication.discovery = Discovery::Running { peers: 2 };
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_fixtures::podcast_id(), Publication::Published);
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("shared · 3 ep"), "{screen}");
+        assert!(screen.contains("shared · published from"), "{screen}");
+
+        state.podcasts.publication.podcasts.insert(
+            podcast_fixtures::podcast_id(),
+            Publication::HeldBack(Vec::new()),
+        );
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("held back"), "{screen}");
+
+        // Restarted with other devices in the group: not published before
+        // a sync with one of them.
+        state.podcasts.publication.podcasts.insert(
+            podcast_fixtures::podcast_id(),
+            Publication::WaitingForDevices,
+        );
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("waiting for a sync"), "{screen}");
+        assert!(!screen.contains("published from"), "{screen}");
+
+        state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("not published:"), "{screen}");
+
+        // Sharing turned off here: until a pass revoked the card, the panel
+        // does not claim the podcast is simply private.
+        state.podcasts.publication.discovery = Discovery::Running { peers: 2 };
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_fixtures::podcast_id(), Publication::Published);
+        state
+            .podcasts
+            .publication
+            .note_revocation(&podcast_fixtures::podcast_id(), true);
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private · revoking the"), "{screen}");
+        if let Some(crate::app::state::Loadable::Ready(rows)) = &mut state.podcasts.list {
+            rows[0].summary.shared = false;
+        }
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private · revoking the"), "{screen}");
+        assert!(!screen.contains("private (not shared"), "{screen}");
+        state.podcasts.publication.discovery = Discovery::Off("federation is off".into());
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("may not be revoked yet:"), "{screen}");
+        assert!(screen.contains("federation is off"), "{screen}");
+        state.podcasts.publication.unrevoked.clear();
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("private (not shared"), "{screen}");
+    }
+
+    #[test]
+    fn the_podcast_card_scrolls_exactly_to_its_last_line() {
+        use crate::app::state::Popup;
+        use crate::app::update::podcast_discovery::card_key;
+        use crossterm::event::KeyCode;
+        let mut state = search_with_podcasts();
+        let mut hit = state.search.fed_podcasts[1].clone();
+        // Long words word-wrap into far more rows than their character
+        // count suggests (one 50-character word per 90-column row).
+        let word = "x".repeat(50);
+        hit.hit.card.description = Some(vec![word.as_str(); 30].join(" "));
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit),
+            preview: None,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
+        });
+        let last_line = "e — прочитать ленту";
+        let screen = render(&state, 110, 30);
+        assert!(!screen.contains(last_line), "below the fold:\n{screen}");
+
+        // Paging far past the end stops at the last line ...
+        for _ in 0..20 {
+            let popup = state.popup.take().unwrap();
+            assert_eq!(card_key(&mut state, popup, KeyCode::PageDown), None);
+        }
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains(last_line), "{screen}");
+        let Some(Popup::PodcastCard {
+            scroll, max_scroll, ..
+        }) = &state.popup
+        else {
+            panic!("the card is open");
+        };
+        assert_eq!(*scroll, max_scroll.get());
+        let end = *scroll;
+        // ... and one step back moves the view at once.
+        let popup = state.popup.take().unwrap();
+        card_key(&mut state, popup, KeyCode::Up);
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { scroll, .. }) if *scroll == end - 1
+        ));
+    }
+
+    /// Search view with a federated artist and two public podcast cards;
+    /// the first podcast is subscribed on this device.
+    fn search_with_podcasts() -> AppState {
+        use crate::podcasts::discovery::{PodcastHit, test_hit};
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 3, 0)]);
+        state.active_tab = Tab::Global;
+        state.search.query = "show".into();
+        state.search.results = Some(Default::default());
+        state.search.fed_artists = vec![crate::federation::FedArtistHit {
+            name: "Show Band".into(),
+            peers: 2,
+        }];
+        let mut other = test_hit("https://feeds.example.test/other.xml", "Other Show");
+        other.card.author = None;
+        state.search.fed_podcasts = vec![
+            PodcastHit::new(test_hit("https://example.test/feed.xml", "Test Show")),
+            PodcastHit::new(other),
+        ];
+        state.global.stack.push(GlobalView::Search { cursor: 1 });
+        state
+    }
+
+    #[test]
+    fn search_marks_podcast_hits_apart_from_music() {
+        let screen = render(&search_with_podcasts(), 120, 20);
+        assert!(screen.contains("Federation"), "{screen}");
+        assert!(
+            screen.contains("Show Band  artist · open the card"),
+            "{screen}"
+        );
+        assert!(screen.contains("Podcasts · public cards"), "{screen}");
+        assert!(
+            screen.contains("[podcast] Test Show  Ferris Crab · open the card"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[podcast] Other Show  open the card"),
+            "{screen}"
+        );
+        assert!(screen.contains("✓ subscribed"), "{screen}");
+        assert!(screen.contains("12 ep · 1 publisher"), "{screen}");
+        // The podcasts come after the music rows.
+        let artist = screen.find("Show Band").unwrap();
+        let podcast = screen.find("[podcast]").unwrap();
+        assert!(artist < podcast, "{screen}");
+    }
+
+    #[test]
+    fn podcast_card_offers_subscribe_or_shows_already_subscribed() {
+        use crate::app::state::{Loadable, Popup};
+        use crate::podcasts::discovery::{FeedPreview, PreviewEpisode};
+        let mut state = search_with_podcasts();
+        let mut hit = state.search.fed_podcasts[1].clone();
+        hit.hit.claimed_feed_urls = vec![music_dht::podcast_dht::ClaimedFeedUrl {
+            feed_url: music_dht::podcast::FeedUrl::parse("https://elsewhere.test/claimed.xml")
+                .unwrap(),
+            publishers: hit.hit.publishers.clone(),
+        }];
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit.clone()),
+            preview: None,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
+        });
+        let screen = render(&state, 110, 40);
+        assert!(screen.contains("[podcast] Other Show"), "{screen}");
+        assert!(screen.contains("они не проверены"), "{screen}");
+        assert!(screen.contains("Категории: Technology"), "{screen}");
+        assert!(
+            screen.contains("Выпусков: 12 · последний 2024-06-15"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Опубликовали: 1 устройство (не число подписчиков"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Лента: https://feeds.example.test/other.xml"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("(не проверен, не используется): https://elsewhere.test/claimed.xml"),
+            "{screen}"
+        );
+        assert!(screen.contains("[ Подписаться ]"), "{screen}");
+        assert!(
+            screen.contains("e — прочитать ленту без подписки"),
+            "{screen}"
+        );
+        assert!(screen.contains("enter подписаться"), "{screen}");
+        assert!(!screen.contains("Уже подписан"), "{screen}");
+
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(hit),
+            preview: Some(Loadable::Ready(FeedPreview {
+                title: "Other Show (feed)".into(),
+                episode_count: 3,
+                seasons: vec![(Some(1), 2), (None, 1)],
+                episodes: vec![PreviewEpisode {
+                    title: "Pilot".into(),
+                    season: Some(1),
+                    episode_number: Some(1),
+                    published_at_ms: Some(1_718_445_600_000),
+                    duration_ms: Some(2_700_000),
+                }],
+                moved_to: None,
+                subscribed_as: None,
+            })),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
+        });
+        let screen = render(&state, 110, 40);
+        assert!(
+            screen.contains("Название в ленте: Other Show (feed)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("В ленте: 3 выпуска · сезон 1: 2, без сезона: 1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("• Pilot  S1E1 · 2024-06-15 · 45:00"),
+            "{screen}"
+        );
+        assert!(screen.contains("… и ещё 2"), "{screen}");
+
+        // The subscribed podcast: «Уже подписан», Enter opens it.
+        state.popup = Some(Popup::PodcastCard {
+            hit: Box::new(state.search.fed_podcasts[0].clone()),
+            preview: None,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(u16::MAX),
+        });
+        let screen = render(&state, 110, 40);
+        assert!(screen.contains("✓ Уже подписан"), "{screen}");
+        assert!(screen.contains("enter открыть"), "{screen}");
+        assert!(!screen.contains("[ Подписаться ]"), "{screen}");
+    }
+
+    #[test]
+    fn podcast_share_confirmation_lists_the_warnings_in_russian() {
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 1, 0)]);
+        state.popup = Some(crate::app::state::Popup::ConfirmPodcastShare {
+            podcast_id: podcast_fixtures::podcast_id(),
+            title: "Test Show".into(),
+            urls: crate::podcasts::publication::ConfirmedUrls {
+                feed_url: music_dht::podcast::FeedUrl::parse(
+                    "https://example.test/feed.xml?token=abc",
+                )
+                .unwrap(),
+                id_feed_url: None,
+            },
+            warnings: vec!["в адресе ленты есть параметр «token», похожий на ключ доступа".into()],
+            already_shared: false,
+        });
+        let screen = render(&state, 100, 30);
+        assert!(
+            screen.contains("Поделиться подкастом «Test Show»"),
+            "{screen}"
+        );
+        assert!(screen.contains("Адрес похож на личный"), "{screen}");
+        assert!(screen.contains("параметр «token»"), "{screen}");
+        assert!(screen.contains("feed.xml?token=abc"), "{screen}");
+        assert!(
+            screen.contains("enter/y опубликовать · esc/n отмена"),
+            "{screen}"
+        );
+        assert!(!screen.contains("x не делиться"), "{screen}");
     }
 
     #[test]

@@ -319,3 +319,8 @@ context = "podcasts"
 key_sequence = "b"
 command = "RestartEpisode"
 context = "podcasts"
+
+[[keymaps]]
+key_sequence = "shift-f"
+command = "TogglePodcastShare"
+context = "podcasts"

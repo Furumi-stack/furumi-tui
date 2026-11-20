@@ -135,3 +135,35 @@ fn artist_catalog_discovery_prioritizes_matching_owners_and_bounds_fanout() {
         );
     }
 }
+
+/// The podcast-discovery overlay opens next to the other overlay caches; a
+/// cache that cannot be opened only turns discovery off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn podcast_discovery_opens_or_turns_itself_off() {
+    async fn service(dir: &Path) -> Arc<MusicDhtService> {
+        let config = MusicDhtConfig::builder()
+            .data_dir(dir)
+            .network_id(NetworkId::from_name("furumi-tui-podcast-dht-open-test"))
+            .schema_independent_stream_protocol(PODCAST_DHT_ALPN)
+            .build()
+            .unwrap();
+        let (service, mut events) = MusicDhtService::start(config).await.unwrap();
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        Arc::new(service)
+    }
+
+    let ok_dir = tempfile::tempdir().unwrap();
+    let ok = service(ok_dir.path()).await;
+    let opened = open_podcast_dht(&ok, ok_dir.path()).await;
+    assert!(opened.is_some());
+    assert!(ok_dir.path().join(PODCAST_DHT_CACHE_FILE).is_file());
+    drop(opened);
+    ok.shutdown().await.unwrap();
+
+    // A directory where the cache file belongs cannot be opened as SQLite.
+    let broken_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(broken_dir.path().join(PODCAST_DHT_CACHE_FILE)).unwrap();
+    let broken = service(broken_dir.path()).await;
+    assert!(open_podcast_dht(&broken, broken_dir.path()).await.is_none());
+    broken.shutdown().await.unwrap();
+}

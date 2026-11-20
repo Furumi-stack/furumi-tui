@@ -28,6 +28,19 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Some(Popup::ConfirmPodcastUnsubscribe { title, .. }) => {
             draw_confirm_podcast_unsubscribe(frame, state, title)
         }
+        Some(Popup::PodcastCard {
+            hit,
+            preview,
+            scroll,
+            max_scroll,
+        }) => super::podcast_card::draw(frame, state, hit, preview.as_ref(), *scroll, max_scroll),
+        Some(Popup::ConfirmPodcastShare {
+            title,
+            urls,
+            warnings,
+            already_shared,
+            ..
+        }) => draw_confirm_podcast_share(frame, state, title, urls, warnings, *already_shared),
         Some(Popup::SimilarityPrivacyConsent { .. }) => {
             draw_similarity_privacy_consent(frame, state)
         }
@@ -1318,6 +1331,85 @@ fn draw_confirm_podcast_unsubscribe(frame: &mut Frame, state: &AppState, title: 
     );
 }
 
+/// Sharing a podcast whose feed URL looks private. In Russian: the warning
+/// is about the user's own secret, so it must not be missed.
+fn draw_confirm_podcast_share(
+    frame: &mut Frame,
+    state: &AppState,
+    title: &str,
+    urls: &crate::podcasts::publication::ConfirmedUrls,
+    warnings: &[String],
+    already_shared: bool,
+) {
+    let width = 78.min(frame.area().width.saturating_sub(4)).max(30);
+    let mut lines = vec![
+        Line::styled(
+            format!("Поделиться подкастом «{title}» в федерации?"),
+            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(
+            "Карточка с адресом RSS-ленты станет видна всем участникам федерации, \
+             и любой из них сможет читать ленту по этому адресу.",
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Адрес похож на личный:",
+            ratatui::style::Style::new().fg(ratatui::style::Color::Yellow),
+        ),
+    ];
+    lines.extend(warnings.iter().map(|warning| {
+        Line::styled(
+            format!("• {warning}"),
+            ratatui::style::Style::new().fg(ratatui::style::Color::Yellow),
+        )
+    }));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Лента: {}", urls.feed_url.as_str()),
+        theme::dim(),
+    ));
+    if let Some(origin) = &urls.id_feed_url {
+        lines.push(Line::styled(
+            format!("Исходный адрес: {}", origin.as_str()),
+            theme::dim(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Публикацию можно отозвать, но копии, которые уже получили другие, \
+         отозвать нельзя. Подтверждение хранится только на этом устройстве.",
+        theme::dim(),
+    ));
+    let footer = if already_shared {
+        "enter/y опубликовать · x не делиться · esc/n отмена"
+    } else {
+        "enter/y опубликовать · esc/n отмена"
+    };
+    let inner_width = width.saturating_sub(2).max(1);
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // The height of the word-wrapped text, as it is rendered.
+    let body_height = u16::try_from(body.line_count(inner_width)).unwrap_or(u16::MAX);
+    let height = body_height
+        .saturating_add(4)
+        .min(frame.area().height.saturating_sub(2));
+    let area = centered(frame.area(), width, height);
+    let block = Block::bordered()
+        .title(" Поделиться в федерации ")
+        .title_style(theme::header_for(state))
+        .border_style(theme::strong_border_for(state));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(body, body_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(footer, theme::dim())).alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
 fn draw_log_detail(frame: &mut Frame, state: &AppState, entry: &crate::config::logging::LogEntry) {
     let width = 90.min(frame.area().width.saturating_sub(4)).max(40);
     let height = 18.min(frame.area().height.saturating_sub(2)).max(7);
@@ -1736,7 +1828,7 @@ fn draw_name_entry(
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [rect] = Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
         .areas(area);

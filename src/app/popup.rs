@@ -124,6 +124,20 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
             _ => state.popup = Some(Popup::ConfirmPodcastUnsubscribe { podcast_id, title }),
         },
+        popup @ Popup::PodcastCard { .. } => {
+            if let Some(effect) =
+                crate::app::update::podcast_discovery::card_key(state, popup, key.code)
+            {
+                super::perform_effect(state, runtime, effect);
+            }
+        }
+        popup @ Popup::ConfirmPodcastShare { .. } => {
+            if let Some(effect) =
+                crate::app::update::podcasts::share_confirmation_key(state, popup, key.code)
+            {
+                super::perform_effect(state, runtime, effect);
+            }
+        }
         Popup::SimilarityPrivacyConsent { enable_federation } => match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
                 state.similarity.settings.federation_consent = true;

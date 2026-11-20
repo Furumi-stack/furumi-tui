@@ -142,6 +142,9 @@ struct PodcastLink {
     /// Other podcast state (subscriptions, shares, feed URLs, sessions)
     /// changed since the last notification.
     changed: bool,
+    /// Whether the podcast registers are current enough to publish public
+    /// cards from ([`DeviceSync::podcast_registers_current`]).
+    registers_current: tokio::sync::watch::Sender<bool>,
 }
 
 /// Converts queue items to and from the shared wire form
@@ -844,11 +847,74 @@ impl DeviceSync {
             tracing::info!(applied, "applied podcast operations received earlier");
         }
         self.flush_podcast_changes();
-        Ok(())
+        self.check_podcast_registers_without_peers()
     }
 
     fn podcast_store(&self) -> Option<Arc<PodcastStore>> {
         lock(&self.podcasts).store.clone()
+    }
+
+    /// Becomes `true` once the share and subscription registers in the
+    /// attached podcast store are current enough to publish this device's
+    /// public podcast cards from, and stays `true` for the process.
+    ///
+    /// A device that was closed or offline may hold a "share" decision that
+    /// another trusted device revoked meanwhile. Its registers count as
+    /// current once it exchanged sync messages (in either direction) with a
+    /// trusted device that syncs podcasts (protocol v4 or newer) after the
+    /// store was attached, or when it has no such device it can reach (no
+    /// device in its group, only older ones, or none with an address): then
+    /// nobody can bring it a newer decision. Until then
+    /// `podcasts::publication` only revokes and publishes nothing.
+    pub fn podcast_registers_current(&self) -> tokio::sync::watch::Receiver<bool> {
+        lock(&self.podcasts).registers_current.subscribe()
+    }
+
+    fn set_podcast_registers_current(&self, why: &str) {
+        let link = lock(&self.podcasts);
+        let opened = link.registers_current.send_if_modified(|current| {
+            let opened = !*current;
+            *current = true;
+            opened
+        });
+        if opened {
+            tracing::info!("podcast share decisions are current: {why}");
+        }
+    }
+
+    /// A sync exchange with `device_id` was applied. `store_attached`: the
+    /// podcast store was attached before the received state was applied, so
+    /// the received podcast operations and snapshot sections reached it.
+    fn podcast_exchange_applied(&self, device_id: &str, store_attached: bool) -> Result<()> {
+        if store_attached
+            && music_dht::device_sync::supports_podcasts(self.peer_protocol_version(device_id)?)
+        {
+            self.set_podcast_registers_current("synced with a trusted device");
+        }
+        Ok(())
+    }
+
+    /// Marks the podcast registers current when the store is attached and
+    /// no trusted device that syncs podcasts can be reached to bring newer
+    /// decisions (see [`DeviceSync::podcast_registers_current`]).
+    fn check_podcast_registers_without_peers(&self) -> Result<()> {
+        {
+            let link = lock(&self.podcasts);
+            if link.store.is_none() || *link.registers_current.borrow() {
+                return Ok(());
+            }
+        }
+        for device in self.active_remote_devices()? {
+            if !device.endpoint_ticket.trim().is_empty()
+                && music_dht::device_sync::supports_podcasts(
+                    self.peer_protocol_version(&device.device_id)?,
+                )
+            {
+                return Ok(());
+            }
+        }
+        self.set_podcast_registers_current("no trusted device syncs podcasts");
+        Ok(())
     }
 
     /// Merges a received podcast operation into the podcast store, or keeps
@@ -1097,7 +1163,9 @@ impl DeviceSync {
                     }
                 }
                 self.apply_device_profiles(&devices, Some(&invite.device_id))?;
+                let store_attached = self.podcast_store().is_some();
                 self.apply_received(snapshot, ops)?;
+                self.podcast_exchange_applied(&invite.device_id, store_attached)?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: invite.device_id.clone(),
                 })?;
@@ -1600,7 +1668,9 @@ impl DeviceSync {
                 if let Some(playback) = playback {
                     self.apply_playback_snapshot(&device.device_id, playback)?;
                 }
+                let store_attached = self.podcast_store().is_some();
                 self.apply_received(snapshot, ops)?;
+                self.podcast_exchange_applied(&device.device_id, store_attached)?;
                 self.note_peer_vector(&device.device_id, &vector)?;
                 self.mark_seen(&device.device_id, Some(peer.to_string()))?;
                 self.set_last_sync(Some(format!("synced {}", short_id(&device.device_id))))?;
@@ -3404,6 +3474,10 @@ pub async fn sync_loop(
                 if let Err(err) = sync.gc_tombstones() {
                     tracing::debug!("personal sync cleanup failed: {err:#}");
                 }
+                // A device removed from the group is no longer waited for.
+                if let Err(err) = sync.check_podcast_registers_without_peers() {
+                    tracing::debug!("podcast sync state not checked: {err:#}");
+                }
             }
             Some(completed) = polls.join_next_with_id(), if !polls.is_empty() => {
                 let (task, result) = match completed {
@@ -3646,7 +3720,9 @@ async fn handle_pair_request(
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
+    let store_attached = sync.podcast_store().is_some();
     sync.apply_received(snapshot, ops)?;
+    sync.podcast_exchange_applied(&profile.device_id, store_attached)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     {
         let conn = lock(&sync.conn);
@@ -3740,7 +3816,9 @@ async fn handle_hello(
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
+    let store_attached = sync.podcast_store().is_some();
     sync.apply_received(snapshot, ops)?;
+    sync.podcast_exchange_applied(&profile.device_id, store_attached)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     sync.mark_seen(&profile.device_id, Some(stream.peer_id.to_string()))?;
     sync.set_last_sync(Some(format!("synced {}", short_id(&profile.device_id))))?;

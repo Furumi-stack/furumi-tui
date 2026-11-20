@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use music_dht::podcast_dht::{PODCAST_DHT_ALPN, PodcastDht};
 use music_dht::similarity_dht::SimilarityDht;
 use music_dht::similarity_lsh::SIMILARITY_DHT_ALPN;
 use music_dht::{
@@ -43,6 +44,10 @@ pub use audio::{AUDIO_ALPN, DownloadProgress, StreamingStart, TrackMetadata};
 pub use capabilities::ProtocolVersions;
 pub use catalog::{CATALOG_ALPN, FedAppearsOn, FedArtistCard, FedCardTrack, FedRelease};
 pub use similarity::SIMILARITY_ALPN;
+
+/// Cache of the public podcast-discovery overlay (`music_dht::podcast_dht`),
+/// next to the similarity overlay's cache in the federation data directory.
+pub const PODCAST_DHT_CACHE_FILE: &str = "podcast-dht.sqlite3";
 
 /// How often the published library is re-synchronized with the local index.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -412,6 +417,9 @@ pub struct NetworkLibrarySource {
 struct Running {
     service: Arc<MusicDhtService>,
     similarity_dht: Arc<SimilarityDht>,
+    /// Public podcast discovery; `None` when its cache could not be opened
+    /// (discovery is then off and the overlay is not advertised).
+    podcast_dht: Option<Arc<PodcastDht>>,
     network_name: String,
     network_id: NetworkId,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -438,6 +446,9 @@ pub struct Federation {
     last_error: std::sync::Mutex<Option<String>>,
     transport_stats: Arc<TransportStats>,
     observed_protocols: Arc<capabilities::ObservedVersions>,
+    /// The running podcast-discovery overlay, for the podcast publication
+    /// reconciler (`podcasts::publication`); `None` while federation is off.
+    podcast_dht: tokio::sync::watch::Sender<Option<Arc<PodcastDht>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -572,7 +583,15 @@ impl Federation {
             last_error: std::sync::Mutex::new(initial_error),
             transport_stats: Arc::new(TransportStats::default()),
             observed_protocols: Arc::new(capabilities::ObservedVersions::default()),
+            podcast_dht: tokio::sync::watch::Sender::new(None),
         })
+    }
+
+    /// Follows the podcast-discovery overlay of the running node: `Some`
+    /// while federation runs with the overlay, `None` otherwise. Every
+    /// (re)start publishes a new value.
+    pub fn podcast_dht(&self) -> tokio::sync::watch::Receiver<Option<Arc<PodcastDht>>> {
+        self.podcast_dht.subscribe()
     }
 
     pub fn settings(&self) -> FedSettings {
@@ -730,6 +749,7 @@ impl Federation {
             } else if recovery_only {
                 return Ok(false);
             }
+            self.podcast_dht.send_replace(None);
             stop_running(guard.take()).await;
         } else if recovery_only {
             tracing::warn!(network = %network_name, "retrying stopped federation service");
@@ -756,6 +776,8 @@ impl Federation {
             .stream_protocol(crate::jam::JAM_ALPN)
             // Signed LSH summaries form their own upgrade-safe DHT overlay.
             .schema_independent_stream_protocol(SIMILARITY_DHT_ALPN)
+            // Public cards of podcasts the user chose to share.
+            .schema_independent_stream_protocol(PODCAST_DHT_ALPN)
             // Informational application/protocol versions.
             .schema_independent_stream_protocol(capabilities::CAPABILITIES_ALPN)
             .build()
@@ -788,6 +810,18 @@ impl Federation {
             Arc::clone(&self.similarity),
             Arc::clone(&self.library),
         ));
+        // Public podcast discovery: serving, bootstrap, republishing and
+        // expiry run here; what to publish is decided by the podcast
+        // publication reconciler from the user's share decisions.
+        let mut podcast_dht_tasks = Vec::new();
+        let podcast_dht =
+            open_podcast_dht(&service, &self.data_dir)
+                .await
+                .map(|(dht, acceptor)| {
+                    podcast_dht_tasks.push(tokio::spawn(Arc::clone(&dht).serve(acceptor)));
+                    podcast_dht_tasks.push(tokio::spawn(Arc::clone(&dht).maintenance()));
+                    dht
+                });
 
         // Drain DHT events into the log; the channel is bounded.
         let event_task = tokio::spawn(async move {
@@ -861,33 +895,41 @@ impl Federation {
         let capabilities_acceptor = service
             .stream_acceptor(capabilities::CAPABILITIES_ALPN)
             .map_err(|err| anyhow::anyhow!("failed to take capabilities acceptor: {err}"))?;
-        let capabilities_serve_task = tokio::spawn(capabilities::serve(capabilities_acceptor));
+        let capabilities_serve_task = tokio::spawn(capabilities::serve(
+            capabilities_acceptor,
+            podcast_dht.is_some(),
+        ));
         let capabilities_probe_task = tokio::spawn(capabilities::probe_loop(
             Arc::clone(&service),
             Arc::clone(&self.observed_protocols),
+            podcast_dht.clone(),
         ));
 
+        let mut tasks = podcast_dht_tasks;
+        tasks.extend([
+            event_task,
+            sync_task,
+            audio_task,
+            catalog_task,
+            similarity_task,
+            device_sync_task,
+            device_tick_task,
+            jam_serve_task,
+            jam_poll_task,
+            capabilities_serve_task,
+            capabilities_probe_task,
+            similarity_dht_serve_task,
+            similarity_dht_maintenance_task,
+            similarity_dht_sync_task,
+        ]);
+        self.podcast_dht.send_replace(podcast_dht.clone());
         *guard = Some(Running {
             service,
             similarity_dht,
+            podcast_dht,
             network_name,
             network_id,
-            tasks: vec![
-                event_task,
-                sync_task,
-                audio_task,
-                catalog_task,
-                similarity_task,
-                device_sync_task,
-                device_tick_task,
-                jam_serve_task,
-                jam_poll_task,
-                capabilities_serve_task,
-                capabilities_probe_task,
-                similarity_dht_serve_task,
-                similarity_dht_maintenance_task,
-                similarity_dht_sync_task,
-            ],
+            tasks,
         });
         self.set_error(None);
         Ok(true)
@@ -895,6 +937,7 @@ impl Federation {
 
     async fn stop(&self) {
         let mut guard = self.running.lock().await;
+        self.podcast_dht.send_replace(None);
         stop_running(guard.take()).await;
     }
 
@@ -1088,7 +1131,12 @@ impl Federation {
             recovery_count: self.recovery_count.load(Ordering::Relaxed),
             last_sync: lock(&self.last_sync).clone(),
             last_error: lock(&self.last_error).clone(),
-            protocols: ProtocolVersions::snapshot(&self.observed_protocols),
+            protocols: ProtocolVersions::snapshot(
+                &self.observed_protocols,
+                guard
+                    .as_ref()
+                    .is_some_and(|running| running.podcast_dht.is_some()),
+            ),
             ..FedStatus::default()
         };
         if let Some(running) = guard.as_ref() {
@@ -1214,6 +1262,10 @@ impl Federation {
     /// Searches the federated network: matching tracks plus the artists a
     /// card can be assembled for (from artist records and from the artist
     /// names of matching tracks/releases).
+    ///
+    /// Public podcast cards are searched separately
+    /// ([`Federation::search_podcasts`]), so the music results never wait
+    /// for the discovery overlay.
     pub async fn search(&self, query: &str) -> Result<FedSearchResults> {
         let service = self.service().await?;
         let normalized = music_dht::normalize_name(query);
@@ -1307,6 +1359,24 @@ impl Federation {
         rank_fed_search_results(&mut artists, &mut tracks, &normalized);
 
         Ok(FedSearchResults { artists, tracks })
+    }
+
+    /// Public podcast cards matching `query` in the discovery overlay
+    /// (explicit type `podcast`), bounded by
+    /// [`crate::podcasts::discovery::PODCAST_SEARCH_TIMEOUT`] including the
+    /// overlay's bootstrap. Empty while the overlay is not running, on an
+    /// error or on timeout.
+    pub async fn search_podcasts(
+        &self,
+        query: &str,
+    ) -> Vec<crate::podcasts::discovery::PodcastHit> {
+        let podcast_dht = self.podcast_dht.borrow().clone();
+        crate::podcasts::discovery::search(
+            podcast_dht.as_deref(),
+            query,
+            crate::podcasts::discovery::PODCAST_SEARCH_TIMEOUT,
+        )
+        .await
     }
 
     /// Bounded fan-out to known peers using the exact model/profile
@@ -2800,6 +2870,31 @@ async fn similarity_route_sync_loop(
             Err(error) => {
                 tracing::warn!(%error, %profile_id, "similarity DHT synchronization failed");
             }
+        }
+    }
+}
+
+/// Opens the podcast-discovery overlay and takes its stream acceptor. A
+/// failure (unreadable or newer cache, …) is logged and only disables public
+/// podcast discovery: the acceptor is dropped so the overlay's ALPN refuses
+/// streams, and the overlay is not advertised.
+async fn open_podcast_dht(
+    service: &Arc<MusicDhtService>,
+    data_dir: &Path,
+) -> Option<(Arc<PodcastDht>, music_dht::StreamAcceptor)> {
+    let acceptor = match service.stream_acceptor(PODCAST_DHT_ALPN) {
+        Ok(acceptor) => acceptor,
+        Err(err) => {
+            tracing::warn!("podcast discovery is off: cannot take its acceptor: {err}");
+            return None;
+        }
+    };
+    match PodcastDht::open(Arc::clone(service), data_dir.join(PODCAST_DHT_CACHE_FILE)).await {
+        Ok(dht) => Some((dht, acceptor)),
+        Err(err) => {
+            tracing::warn!("podcast discovery is off: cannot open its cache: {err}");
+            drop(acceptor);
+            None
         }
     }
 }

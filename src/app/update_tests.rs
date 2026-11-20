@@ -1834,6 +1834,335 @@ mod podcast_tab {
             Some(Effect::PodcastLoadEpisodes { .. })
         ));
     }
+
+    // --- Sharing in the federation (MR-T3) ---
+
+    use crate::podcasts::publication::{
+        ConfirmedUrls, Discovery, Publication, PublicationReport, ShareCheck,
+    };
+    use crossterm::event::KeyCode;
+
+    fn urls() -> ConfirmedUrls {
+        ConfirmedUrls {
+            feed_url: FeedUrl::parse("https://example.test/feed.xml").unwrap(),
+            id_feed_url: None,
+        }
+    }
+
+    fn check(warnings: bool, confirmed: bool) -> ShareCheck {
+        ShareCheck {
+            urls: urls(),
+            warnings: if warnings {
+                vec![
+                    music_dht::podcast_dht::FeedUrlPrivacyWarning::SecretQueryParameter {
+                        name: "token".into(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+            confirmed,
+        }
+    }
+
+    fn set_shared(shared: bool, confirm: Option<ConfirmedUrls>) -> Option<Effect> {
+        Some(Effect::PodcastSetShared {
+            podcast_id: podcast_id(),
+            title: "Show".into(),
+            shared,
+            confirm,
+        })
+    }
+
+    fn shared_row() -> crate::app::state::PodcastRow {
+        let mut row = fx::row("Show", 0, 1, 0);
+        row.summary.shared = true;
+        row
+    }
+
+    #[test]
+    fn sharing_a_podcast_checks_its_card_first_and_shares_without_warnings() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        assert_eq!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare {
+                podcast_id: podcast_id(),
+                title: "Show".into(),
+            })
+        );
+        // A second press while the check runs does nothing.
+        assert_eq!(update(&mut state, Action::TogglePodcastShare), None);
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(false, false)),
+        );
+        assert_eq!(effect, set_shared(true, None));
+        assert!(state.popup.is_none());
+        // Also inside the opened podcast.
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(1)));
+        assert!(matches!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare { .. })
+        ));
+        // Already confirmed for exactly these URLs: no dialog.
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, true)),
+        );
+        assert_eq!(effect, set_shared(true, None));
+    }
+
+    #[test]
+    fn a_private_looking_feed_url_is_shared_only_after_confirmation() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        update(&mut state, Action::TogglePodcastShare);
+        let effect = podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        assert_eq!(effect, None, "nothing is written before the user confirms");
+        let Some(Popup::ConfirmPodcastShare {
+            warnings,
+            already_shared,
+            urls: shown,
+            ..
+        }) = &state.popup
+        else {
+            panic!("expected the share confirmation, got {:?}", state.popup);
+        };
+        assert_eq!(
+            warnings,
+            &vec!["в адресе ленты есть параметр «token», похожий на ключ доступа".to_string()]
+        );
+        assert!(!already_shared);
+        assert_eq!(shown, &urls());
+        assert!(state.podcasts.share_busy.is_empty());
+
+        // Esc keeps the podcast private; other keys keep the dialog.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('j')),
+            None
+        );
+        assert!(state.popup.is_some());
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('x')),
+            None
+        );
+        assert!(state.popup.is_some(), "x only stops an existing share");
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Esc),
+            None
+        );
+        assert!(state.popup.is_none());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("stays private"))
+        );
+
+        // Enter confirms exactly the URLs shown.
+        update(&mut state, Action::TogglePodcastShare);
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Enter),
+            set_shared(true, Some(urls()))
+        );
+        assert!(state.podcasts.share_busy.contains(&podcast_id()));
+        assert_eq!(
+            podcasts::share_set(&mut state, podcast_id(), "Show".into(), true, Ok(())),
+            Some(Effect::PodcastsReload)
+        );
+        assert!(state.podcasts.share_busy.is_empty());
+    }
+
+    #[test]
+    fn stopping_sharing_needs_no_dialog_and_a_held_publication_asks_again() {
+        let mut state = ready(vec![shared_row()]);
+        assert_eq!(
+            update(&mut state, Action::TogglePodcastShare),
+            set_shared(false, None)
+        );
+        state
+            .podcasts
+            .publication
+            .podcasts
+            .insert(podcast_id(), Publication::Published);
+        let effect = podcasts::share_set(&mut state, podcast_id(), "Show".into(), false, Ok(()));
+        assert_eq!(effect, Some(Effect::PodcastsReload));
+        assert!(state.podcasts.publication.podcasts.is_empty());
+        assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("private again"))
+        );
+
+        // The federation is off (since the start, or the app was restarted
+        // since the card was published): no pass knows whether a card from
+        // an earlier session is live, so one that was shared counts as not
+        // revoked yet, for share-off and unsubscribe alike.
+        for discovery in [
+            Discovery::Off("federation is off".into()),
+            Discovery::Starting,
+        ] {
+            let mut state = ready(vec![shared_row()]);
+            state.podcasts.publication.discovery = discovery.clone();
+            podcasts::share_set(&mut state, podcast_id(), "Show".into(), false, Ok(()));
+            assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
+            let mut state = ready(vec![shared_row()]);
+            state.podcasts.publication.discovery = discovery.clone();
+            podcasts::unsubscribed(&mut state, podcast_id(), "Show".into(), Ok(()));
+            assert!(state.podcasts.publication.unrevoked.contains(&podcast_id()));
+            // A podcast that was not shared has no card to revoke.
+            let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+            state.podcasts.publication.discovery = discovery;
+            podcasts::unsubscribed(&mut state, podcast_id(), "Show".into(), Ok(()));
+            assert!(state.podcasts.publication.unrevoked.is_empty());
+        }
+
+        // Shared (for example from another device) but held back here: the
+        // key asks for this device's confirmation instead of unsharing.
+        let mut state = ready(vec![shared_row()]);
+        state.podcasts.publication.podcasts.insert(
+            podcast_id(),
+            Publication::HeldBack(check(true, false).warnings),
+        );
+        assert!(matches!(
+            update(&mut state, Action::TogglePodcastShare),
+            Some(Effect::PodcastPrepareShare { .. })
+        ));
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::ConfirmPodcastShare {
+                already_shared: true,
+                ..
+            })
+        ));
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('x')),
+            set_shared(false, None)
+        );
+        // Or confirms it (sharing is already on; the confirmation is new).
+        state.podcasts.share_busy.clear();
+        podcasts::share_prepared(
+            &mut state,
+            podcast_id(),
+            "Show".into(),
+            Ok(check(true, false)),
+        );
+        let popup = state.popup.take().unwrap();
+        assert_eq!(
+            podcasts::share_confirmation_key(&mut state, popup, KeyCode::Char('y')),
+            set_shared(true, Some(urls()))
+        );
+        // Held without warnings any more: just reconcile again.
+        state.podcasts.share_busy.clear();
+        assert_eq!(
+            podcasts::share_prepared(
+                &mut state,
+                podcast_id(),
+                "Show".into(),
+                Ok(check(false, false))
+            ),
+            Some(Effect::PodcastPublicationSync)
+        );
+    }
+
+    #[test]
+    fn share_errors_and_publication_failures_are_shown() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        update(&mut state, Action::TogglePodcastShare);
+        assert_eq!(
+            podcasts::share_prepared(&mut state, podcast_id(), "Show".into(), Err("boom".into())),
+            None
+        );
+        assert!(state.podcasts.share_busy.is_empty());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot share: boom"))
+        );
+        assert_eq!(
+            podcasts::share_set(
+                &mut state,
+                podcast_id(),
+                "Show".into(),
+                true,
+                Err("db".into())
+            ),
+            None
+        );
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot change sharing: db"))
+        );
+
+        state.status_message = None;
+        let mut report = PublicationReport {
+            discovery: Discovery::Running { peers: 3 },
+            ..PublicationReport::default()
+        };
+        report
+            .podcasts
+            .insert(podcast_id(), Publication::Failed("signing failed".into()));
+        podcasts::publication_reported(&mut state, report.clone());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot publish \"Show\": signing failed"))
+        );
+        // The same failure again is not repeated in the status bar.
+        state.status_message = None;
+        podcasts::publication_reported(&mut state, report);
+        assert_eq!(state.status_message, None);
+        assert_eq!(
+            state.podcasts.publication.discovery,
+            Discovery::Running { peers: 3 }
+        );
+    }
+
+    #[test]
+    fn share_actions_outside_the_tab_only_explain() {
+        let mut state = fx::ready_state(vec![fx::row("Show", 0, 1, 0)]);
+        state.active_tab = Tab::Global;
+        assert_eq!(update(&mut state, Action::TogglePodcastShare), None);
+        assert!(state.podcasts.share_busy.is_empty());
+        let mut opening = AppState {
+            active_tab: Tab::Podcasts,
+            ..AppState::default()
+        };
+        assert_eq!(update(&mut opening, Action::TogglePodcastShare), None);
+    }
 }
 
 /// Podcast episodes in the shared queue: identity by episode id (never the
@@ -2218,5 +2547,269 @@ mod podcast_queue {
         // Before the store is ready there is nothing to reload.
         let mut opening = AppState::default();
         assert!(crate::app::update::podcasts::synced(&mut opening, Vec::new(), true).is_empty());
+    }
+}
+
+mod podcast_discovery {
+    use crossterm::event::KeyCode;
+    use music_dht::podcast::{FeedUrl, PodcastId};
+    use music_dht::podcast_dht::ClaimedFeedUrl;
+
+    use super::*;
+    use crate::app::podcast_fixtures::{self as fx, podcast_id};
+    use crate::app::state::{Loadable, PODCAST_ACTION_ROWS, Popup};
+    use crate::app::update::podcast_discovery::{card_key, preview_loaded};
+    use crate::podcasts::discovery::{FeedPreview, PodcastHit, test_hit};
+
+    const ORIGIN: &str = "https://feeds.example.test/origin.xml";
+    const CLAIMED: &str = "https://elsewhere.example.test/claimed.xml";
+
+    /// A card whose publisher also claims the feed moved elsewhere.
+    fn claimed_hit() -> PodcastHit {
+        let mut hit = test_hit(ORIGIN, "Rust Radio");
+        let claimed = FeedUrl::parse(CLAIMED).unwrap();
+        hit.claimed_feed_urls = vec![ClaimedFeedUrl {
+            feed_url: claimed.clone(),
+            publishers: hit.publishers.clone(),
+        }];
+        hit.card.feed_url = claimed;
+        hit.card.id_feed_url = Some(FeedUrl::parse(ORIGIN).unwrap());
+        PodcastHit::new(hit)
+    }
+
+    /// The search view with one local track, a federated artist and the
+    /// given podcast hits; the podcast store is ready with `rows`.
+    fn search_state(rows: Vec<crate::app::state::PodcastRow>, hits: Vec<PodcastHit>) -> AppState {
+        let mut state = fx::ready_state(rows);
+        state.active_tab = Tab::Global;
+        state.search.query = "rust radio".into();
+        state.search.results = Some(crate::library::models::SearchResults {
+            tracks: vec![test_track(1)],
+            ..Default::default()
+        });
+        state.search.fed_artists = vec![crate::federation::FedArtistHit {
+            name: "Rust Radio Band".into(),
+            peers: 2,
+        }];
+        state.search.fed_podcasts = hits;
+        state.global.stack.push(GlobalView::Search { cursor: 0 });
+        state
+    }
+
+    fn open_card_at(state: &mut AppState, cursor: usize) -> Popup {
+        if let Some(GlobalView::Search { cursor: at }) = state.global.stack.last_mut() {
+            *at = cursor;
+        }
+        assert_eq!(update(state, Action::Select), None);
+        state.popup.take().expect("the card opens")
+    }
+
+    #[test]
+    fn the_cursor_reaches_podcast_hits_after_the_music_results() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert_eq!(state.search.total_len(), 3);
+        update(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.global.stack.last(),
+            Some(GlobalView::Search { cursor: 2 })
+        ));
+        // Enter on a podcast opens its card; nothing is played or queued.
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert!(state.player.queue.is_empty());
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { hit, preview: None, scroll: 0, .. }) if hit.title() == "Rust Radio"
+        ));
+        // The music rows keep their behavior.
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PlayCurrent)
+        );
+    }
+
+    #[test]
+    fn subscribing_from_a_card_uses_the_origin_url_only() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        let Some(Effect::PodcastSubscribeFromCard(hit)) = effect else {
+            panic!("expected a subscription, got {effect:?}");
+        };
+        assert_eq!(hit.feed_url.as_str(), ORIGIN);
+        assert_eq!(
+            hit.podcast_id,
+            PodcastId::from_feed_url(&FeedUrl::parse(ORIGIN).unwrap())
+        );
+        assert!(state.podcasts.subscribing);
+        assert!(matches!(state.popup, Some(Popup::PodcastCard { .. })));
+
+        // One subscription at a time.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Char('s')), None);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already being added"))
+        );
+
+        // Esc closes without anything else.
+        state.podcasts.subscribing = false;
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Esc), None);
+        assert!(state.popup.is_none());
+
+        // Without a podcast store nothing is requested.
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        state.podcasts.store = crate::app::state::PodcastStoreStatus::Opening;
+        let popup = open_card_at(&mut state, 2);
+        assert_eq!(card_key(&mut state, popup, KeyCode::Enter), None);
+        assert!(!state.podcasts.subscribing);
+    }
+
+    #[test]
+    fn already_subscribed_cards_open_the_podcast_instead() {
+        // Subscribed under the card's own id.
+        let mut hit = test_hit("https://example.test/feed.xml", "Test Show");
+        hit.card.episode_count = None;
+        let mut state = search_state(
+            vec![fx::row("Test Show", 0, 3, 0)],
+            vec![PodcastHit::new(hit)],
+        );
+        assert!(state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            matches!(&effect, Some(Effect::PodcastLoadEpisodes { query, .. }) if query.podcast_id == podcast_id()),
+            "{effect:?}"
+        );
+        assert_eq!(state.active_tab, Tab::Podcasts);
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS);
+        assert!(state.popup.is_none());
+        assert!(!state.podcasts.subscribing);
+
+        // Subscribed under another id: the card's origin URL is a feed
+        // alias of that podcast here (resolved by the search task).
+        let mut aliased = claimed_hit();
+        assert_ne!(aliased.hit.podcast_id, podcast_id());
+        aliased.local_id = podcast_id();
+        let mut state = search_state(vec![fx::row("Test Show", 0, 3, 0)], vec![aliased]);
+        assert!(state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            !matches!(effect, Some(Effect::PodcastSubscribeFromCard(_))),
+            "{effect:?}"
+        );
+        assert_eq!(state.active_tab, Tab::Podcasts);
+
+        // Subscribed under the newer address the card's feed moved to:
+        // known once the feed was read (`e`), then Enter opens it too.
+        let unknown = claimed_hit();
+        assert!(!unknown.ids().contains(&&podcast_id()));
+        let mut state = search_state(vec![fx::row("Test Show", 0, 3, 0)], vec![unknown]);
+        assert!(!state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+        let popup = open_card_at(&mut state, 2);
+        let card_id = state.search.fed_podcasts[0].hit.podcast_id.clone();
+        assert!(matches!(
+            card_key(&mut state, popup, KeyCode::Char('e')),
+            Some(Effect::PodcastPreview { .. })
+        ));
+        preview_loaded(
+            &mut state,
+            card_id,
+            Ok(Box::new(FeedPreview {
+                title: "Test Show".into(),
+                episode_count: 1,
+                seasons: Vec::new(),
+                episodes: Vec::new(),
+                moved_to: Some(FeedUrl::parse("https://example.test/feed.xml").unwrap()),
+                subscribed_as: Some(podcast_id()),
+            })),
+        );
+        let popup = state.popup.take().unwrap();
+        let effect = card_key(&mut state, popup, KeyCode::Enter);
+        assert!(
+            matches!(&effect, Some(Effect::PodcastLoadEpisodes { query, .. }) if query.podcast_id == podcast_id()),
+            "{effect:?}"
+        );
+        assert!(!state.podcasts.subscribing);
+
+        // Not subscribed: an unsubscribed podcast is not in the rows.
+        let state = search_state(Vec::new(), vec![claimed_hit()]);
+        assert!(!state.podcasts.subscribed_to(&state.search.fed_podcasts[0]));
+    }
+
+    #[test]
+    fn the_episode_preview_is_requested_once_and_folded_in() {
+        let mut state = search_state(Vec::new(), vec![claimed_hit()]);
+        let popup = open_card_at(&mut state, 2);
+        let effect = card_key(&mut state, popup, KeyCode::Char('e'));
+        let Some(Effect::PodcastPreview {
+            podcast_id: card_id,
+            feed_url,
+        }) = effect
+        else {
+            panic!("expected a preview request, got {effect:?}");
+        };
+        assert_eq!(feed_url.as_str(), ORIGIN, "never the claimed URL");
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Char('e')), None);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Loading),
+                ..
+            })
+        ));
+        // Scrolling keeps the card.
+        let popup = state.popup.take().unwrap();
+        assert_eq!(card_key(&mut state, popup, KeyCode::Down), None);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard { scroll: 1, .. })
+        ));
+
+        let feed = FeedPreview {
+            title: "Rust Radio".into(),
+            episode_count: 0,
+            seasons: Vec::new(),
+            episodes: Vec::new(),
+            moved_to: None,
+            subscribed_as: None,
+        };
+        // A preview of another card is ignored.
+        preview_loaded(&mut state, podcast_id(), Ok(Box::new(feed.clone())));
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Loading),
+                ..
+            })
+        ));
+        preview_loaded(
+            &mut state,
+            card_id.clone(),
+            Err("HTTP 404 Not Found".into()),
+        );
+        assert!(matches!(
+            state.popup,
+            Some(Popup::PodcastCard {
+                preview: Some(Loadable::Failed(_)),
+                ..
+            })
+        ));
+        // A failed preview may be asked again.
+        let popup = state.popup.take().unwrap();
+        assert!(matches!(
+            card_key(&mut state, popup, KeyCode::Char('e')),
+            Some(Effect::PodcastPreview { .. })
+        ));
+        preview_loaded(&mut state, card_id, Ok(Box::new(feed.clone())));
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::PodcastCard { preview: Some(Loadable::Ready(ready)), .. }) if *ready == feed
+        ));
     }
 }

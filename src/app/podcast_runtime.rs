@@ -12,13 +12,15 @@ use music_dht::podcast::{PodcastEpisodeRef, reaches_completion};
 
 use super::event::AppEvent;
 use super::state::{AppState, PodcastRow};
-use super::update::{Effect, podcasts};
+use super::update::{Effect, podcast_discovery, podcasts};
 use super::{Runtime, err_string, perform_effect};
 use crate::library::models::TrackItem;
+use crate::podcasts::discovery;
 use crate::podcasts::playback::{self, StartAt};
 use crate::podcasts::progress::{
     CHECKPOINT_INTERVAL, ProgressCommand, ProgressEvent, ProgressWriter,
 };
+use crate::podcasts::publication::{self, Reconciler, ShareConfirmations};
 use crate::podcasts::refresh::{self, Services};
 use crate::podcasts::stream::{CancelToken, StreamEnd, StreamProbe};
 
@@ -31,6 +33,9 @@ const SCHEDULER_FIRST_DELAY: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_REFRESHES: usize = 4;
 /// Feeds started per scheduler pass.
 const MAX_DUE_PER_PASS: usize = 16;
+/// How long quitting waits for a pending revocation (share turned off or
+/// unsubscribed just before) to be signed and pushed.
+const PUBLICATION_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Podcast services available once the store opened.
 pub struct PodcastRuntime {
@@ -39,6 +44,8 @@ pub struct PodcastRuntime {
     /// Writes progress in order on its own thread; `None` if it could not
     /// start (episodes then play without saving progress).
     progress: Option<ProgressWriter>,
+    /// Publishes shared podcasts to public discovery and revokes the rest.
+    publication: Reconciler,
 }
 
 /// The episode this device is playing (or starting), as the progress
@@ -124,6 +131,53 @@ fn spawn_scheduler(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
+/// Starts the publication reconciler. Without a store every own public
+/// card is revoked (see `publication::reconcile`). Nothing is published
+/// before device sync says the share registers are current
+/// (`DeviceSync::podcast_registers_current`).
+fn spawn_publication(
+    runtime: &Runtime,
+    store: Option<Arc<PodcastStore>>,
+    confirmations: Arc<ShareConfirmations>,
+) -> Reconciler {
+    let tx = runtime.event_tx.clone();
+    publication::spawn(
+        runtime.federation.podcast_dht(),
+        runtime.devices.podcast_registers_current(),
+        store,
+        confirmations,
+        move |report| {
+            let _ = tx.send(AppEvent::PodcastPublication(report));
+        },
+    )
+}
+
+/// Asks the publication reconciler for a pass (share decisions, feed
+/// metadata or subscriptions changed).
+fn wake_publication(runtime: &Runtime) {
+    if let Some(podcasts) = &runtime.podcasts {
+        podcasts.publication.wake();
+    }
+}
+
+/// A card may have to be revoked (sharing turned off or unsubscribed here):
+/// the write about to start ends with an immediate reconciler pass
+/// ([`publication::RevocationTicket::done`]), and quitting waits for both,
+/// bounded ([`PUBLICATION_FLUSH_TIMEOUT`]), even when it is handled before
+/// the write finished.
+fn begin_revocation(runtime: &Runtime) -> Option<publication::RevocationTicket> {
+    runtime
+        .podcasts
+        .as_ref()
+        .map(|podcasts| podcasts.publication.begin_revocation())
+}
+
+/// Whether `podcast_id` is shared now (a card from this device may be
+/// live), read before a share-off or unsubscribe is written. Blocking.
+fn shared_now(services: &Services, podcast_id: &music_dht::podcast::PodcastId) -> bool {
+    matches!(services.store.podcast(podcast_id), Ok(Some(summary)) if summary.shared)
+}
+
 fn services(runtime: &Runtime) -> Option<Services> {
     runtime
         .podcasts
@@ -140,8 +194,23 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
                     state.podcasts.refreshing.remove(id);
                 }
             }
-            if matches!(effect, Effect::PodcastSubscribe(_)) {
+            if matches!(
+                effect,
+                Effect::PodcastSubscribe(_) | Effect::PodcastSubscribeFromCard(_)
+            ) {
                 state.podcasts.subscribing = false;
+            }
+            if let Effect::PodcastPreview { podcast_id, .. } = &effect {
+                podcast_discovery::preview_loaded(
+                    state,
+                    podcast_id.clone(),
+                    Err("podcasts are unavailable".into()),
+                );
+            }
+            if let Effect::PodcastPrepareShare { podcast_id, .. }
+            | Effect::PodcastSetShared { podcast_id, .. } = &effect
+            {
+                state.podcasts.share_busy.remove(podcast_id);
             }
             state.status_message = Some("podcasts are unavailable (see the Podcasts tab)".into());
             return None;
@@ -181,6 +250,26 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
                 let _ = tx.send(AppEvent::PodcastSubscribed(result));
             });
         }
+        Effect::PodcastSubscribeFromCard(hit) => {
+            tokio::spawn(async move {
+                let result = discovery::subscribe_from_hit(&services, &hit, now_ms())
+                    .await
+                    .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastSubscribed(result));
+            });
+        }
+        Effect::PodcastPreview {
+            podcast_id,
+            feed_url,
+        } => {
+            tokio::spawn(async move {
+                let result = discovery::preview_for(&services, &feed_url)
+                    .await
+                    .map(Box::new)
+                    .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastPreviewLoaded { podcast_id, result });
+            });
+        }
         Effect::PodcastRefresh { targets, manual } => {
             let slots = runtime
                 .podcasts
@@ -206,13 +295,28 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
             }
         }
         Effect::PodcastUnsubscribe { podcast_id, title } => {
+            let revocation = begin_revocation(runtime);
             tokio::task::spawn_blocking(move || {
                 let store = Arc::clone(&services.store);
                 let id = podcast_id.clone();
+                let was_shared = shared_now(&services, &podcast_id);
                 let result = services
                     .log
                     .record(&mut |stamps| store.unsubscribe(stamps, &id))
                     .map_err(err_string);
+                // Unsubscribing also revoked the share decision: sharing
+                // after subscribing again asks again.
+                if result.is_ok()
+                    && let Err(err) = services.confirmations.forget(&podcast_id)
+                {
+                    tracing::warn!("podcast share confirmation not removed: {err:#}");
+                }
+                // Unsubscribing revokes this device's card, right away.
+                if let Some(revocation) = revocation
+                    && result.is_ok()
+                {
+                    revocation.done(was_shared.then_some(&podcast_id));
+                }
                 let _ = tx.send(AppEvent::PodcastUnsubscribed {
                     podcast_id,
                     title,
@@ -235,9 +339,73 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
                 }
             }
         }
+        Effect::PodcastPrepareShare { podcast_id, title } => {
+            tokio::task::spawn_blocking(move || {
+                let result =
+                    publication::check_share(&services.store, &services.confirmations, &podcast_id)
+                        .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastSharePrepared {
+                    podcast_id,
+                    title,
+                    result,
+                });
+            });
+        }
+        Effect::PodcastSetShared {
+            podcast_id,
+            title,
+            shared,
+            confirm,
+        } => {
+            let revocation = if shared {
+                None
+            } else {
+                begin_revocation(runtime)
+            };
+            tokio::task::spawn_blocking(move || {
+                let was_shared = !shared && shared_now(&services, &podcast_id);
+                let result =
+                    set_shared(&services, &podcast_id, shared, confirm).map_err(err_string);
+                if let Some(revocation) = revocation
+                    && result.is_ok()
+                {
+                    revocation.done(was_shared.then_some(&podcast_id));
+                }
+                let _ = tx.send(AppEvent::PodcastShareSet {
+                    podcast_id,
+                    title,
+                    shared,
+                    result,
+                });
+            });
+        }
+        Effect::PodcastPublicationSync => wake_publication(runtime),
         other => return Some(other),
     }
     None
+}
+
+/// Writes a share decision and keeps the local privacy confirmation bound
+/// to it (`publication::set_shared`). Blocking.
+fn set_shared(
+    services: &Services,
+    podcast_id: &music_dht::podcast::PodcastId,
+    shared: bool,
+    confirm: Option<publication::ConfirmedUrls>,
+) -> anyhow::Result<()> {
+    let store = Arc::clone(&services.store);
+    publication::set_shared(
+        &services.store,
+        &services.confirmations,
+        podcast_id,
+        shared,
+        confirm,
+        || {
+            services
+                .log
+                .record(&mut |stamps| store.set_shared(stamps, podcast_id, shared))
+        },
+    )
 }
 
 fn is_podcast_effect(effect: &Effect) -> bool {
@@ -250,6 +418,11 @@ fn is_podcast_effect(effect: &Effect) -> bool {
             | Effect::PodcastRefresh { .. }
             | Effect::PodcastUnsubscribe { .. }
             | Effect::PodcastSetPlayed { .. }
+            | Effect::PodcastPrepareShare { .. }
+            | Effect::PodcastSetShared { .. }
+            | Effect::PodcastPublicationSync
+            | Effect::PodcastSubscribeFromCard(_)
+            | Effect::PodcastPreview { .. }
     )
 }
 
@@ -274,6 +447,11 @@ pub fn handle_event(
 ) -> Option<AppEvent> {
     let effects: Vec<Effect> = match event {
         AppEvent::PodcastStoreOpened(result) => {
+            if result.is_err() {
+                // This device can no longer tell what is shared: revoke its
+                // own public cards (fail-safe for privacy).
+                let _ = spawn_publication(runtime, None, Arc::new(ShareConfirmations::in_memory()));
+            }
             let result = result.map(|services| {
                 let tx = runtime.event_tx.clone();
                 let progress = ProgressWriter::spawn(services.clone(), move |event| {
@@ -291,10 +469,16 @@ pub fn handle_event(
                         tracing::warn!("podcast sync: {err:#}");
                     }
                 });
+                let publication = spawn_publication(
+                    runtime,
+                    Some(Arc::clone(&services.store)),
+                    Arc::clone(&services.confirmations),
+                );
                 runtime.podcasts = Some(PodcastRuntime {
                     services,
                     refresh_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES)),
                     progress,
+                    publication,
                 });
                 spawn_scheduler(runtime.event_tx.clone());
             });
@@ -323,17 +507,59 @@ pub fn handle_event(
             podcast_id,
             result,
             manual,
-        } => podcasts::refreshed(state, podcast_id, result, manual),
+        } => {
+            // The card of a shared podcast follows its feed metadata.
+            if result.is_ok() {
+                wake_publication(runtime);
+            }
+            podcasts::refreshed(state, podcast_id, result, manual)
+        }
         AppEvent::PodcastUnsubscribed {
             podcast_id,
             title,
             result,
-        } => podcasts::unsubscribed(state, podcast_id, title, result)
+        } => {
+            // The blocking write already asked for the revocation pass.
+            podcasts::unsubscribed(state, podcast_id, title, result)
+                .into_iter()
+                .collect()
+        }
+        AppEvent::PodcastSharePrepared {
+            podcast_id,
+            title,
+            result,
+        } => podcasts::share_prepared(state, podcast_id, title, result)
             .into_iter()
             .collect(),
+        AppEvent::PodcastShareSet {
+            podcast_id,
+            title,
+            shared,
+            result,
+        } => {
+            // A share-off already asked for its revocation pass when it
+            // was written.
+            if shared || result.is_err() {
+                wake_publication(runtime);
+            }
+            podcasts::share_set(state, podcast_id, title, shared, result)
+                .into_iter()
+                .collect()
+        }
+        AppEvent::PodcastPreviewLoaded { podcast_id, result } => {
+            podcast_discovery::preview_loaded(state, podcast_id, result);
+            Vec::new()
+        }
+        AppEvent::PodcastPublication(report) => {
+            podcasts::publication_reported(state, report);
+            Vec::new()
+        }
         AppEvent::PodcastProgress(event) => progress_event(state, runtime, event),
         AppEvent::PodcastsSynced { progress, changed } => {
             if changed {
+                // Share or subscription decisions of another device: publish
+                // or revoke this device's own cards accordingly.
+                wake_publication(runtime);
                 // A subscription that came from another device has no
                 // episodes here until its feed is fetched: check now.
                 let _ = runtime.event_tx.send(AppEvent::PodcastRefreshTick);
@@ -916,18 +1142,33 @@ fn progress_event(
     }
 }
 
-/// Before exit: end the playing episode's session and give the progress
-/// writer a moment to save it.
+/// Before exit (before the federation node stops): end the playing
+/// episode's session and give the progress writer a moment to save it, and
+/// let a revocation requested just before (sharing turned off, unsubscribed;
+/// also one still being written) reach the overlay. Logs a warning when a
+/// card of a private podcast may still be live.
 pub(crate) async fn shutdown(runtime: &mut Runtime) {
     end_playback(runtime);
-    let Some(mut progress) = runtime
-        .podcasts
-        .as_mut()
-        .and_then(|podcasts| podcasts.progress.take())
-    else {
+    let Some(podcasts) = runtime.podcasts.as_mut() else {
         return;
     };
-    let _ = tokio::task::spawn_blocking(move || progress.close(Duration::from_secs(3))).await;
+    let publication = podcasts.publication.clone();
+    let progress = podcasts.progress.take();
+    let flush = async {
+        if !publication.flush(PUBLICATION_FLUSH_TIMEOUT).await {
+            tracing::warn!(
+                "podcast publication: a public card may not be revoked yet; \
+                 it is revoked on the next start with federation on"
+            );
+        }
+    };
+    let close = async {
+        if let Some(mut progress) = progress {
+            let _ =
+                tokio::task::spawn_blocking(move || progress.close(Duration::from_secs(3))).await;
+        }
+    };
+    tokio::join!(flush, close);
 }
 
 #[cfg(test)]

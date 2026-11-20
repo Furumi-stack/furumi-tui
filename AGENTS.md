@@ -65,8 +65,21 @@ update it only when dependencies change.
   stream reader (HTTP Range, bounded buffer) and the ordered progress writer;
   podcast identity, merge rules and the SQLite store come from FRID
   (`music_dht::podcast`, `furumi_library::podcasts`) and must not be
-  re-derived here. Queue items are identified by `state::track_key` /
-  `TrackItem::key`, never by numeric id (every episode has the same sentinel
+  re-derived here. Public podcast cards are published only through
+  `podcasts::publication` (`PodcastDht::sync_shares` over the merged
+  registers): never publish a podcast directly, never log feed URLs or ids of
+  podcasts that are not shared, never put progress, history, counters or
+  device names into a card. A local share-off or unsubscribe asks for an
+  immediate pass (`Reconciler::revoke_now`), which quitting waits for, and
+  privacy confirmations change only through `publication::set_shared` /
+  `ShareConfirmations` (bound to the share decision, never synced). Nothing
+  is published before `DeviceSync::podcast_registers_current` (a restarted
+  device may hold a revoked share decision); passes before it only revoke.
+  Public cards found by search are publisher claims:
+  subscribe and preview only through `podcasts::discovery`, which uses the
+  card's origin URL (`PodcastSearchHit::feed_url`), never a claimed URL, and
+  never stores card metadata. Queue items are identified by `state::track_key`
+  / `TrackItem::key`, never by numeric id (every episode has the same sentinel
   id); music-only code must skip `TrackItem::is_podcast()` items.
 - `src/devices.rs` owns trusted-device replication, membership, and playback
   coordination. Its wire types are the shared `music_dht::device_sync`
