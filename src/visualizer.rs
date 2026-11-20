@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 1,
+        version: 2,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
@@ -348,7 +348,15 @@ fn input_map_with_features(area: Rect, state: &AppState, features: AudioFeatures
         "show_clock".into(),
         state.visualizer.config.show_clock.into(),
     );
-    input.insert("clock".into(), clock_label().into());
+    let (hour, minute, second, millis) = clock_now();
+    input.insert(
+        "clock".into(),
+        format!("{hour:02}:{minute:02}:{second:02}").into(),
+    );
+    insert_int(&mut input, "clock_hour", i64::from(hour));
+    insert_int(&mut input, "clock_minute", i64::from(minute));
+    insert_int(&mut input, "clock_second", i64::from(second));
+    insert_int(&mut input, "clock_millis", i64::from(millis));
     let (title, artist) = state
         .player
         .current
@@ -1275,16 +1283,16 @@ fn insert_float(map: &mut Map, key: &str, value: f64) {
     map.insert(key.into(), Dynamic::from_float(value as FLOAT));
 }
 
-fn clock_label() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!(
-        "{:02}:{:02}:{:02}",
-        secs / 3600 % 24,
-        secs / 60 % 60,
-        secs % 60
+/// Local wall-clock time as (hour, minute, second, millisecond), read once
+/// so all clock inputs of a frame agree.
+fn clock_now() -> (u32, u32, u32, u32) {
+    use chrono::Timelike as _;
+    let now = chrono::Local::now();
+    (
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.timestamp_subsec_millis().min(999),
     )
 }
 
@@ -2002,6 +2010,117 @@ mod tests {
                     render_commands_to_buffer(&mut buffer, area, &commands);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn vfd_panel_options_standby_and_effects_render() {
+        let base = BUNDLED_SCRIPTS
+            .iter()
+            .find(|script| script.id == "vfd_panel")
+            .unwrap()
+            .source;
+        let variants = [
+            base.to_string(),
+            base.replacen(
+                r#"fn METER_STYLE() { "bars" }"#,
+                r#"fn METER_STYLE() { "needles" }"#,
+                1,
+            ),
+            base.replacen(
+                r#"fn PALETTE() { "classic" }"#,
+                r#"fn PALETTE() { "green" }"#,
+                1,
+            ),
+            base.replacen(
+                r#"fn PALETTE() { "classic" }"#,
+                r#"fn PALETTE() { "ice" }"#,
+                1,
+            ),
+        ];
+        assert_ne!(variants[0], variants[1]);
+        assert_ne!(variants[0], variants[2]);
+        for source in variants {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &source).unwrap();
+            for (width, height) in [(30, 8), (80, 24), (160, 45), (240, 70)] {
+                for title in ["", "Даже не думай — Ёлка", "Track"] {
+                    let mut runtime = ScriptRuntime::default();
+                    // Past the power-on test, with static and a seek pending.
+                    let state: Map = [
+                        ("boot".into(), Dynamic::from_float(-1.0)),
+                        ("spin".into(), Dynamic::from_float(0.3)),
+                        ("over".into(), Dynamic::from_float(0.5)),
+                        ("noise".into(), Dynamic::from_float(0.2)),
+                        ("search".into(), Dynamic::from_float(0.4)),
+                        ("key".into(), "another track".into()),
+                        ("source".into(), "local".into()),
+                        ("last_pos".into(), Dynamic::from_float(5.0)),
+                    ]
+                    .into_iter()
+                    .collect();
+                    runtime.load(file.path()).unwrap();
+                    runtime.script_state = Dynamic::from_map(state);
+                    let mut input = test_input();
+                    insert_int(&mut input, "width", width);
+                    insert_int(&mut input, "height", height);
+                    input.insert("track_title".into(), title.into());
+                    insert_float(&mut input, "volume", 0.2);
+                    insert_int(&mut input, "clock_hour", 23);
+                    insert_int(&mut input, "clock_second", 1);
+                    let commands = runtime
+                        .render(file.path(), input)
+                        .unwrap_or_else(|err| panic!("{width}x{height} {title:?}: {err}"));
+                    let area = Rect::new(0, 0, width as u16, height as u16);
+                    let mut buffer = Buffer::empty(area);
+                    render_commands_to_buffer(&mut buffer, area, &commands);
+                    if title.is_empty() && width >= 80 {
+                        let text = rendered_text(&commands);
+                        assert!(
+                            text.contains("STANDBY"),
+                            "{width}x{height}: no standby clock"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vfd_panel_clock_keeps_clear_of_the_lamps() {
+        let script = BUNDLED_SCRIPTS
+            .iter()
+            .find(|script| script.id == "vfd_panel")
+            .unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), script.source).unwrap();
+        for (width, height) in [(120, 34), (160, 34), (180, 40)] {
+            let mut runtime = ScriptRuntime::default();
+            runtime.load(file.path()).unwrap();
+            runtime.script_state = Dynamic::from_map(
+                [("boot".into(), Dynamic::from_float(-1.0))]
+                    .into_iter()
+                    .collect(),
+            );
+            let mut input = test_input();
+            insert_int(&mut input, "width", width);
+            insert_int(&mut input, "height", height);
+            let commands = runtime.render(file.path(), input).unwrap();
+            let area = Rect::new(0, 0, width as u16, height as u16);
+            let mut buffer = Buffer::empty(area);
+            render_commands_to_buffer(&mut buffer, area, &commands);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect()
+                })
+                .collect();
+            assert!(rows[0].contains("12:34:56"), "{width}x{height}: clock");
+            assert!(
+                rows.iter().any(|row| row.contains("HIGH")),
+                "{width}x{height}: lamps overdrawn"
+            );
         }
     }
 

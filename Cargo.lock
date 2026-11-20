@@ -1720,6 +1720,7 @@ dependencies = [
  "anyhow",
  "base64",
  "blake3",
+ "chrono",
  "core-foundation 0.10.1",
  "crokey",
  "crossterm",

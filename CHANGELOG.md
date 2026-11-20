@@ -13,14 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thin segment digits, a stereo peak level meter, a 25-band analyzer with
   peak hold, tone fans, a routing diagram and transport lamps, plus a
   power-on segment test, a counter "search" on track changes and an OVER
-  lamp.
+  lamp. It also has a dot-matrix title line (Latin and Cyrillic), palettes
+  ("classic", "green", "amber", "ice"), needle VU meters as an option, a
+  night dimmer, a slow filament "breath", slightly uneven digit brightness,
+  a mesh behind the big digits, a tape counter, LOUDNESS / MUTE / SEARCH
+  lamps, a burst of static on track changes and a standby clock when
+  nothing is loaded.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
   peak hold, left/right RMS and held peaks, the sample rate, and track,
   queue and transport details in the script input; `render` may return
   `#{ commands, state }` to keep state between frames (with `dt` and
   `frame`); new braille `dots` and `line` commands for thin drawing; bold,
   dim, italic, underline and reversed attributes on any command. v2 scripts
-  keep working unchanged.
+  keep working unchanged. Scripts also get the local time as
+  `clock_hour`, `clock_minute`, `clock_second` and `clock_millis`.
+
+### Fixed
+
+- The visualization clock shows local time instead of UTC.
 
 ## [0.5.0] - 2026-11-20
 

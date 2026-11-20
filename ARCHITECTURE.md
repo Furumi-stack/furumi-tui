@@ -507,7 +507,7 @@ Protocol v3 adds what front-panel displays need: a third-octave spectrum
 partition the FFT bins) with per-band peak hold, left/right RMS and held
 sample peaks, the analyzed sample rate, and track, queue and transport
 details (format, bit depth, bitrate, track number, queue position, repeat,
-shuffle, source). The audio thread only appends mono samples to a lock-free
+shuffle, source), and the local wall-clock time. The audio thread only appends mono samples to a lock-free
 ring and accumulates per-window channel levels; the FFT (an ~85 ms window
 whose length follows the sample rate) and all ballistics run when the UI
 takes a snapshot, under a mutex the audio thread never touches. Ballistics
