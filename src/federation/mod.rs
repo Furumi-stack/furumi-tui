@@ -2333,6 +2333,7 @@ fn metadata_preview_track(
             .or(base.file_size_bytes),
         play_count: base.play_count,
         fed: Some(fed.clone()),
+        podcast: None,
     }
 }
 
@@ -2948,6 +2949,7 @@ pub fn pending_track(fed: &FedTrack) -> TrackItem {
         file_size_bytes: None,
         play_count: 0,
         fed: Some(fed.clone()),
+        podcast: None,
     }
 }
 
@@ -3020,6 +3022,7 @@ fn ephemeral_track(
         // Keep the federation reference: the cached track can still be
         // liked, re-downloaded and marked as federated in the lists.
         fed: Some(fed.clone()),
+        podcast: None,
     }
 }
 

@@ -338,6 +338,7 @@ mod tests {
                 file_size_bytes: None,
                 play_count: 0,
                 fed: None,
+                podcast: None,
             }],
         };
         let mut state = AppState::default();
@@ -762,6 +763,11 @@ pub enum Popup {
     },
     /// Delete confirmation; Enter/y deletes, Esc/n cancels.
     ConfirmDelete { target: DeleteTarget, label: String },
+    /// Unsubscribe confirmation; progress and history are kept.
+    ConfirmPodcastUnsubscribe {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+    },
     /// Enabling network similarity reveals an embedding query to peers.
     SimilarityPrivacyConsent { enable_federation: bool },
     /// Derived data is safe to recreate but potentially expensive.
@@ -899,6 +905,10 @@ pub enum FedInputField {
     DeviceName,
     ConnectInvite,
     JamInvite,
+    /// Podcasts: RSS/Atom feed URL of a new subscription.
+    PodcastFeedUrl,
+    /// Podcasts: live search in the opened episode list.
+    PodcastSearch,
 }
 
 impl FedInputField {
@@ -913,6 +923,8 @@ impl FedInputField {
             FedInputField::DeviceName => "Device name",
             FedInputField::ConnectInvite => "Connect device (paste frid://i invite)",
             FedInputField::JamInvite => "Join Jam (paste frid://j invite)",
+            FedInputField::PodcastFeedUrl => "Add podcast (RSS feed URL)",
+            FedInputField::PodcastSearch => "Search episodes",
         }
     }
 
@@ -944,6 +956,12 @@ impl FedInputField {
             }
             FedInputField::JamInvite => {
                 "Paste a frid://j capability to control the host player for this Jam only."
+            }
+            FedInputField::PodcastFeedUrl => {
+                "Paste the podcast's RSS or Atom feed URL. Only episode information is stored; audio streams from the publisher when you play. New subscriptions are private."
+            }
+            FedInputField::PodcastSearch => {
+                "Words from episode titles or descriptions; the list updates as you type. Enter keeps the search, Esc clears it."
             }
         }
     }
@@ -1382,7 +1400,7 @@ impl SimilaritySearchHit {
             Self::Local { track, .. } => track
                 .content_id
                 .clone()
-                .unwrap_or_else(|| format!("local:{}", track.id)),
+                .unwrap_or_else(|| track.key().to_string()),
             Self::Federated { track, .. } => track
                 .content_id
                 .clone()
@@ -1665,6 +1683,197 @@ impl DevicePlaybackState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Podcasts tab
+// ---------------------------------------------------------------------------
+
+/// Episodes loaded per page; the next page loads when the cursor nears the end.
+pub const PODCAST_EPISODE_PAGE: usize = 500;
+/// "Add podcast" and "Check all" rows above the subscriptions.
+pub const PODCAST_ACTION_ROWS: usize = 2;
+
+/// State of the podcast store (`podcasts.sqlite3`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PodcastStoreStatus {
+    #[default]
+    Opening,
+    Ready,
+    /// The store could not be opened (newer schema, foreign file, I/O). The
+    /// file was left unchanged; only the Podcasts tab is unavailable.
+    Failed(String),
+}
+
+/// A subscribed podcast with its local fetch state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PodcastRow {
+    pub summary: furumi_library::podcasts::PodcastSummary,
+    pub fetch: furumi_library::podcasts::FetchState,
+}
+
+impl PodcastRow {
+    pub fn id(&self) -> &music_dht::podcast::PodcastId {
+        &self.summary.podcast_id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.summary.meta.title
+    }
+}
+
+/// One row of the subscriptions list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodcastListRow {
+    Add,
+    RefreshAll,
+    /// Index into the loaded podcasts.
+    Podcast(usize),
+}
+
+/// One row of a podcast's season list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeasonRow {
+    All,
+    /// Index into the loaded seasons.
+    Group(usize),
+}
+
+/// The podcast opened from the list: its season list (when the feed has
+/// seasons) and the episode list of the chosen group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedPodcast {
+    pub podcast_id: music_dht::podcast::PodcastId,
+    /// Season list cursor; `None` when the podcast has no seasons and its
+    /// episodes open directly.
+    pub season_cursor: Option<usize>,
+    /// The episode group shown; `None` while the season list is shown.
+    pub season: Option<furumi_library::podcasts::SeasonFilter>,
+    pub episode_cursor: usize,
+}
+
+/// The episode list of the opened group, loaded page by page.
+#[derive(Debug, Clone)]
+pub struct EpisodeList {
+    /// Request sequence: results of older requests are dropped.
+    pub seq: u64,
+    /// Query of the first page (`offset` 0, `limit` one page).
+    pub query: furumi_library::podcasts::EpisodeQuery,
+    pub items: Vec<furumi_library::podcasts::EpisodeListItem>,
+    /// The first page of `query` is in flight (`items` may still hold the
+    /// previous result, so the list does not flash empty).
+    pub loading: bool,
+    pub loading_more: bool,
+    /// Every matching episode is loaded.
+    pub complete: bool,
+    pub error: Option<String>,
+    /// Episode to keep the cursor on when the first page arrives.
+    pub focus: Option<music_dht::podcast::EpisodeId>,
+}
+
+/// Podcasts tab: subscriptions, seasons and episodes from the podcast store.
+/// Nothing here touches SQLite or the network; see `app::podcast_runtime`.
+#[derive(Debug, Default)]
+pub struct PodcastsTab {
+    pub store: PodcastStoreStatus,
+    /// Subscribed podcasts; `None` until the first load.
+    pub list: Option<Loadable<Vec<PodcastRow>>>,
+    /// Cursor over [`PodcastsTab::list_rows`] (action rows first).
+    pub selected: usize,
+    pub opened: Option<OpenedPodcast>,
+    /// Season groups of the opened podcast.
+    pub seasons: Option<(
+        music_dht::podcast::PodcastId,
+        Loadable<Vec<furumi_library::podcasts::SeasonSummary>>,
+    )>,
+    pub episodes: Option<EpisodeList>,
+    /// Episode search text (titles and descriptions).
+    pub search: String,
+    pub played: furumi_library::podcasts::PlayedFilter,
+    pub sort: furumi_library::podcasts::EpisodeSort,
+    /// Feeds with a refresh in flight (spinner and request de-duplication).
+    pub refreshing: HashSet<music_dht::podcast::PodcastId>,
+    pub subscribing: bool,
+    /// Podcast to select once the reloaded list arrives.
+    pub pending_select: Option<music_dht::podcast::PodcastId>,
+    /// Last episode request sequence handed out.
+    pub episode_seq: u64,
+}
+
+impl PodcastsTab {
+    pub fn podcasts(&self) -> &[PodcastRow] {
+        match &self.list {
+            Some(Loadable::Ready(list)) => list,
+            _ => &[],
+        }
+    }
+
+    pub fn podcast(&self, id: &music_dht::podcast::PodcastId) -> Option<&PodcastRow> {
+        self.podcasts().iter().find(|row| row.id() == id)
+    }
+
+    pub fn list_rows(&self) -> Vec<PodcastListRow> {
+        let mut rows = vec![PodcastListRow::Add, PodcastListRow::RefreshAll];
+        rows.extend((0..self.podcasts().len()).map(PodcastListRow::Podcast));
+        rows
+    }
+
+    /// The opened podcast, or the one under the list cursor.
+    pub fn current_podcast(&self) -> Option<&PodcastRow> {
+        if let Some(opened) = &self.opened {
+            return self.podcast(&opened.podcast_id);
+        }
+        match self.list_rows().get(self.selected)? {
+            PodcastListRow::Podcast(index) => self.podcasts().get(*index),
+            _ => None,
+        }
+    }
+
+    /// Season groups of the opened podcast, when loaded.
+    pub fn opened_seasons(&self) -> Option<&[furumi_library::podcasts::SeasonSummary]> {
+        let opened = self.opened.as_ref()?;
+        match &self.seasons {
+            Some((id, Loadable::Ready(seasons))) if *id == opened.podcast_id => Some(seasons),
+            _ => None,
+        }
+    }
+
+    pub fn season_rows(&self) -> Vec<SeasonRow> {
+        let mut rows = vec![SeasonRow::All];
+        rows.extend((0..self.opened_seasons().map_or(0, <[_]>::len)).map(SeasonRow::Group));
+        rows
+    }
+
+    /// Whether the episode list (rather than the season list) is shown.
+    pub fn showing_episodes(&self) -> bool {
+        self.opened
+            .as_ref()
+            .is_some_and(|opened| opened.season.is_some())
+    }
+
+    /// Episodes of the opened group, when they belong to it.
+    pub fn opened_episodes(&self) -> Option<&EpisodeList> {
+        let opened = self.opened.as_ref()?;
+        let season = opened.season?;
+        self.episodes.as_ref().filter(|list| {
+            list.query.podcast_id == opened.podcast_id && list.query.season == season
+        })
+    }
+
+    pub fn selected_episode(&self) -> Option<&furumi_library::podcasts::EpisodeListItem> {
+        let opened = self.opened.as_ref()?;
+        let list = self.opened_episodes()?;
+        list.items.get(opened.episode_cursor)
+    }
+
+    /// The selected episode as a queue item (explicit podcast source).
+    pub fn selected_episode_track(&self) -> Option<TrackItem> {
+        let item = self.selected_episode()?;
+        let row = self.podcast(&item.episode.podcast_id)?;
+        let mut episode = item.episode.to_ref(&row.summary.meta);
+        episode.progress_generation = item.progress.as_ref().map(|record| record.generation);
+        Some(TrackItem::podcast_episode(episode))
+    }
+}
+
 /// Single source of truth for the UI. Mutated only by `update()` and the
 /// event handlers in the main loop; views render from `&AppState`.
 #[derive(Debug, Default)]
@@ -1717,6 +1926,7 @@ pub struct AppState {
     pub queue_tab: QueueTab,
     pub federation: FederationTab,
     pub similarity: SimilarityTab,
+    pub podcasts: PodcastsTab,
     /// The one federated artist card being viewed (name + loading state);
     /// opening another card replaces it.
     pub fed_artist_view: Option<(String, Loadable<crate::federation::FedArtistCard>)>,
@@ -2181,7 +2391,13 @@ fn fed_release_slot_availability(
     }
 }
 
+/// Audio content id of a music track (library or federated). Podcast
+/// episodes have none: they are never content-addressed, resolved by hash
+/// or fetched from peers.
 pub fn track_content_id(track: &TrackItem) -> Option<String> {
+    if track.is_podcast() {
+        return None;
+    }
     track
         .content_id
         .as_deref()
@@ -2195,12 +2411,24 @@ pub fn track_content_id(track: &TrackItem) -> Option<String> {
         })
 }
 
+/// Identity of a queue item for matching it across queue edits, shuffle,
+/// resolution and playback state.
+///
+/// Podcast episodes are keyed by their episode id only (`ep:…`, from
+/// `TrackItem::key`): all of them share the sentinel numeric id, which must
+/// never identify anything. Music is keyed content-first (a pending
+/// federated item and its library copy are the same track), then by its
+/// federated source, then by `TrackItem::key` (`lib:<row id>` for library
+/// rows, `tmp:<id>` for process-local placeholders).
 pub fn track_key(track: &TrackItem) -> String {
+    if track.is_podcast() {
+        return track.key().to_string();
+    }
     if let Some(content_id) = track_content_id(track) {
         return format!("content:{content_id}");
     }
     if let Some(fed) = &track.fed {
         return format!("fed:{}:{}", fed.owner, fed.item_id);
     }
-    format!("local:{}", track.id)
+    track.key().to_string()
 }

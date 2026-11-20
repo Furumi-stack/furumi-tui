@@ -30,6 +30,7 @@ async fn localhost_devices_exchange_state_and_handoff() {
                 library: Arc::new(Library::open(&dir.path().join("library.sqlite3")).unwrap()),
                 event_tx: Default::default(),
                 playback: Default::default(),
+                podcasts: Default::default(),
             });
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             sync.set_event_tx(tx);
@@ -54,8 +55,18 @@ async fn localhost_devices_exchange_state_and_handoff() {
         let profile_b = b
             .own_profile(&service_b.ticket().await.unwrap().to_string())
             .unwrap();
-        a.apply_device_profile(&profile_b, true).unwrap();
-        b.apply_device_profile(&profile_a, true).unwrap();
+        a.apply_device_profile(
+            &profile_b,
+            true,
+            VersionReport::SelfReported(Some(profile_b.protocol_version)),
+        )
+        .unwrap();
+        b.apply_device_profile(
+            &profile_a,
+            true,
+            VersionReport::SelfReported(Some(profile_a.protocol_version)),
+        )
+        .unwrap();
         a.claim_playback(&profile_a.device_id).unwrap();
         a.playback_tick(true, true).unwrap();
         let mut state = empty_playback_state();
@@ -163,7 +174,12 @@ async fn localhost_devices_exchange_state_and_handoff() {
         silent_profile.device_id = "silent-peer".into();
         silent_profile.endpoint_id = silent.endpoint_id().to_string();
         silent_profile.endpoint_ticket = silent.ticket().await.unwrap().to_string();
-        a.apply_device_profile(&silent_profile, true).unwrap();
+        a.apply_device_profile(
+            &silent_profile,
+            true,
+            VersionReport::SelfReported(Some(silent_profile.protocol_version)),
+        )
+        .unwrap();
         lock(&a.conn)
             .execute(
                 "UPDATE sync_devices SET last_seen_ms = ?1 WHERE device_id = 'silent-peer'",
@@ -218,6 +234,121 @@ async fn localhost_devices_exchange_state_and_handoff() {
     .expect("localhost sync must complete within 30 seconds");
 }
 
+/// Podcast state over the production stream handlers: a subscription and
+/// progress from A reach B through `sync_device` → `handle_hello`, and B's
+/// start over reaches A through the response of B's own sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn localhost_devices_sync_podcasts() {
+    use super::podcast_sync_tests::{checkpoint, device_with_store, episode_ref, start, subscribe};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let network = NetworkId::from_name(&format!("podcast-sync-test-{}", random_hex(16)));
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join("network")).unwrap();
+            let config = music_dht::MusicDhtConfig::builder()
+                .data_dir(dir.path().join("network"))
+                .network_id(network)
+                .stream_protocol(SYNC_ALPN)
+                .build()
+                .unwrap();
+            let (service, _events) = MusicDhtService::start(config).await.unwrap();
+            let service = Arc::new(service);
+            let store = Arc::new(
+                furumi_library::podcasts::PodcastStore::open(&dir.path().join("podcasts.sqlite3"))
+                    .unwrap(),
+            );
+            let device = device_with_store(store, true);
+            let sync = Arc::new(device.sync.clone());
+            let stats = Arc::new(crate::federation::TransportStats::default());
+            servers.push(tokio::spawn(serve_peers(
+                service.stream_acceptor(SYNC_ALPN).unwrap(),
+                sync.clone(),
+                service.clone(),
+                stats.clone(),
+            )));
+            peers.push((device, sync, service, stats));
+        }
+        let (a, sync_a, service_a, stats_a) = &peers[0];
+        let (b, sync_b, service_b, stats_b) = &peers[1];
+        sync_b
+            .set_group_id(&sync_a.ensure_identity().unwrap().group_id)
+            .unwrap();
+        let profile_a = sync_a
+            .own_profile(&service_a.ticket().await.unwrap().to_string())
+            .unwrap();
+        let profile_b = sync_b
+            .own_profile(&service_b.ticket().await.unwrap().to_string())
+            .unwrap();
+        for (sync, profile) in [(sync_a, &profile_b), (sync_b, &profile_a)] {
+            sync.apply_device_profile(
+                profile,
+                true,
+                VersionReport::SelfReported(Some(profile.protocol_version)),
+            )
+            .unwrap();
+        }
+
+        let podcast_id = subscribe(a).podcast_id;
+        let episode = episode_ref(1);
+        let session = start(a, &episode, 0);
+        checkpoint(a, &session, 1_200_000);
+        sync_a
+            .sync_device(
+                service_a.clone(),
+                &sync_a.active_remote_devices().unwrap()[0],
+                stats_a.clone(),
+            )
+            .await
+            .unwrap();
+        let subscribed = b
+            .store
+            .list_podcasts(furumi_library::podcasts::PodcastListFilter::Subscribed)
+            .unwrap();
+        assert_eq!(subscribed.len(), 1);
+        assert_eq!(subscribed[0].podcast_id, podcast_id);
+        assert_eq!(
+            b.store.resume_position_ms(&episode.episode_id).unwrap(),
+            1_200_000
+        );
+
+        // B starts over; its next sync carries the start over to A, which
+        // then refuses A's older session.
+        let store = Arc::clone(&b.store);
+        sync_b
+            .run_podcast_action(|stamps| {
+                let write = store.restart(stamps, &episode, "restart-on-b")?;
+                Ok(((), vec![write.op]))
+            })
+            .unwrap();
+        sync_b
+            .sync_device(
+                service_b.clone(),
+                &sync_b.active_remote_devices().unwrap()[0],
+                stats_b.clone(),
+            )
+            .await
+            .unwrap();
+        let progress = a.store.progress(&episode.episode_id).unwrap().unwrap();
+        assert_eq!(progress.position_ms, 0);
+        assert_eq!(progress.session_id, "restart-on-b");
+        assert!(matches!(
+            checkpoint(a, &session, 1_230_000),
+            furumi_library::podcasts::CheckpointOutcome::Superseded { .. }
+        ));
+
+        for server in servers {
+            server.abort();
+        }
+        for (_, _, service, _) in &peers {
+            service.shutdown().await.unwrap();
+        }
+    })
+    .await
+    .expect("localhost podcast sync must complete within 30 seconds");
+}
+
 fn empty_playback_state() -> PlaybackStateWire {
     PlaybackStateWire {
         queue: vec![],
@@ -229,6 +360,7 @@ fn empty_playback_state() -> PlaybackStateWire {
         volume: 80,
         shuffle: false,
         repeat: PlaybackRepeat::Off,
+        playback_rate: None,
     }
 }
 
@@ -282,7 +414,7 @@ fn coordination_ignores_legacy_commands_and_wrong_snapshot_sender() {
         coordination: None,
     });
     let gossip = sync
-        .local_playback_snapshot()
+        .local_playback_snapshot_for(PROTOCOL_VERSION)
         .unwrap()
         .coordination
         .unwrap();
@@ -342,6 +474,7 @@ fn test_sync() -> DeviceSync {
         library: Arc::new(Library::open(&library_path).unwrap()),
         event_tx: Arc::new(std::sync::Mutex::new(None)),
         playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
+        podcasts: Default::default(),
     };
     sync.ensure_identity().unwrap();
     sync
@@ -424,12 +557,25 @@ fn test_fed_track(content_id: &str) -> crate::federation::FedTrack {
 }
 
 #[test]
-fn base64url_round_trip_without_padding() {
-    for input in [b"".as_slice(), b"a", b"ab", b"abc", b"abcdef"] {
-        let encoded = base64url_encode(input);
-        assert!(!encoded.contains('='));
-        assert_eq!(base64url_decode(&encoded).unwrap(), input);
-    }
+fn invites_round_trip_through_the_shared_encoding() {
+    let invite = InviteWire {
+        v: 1,
+        ticket: "ticket".into(),
+        device_id: "dev_a".into(),
+        invite_id: "inv".into(),
+        secret: "s3cr3t".into(),
+        expires_at_ms: 10,
+        protocol_version: None,
+    };
+    let link = encode_invite(&invite).unwrap();
+    assert!(!link.contains('='));
+    assert_eq!(parse_invite(&link).unwrap(), invite);
+    assert!(
+        parse_invite("frid://x/abc")
+            .unwrap_err()
+            .to_string()
+            .contains(":connect")
+    );
 }
 
 #[test]
@@ -450,6 +596,35 @@ fn tombstone_detection() {
         }
         .is_tombstone()
     );
+}
+
+fn music_track(id: i64, content_id: &str) -> TrackItem {
+    TrackItem {
+        id,
+        title: "Local Song".to_string(),
+        track_number: Some(1),
+        disc_number: Some(1),
+        duration_seconds: 180.0,
+        artists: vec![ArtistRef {
+            id: 1,
+            name: "Local Artist".to_string(),
+        }],
+        featured_artists: Vec::new(),
+        release_id: 2,
+        release_title: "Local Release".to_string(),
+        release_year: Some(2026),
+        file_path: format!("/music/{id}.mp3"),
+        content_id: Some(content_id.to_string()),
+        cover_path: None,
+        audio_format: Some("mp3".to_string()),
+        audio_bitrate: Some(320),
+        audio_sample_rate: Some(44_100),
+        audio_bit_depth: None,
+        file_size_bytes: Some(123_456),
+        play_count: 3,
+        fed: None,
+        podcast: None,
+    }
 }
 
 #[test]
@@ -478,6 +653,7 @@ fn playback_tracks_do_not_sync_device_local_paths() {
         file_size_bytes: Some(123_456),
         play_count: 3,
         fed: None,
+        podcast: None,
     };
 
     let wire = PlaybackTrack::from_track(&source);
@@ -565,6 +741,7 @@ fn playback_command_is_targeted_and_deduplicated() {
             volume: 42,
             shuffle: false,
             repeat: PlaybackRepeat::Off,
+            playback_rate: None,
         },
         seek: false,
     };
@@ -621,6 +798,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
             volume: 42,
             shuffle: false,
             repeat: PlaybackRepeat::Off,
+            playback_rate: None,
         },
         seek: false,
     };
@@ -629,7 +807,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         .unwrap();
     sync.record_playback_command("dev_other", command).unwrap();
 
-    let target_ops = sync.ops_for_peer("dev_target").unwrap();
+    let target_ops = sync.ops_for_peer("dev_target", PROTOCOL_VERSION).unwrap();
     assert_eq!(
         target_ops
             .iter()
@@ -638,7 +816,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         1
     );
     assert!(
-        sync.ops_for_peer("dev_unknown")
+        sync.ops_for_peer("dev_unknown", PROTOCOL_VERSION)
             .unwrap()
             .iter()
             .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
@@ -653,7 +831,7 @@ fn playback_commands_are_caught_up_only_by_their_target_while_fresh() {
         )
         .unwrap();
     assert!(
-        sync.ops_for_peer("dev_target")
+        sync.ops_for_peer("dev_target", PROTOCOL_VERSION)
             .unwrap()
             .iter()
             .all(|op| !matches!(op.payload, SyncOpPayload::PlaybackCommand { .. }))
@@ -692,6 +870,7 @@ fn newer_device_trust_reactivates_revoked_device() {
             updated_at_ms: 20,
         },
         false,
+        VersionReport::Relayed(PROTOCOL_VERSION),
     )
     .unwrap();
     assert!(!device_revoked(&sync, device_id));
@@ -935,4 +1114,313 @@ fn stale_synced_playlist_item_metadata_repairs_pending_fed_track() {
     assert_eq!(detail.tracks.len(), 1);
     assert!(detail.tracks[0].is_fed_pending());
     assert_eq!(detail.tracks[0].title, fed.title);
+}
+
+fn podcast_meta() -> music_dht::podcast::PodcastMeta {
+    music_dht::podcast::PodcastMeta {
+        feed_url: music_dht::podcast::FeedUrl::parse("https://example.test/feed.xml").unwrap(),
+        title: "Show".into(),
+        author: None,
+        description: None,
+        link: None,
+        image_url: None,
+    }
+}
+
+/// Rows of the local sync log: (op_id, seq, kind, payload_json, hlc_ms).
+fn logged_ops(sync: &DeviceSync) -> Vec<(String, i64, String, String, i64)> {
+    let conn = lock(&sync.conn);
+    let mut stmt = conn
+        .prepare("SELECT op_id, seq, kind, payload_json, hlc_ms FROM sync_ops ORDER BY seq")
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+}
+
+#[test]
+fn podcast_actions_are_appended_to_the_sync_log_with_their_stamps() {
+    let sync = test_sync();
+    let device_id = sync.ensure_identity().unwrap().device_id;
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    sync.record_content_like(&format!("b3:{}", "a".repeat(64)), true)
+        .unwrap();
+    let outcome = sync
+        .run_podcast_action(|stamps| {
+            let outcome = store.subscribe(stamps, &podcast_meta())?;
+            let ops = outcome.ops.clone();
+            Ok((outcome, ops))
+        })
+        .unwrap();
+    let ops = logged_ops(&sync);
+    assert_eq!(ops.len(), 2, "{ops:?}");
+    let (op_id, seq, kind, payload_json, hlc_ms) = &ops[1];
+    assert_eq!(kind, "podcast_subscription_set");
+    assert_eq!(*seq, 2);
+    assert_eq!(*op_id, format!("{device_id}:2"));
+    assert!(*hlc_ms > ops[0].4, "hlc keeps increasing");
+    // The log carries the shared FRID payload, and the store's register
+    // was written with exactly this stamp.
+    let payload: music_dht::device_sync::SyncOpPayload =
+        serde_json::from_str(payload_json).unwrap();
+    assert!(payload.is_podcast());
+    let register = store.subscription(&outcome.podcast_id).unwrap().unwrap();
+    assert_eq!(register.op_id, *op_id);
+    assert_eq!(register.hlc_ms, *hlc_ms);
+    let vector = sync.vector().unwrap();
+    assert_eq!(vector.get(&device_id), Some(&2));
+
+    // Unsubscribing emits two operations with consecutive stamps; a music
+    // operation afterwards continues the same sequence.
+    let unsubscribe = sync
+        .run_podcast_action(|stamps| {
+            let ops = store.unsubscribe(stamps, &outcome.podcast_id)?;
+            Ok((ops.len(), ops))
+        })
+        .unwrap();
+    assert_eq!(unsubscribe, 2);
+    sync.record_content_like(&format!("b3:{}", "b".repeat(64)), true)
+        .unwrap();
+    let ops = logged_ops(&sync);
+    let kinds: Vec<(i64, &str)> = ops
+        .iter()
+        .map(|(_, seq, kind, ..)| (*seq, kind.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (1, "track_like_set"),
+            (2, "podcast_subscription_set"),
+            (3, "podcast_subscription_set"),
+            (4, "podcast_share_set"),
+            (5, "track_like_set"),
+        ]
+    );
+
+    // An action that emits nothing leaves the log alone.
+    sync.run_podcast_action(|stamps| {
+        let ops = store.unsubscribe(stamps, &outcome.podcast_id)?;
+        Ok(((), ops))
+    })
+    .unwrap();
+    assert_eq!(logged_ops(&sync).len(), 5);
+}
+
+#[test]
+fn podcast_ops_are_sent_only_to_v4_peers() {
+    let sync = test_sync();
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    sync.run_podcast_action(|stamps| {
+        let outcome = store.subscribe(stamps, &podcast_meta())?;
+        let ops = outcome.ops.clone();
+        Ok(((), ops))
+    })
+    .unwrap();
+    sync.record_content_like(&format!("b3:{}", "a".repeat(64)), true)
+        .unwrap();
+    // A v3 peer cannot parse the podcast payload (an unknown `kind` breaks
+    // its whole message), so its batch keeps only the music operation.
+    let ops = sync.ops_for_peer("dev_peer", 3).unwrap();
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(ops[0].payload, SyncOpPayload::TrackLikeSet { .. }));
+    let ops = sync.ops_for_peer("dev_peer", 4).unwrap();
+    assert_eq!(ops.len(), 2);
+    assert!(ops[0].payload.is_podcast());
+    // Unreported versions are the oldest protocol, except that every
+    // `furumi/sync/2` peer keeps listen history.
+    let event = sync
+        .listen_event_for_track(
+            sync.new_listen_id(),
+            &music_track(7, &format!("b3:{}", "b".repeat(64))),
+            1,
+            120_000,
+            music_dht::device_sync::ListenEndReason::Finished,
+        )
+        .unwrap();
+    sync.record_listen(event).unwrap();
+    let kinds: Vec<_> = sync
+        .ops_for_peer(
+            "dev_peer",
+            music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|op| payload_kind(&op.payload))
+        .collect();
+    assert_eq!(kinds, ["track_like_set", "listen_recorded"]);
+}
+
+#[test]
+fn failed_podcast_actions_append_nothing() {
+    let sync = test_sync();
+    let store = furumi_library::podcasts::PodcastStore::open_in_memory().unwrap();
+    let unknown = music_dht::podcast::PodcastId::from_feed_url(
+        &music_dht::podcast::FeedUrl::parse("https://example.test/other.xml").unwrap(),
+    );
+    let result = sync.run_podcast_action(|stamps| {
+        let ops = store.set_shared(stamps, &unknown, true)?;
+        Ok(((), ops))
+    });
+    assert!(result.is_err());
+    assert!(logged_ops(&sync).is_empty());
+}
+
+#[test]
+fn podcast_episodes_never_enter_music_listening_history() {
+    let sync = test_sync();
+    let episode = crate::app::podcast_fixtures::episode_track(1);
+    assert!(
+        sync.listen_event_for_track(
+            "listen-1".into(),
+            &episode,
+            1_000,
+            120_000,
+            music_dht::device_sync::ListenEndReason::Finished,
+        )
+        .is_none()
+    );
+}
+
+fn stored_version(sync: &DeviceSync, device_id: &str) -> Option<u16> {
+    stored_protocol_version(&lock(&sync.conn), device_id).unwrap()
+}
+
+fn profile_wire(device_id: &str, protocol_version: u16) -> DeviceProfileWire {
+    DeviceProfileWire {
+        device_id: device_id.to_string(),
+        name: device_id.to_string(),
+        client_version: "0.0.0".to_string(),
+        protocol_version,
+        endpoint_id: String::new(),
+        endpoint_ticket: String::new(),
+        revoked: false,
+        revoke_cutoff_seq: None,
+        updated_at_ms: 1,
+    }
+}
+
+fn profile_set_op(origin: &str, seq: i64, protocol_version: Option<u16>) -> SyncOpWire {
+    SyncOpWire {
+        op_id: format!("{origin}:{seq}"),
+        origin_device_id: origin.to_string(),
+        seq,
+        hlc_ms: seq,
+        payload: SyncOpPayload::DeviceProfileSet {
+            name: origin.to_string(),
+            client_version: "0.0.0".to_string(),
+            endpoint_ticket: String::new(),
+            endpoint_id: String::new(),
+            protocol_version,
+        },
+    }
+}
+
+#[test]
+fn peer_versions_come_from_the_peer_itself_never_from_this_build() {
+    let sync = test_sync();
+    sync.apply_device_trusted("dev_new", 1).unwrap();
+    sync.apply_device_trusted("dev_old", 1).unwrap();
+    // A device known only from `device_trusted` has reported nothing.
+    assert_eq!(
+        stored_version(&sync, "dev_new"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+
+    // Its own profile announcement (v4) is a self-report.
+    sync.apply_op(&profile_set_op("dev_new", 1, Some(4)))
+        .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(4));
+    // An announcement of an older client carries no version: this device
+    // keeps what it knows and never substitutes its own constant.
+    sync.apply_op(&profile_set_op("dev_old", 1, None)).unwrap();
+    assert_eq!(
+        stored_version(&sync, "dev_old"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+
+    // Relays of v1-v3 clients list every device with their own constant:
+    // a relayed value only raises the stored version.
+    sync.apply_device_profiles(
+        &[profile_wire("dev_new", 3), profile_wire("dev_old", 3)],
+        Some("dev_relay"),
+    )
+    .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(4));
+    assert_eq!(stored_version(&sync, "dev_old"), Some(3));
+
+    // The sender's own entry of a `devices` list is a self-report, so a
+    // downgraded device is noticed.
+    sync.apply_device_profiles(&[profile_wire("dev_new", 3)], Some("dev_new"))
+        .unwrap();
+    assert_eq!(stored_version(&sync, "dev_new"), Some(3));
+}
+
+#[test]
+fn accepted_pairing_keeps_the_version_the_requester_reported() {
+    let sync = test_sync();
+    let insert = |request_id: &str, device_id: &str, version: Option<i64>| {
+        lock(&sync.conn)
+            .execute(
+                "INSERT INTO sync_pending_pairing
+                    (request_id, device_id, name, client_version, endpoint_id,
+                     endpoint_ticket, invite_id, created_at_ms, status, protocol_version)
+                 VALUES (?1, ?2, 'phone', '0.0.0', '', '', 'inv', 1, 'pending', ?3)",
+                params![request_id, device_id, version],
+            )
+            .unwrap();
+    };
+    insert("req_v3", "dev_v3", Some(3));
+    // A request stored by an older build of this client has no version.
+    insert("req_legacy", "dev_legacy", None);
+    sync.answer_pairing("req_v3", true, false).unwrap();
+    sync.answer_pairing("req_legacy", true, false).unwrap();
+    assert_eq!(stored_version(&sync, "dev_v3"), Some(3));
+    assert_eq!(
+        stored_version(&sync, "dev_legacy"),
+        Some(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION)
+    );
+}
+
+#[test]
+fn a_new_protocol_version_is_announced_once_in_the_log() {
+    let sync = test_sync();
+    let device_id = sync.ensure_identity().unwrap().device_id;
+    let announcements = |sync: &DeviceSync| {
+        logged_ops(sync)
+            .into_iter()
+            .filter(|(_, _, kind, ..)| kind == "device_profile_set")
+            .map(|(_, _, _, payload, _)| serde_json::from_str::<SyncOpPayload>(&payload).unwrap())
+            .collect::<Vec<_>>()
+    };
+    // A fresh identity already reports this version in every hello.
+    sync.own_profile("").unwrap();
+    assert!(announcements(&sync).is_empty());
+    // The row written by the previous release.
+    lock(&sync.conn)
+        .execute(
+            "UPDATE sync_devices SET protocol_version = ?2 WHERE device_id = ?1",
+            params![device_id, PROTOCOL_VERSION - 1],
+        )
+        .unwrap();
+    sync.own_profile("").unwrap();
+    sync.own_profile("").unwrap();
+    let announced = announcements(&sync);
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert!(matches!(
+        announced[0],
+        SyncOpPayload::DeviceProfileSet {
+            protocol_version: Some(PROTOCOL_VERSION),
+            ..
+        }
+    ));
+    assert_eq!(stored_version(&sync, &device_id), Some(PROTOCOL_VERSION));
 }

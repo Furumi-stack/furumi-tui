@@ -24,6 +24,7 @@ fn playing_state() -> AppState {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     });
     state.player.playing = true;
     state.player.position_secs = 12.0;

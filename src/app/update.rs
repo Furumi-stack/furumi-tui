@@ -20,8 +20,12 @@ pub const QUIT_CONFIRM_HINT: &str = "press quit again to exit";
 pub enum Effect {
     CheckUpdate,
     InstallUpdate(crate::updater::Update),
-    /// (Re)start playback of `queue[queue_pos]`.
+    /// (Re)start playback of `queue[queue_pos]` (a podcast episode resumes
+    /// from its saved position).
     PlayCurrent,
+    /// Play `queue[queue_pos]`, a podcast episode, from the beginning as an
+    /// explicit "start over".
+    PlayCurrentFromStart,
     TogglePause,
     StopPlayback,
     /// Seek relative to the current position, in seconds.
@@ -106,6 +110,32 @@ pub enum Effect {
     },
     /// Load qualified listening history without blocking the UI thread.
     LoadListenHistory,
+    /// Reload the subscribed podcasts with their fetch state.
+    PodcastsReload,
+    /// Load the season groups of a podcast.
+    PodcastLoadSeasons(music_dht::podcast::PodcastId),
+    /// Load one page of episodes; `seq` drops stale results.
+    PodcastLoadEpisodes {
+        seq: u64,
+        query: furumi_library::podcasts::EpisodeQuery,
+    },
+    /// Fetch a feed the user typed and subscribe to it.
+    PodcastSubscribe(String),
+    /// Check feeds for new episodes (`manual`: asked by the user).
+    PodcastRefresh {
+        targets: Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>,
+        manual: bool,
+    },
+    /// Unsubscribe; progress and history are kept.
+    PodcastUnsubscribe {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+    },
+    /// Mark an episode played or unplayed (an explicit progress action).
+    PodcastSetPlayed {
+        episode_id: music_dht::podcast::EpisodeId,
+        played: bool,
+    },
 }
 
 pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
@@ -115,6 +145,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         .take()
         .is_some_and(|deadline| Instant::now() <= deadline);
     state.status_message = None;
+    if state.active_tab == Tab::Podcasts
+        && !state.help_visible
+        && !state.visualizer.active
+        && !state.additional_settings_open
+        && let Some(effect) = podcasts::handle(state, &action)
+    {
+        return effect;
+    }
     if state.additional_settings_open
         && !matches!(
             action,
@@ -352,7 +390,14 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             let mut local_tracks: Vec<TrackItem> = Vec::new();
             let mut fed_tracks: Vec<crate::federation::FedTrack> = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            let mut episodes = 0usize;
             for track in tracks {
+                // Likes are music library state; episodes have their own
+                // "played" progress instead.
+                if track.is_podcast() {
+                    episodes += 1;
+                    continue;
+                }
                 if !seen.insert(track_key(&track)) {
                     continue;
                 }
@@ -365,7 +410,11 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
                 }
             }
             if local_tracks.is_empty() && fed_tracks.is_empty() {
-                state.status_message = Some("no track selected".into());
+                state.status_message = Some(if episodes > 0 {
+                    PODCAST_NOT_MUSIC.into()
+                } else {
+                    "no track selected".into()
+                });
                 None
             } else {
                 let should_like = local_tracks.iter().any(|track| !state.track_liked(track))
@@ -411,6 +460,9 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         Action::GoToRelease => {
             let track = selected_track(state).or_else(|| state.player.current.clone());
             match track {
+                Some(track) if track.is_podcast() => {
+                    return podcasts::reveal_episode_podcast(state, &track);
+                }
                 Some(track) => open_release_for_track(state, &track),
                 None => state.status_message = Some("no track selected".into()),
             }
@@ -418,12 +470,17 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
         }
         Action::AddToPlaylist => {
             let target = selected_playlist_target(state, true);
+            let target = without_podcast_episodes(state, target);
             match target {
                 Some(target) => {
                     state.popup = Some(super::state::Popup::AddToPlaylist { target, cursor: 0 });
                     state.track_selection.clear();
                 }
-                None => state.status_message = Some("no track selected".into()),
+                None => {
+                    state
+                        .status_message
+                        .get_or_insert_with(|| "no track selected".into());
+                }
             }
             None
         }
@@ -442,7 +499,8 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
         }
         Action::NewPlaylist => {
-            let for_target = selected_playlist_target(state, false);
+            let for_target =
+                without_podcast_episodes(state, selected_playlist_target(state, false));
             state.popup = Some(super::state::Popup::NewPlaylist {
                 for_target,
                 input: crate::app::input::LineEdit::default(),
@@ -475,6 +533,21 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::DeleteSelected => delete_selected(state),
+        Action::RestartEpisode => podcasts::restart_current(state),
+        Action::AddPodcast
+        | Action::SearchEpisodes
+        | Action::RefreshPodcast
+        | Action::RefreshAllPodcasts
+        | Action::CycleEpisodeSort
+        | Action::CycleEpisodeFilter
+        | Action::ToggleEpisodePlayed
+        | Action::UnsubscribePodcast => {
+            state.status_message = Some(format!(
+                "open the Podcasts tab ({}) for this command",
+                Tab::Podcasts.index() + 1
+            ));
+            None
+        }
     }
 }
 
@@ -489,7 +562,9 @@ fn current_track_for_info(state: &AppState) -> Option<TrackItem> {
     queued_at_position
         .filter(|queued| {
             super::state::track_key(queued) == current_key
-                || queued.id == current.id
+                // Podcast episodes share the sentinel id; only their key
+                // identifies them.
+                || (!current.is_podcast() && !queued.is_podcast() && queued.id == current.id)
                 || current.is_fed_pending()
         })
         .or_else(|| {
@@ -539,6 +614,36 @@ fn open_track_info(
     } else {
         state.status_message = Some("federation: fetching track metadata…".to_string());
         Some(Effect::FedFetchTrackInfo { tracks: fed_tracks })
+    }
+}
+
+/// Status text when a music-only action meets a podcast episode.
+pub const PODCAST_NOT_MUSIC: &str =
+    "podcast episodes are not music: likes, playlists and library actions do not apply";
+
+/// Playlists hold music only: drops podcast episodes from a local target
+/// (and says so when nothing is left).
+fn without_podcast_episodes(
+    state: &mut AppState,
+    target: Option<super::state::PlaylistAddTarget>,
+) -> Option<super::state::PlaylistAddTarget> {
+    use super::state::PlaylistAddTarget;
+    match target {
+        Some(PlaylistAddTarget::Local(tracks)) => {
+            let total = tracks.len();
+            let music: Vec<TrackItem> = tracks
+                .into_iter()
+                .filter(|track| !track.is_podcast())
+                .collect();
+            if music.is_empty() {
+                if total > 0 {
+                    state.status_message = Some(PODCAST_NOT_MUSIC.into());
+                }
+                return None;
+            }
+            Some(PlaylistAddTarget::Local(music))
+        }
+        other => other,
     }
 }
 
@@ -629,6 +734,10 @@ fn open_edit_popup(state: &mut AppState) {
         return;
     }
     if let Some(track) = selected_track(state).or_else(|| state.player.current.clone()) {
+        if track.is_podcast() {
+            state.status_message = Some("podcast details come from the RSS feed".into());
+            return;
+        }
         state.popup = Some(track_edit_popup(&track));
         return;
     }
@@ -1371,7 +1480,8 @@ pub fn selected_track(state: &AppState) -> Option<TrackItem> {
                 .map(|track| (*track).clone())
         }
         Tab::Queue => state.player.queue.get(state.queue_tab.cursor).cloned(),
-        Tab::Podcasts | Tab::Federation | Tab::Logs => None,
+        Tab::Podcasts => state.podcasts.selected_episode_track(),
+        Tab::Federation | Tab::Logs => None,
     }
 }
 
@@ -1390,8 +1500,14 @@ pub fn playlist_tracks(state: &AppState, id: i64) -> Option<Vec<&TrackItem>> {
     }
 }
 
+/// Whether the library source mode lets a queue item stay in a received
+/// queue. Only pending federated music depends on it: podcast episodes
+/// (streamed from their publisher) and Jam private placeholders are never
+/// dropped, or a received queue would lose them.
 pub(crate) fn track_allowed_by_source_mode(state: &AppState, track: &TrackItem) -> bool {
-    state.global.filters.source_mode.includes_network() || !track.is_fed_pending()
+    track.is_podcast()
+        || state.global.filters.source_mode.includes_network()
+        || !track.is_fed_pending()
 }
 
 /// A *release* under the cursor (artist-view tile/row or a search release).
@@ -1427,6 +1543,9 @@ fn selected_release_id(state: &AppState) -> Option<i64> {
 /// an async fetch effect.
 fn queue_add(state: &mut AppState, next: bool) -> Option<Effect> {
     let tracks = selected_tracks(state);
+    if tracks.iter().any(TrackItem::is_podcast) && !podcasts::episodes_play_here(state) {
+        return None;
+    }
     if !tracks.is_empty() {
         let count = tracks.len();
         let title = tracks[0].title.clone();
@@ -3250,13 +3369,16 @@ fn reset_tab(state: &mut AppState, tab: Tab) {
             state.logs.follow = true;
             state.logs.selected_seq = None;
         }
-        Tab::Queue | Tab::Podcasts => {}
+        Tab::Queue => {}
+        Tab::Podcasts => podcasts::close(state),
     }
 }
 
 fn not_yet(state: &mut AppState, what: &str) {
     state.status_message = Some(format!("{what}: coming in a later milestone"));
 }
+
+pub(crate) mod podcasts;
 
 #[cfg(test)]
 #[path = "update_tests.rs"]

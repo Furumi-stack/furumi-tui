@@ -1,6 +1,11 @@
 use crate::library::models::TrackItem;
 
+/// Content id of a music track. Podcast episodes have none: they are not
+/// content-addressed and never shared as `frid://` track links.
 pub fn track_content_id(track: &TrackItem) -> Option<String> {
+    if track.is_podcast() {
+        return None;
+    }
     track
         .fed
         .as_ref()
@@ -14,6 +19,9 @@ pub fn track_can_share(track: &TrackItem) -> bool {
 }
 
 pub fn track_share_link(track: &TrackItem) -> Option<String> {
+    if track.is_podcast() {
+        return None;
+    }
     let content_id = track_content_id(track).or_else(|| {
         (!track.file_path.trim().is_empty())
             .then(|| crate::library::audio_content_id(&track.file_path))
@@ -154,6 +162,7 @@ mod tests {
             file_size_bytes: None,
             play_count: 0,
             fed: None,
+            podcast: None,
         };
 
         assert_eq!(
@@ -231,6 +240,7 @@ mod tests {
             file_size_bytes: None,
             play_count: 0,
             fed: None,
+            podcast: None,
         };
         let link = track_share_link(&track).expect("link");
         let parsed = parse_frid_link(&link).expect("parses back");

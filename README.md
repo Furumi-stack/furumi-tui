@@ -163,9 +163,9 @@ Shift+Tab cycle through them:
 | `5` | Settings |
 | `6` | Logs |
 
-The Podcasts tab is a placeholder in this build; podcast support is not
-available yet. On narrow terminals the tab bar shortens titles and then shows
-only the numbers, keeping the active tab's full name. Press `?` for the full list of bindings and commands.
+On narrow terminals the tab bar shortens titles and then shows only the
+numbers, keeping the active tab's full name. Press `?` for the full list of
+bindings and commands.
 
 Bindings can be overridden in `keymap.toml` in the platform config directory
 (`~/.config/furumi/keymap.toml` on Linux,
@@ -180,6 +180,112 @@ prototype podcast build); Furumi adapts their tab shortcuts in memory so they
 keep opening the same tabs, shows a short notice at startup, and never
 rewrites the file. Add `version = 2` once the indices match the new order to
 take them literally and silence the notice.
+
+### Podcasts
+
+The Podcasts tab (`4`) follows RSS and Atom podcast feeds. Furumi stores only
+the feed's episode information; audio stays on the publisher's server and is
+never imported into the music library or offered to other peers.
+
+- **Add podcast** (`o`, or the first row) takes a feed URL; `feed://`,
+  `podcast://` and URLs without a scheme are accepted. Nothing is stored unless
+  the URL serves a feed. New subscriptions are private.
+- The list shows each podcast's unplayed and total episode counts and its
+  check status; `!` marks a podcast whose last check failed, with the error in
+  the side panel (or below the list on narrow terminals).
+- `Enter` opens a podcast. Podcasts with seasons show their seasons first
+  (plus "All episodes" and "Without a season"); `Esc` goes back.
+- Episodes show the date, season/episode number, duration and listening
+  state: `●` not started, `◐` in progress with the saved position, `✓` played.
+  `/` searches titles and descriptions, `f` cycles all / unplayed / in
+  progress / played, `Shift+S` changes the order, `m` marks the selected
+  episode played or unplayed.
+- `Shift+R` checks the selected podcast for new episodes, `Ctrl+R` checks all
+  of them. Feeds are also checked in the background about once an hour with
+  conditional requests; a failing feed is retried with growing pauses and its
+  known episodes stay available. A permanent redirect moves the subscription
+  to the new address.
+- `Shift+U` (or `Shift+D`) unsubscribes after a confirmation. Listening
+  progress and history are kept, so subscribing again continues where you
+  left off.
+
+Episodes play in the same queue as music:
+
+- `Enter` on an episode plays it right after the current item and continues
+  from the saved position; a played episode starts from the beginning. `b`
+  ("start over") plays it from the beginning even when it is in progress.
+  `a` / `Shift+A` queue episodes like tracks, and the queue can mix music and
+  episodes.
+- Audio streams from the publisher's server through a bounded buffer (about
+  9 MB) and seeks with HTTP range requests. Nothing is downloaded ahead of
+  time and nothing is kept after playback. If the server cannot seek (no
+  file length), Furumi says that it cannot continue at the saved position
+  instead of starting from the wrong place; "start over" still works, and
+  seeking in such an episode is refused with a message. If the episode's
+  address no longer works, the feed is checked once for a new one.
+- If the connection is lost during an episode (no data for 30 seconds, or
+  the address stops working), playback stops there: the position is saved,
+  the episode is not marked played and the queue does not move on; play
+  continues from that position. A pause pressed while an episode is still
+  connecting is kept when the audio arrives.
+- Some servers send episodes without a file size. There a closed connection
+  looks like the end of the file, so Furumi compares the position with the
+  episode's duration: the one the audio file states, or else the
+  `itunes:duration` of the feed. Feed durations are often a little off, so
+  reaching 80 % of one is enough; an episode that stops earlier is treated as
+  a lost connection. Such servers do not allow seeking either, so play cannot
+  continue in the middle: start the episode over (`b`) or mark it played
+  (`m`).
+- The position is saved every 20 seconds while playing and on pause, seek,
+  stop, track change and exit. An episode counts as played within the last
+  30 seconds (or 5 %) or when its stream reaches its end; a listen enters the episode's
+  history when it completed or lasted at least 30 seconds. Seeking back and
+  "start over" are real changes: an older save never moves the position
+  forward again.
+- Likes, playlists, music history, similarity search and share links are for
+  music only and skip episodes; `Shift+J` on an episode opens its podcast.
+
+Podcasts and your connected devices:
+
+- **Private by default.** Subscriptions, episode progress and listening
+  history are personal. They are synchronized only between your trusted
+  devices (Connected Devices), never published to the federation: no DHT
+  record, public catalog or search result contains them. Publishing a
+  podcast for discovery is a separate, explicit choice that this version
+  does not offer yet.
+- **Synchronized between trusted devices.** A podcast you subscribe to on
+  one device appears on the others without typing its URL again; each
+  device then checks the feed itself. Unsubscribing, "played", the saved
+  position and "start over" follow the same way, also through a device
+  that relays them and after a device was offline for a while. When two
+  devices played the same episode offline, they agree on one position and
+  keep both listening sessions.
+- **Handoff.** A queue with episodes moves to another device like music:
+  the episode continues there at the handed-off position, paused or
+  playing, even if that device is not subscribed. Devices that run an older
+  Furumi (device sync before v4) cannot keep episodes: handing such a queue
+  to them is refused with "needs a Furumi update", their remote control is
+  ignored while the queue has episodes, and they get no podcast data: they
+  see such a queue with "Private item" in place of each episode, so they
+  keep seeing this device as the playing one. An older device still takes
+  over when you choose it as the output (Play on it), when it starts while
+  this device is paused (`take_paused_on_startup`), or by itself once this
+  device has been closed, asleep or offline for about two minutes. Its queue
+  then has an unplayable "Private item" music entry for each episode; this
+  device shows that queue without them (with a status message), and the
+  episodes' saved positions stay.
+- **Audio from the publisher.** Every device streams the episode from the
+  publisher's server itself. Furumi peers never pass podcast audio to each
+  other, and nothing is kept after playback.
+- **Jam.** Guests see the host's episodes as "Private item" (no title, feed
+  or address), cannot add episodes to the host's queue and cannot seek in a
+  private item. They can still reorder the queue and skip.
+
+Podcast data lives in `podcasts.sqlite3` in the platform data directory (the
+same file the earlier podcast test build used; it is upgraded in place). If
+that file was written by a newer Furumi or is not a podcast database, the tab
+explains why it is unavailable and the file is left unchanged; podcast
+changes from other devices then wait in the device-sync log until it opens.
 
 ### Now playing in tmux
 
@@ -268,11 +374,16 @@ Run the local protocol checks from the TUI repository:
 
 ```bash
 cargo test localhost_devices_exchange_state_and_handoff
+cargo test localhost_devices_sync_podcasts
+cargo test devices::podcast_sync_tests
 python scripts/test_device_interop.py ../furumusic
 ```
 
 The first test uses real iroh streams, isolated SQLite databases, ownership
-handoff, and a stalled peer. The second builds both player test binaries and
+handoff, and a stalled peer. The podcast tests sync subscriptions, progress
+and "start over" between TUI device stores (over iroh streams and through
+the JSON messages), check a handoff with an episode and simulate a device
+sync v3 peer with the exact JSON types of furumi-tui 0.3.x. The second builds both player test binaries and
 exchanges their actual JSON messages over `127.0.0.1`: queue metadata,
 bidirectional handoff, pause/seek and duplicate command fencing. It exercises
 the TUI command adapter and web player hub, but does not start a browser or

@@ -130,7 +130,8 @@ pub enum AppEvent {
         tracks: Vec<TrackItem>,
     },
     /// A status snapshot for the Federation tab.
-    FederationStatus(crate::federation::FedStatus),
+    /// Boxed to keep `AppEvent` small; the status is large and rare.
+    FederationStatus(Box<crate::federation::FedStatus>),
     /// Federated live-search results (artists a card can be opened for,
     /// plus matching tracks).
     FedSearchLoaded {
@@ -172,7 +173,8 @@ pub enum AppEvent {
     FedTrackInfoLoaded {
         placeholder_id: i64,
         item_id: String,
-        result: Result<TrackItem, String>,
+        /// Boxed: `TrackItem` is large since it can carry a podcast episode.
+        result: Result<Box<TrackItem>, String>,
     },
     /// This peer's connection ticket, requested from the Federation tab.
     FedTicket(Result<String, String>),
@@ -206,4 +208,64 @@ pub enum AppEvent {
     JamInvite(Result<String, String>),
     /// Result of joining a Jam capability.
     JamJoined(Result<String, String>),
+    /// Received podcast operations or snapshot sections changed the podcast
+    /// store: `progress` lists changed progress registers, `changed` means
+    /// anything else (subscriptions, feeds, sessions).
+    PodcastsSynced {
+        progress: Vec<music_dht::podcast::ProgressRecord>,
+        changed: bool,
+    },
+    /// The podcast store opened (with the feed client), or why it did not.
+    PodcastStoreOpened(Result<crate::podcasts::refresh::Services, String>),
+    /// Subscribed podcasts reloaded from the podcast store.
+    PodcastsLoaded(Result<Vec<crate::app::state::PodcastRow>, String>),
+    PodcastSeasonsLoaded {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<Vec<furumi_library::podcasts::SeasonSummary>, String>,
+    },
+    /// One page of episodes; `seq` drops results of older requests.
+    PodcastEpisodesLoaded {
+        seq: u64,
+        offset: usize,
+        result: Result<Vec<furumi_library::podcasts::EpisodeListItem>, String>,
+    },
+    PodcastSubscribed(Result<crate::podcasts::refresh::SubscribeReport, String>),
+    /// One feed check finished.
+    PodcastRefreshed {
+        podcast_id: music_dht::podcast::PodcastId,
+        result: Result<crate::podcasts::refresh::RefreshReport, String>,
+        /// Asked by the user (status bar), not the background scheduler.
+        manual: bool,
+    },
+    PodcastUnsubscribed {
+        podcast_id: music_dht::podcast::PodcastId,
+        title: String,
+        result: Result<(), String>,
+    },
+    /// Result of the progress writer (saves, supersedes, mark played).
+    PodcastProgress(crate::podcasts::progress::ProgressEvent),
+    /// An episode stream is playing; `generation` is the player source
+    /// generation of the start that requested it.
+    PodcastEpisodeStarted {
+        generation: u64,
+        episode: Box<music_dht::podcast::PodcastEpisodeRef>,
+        start_ms: i64,
+        duration_ms: Option<i64>,
+        /// The decoder measured `duration_ms` (else the feed announced it).
+        duration_measured: bool,
+        restart: bool,
+        /// The server allows seeking in the stream.
+        seekable: bool,
+        /// How the stream ended, once it does.
+        probe: crate::podcasts::stream::StreamProbe,
+    },
+    /// Starting an episode failed (network, decoding, cannot resume).
+    PodcastEpisodeFailed {
+        generation: u64,
+        message: String,
+    },
+    /// Scheduler timer: ask the store which feeds are due.
+    PodcastRefreshTick,
+    /// Feeds due for a background refresh.
+    PodcastsDue(Result<Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>, String>),
 }

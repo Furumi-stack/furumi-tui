@@ -41,6 +41,14 @@ pub enum PlayerEvent {
         has_next: bool,
     },
     Failed(String),
+    /// A seek was handled for the source started under `generation`
+    /// ([`Controller::source_generation`]); `result` says whether the source
+    /// actually moved to `position`.
+    Seeked {
+        generation: u64,
+        position: Duration,
+        result: Result<(), String>,
+    },
 }
 
 enum Command {
@@ -50,6 +58,18 @@ enum Command {
         mime_type: Option<String>,
         seekable: bool,
         volume: f32,
+    },
+    /// Play a source that was already opened, probed and positioned off
+    /// this thread (remote podcast streams, whose probing and seeking wait
+    /// on the network). Dropped unless `generation` is still current. It
+    /// starts paused if the latest pause/resume says so
+    /// ([`Controller::expect_source`]), not as it was when requested.
+    PlaySource {
+        source: DecodedSource,
+        volume: f32,
+        /// Where `source` was positioned before it was handed over.
+        start: Duration,
+        generation: u64,
     },
     /// Append the next track behind the current one without interrupting
     /// playback — rodio switches sources back to back (gapless-ish).
@@ -91,6 +111,13 @@ pub struct Controller {
     tx: Sender<Command>,
     pub shared: Arc<Shared>,
     playback_allowed: Arc<AtomicBool>,
+    /// Bumped by every start and stop; a source prepared in the background
+    /// plays only if no start or stop happened since it was requested.
+    generation: Arc<AtomicU64>,
+    /// The user's latest play/pause intent for a source still being
+    /// prepared: set by [`Controller::expect_source`], [`Controller::pause`]
+    /// and [`Controller::resume`], read when the source is handed over.
+    start_paused: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -102,7 +129,52 @@ impl Controller {
         }
     }
 
+    /// The current source generation: capture it when starting to prepare a
+    /// source in the background and pass it to [`Controller::play_source`].
+    pub fn source_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn supersede(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether a start or stop happened since `generation` was read; for
+    /// cancelling background preparation and reads of a superseded source.
+    pub fn superseded_check(&self, generation: u64) -> impl Fn() -> bool + Send + Sync + 'static {
+        let current = Arc::clone(&self.generation);
+        move || current.load(Ordering::SeqCst) != generation
+    }
+
+    /// A source is being prepared in the background and should start
+    /// paused or not. Pause and resume calls made before it is handed over
+    /// update this intent, so a pause pressed while it connects is kept.
+    pub fn expect_source(&self, paused: bool) {
+        self.start_paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Play a source decoded (and possibly positioned at `start`) outside
+    /// the audio thread, built with [`decode_source_with`]. The audio thread
+    /// drops it when another start or stop happened after `generation` was
+    /// read, so a slow stream never interrupts what the user chose since.
+    pub fn play_source(
+        &self,
+        source: DecodedSource,
+        volume: f32,
+        start: Duration,
+        generation: u64,
+    ) {
+        let _ = self.tx.send(Command::PlaySource {
+            source,
+            volume,
+            start,
+            generation,
+        });
+    }
+
     pub fn play(&self, reader: TrackReader, byte_len: Option<u64>, volume: f32) {
+        self.supersede();
+        self.start_paused.store(false, Ordering::SeqCst);
         let _ = self.tx.send(Command::Play {
             reader,
             byte_len,
@@ -113,6 +185,8 @@ impl Controller {
     }
 
     pub fn play_stream(&self, reader: TrackReader, mime_type: Option<String>, volume: f32) {
+        self.supersede();
+        self.start_paused.store(false, Ordering::SeqCst);
         let _ = self.tx.send(Command::Play {
             reader,
             byte_len: None,
@@ -127,14 +201,17 @@ impl Controller {
     }
 
     pub fn pause(&self) {
+        self.start_paused.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Command::Pause);
     }
 
     pub fn resume(&self) {
+        self.start_paused.store(false, Ordering::SeqCst);
         let _ = self.tx.send(Command::Resume);
     }
 
     pub fn stop(&self) {
+        self.supersede();
         let _ = self.tx.send(Command::Stop);
     }
 
@@ -153,15 +230,38 @@ pub fn spawn(on_event: impl Fn(PlayerEvent) + Send + 'static) -> Controller {
     let thread_shared = Arc::clone(&shared);
     let playback_allowed = Arc::new(AtomicBool::new(true));
     let thread_allowed = Arc::clone(&playback_allowed);
+    let generation = Arc::new(AtomicU64::new(0));
+    let thread_generation = Arc::clone(&generation);
+    let start_paused = Arc::new(AtomicBool::new(false));
+    let thread_start_paused = Arc::clone(&start_paused);
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, thread_shared, thread_allowed, on_event))
+        .spawn(move || {
+            run(
+                rx,
+                thread_shared,
+                thread_allowed,
+                Generations {
+                    current: thread_generation,
+                    start_paused: thread_start_paused,
+                },
+                on_event,
+            )
+        })
         .expect("spawning the audio thread cannot fail");
     Controller {
         tx,
         shared,
         playback_allowed,
+        generation,
+        start_paused,
     }
+}
+
+/// Controller state the audio thread reads.
+struct Generations {
+    current: Arc<AtomicU64>,
+    start_paused: Arc<AtomicBool>,
 }
 
 struct Output {
@@ -170,14 +270,33 @@ struct Output {
     player: Player,
 }
 
+/// Audio-thread state besides the output device.
+struct Playing {
+    track_loaded: bool,
+    /// Position of the current source when it was appended: sources
+    /// positioned before playback (resumed podcast episodes) start there,
+    /// while rodio counts from zero until the next seek.
+    base: Duration,
+    /// Controller generation the current source was started under. When
+    /// the controller moved on, the end of this source is not reported: a
+    /// stop or another start is already on its way.
+    generation: u64,
+}
+
 fn run(
     rx: Receiver<Command>,
     shared: Arc<Shared>,
     playback_allowed: Arc<AtomicBool>,
+    generations: Generations,
     on_event: impl Fn(PlayerEvent),
 ) {
+    let generation = &generations.current;
     let mut output: Option<Output> = None;
-    let mut track_loaded = false;
+    let mut playing = Playing {
+        track_loaded: false,
+        base: Duration::ZERO,
+        generation: generation.load(Ordering::SeqCst),
+    };
     let mut last_len = 0usize;
 
     loop {
@@ -186,31 +305,68 @@ fn run(
                 if !playback_allowed.load(Ordering::Acquire)
                     && matches!(
                         command,
-                        Command::Play { .. } | Command::Enqueue { .. } | Command::Resume
+                        Command::Play { .. }
+                            | Command::PlaySource { .. }
+                            | Command::Enqueue { .. }
+                            | Command::Resume
                     )
                 {
                     continue;
                 }
+                if let Command::PlaySource {
+                    generation: requested,
+                    ..
+                } = &command
+                    && *requested != generation.load(Ordering::SeqCst)
+                {
+                    // Superseded while it was being prepared.
+                    continue;
+                }
+                let started_under = match &command {
+                    Command::PlaySource {
+                        generation: requested,
+                        ..
+                    } => Some(*requested),
+                    Command::Play { .. } | Command::Stop => Some(generation.load(Ordering::SeqCst)),
+                    _ => None,
+                };
                 // Commands change the source queue legitimately; resync the
                 // length so the next tick doesn't read it as a track ending.
-                handle(command, &shared, &mut output, &mut track_loaded, &on_event);
+                handle(
+                    command,
+                    &shared,
+                    &generations.start_paused,
+                    &mut output,
+                    &mut playing,
+                    &on_event,
+                );
+                if let Some(started_under) = started_under {
+                    playing.generation = started_under;
+                }
                 last_len = output.as_ref().map_or(0, |out| out.player.len());
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(out) = &output {
+                    let position = out.player.get_pos() + playing.base;
                     shared
                         .position_ms
-                        .store(out.player.get_pos().as_millis() as u64, Ordering::Relaxed);
+                        .store(position.as_millis() as u64, Ordering::Relaxed);
                     shared
                         .paused
                         .store(out.player.is_paused(), Ordering::Relaxed);
                     let len = out.player.len();
-                    if track_loaded && len < last_len {
+                    if playing.track_loaded && len < last_len {
+                        // The next (gapless) source starts at zero.
+                        playing.base = Duration::ZERO;
                         if len == 0 {
-                            track_loaded = false;
+                            playing.track_loaded = false;
                         }
-                        for _ in len..last_len {
-                            on_event(PlayerEvent::TrackFinished { has_next: len > 0 });
+                        // A source that ended because it was superseded
+                        // (its stream cancelled) did not finish.
+                        if generation.load(Ordering::SeqCst) == playing.generation {
+                            for _ in len..last_len {
+                                on_event(PlayerEvent::TrackFinished { has_next: len > 0 });
+                            }
                         }
                     }
                     last_len = len;
@@ -224,8 +380,9 @@ fn run(
 fn handle(
     command: Command,
     shared: &Arc<Shared>,
+    start_paused: &AtomicBool,
     output: &mut Option<Output>,
-    track_loaded: &mut bool,
+    playing: &mut Playing,
     on_event: &impl Fn(PlayerEvent),
 ) {
     match command {
@@ -236,42 +393,35 @@ fn handle(
             seekable,
             volume,
         } => {
-            // The device is opened lazily on first playback so the app works
-            // on machines with no audio output until you actually press play.
-            if output.is_none() {
-                match DeviceSinkBuilder::open_default_sink() {
-                    Ok(device) => {
-                        let player = Player::connect_new(device.mixer());
-                        *output = Some(Output {
-                            _device: device,
-                            player,
-                        });
-                    }
-                    Err(err) => {
-                        on_event(PlayerEvent::Failed(format!("no audio device: {err}")));
-                        return;
-                    }
-                }
-            }
-            let out = output.as_ref().expect("output opened above");
-
+            let Some(out) = ensure_output(output, on_event) else {
+                return;
+            };
             match decode_source(reader, byte_len, mime_type.as_deref(), seekable) {
-                Ok(source) => {
-                    shared.analysis.clear();
-                    out.player.stop();
-                    out.player.set_volume(volume);
-                    out.player.append(analyzer::AnalyzedSource::new(
-                        source,
-                        Arc::clone(&shared.analysis),
-                    ));
-                    out.player.play();
-                    *track_loaded = true;
-                    on_event(PlayerEvent::Started);
-                }
+                Ok(source) => start_source(out, source, volume, false, shared, on_event),
                 Err(err) => {
                     on_event(PlayerEvent::Failed(format!("cannot decode track: {err}")));
+                    return;
                 }
             }
+            playing.track_loaded = true;
+            playing.base = Duration::ZERO;
+        }
+        Command::PlaySource {
+            source,
+            volume,
+            start,
+            generation: _,
+        } => {
+            let Some(out) = ensure_output(output, on_event) else {
+                return;
+            };
+            let paused = start_paused.load(Ordering::SeqCst);
+            start_source(out, source, volume, paused, shared, on_event);
+            playing.track_loaded = true;
+            playing.base = start;
+            shared
+                .position_ms
+                .store(start.as_millis() as u64, Ordering::Relaxed);
         }
         Command::Enqueue { reader, byte_len } => {
             let Some(out) = output.as_ref() else {
@@ -304,15 +454,25 @@ fn handle(
                 out.player.stop();
             }
             shared.analysis.clear();
-            *track_loaded = false;
+            playing.track_loaded = false;
+            playing.base = Duration::ZERO;
         }
         Command::Seek(position) => {
-            if let Some(out) = output
-                && let Err(err) = out.player.try_seek(position)
-            {
-                tracing::warn!(%err, "seek failed");
+            let result = match output {
+                Some(out) => out.player.try_seek(position).map_err(|err| err.to_string()),
+                None => Err("nothing is playing".to_string()),
+            };
+            match &result {
+                // rodio now reports absolute positions.
+                Ok(()) => playing.base = Duration::ZERO,
+                Err(err) => tracing::warn!(%err, "seek failed"),
             }
             shared.analysis.clear();
+            on_event(PlayerEvent::Seeked {
+                generation: playing.generation,
+                position,
+                result,
+            });
         }
         Command::SetVolume(volume) => {
             if let Some(out) = output {
@@ -322,13 +482,74 @@ fn handle(
     }
 }
 
+/// The device is opened lazily on first playback so the app works on
+/// machines with no audio output until you actually press play.
+fn ensure_output<'a>(
+    output: &'a mut Option<Output>,
+    on_event: &impl Fn(PlayerEvent),
+) -> Option<&'a Output> {
+    if output.is_none() {
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(device) => {
+                let player = Player::connect_new(device.mixer());
+                *output = Some(Output {
+                    _device: device,
+                    player,
+                });
+            }
+            Err(err) => {
+                on_event(PlayerEvent::Failed(format!("no audio device: {err}")));
+                return None;
+            }
+        }
+    }
+    output.as_ref()
+}
+
+/// Replace whatever is playing with `source`.
+fn start_source(
+    out: &Output,
+    source: DecodedSource,
+    volume: f32,
+    paused: bool,
+    shared: &Shared,
+    on_event: &impl Fn(PlayerEvent),
+) {
+    shared.analysis.clear();
+    out.player.stop();
+    out.player.set_volume(volume);
+    out.player.append(analyzer::AnalyzedSource::new(
+        source,
+        Arc::clone(&shared.analysis),
+    ));
+    if paused {
+        out.player.pause();
+    } else {
+        out.player.play();
+    }
+    on_event(PlayerEvent::Started);
+}
+
 pub(crate) type DecodedSource = Box<dyn Source + Send>;
 
 pub(crate) fn decode_source(
+    reader: TrackReader,
+    byte_len: Option<u64>,
+    mime_type: Option<&str>,
+    seekable: bool,
+) -> Result<DecodedSource, String> {
+    decode_source_with(reader, byte_len, mime_type, seekable, false)
+}
+
+/// `decode_source` with optional coarse (byte-estimate) seeking, which
+/// remote streams need: an accurate MP3 seek decodes every frame before the
+/// target, i.e. downloads it.
+pub(crate) fn decode_source_with(
     mut reader: TrackReader,
     byte_len: Option<u64>,
     mime_type: Option<&str>,
     seekable: bool,
+    coarse_seek: bool,
 ) -> Result<DecodedSource, String> {
     let mime_is_opus = mime_type.is_some_and(|mime| {
         let mime = mime.to_ascii_lowercase();
@@ -344,6 +565,7 @@ pub(crate) fn decode_source(
     let mut builder = Decoder::builder()
         .with_data(reader)
         .with_seekable(seekable)
+        .with_coarse_seek(coarse_seek)
         .with_gapless(true);
     if let Some(len) = byte_len {
         builder = builder.with_byte_len(len);
@@ -355,4 +577,61 @@ pub(crate) fn decode_source(
         .build()
         .map(|decoder| Box::new(decoder) as DecodedSource)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A controller without the audio thread; the commands it sends are
+    /// returned instead (no audio device in tests).
+    fn detached() -> (Controller, Receiver<Command>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let controller = Controller {
+            tx,
+            shared: Arc::default(),
+            playback_allowed: Arc::new(AtomicBool::new(true)),
+            generation: Arc::new(AtomicU64::new(0)),
+            start_paused: Arc::new(AtomicBool::new(false)),
+        };
+        (controller, rx)
+    }
+
+    /// The audio thread starts a prepared source with the intent read when
+    /// the source arrives (`Command::PlaySource` reads `start_paused`), so a
+    /// pause pressed while an episode was connecting is kept, and a resume
+    /// pressed after a paused start is too.
+    #[test]
+    fn play_and_pause_pressed_while_a_source_is_prepared_are_kept() {
+        let (controller, rx) = detached();
+        controller.stop();
+        let generation = controller.source_generation();
+        let superseded = controller.superseded_check(generation);
+        controller.expect_source(false);
+        controller.pause();
+        controller.play_source(
+            Box::new(rodio::source::Zero::new(
+                std::num::NonZero::new(1).unwrap(),
+                std::num::NonZero::new(8_000).unwrap(),
+            )),
+            1.0,
+            Duration::ZERO,
+            generation,
+        );
+        let commands: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Stop, Command::Pause, Command::PlaySource { .. }]
+        ));
+        assert!(controller.start_paused.load(Ordering::SeqCst));
+        assert!(!superseded(), "pausing does not supersede the source");
+
+        controller.expect_source(true);
+        controller.resume();
+        assert!(!controller.start_paused.load(Ordering::SeqCst));
+
+        // Another start or a stop supersedes the prepared source.
+        controller.stop();
+        assert!(superseded());
+    }
 }

@@ -4,20 +4,42 @@
 //! byte-stream ALPN. Local state is stored as an append-only operation log plus
 //! materialized tables, so offline clients can merge likes, playlists and
 //! membership changes deterministically.
+//!
+//! The wire types are the shared `music_dht::device_sync` definitions. This
+//! client speaks protocol v4: podcast operations stay in the log, are
+//! applied to the podcast store (`furumi_library::podcasts::PodcastStore`)
+//! and are relayed; podcast snapshot sections are exported from and merged
+//! into that store. Everything sent to a peer is gated by the version that
+//! peer reported itself (`op_allowed_for_peer`, `SyncSnapshot::for_peer`,
+//! `playback_allowed_for_peer`; a queue with podcast items reaches an older
+//! peer only redacted, for its ownership engine, and the placeholders such a
+//! peer echoes back as music are left out of what it sends:
+//! `drop_echoed_private_items`).
 
 use music_dht::playback::{Checkpoint, CommandStamp, Config as PlaybackConfig, Engine};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use music_dht::device_sync::{ListenEvent, ListenTrackMetadata};
+use furumi_library::podcasts::{
+    ApplyOutcome as PodcastApplyOutcome, OpStamp as PodcastOpStamp, PodcastLocalOp, PodcastStore,
+    StampSource as PodcastStampSource,
+};
+use music_dht::device_sync::{
+    DeviceProfileWire, InviteWire, ListenEvent, ListenTrackMetadata, SnapshotLike,
+    SnapshotLikeTombstone, SnapshotPlaylist, SnapshotPlaylistItem, SnapshotPlaylistItemTombstone,
+    SnapshotPlaylistTombstone, SyncOpWire, SyncSnapshot, WireMessage, encode_invite, finish_send,
+    hash_secret, random_hex, read_msg, ticket_endpoint_id,
+};
+pub use music_dht::device_sync::{
+    PlaybackCommand, PlaybackRepeat, PlaybackSnapshot, PlaybackStateWire, PlaybackTrack,
+    SyncOpPayload, SyncedFedTrack,
+};
+use music_dht::podcast::ProgressRecord;
 use music_dht::{ByteStream, MusicDhtService, NetworkId, PeerTicket, SecretKey, StreamAcceptor};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::app::event::AppEvent;
 use crate::library::Library;
@@ -25,13 +47,24 @@ use crate::library::models::{ArtistRef, TrackItem};
 
 pub const SYNC_ALPN: &[u8] = b"furumi/sync/2";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Device-sync protocol version of this client.
+///
+/// Version 4 is announced because podcast operations, podcast snapshot
+/// sections and podcast queue items are applied, kept and relayed (see the
+/// module documentation). Review that support before following a newer
+/// shared protocol version.
+pub const PROTOCOL_VERSION: u16 = 4;
+const _: () = assert!(
+    PROTOCOL_VERSION == music_dht::device_sync::DEVICE_SYNC_PROTOCOL_VERSION,
+    "review device-sync support before announcing a new protocol version"
+);
+/// Lowest protocol version of a peer that speaks `furumi/sync/2`.
+const SYNC_V2_PROTOCOL_VERSION: u16 = 2;
 const INVITE_TTL_MS: i64 = 10 * 60 * 1000;
 const PAIRING_WAIT_MS: i64 = 5 * 60 * 1000;
 const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_LINE: usize = 8 * 1024 * 1024;
 /// Playback control is ephemeral. Keeping old full-queue commands in a new
 /// peer's catch-up batch can make the initial pairing frame arbitrarily large.
 const PLAYBACK_COMMAND_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -52,6 +85,8 @@ pub struct DeviceStatusRow {
     pub device_id: String,
     pub name: String,
     pub client_version: String,
+    /// Device-sync protocol version the device reported itself.
+    pub protocol_version: u16,
     pub endpoint_id: String,
     pub last_seen_ms: Option<i64>,
     pub revoked: bool,
@@ -90,80 +125,185 @@ pub struct DeviceSync {
     library: Arc<Library>,
     event_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
     playback: Arc<std::sync::Mutex<PlaybackShared>>,
+    podcasts: Arc<std::sync::Mutex<PodcastLink>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaybackRepeat {
-    #[default]
-    Off,
-    One,
-    All,
+/// The podcast store as device sync sees it.
+///
+/// The store opens in the background after device sync started. Podcast
+/// operations received before that (or whose application failed) are kept
+/// in `sync_podcast_pending` and applied when the store is attached.
+#[derive(Default)]
+struct PodcastLink {
+    store: Option<Arc<PodcastStore>>,
+    /// Progress registers that received operations changed since the last
+    /// notification.
+    progress: Vec<ProgressRecord>,
+    /// Other podcast state (subscriptions, shares, feed URLs, sessions)
+    /// changed since the last notification.
+    changed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackTrack {
-    pub id: i64,
-    pub title: String,
-    pub track_number: Option<i32>,
-    pub disc_number: Option<i32>,
-    pub duration_seconds: f64,
-    #[serde(default)]
-    pub artist_names: Vec<String>,
-    #[serde(default)]
-    pub featured_artist_names: Vec<String>,
-    pub release_id: i64,
-    pub release_title: String,
-    pub release_year: Option<i32>,
-    /// Legacy compatibility only. Paths are device-local, so playback sync
-    /// must resolve tracks from content/federation identifiers instead.
-    #[serde(default)]
-    pub file_path: String,
-    pub content_id: Option<String>,
-    pub audio_format: Option<String>,
-    pub audio_bitrate: Option<i32>,
-    pub audio_sample_rate: Option<i32>,
-    pub audio_bit_depth: Option<i32>,
-    pub file_size_bytes: Option<i64>,
-    #[serde(default)]
-    pub play_count: i64,
-    #[serde(default)]
-    pub fed: Option<SyncedFedTrack>,
+/// Converts queue items to and from the shared wire form
+/// ([`PlaybackTrack`]). The wire types themselves are the shared
+/// `music_dht::device_sync` definitions; this client keeps no copies.
+///
+/// A podcast episode travels with its explicit source
+/// (`PlaybackSource::PodcastEpisode`), never as a music item. Peers below
+/// protocol v4 never get the episodes (`playback_allowed_for_peer`): they
+/// see the queue redacted to "Private item" placeholders, only so that their
+/// ownership engine keeps hearing from the owner.
+pub trait PlaybackTrackExt {
+    /// Wire form of a queue item. Device-local paths are never sent.
+    fn from_track(track: &TrackItem) -> Self;
+    /// Queue item for a wire track received from another device. A Jam
+    /// private placeholder becomes [`private_track_item`]`(0)`; callers
+    /// that keep a queue number them ([`track_items_from_wire`]).
+    fn to_track_item(&self) -> TrackItem;
 }
 
-impl PlaybackTrack {
-    fn portable_placeholder_id(&self) -> i64 {
-        let key = self
-            .content_id
-            .as_deref()
-            .and_then(music_dht::normalize_content_id)
-            .map(|content_id| format!("content:{content_id}"))
-            .or_else(|| {
-                self.fed
-                    .as_ref()
-                    .map(|fed| fed.content_id.as_str())
-                    .and_then(music_dht::normalize_content_id)
-                    .map(|content_id| format!("content:{content_id}"))
-            })
-            .or_else(|| {
-                self.fed
-                    .as_ref()
-                    .map(|fed| format!("fed:{}:{}", fed.owner, fed.item_id))
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "remote:{}:{}:{}:{}",
-                    self.id, self.title, self.release_title, self.duration_seconds
-                )
-            });
-        let hash = blake3::hash(key.as_bytes());
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&hash.as_bytes()[..8]);
-        let positive = (i64::from_be_bytes(bytes) & i64::MAX).max(1);
-        -positive
+/// Ids of the "private item" queue entries that stand for a Jam host's
+/// podcast episodes on a guest: `PRIVATE_ITEM_ID_BASE - k` for the k-th, so
+/// each has its own queue key. Process-local; never sent (they go back on
+/// the wire as `PlaybackSource::Private`).
+const PRIVATE_ITEM_ID_BASE: i64 = -(1 << 62);
+const PRIVATE_ITEM_ID_SPAN: i64 = 1 << 32;
+
+/// Queue entry for the k-th Jam private placeholder: no title but
+/// [`music_dht::device_sync::PRIVATE_ITEM_TITLE`], no URL, not playable.
+pub fn private_track_item(k: usize) -> TrackItem {
+    TrackItem {
+        id: PRIVATE_ITEM_ID_BASE - (k as i64 % PRIVATE_ITEM_ID_SPAN),
+        title: music_dht::device_sync::PRIVATE_ITEM_TITLE.to_string(),
+        track_number: None,
+        disc_number: None,
+        duration_seconds: 0.0,
+        artists: Vec::new(),
+        featured_artists: Vec::new(),
+        release_id: TrackItem::NOT_A_LIBRARY_ROW,
+        release_title: String::new(),
+        release_year: None,
+        file_path: String::new(),
+        content_id: None,
+        cover_path: None,
+        audio_format: None,
+        audio_bitrate: None,
+        audio_sample_rate: None,
+        audio_bit_depth: None,
+        file_size_bytes: None,
+        play_count: 0,
+        fed: None,
+        podcast: None,
     }
+}
 
-    pub fn from_track(track: &TrackItem) -> Self {
+/// Whether a queue entry is a Jam private placeholder.
+pub fn is_private_track_item(track: &TrackItem) -> bool {
+    track.podcast.is_none()
+        && track.fed.is_none()
+        && track.content_id.is_none()
+        && track.id <= PRIVATE_ITEM_ID_BASE
+        && track.id > PRIVATE_ITEM_ID_BASE - PRIVATE_ITEM_ID_SPAN
+        && track.title == music_dht::device_sync::PRIVATE_ITEM_TITLE
+}
+
+/// Whether a music item received from a device below protocol v4 is a
+/// "Private item" placeholder that it echoes back.
+///
+/// Such a device gets this device's queue redacted
+/// ([`DeviceSync::local_playback_snapshot_for`]) and, while it controls this
+/// device, mirrors it with its own types, which have no
+/// `PlaybackTrack::source`. Each placeholder then turns into a music item
+/// titled "Private item" with nothing else: no content id, federated
+/// source, artist, release or duration. When that device takes playback
+/// over (Play on it, a paused-startup claim, automatic failover) or sends a
+/// command, it announces those items as its queue.
+fn is_echoed_private_item(track: &PlaybackTrack) -> bool {
+    track.source.is_none()
+        && track.title == music_dht::device_sync::PRIVATE_ITEM_TITLE
+        && track.content_id.is_none()
+        && track.fed.is_none()
+        && track.artist_names.is_empty()
+        && track.featured_artist_names.is_empty()
+        && track.release_title.is_empty()
+        && track.duration_seconds == 0.0
+}
+
+/// Removes the "Private item" placeholders that a device below protocol v4
+/// echoed back ([`is_echoed_private_item`]) from a state it sent, and
+/// returns how many there were. They stand for episodes this device keeps
+/// private; as music items they could never play, and they would spread to
+/// every queue as such. The position moves with the queue; when the
+/// current item was one of them, the next item is current from its start.
+pub fn drop_echoed_private_items(state: &mut PlaybackStateWire) -> usize {
+    let current = state.queue_pos;
+    let mut dropped = 0;
+    let mut kept_before = 0;
+    let mut current_dropped = false;
+    let mut index = 0;
+    state.queue.retain(|track| {
+        let echoed = is_echoed_private_item(track);
+        if echoed {
+            dropped += 1;
+            current_dropped |= index == current;
+        } else if index < current {
+            kept_before += 1;
+        }
+        index += 1;
+        !echoed
+    });
+    if dropped == 0 {
+        return 0;
+    }
+    state.queue_pos = kept_before.min(state.queue.len().saturating_sub(1));
+    if current_dropped {
+        state.position_secs = 0.0;
+    }
+    if state.queue.is_empty() {
+        state.playing = false;
+    }
+    dropped
+}
+
+/// Status for placeholders left out of a state from an older device.
+fn echoed_private_items_message(device: &str, dropped: usize) -> String {
+    let items = if dropped == 1 { "entry" } else { "entries" };
+    format!(
+        "left out {dropped} \"{}\" {items} of {device}'s queue: they stand for podcast \
+         episodes, and {device} needs a Furumi update to play them",
+        music_dht::device_sync::PRIVATE_ITEM_TITLE
+    )
+}
+
+/// Queue entries for a received queue, with `resolve_music` deciding music
+/// items (a library copy, for example). Podcast episodes keep their typed
+/// reference; Jam private placeholders are numbered in queue order.
+pub fn track_items_from_wire(
+    queue: &[PlaybackTrack],
+    mut resolve_music: impl FnMut(&PlaybackTrack) -> TrackItem,
+) -> Vec<TrackItem> {
+    let mut private = 0;
+    queue
+        .iter()
+        .map(|track| match TrackItem::from_playback_track(track) {
+            furumi_library::models::PlaybackItem::Music => resolve_music(track),
+            furumi_library::models::PlaybackItem::PodcastEpisode(item) => *item,
+            furumi_library::models::PlaybackItem::Private => {
+                private += 1;
+                private_track_item(private - 1)
+            }
+        })
+        .collect()
+}
+
+impl PlaybackTrackExt for PlaybackTrack {
+    fn from_track(track: &TrackItem) -> Self {
+        if let Some(episode) = &track.podcast {
+            return Self::podcast_episode(episode.clone());
+        }
+        if is_private_track_item(track) {
+            return Self::private_placeholder();
+        }
         Self {
             id: track.id,
             title: track.title.clone(),
@@ -195,10 +335,16 @@ impl PlaybackTrack {
             file_size_bytes: track.file_size_bytes,
             play_count: track.play_count,
             fed: track.fed.as_ref().and_then(SyncedFedTrack::from_fed),
+            source: None,
         }
     }
 
-    pub fn to_track_item(&self) -> TrackItem {
+    fn to_track_item(&self) -> TrackItem {
+        match TrackItem::from_playback_track(self) {
+            furumi_library::models::PlaybackItem::Music => {}
+            furumi_library::models::PlaybackItem::PodcastEpisode(item) => return *item,
+            furumi_library::models::PlaybackItem::Private => return private_track_item(0),
+        }
         let refs = |names: &[String]| -> Vec<ArtistRef> {
             names
                 .iter()
@@ -209,7 +355,7 @@ impl PlaybackTrack {
                 .collect()
         };
         TrackItem {
-            id: self.portable_placeholder_id(),
+            id: portable_placeholder_id(self),
             title: self.title.clone(),
             track_number: self.track_number,
             disc_number: self.disc_number,
@@ -229,246 +375,53 @@ impl PlaybackTrack {
             file_size_bytes: self.file_size_bytes,
             play_count: self.play_count,
             fed: self.fed.as_ref().map(SyncedFedTrack::to_fed_track),
+            podcast: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackStateWire {
-    #[serde(default)]
-    pub queue: Vec<PlaybackTrack>,
-    #[serde(default)]
-    pub queue_pos: usize,
-    pub playing: bool,
-    pub paused: bool,
-    #[serde(default)]
-    pub idle_since_ms: Option<i64>,
-    pub position_secs: f64,
-    #[serde(default)]
-    pub volume: u8,
-    pub shuffle: bool,
-    pub repeat: PlaybackRepeat,
+/// Process-local negative id of a music item received from another device,
+/// derived from its portable identity (content id, then federated source).
+fn portable_placeholder_id(track: &PlaybackTrack) -> i64 {
+    let key = track
+        .content_id
+        .as_deref()
+        .and_then(music_dht::normalize_content_id)
+        .map(|content_id| format!("content:{content_id}"))
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .map(|fed| fed.content_id.as_str())
+                .and_then(music_dht::normalize_content_id)
+                .map(|content_id| format!("content:{content_id}"))
+        })
+        .or_else(|| {
+            track
+                .fed
+                .as_ref()
+                .map(|fed| format!("fed:{}:{}", fed.owner, fed.item_id))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "remote:{}:{}:{}:{}",
+                track.id, track.title, track.release_title, track.duration_seconds
+            )
+        });
+    let hash = blake3::hash(key.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    let positive = (i64::from_be_bytes(bytes) & i64::MAX).max(1);
+    -positive
 }
 
-pub type PlaybackSnapshot = music_dht::playback::Snapshot<PlaybackStateWire>;
-pub type PlaybackCommand = music_dht::playback::Command<PlaybackStateWire>;
-
-#[derive(Debug, Clone, Default)]
-struct PlaybackShared {
-    engine: Option<Engine>,
-    engine_group: String,
-    local: Option<PlaybackSnapshot>,
-    remote: BTreeMap<String, PlaybackSnapshot>,
+/// Converts federated tracks to and from the synced metadata form.
+trait SyncedFedTrackExt: Sized {
+    fn from_fed(fed: &crate::federation::FedTrack) -> Option<Self>;
+    fn to_fed_track(&self) -> crate::federation::FedTrack;
 }
 
-#[derive(Debug, Clone)]
-struct LocalIdentity {
-    device_id: String,
-    group_id: String,
-    name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InviteWire {
-    v: u16,
-    #[serde(rename = "t")]
-    ticket: String,
-    #[serde(rename = "d")]
-    device_id: String,
-    #[serde(rename = "i")]
-    invite_id: String,
-    #[serde(rename = "s")]
-    secret: String,
-    #[serde(rename = "e")]
-    expires_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeviceProfileWire {
-    device_id: String,
-    name: String,
-    client_version: String,
-    protocol_version: u16,
-    endpoint_id: String,
-    endpoint_ticket: String,
-    #[serde(default)]
-    revoked: bool,
-    #[serde(default)]
-    revoke_cutoff_seq: Option<i64>,
-    #[serde(default)]
-    updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SyncOpWire {
-    op_id: String,
-    origin_device_id: String,
-    seq: i64,
-    hlc_ms: i64,
-    payload: SyncOpPayload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SyncOpPayload {
-    TrackLikeSet {
-        content_id: String,
-        liked: bool,
-        #[serde(default)]
-        fed: Option<SyncedFedTrack>,
-    },
-    PlaylistCreated {
-        playlist_id: String,
-        title: String,
-    },
-    PlaylistRenamed {
-        playlist_id: String,
-        title: String,
-    },
-    PlaylistDeleted {
-        playlist_id: String,
-    },
-    PlaylistTrackAdded {
-        playlist_id: String,
-        content_id: String,
-        position: i64,
-        #[serde(default)]
-        fed: Option<SyncedFedTrack>,
-    },
-    PlaylistTrackRemoved {
-        playlist_id: String,
-        content_id: String,
-    },
-    DeviceProfileSet {
-        name: String,
-        client_version: String,
-        endpoint_ticket: String,
-        endpoint_id: String,
-    },
-    DeviceTrusted {
-        target_device_id: String,
-    },
-    DeviceRevoked {
-        target_device_id: String,
-        target_max_seq_seen: i64,
-    },
-    PlaybackCommand {
-        target_device_id: String,
-        command: PlaybackCommand,
-        #[serde(default)]
-        authority: Option<CommandStamp>,
-    },
-    ListenRecorded {
-        event: ListenEvent,
-    },
-}
-
-impl SyncOpPayload {
-    fn is_tombstone(&self) -> bool {
-        matches!(
-            self,
-            SyncOpPayload::TrackLikeSet { liked: false, .. }
-                | SyncOpPayload::PlaylistDeleted { .. }
-                | SyncOpPayload::PlaylistTrackRemoved { .. }
-                | SyncOpPayload::DeviceRevoked { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct SyncSnapshot {
-    #[serde(default)]
-    likes: Vec<SnapshotLike>,
-    #[serde(default)]
-    unlikes: Vec<SnapshotLikeTombstone>,
-    #[serde(default)]
-    playlists: Vec<SnapshotPlaylist>,
-    #[serde(default)]
-    deleted_playlists: Vec<SnapshotPlaylistTombstone>,
-    #[serde(default)]
-    removed_playlist_items: Vec<SnapshotPlaylistItemTombstone>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotLike {
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    fed: Option<SyncedFedTrack>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotLikeTombstone {
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylist {
-    playlist_id: String,
-    title: String,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    items: Vec<SnapshotPlaylistItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistTombstone {
-    playlist_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistItem {
-    content_id: String,
-    position: i64,
-    hlc_ms: i64,
-    op_id: String,
-    #[serde(default)]
-    fed: Option<SyncedFedTrack>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPlaylistItemTombstone {
-    playlist_id: String,
-    content_id: String,
-    hlc_ms: i64,
-    op_id: String,
-}
-
-enum PairAttempt {
-    Accepted(String),
-    Pending,
-    Denied(String),
-}
-
-struct PairingStatus {
-    status: String,
-    use_requester_group: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncedFedTrack {
-    item_id: String,
-    owner: String,
-    title: String,
-    #[serde(default)]
-    artist_names: Vec<String>,
-    #[serde(default)]
-    featured_artist_names: Vec<String>,
-    year: Option<i32>,
-    duration_seconds: Option<i64>,
-    content_id: String,
-    release_title: Option<String>,
-    track_number: Option<i32>,
-    disc_number: Option<i32>,
-}
-
-impl SyncedFedTrack {
+impl SyncedFedTrackExt for SyncedFedTrack {
     fn from_fed(fed: &crate::federation::FedTrack) -> Option<Self> {
         let content_id = fed
             .content_id
@@ -507,71 +460,82 @@ impl SyncedFedTrack {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WireMessage {
-    PairRequest {
-        invite_id: String,
-        secret: String,
-        profile: DeviceProfileWire,
-        #[serde(default)]
-        group_id: Option<String>,
-        #[serde(default)]
-        group_active_devices: usize,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        vector: BTreeMap<String, i64>,
-        ops: Vec<SyncOpWire>,
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    PairResponse {
-        accepted: bool,
-        #[serde(default)]
-        pending: bool,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        group_id: Option<String>,
-        #[serde(default)]
-        profile: Option<DeviceProfileWire>,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        #[serde(default)]
-        vector: BTreeMap<String, i64>,
-        #[serde(default)]
-        ops: Vec<SyncOpWire>,
-        #[serde(default)]
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    Hello {
-        group_id: String,
-        profile: DeviceProfileWire,
-        devices: Vec<DeviceProfileWire>,
-        vector: BTreeMap<String, i64>,
-        ops: Vec<SyncOpWire>,
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
-    SyncResponse {
-        accepted: bool,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        devices: Vec<DeviceProfileWire>,
-        #[serde(default)]
-        vector: BTreeMap<String, i64>,
-        #[serde(default)]
-        ops: Vec<SyncOpWire>,
-        #[serde(default)]
-        snapshot: SyncSnapshot,
-        #[serde(default)]
-        playback: Option<PlaybackSnapshot>,
-    },
+#[derive(Debug, Clone, Default)]
+struct PlaybackShared {
+    engine: Option<Engine>,
+    engine_group: String,
+    local: Option<PlaybackSnapshot>,
+    remote: BTreeMap<String, PlaybackSnapshot>,
+    /// Echoed placeholders last left out of each older device's snapshot
+    /// (`drop_echoed_private_items`), to report a change only once.
+    echoed: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalIdentity {
+    device_id: String,
+    group_id: String,
+    name: String,
+}
+
+enum PairAttempt {
+    Accepted(String),
+    Pending,
+    Denied(String),
+}
+
+struct PairingStatus {
+    status: String,
+    use_requester_group: bool,
+}
+
+/// How the protocol version in a device profile became known.
+///
+/// Version gating (podcast operations, snapshot sections and playback
+/// state need v4) depends on these values, so this device never stores its
+/// own [`PROTOCOL_VERSION`] for another device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionReport {
+    /// The device reported its own version (`None`: an older client left it
+    /// out). Replaces the stored version, so a downgrade is noticed.
+    SelfReported(Option<u16>),
+    /// Another device relayed the profile. Only raises the stored version:
+    /// v1–v3 relays substitute their own constant.
+    Relayed(u16),
+}
+
+impl VersionReport {
+    fn resolve(self, stored: Option<u16>) -> u16 {
+        match self {
+            VersionReport::SelfReported(reported) => {
+                music_dht::device_sync::profile_protocol_version(reported, stored)
+            }
+            VersionReport::Relayed(relayed) => {
+                music_dht::device_sync::relayed_protocol_version(relayed, stored)
+            }
+        }
+    }
+
+    /// Report carried by an entry of a `devices` list sent by `sender`.
+    fn for_listed(profile: &DeviceProfileWire, sender: Option<&str>) -> Self {
+        if sender == Some(profile.device_id.as_str()) {
+            VersionReport::SelfReported(Some(profile.protocol_version))
+        } else {
+            VersionReport::Relayed(profile.protocol_version)
+        }
+    }
+}
+
+/// The stored protocol version of a device, if any row exists.
+fn stored_protocol_version(conn: &Connection, device_id: &str) -> Result<Option<u16>> {
+    Ok(conn
+        .query_row(
+            "SELECT protocol_version FROM sync_devices WHERE device_id = ?1",
+            [device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .and_then(|version| u16::try_from(version).ok()))
 }
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -634,6 +598,7 @@ impl DeviceSync {
             library,
             event_tx: Arc::new(std::sync::Mutex::new(None)),
             playback: Arc::new(std::sync::Mutex::new(PlaybackShared::default())),
+            podcasts: Arc::default(),
         });
         sync.ensure_identity()?;
         sync.repair_like_order_from_sync_state()?;
@@ -794,9 +759,186 @@ impl DeviceSync {
                 client_version: CLIENT_VERSION.to_string(),
                 endpoint_ticket: ticket.to_string(),
                 endpoint_id,
+                protocol_version: Some(PROTOCOL_VERSION),
             })?;
         }
         Ok(())
+    }
+
+    /// Protocol version a device reported itself, for version gating.
+    /// Unknown devices count as the oldest protocol.
+    pub fn peer_protocol_version(&self, device_id: &str) -> Result<u16> {
+        let stored = stored_protocol_version(&lock(&self.conn), device_id)?;
+        Ok(music_dht::device_sync::profile_protocol_version(
+            None, stored,
+        ))
+    }
+
+    /// Connects the podcast store. Podcast operations received from now on
+    /// are applied to it, and those that arrived while it was unavailable
+    /// (or whose application failed) are applied first. Blocking.
+    pub fn attach_podcast_store(&self, store: Arc<PodcastStore>) -> Result<()> {
+        let pending = {
+            // Same lock order as `apply_podcast_op`: link, then log. An
+            // operation received concurrently is either in this list or
+            // sees the attached store.
+            let mut link = lock(&self.podcasts);
+            link.store = Some(Arc::clone(&store));
+            let conn = lock(&self.conn);
+            // Rows whose operation was coalesced away have nothing to apply.
+            conn.execute(
+                "DELETE FROM sync_podcast_pending
+                 WHERE op_id NOT IN (SELECT op_id FROM sync_ops)",
+                [],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT o.op_id, o.origin_device_id, o.seq, o.hlc_ms, o.payload_json
+                 FROM sync_podcast_pending p
+                 JOIN sync_ops o ON o.op_id = p.op_id
+                 ORDER BY o.hlc_ms, o.op_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut applied = 0usize;
+        for (op_id, origin_device_id, seq, hlc_ms, payload_json) in pending {
+            let op = match serde_json::from_str(&payload_json) {
+                Ok(payload) => SyncOpWire {
+                    op_id: op_id.clone(),
+                    origin_device_id,
+                    seq,
+                    hlc_ms,
+                    payload,
+                },
+                Err(err) => {
+                    tracing::warn!(%op_id, "dropping an unreadable podcast operation: {err}");
+                    lock(&self.conn).execute(
+                        "DELETE FROM sync_podcast_pending WHERE op_id = ?1",
+                        [&op_id],
+                    )?;
+                    continue;
+                }
+            };
+            match self.apply_podcast_op_to(&store, &op) {
+                Ok(()) => {
+                    applied += 1;
+                    lock(&self.conn).execute(
+                        "DELETE FROM sync_podcast_pending WHERE op_id = ?1",
+                        [&op_id],
+                    )?;
+                }
+                Err(err) => {
+                    tracing::warn!(%op_id, "podcast operation still not applied: {err:#}");
+                }
+            }
+        }
+        if applied > 0 {
+            tracing::info!(applied, "applied podcast operations received earlier");
+        }
+        self.flush_podcast_changes();
+        Ok(())
+    }
+
+    fn podcast_store(&self) -> Option<Arc<PodcastStore>> {
+        lock(&self.podcasts).store.clone()
+    }
+
+    /// Merges a received podcast operation into the podcast store, or keeps
+    /// it for [`DeviceSync::attach_podcast_store`]. A podcast store problem
+    /// never fails music sync: the operation stays in the log either way.
+    fn apply_podcast_op(&self, op: &SyncOpWire) -> Result<()> {
+        let store = {
+            let link = lock(&self.podcasts);
+            match &link.store {
+                Some(store) => Arc::clone(store),
+                None => {
+                    lock(&self.conn).execute(
+                        "INSERT OR IGNORE INTO sync_podcast_pending (op_id) VALUES (?1)",
+                        [&op.op_id],
+                    )?;
+                    return Ok(());
+                }
+            }
+        };
+        if let Err(err) = self.apply_podcast_op_to(&store, op) {
+            tracing::warn!(op_id = %op.op_id, "podcast operation not applied yet: {err:#}");
+            lock(&self.conn).execute(
+                "INSERT OR IGNORE INTO sync_podcast_pending (op_id) VALUES (?1)",
+                [&op.op_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_podcast_op_to(&self, store: &PodcastStore, op: &SyncOpWire) -> Result<()> {
+        match store.apply_remote_op(op)? {
+            PodcastApplyOutcome::Changed => {
+                let mut link = lock(&self.podcasts);
+                match op.podcast_progress() {
+                    Some(record) => link.progress.push(record),
+                    None => link.changed = true,
+                }
+            }
+            // Acknowledged anyway so the log keeps moving (FRID contract).
+            PodcastApplyOutcome::Rejected(reason) => tracing::warn!(
+                op_id = %op.op_id,
+                kind = payload_kind(&op.payload),
+                %reason,
+                "skipped an invalid podcast operation"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Merges the podcast sections of a received snapshot.
+    fn apply_podcast_snapshot(&self, snapshot: &SyncSnapshot) {
+        let Some(store) = self.podcast_store() else {
+            // Snapshots come with every sync; a later one is merged.
+            return;
+        };
+        match store.apply_snapshot(snapshot) {
+            Ok(stats) => {
+                if stats.ignored_over_limits {
+                    tracing::warn!("ignored podcast snapshot sections over the shared limits");
+                }
+                if stats.rejected > 0 {
+                    tracing::warn!(
+                        rejected = stats.rejected,
+                        "skipped invalid podcast snapshot records"
+                    );
+                }
+                if stats.changed > 0 {
+                    lock(&self.podcasts).changed = true;
+                }
+            }
+            Err(err) => tracing::warn!("podcast snapshot not merged: {err:#}"),
+        }
+    }
+
+    /// Tells the UI about podcast state that received operations or
+    /// snapshots changed (one event per batch).
+    fn flush_podcast_changes(&self) {
+        let (progress, changed) = {
+            let mut link = lock(&self.podcasts);
+            (
+                std::mem::take(&mut link.progress),
+                std::mem::take(&mut link.changed),
+            )
+        };
+        if (changed || !progress.is_empty())
+            && let Some(tx) = lock(&self.event_tx).as_ref()
+        {
+            let _ = tx.send(AppEvent::PodcastsSynced { progress, changed });
+        }
     }
 
     pub fn status(&self) -> DeviceSyncStatus {
@@ -830,9 +972,9 @@ impl DeviceSync {
             invite_id,
             secret,
             expires_at_ms,
+            protocol_version: Some(PROTOCOL_VERSION),
         };
-        let bytes = serde_json::to_vec(&payload)?;
-        Ok(format!("frid://i/{}", base64url_encode(&bytes)))
+        Ok(encode_invite(&payload)?)
     }
 
     pub async fn connect_invite(
@@ -891,9 +1033,11 @@ impl DeviceSync {
         let profile = self.own_profile(&own_ticket)?;
         let devices = self.device_profiles()?;
         let vector = self.vector()?;
-        let ops = self.ops_for_peer(&invite.device_id)?;
-        let snapshot = self.snapshot()?;
-        let playback = self.local_playback_snapshot();
+        // The inviter has not reported anything yet but its invite.
+        let peer_version = invite.inviter_protocol_version();
+        let ops = self.ops_for_peer(&invite.device_id, peer_version)?;
+        let snapshot = self.snapshot_for(peer_version)?;
+        let playback = self.local_playback_snapshot_for(peer_version);
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         crate::federation::record_stream_transport(
             &transport_stats,
@@ -942,15 +1086,18 @@ impl DeviceSync {
                 ..
             } => {
                 self.set_group_id(&group_id)?;
-                if let Some(profile) = profile {
-                    self.apply_device_profile(&profile, true)?;
+                if let Some(profile) = &profile {
+                    self.apply_device_profile(
+                        profile,
+                        true,
+                        VersionReport::SelfReported(Some(profile.protocol_version)),
+                    )?;
                     if let Some(playback) = playback {
                         self.apply_playback_snapshot(&profile.device_id, playback)?;
                     }
                 }
-                self.apply_device_profiles(&devices)?;
-                self.apply_snapshot(snapshot)?;
-                self.apply_ops(ops)?;
+                self.apply_device_profiles(&devices, Some(&invite.device_id))?;
+                self.apply_received(snapshot, ops)?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: invite.device_id.clone(),
                 })?;
@@ -989,7 +1136,8 @@ impl DeviceSync {
             conn.query_row(
                 "SELECT device_id, name, client_version, endpoint_id,
                         endpoint_ticket, created_at_ms,
-                        requester_group_id, requester_group_devices_json
+                        requester_group_id, requester_group_devices_json,
+                        protocol_version
                  FROM sync_pending_pairing
                  WHERE request_id = ?1",
                 [request_id],
@@ -999,7 +1147,7 @@ impl DeviceSync {
                             device_id: row.get(0)?,
                             name: row.get(1)?,
                             client_version: row.get(2)?,
-                            protocol_version: PROTOCOL_VERSION,
+                            protocol_version: music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION,
                             endpoint_id: row.get(3)?,
                             endpoint_ticket: row.get(4)?,
                             revoked: false,
@@ -1008,6 +1156,8 @@ impl DeviceSync {
                         },
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<i64>>(8)?
+                            .and_then(|version| u16::try_from(version).ok()),
                     ))
                 },
             )
@@ -1028,7 +1178,13 @@ impl DeviceSync {
             )?
         };
         if accept && changed > 0 {
-            if let Some((profile, requester_group_id, requester_group_devices_json)) = pending {
+            if let Some((
+                profile,
+                requester_group_id,
+                requester_group_devices_json,
+                requester_version,
+            )) = pending
+            {
                 if use_requester_group {
                     if let Some(group_id) = requester_group_id
                         .as_deref()
@@ -1038,9 +1194,15 @@ impl DeviceSync {
                     }
                     let requester_devices: Vec<DeviceProfileWire> =
                         serde_json::from_str(&requester_group_devices_json)?;
-                    self.apply_device_profiles(&requester_devices)?;
+                    self.apply_device_profiles(&requester_devices, Some(&profile.device_id))?;
                 }
-                self.apply_device_profile(&profile, true)?;
+                // The version the requester reported in its own pairing
+                // request (requests stored by older builds have none).
+                self.apply_device_profile(
+                    &profile,
+                    true,
+                    VersionReport::SelfReported(requester_version),
+                )?;
                 self.record_local_op(SyncOpPayload::DeviceTrusted {
                     target_device_id: profile.device_id,
                 })?;
@@ -1199,6 +1361,11 @@ impl DeviceSync {
         listened_ms: i64,
         ended_reason: music_dht::device_sync::ListenEndReason,
     ) -> Option<ListenEvent> {
+        // Music listening history only: episodes record podcast listening
+        // sessions in the podcast store instead.
+        if track.is_podcast() {
+            return None;
+        }
         let content_id = track
             .content_id
             .as_deref()
@@ -1324,6 +1491,30 @@ impl DeviceSync {
         Ok(())
     }
 
+    /// Runs a `PodcastStore` local action with stamps reserved in this
+    /// device's sync log and appends the operations it returns with exactly
+    /// those stamps (`op_id`, `seq`, `hlc_ms`).
+    ///
+    /// The log connection stays locked from the first stamp until the
+    /// operations are appended, so no sync batch can read past a reserved
+    /// `seq` before its operation exists. Lock order is podcast store, then
+    /// this log: never call the podcast store while holding `self.conn`.
+    pub fn run_podcast_action<T>(
+        &self,
+        action: impl FnOnce(&mut dyn PodcastStampSource) -> Result<(T, Vec<PodcastLocalOp>)>,
+    ) -> Result<T> {
+        let identity = self.ensure_identity()?;
+        let mut log = PodcastLogStamps {
+            conn: &self.conn,
+            guard: None,
+            device_id: identity.device_id,
+            reserved: BTreeMap::new(),
+        };
+        let (value, ops) = action(&mut log)?;
+        log.append(ops)?;
+        Ok(value)
+    }
+
     pub async fn sync_once(
         &self,
         service: Arc<MusicDhtService>,
@@ -1358,9 +1549,10 @@ impl DeviceSync {
         let profile = self.own_profile(&own_ticket)?;
         let devices = self.device_profiles()?;
         let vector = self.vector()?;
-        let ops = self.ops_for_peer(&device.device_id)?;
-        let snapshot = self.snapshot()?;
-        let playback = self.local_playback_snapshot();
+        let peer_version = self.peer_protocol_version(&device.device_id)?;
+        let ops = self.ops_for_peer(&device.device_id, peer_version)?;
+        let snapshot = self.snapshot_for(peer_version)?;
+        let playback = self.local_playback_snapshot_for(peer_version);
         let mut stream = service.open_stream(peer, SYNC_ALPN).await?;
         crate::federation::record_stream_transport(
             &transport_stats,
@@ -1403,12 +1595,12 @@ impl DeviceSync {
                 playback,
                 ..
             } => {
-                self.apply_device_profiles(&devices)?;
+                // The responder lists itself: that entry is its own report.
+                self.apply_device_profiles(&devices, Some(&device.device_id))?;
                 if let Some(playback) = playback {
                     self.apply_playback_snapshot(&device.device_id, playback)?;
                 }
-                self.apply_snapshot(snapshot)?;
-                self.apply_ops(ops)?;
+                self.apply_received(snapshot, ops)?;
                 self.note_peer_vector(&device.device_id, &vector)?;
                 self.mark_seen(&device.device_id, Some(peer.to_string()))?;
                 self.set_last_sync(Some(format!("synced {}", short_id(&device.device_id))))?;
@@ -1474,8 +1666,9 @@ impl DeviceSync {
     fn own_profile(&self, endpoint_ticket: &str) -> Result<DeviceProfileWire> {
         let identity = self.ensure_identity()?;
         let endpoint_id = ticket_endpoint_id(endpoint_ticket).unwrap_or_default();
-        {
+        let previous_version = {
             let conn = lock(&self.conn);
+            let previous_version = stored_protocol_version(&conn, &identity.device_id)?;
             conn.execute(
                 "INSERT INTO sync_devices
                     (device_id, name, client_version, protocol_version, endpoint_id,
@@ -1498,6 +1691,19 @@ impl DeviceSync {
                     now_ms(),
                 ],
             )?;
+            previous_version
+        };
+        if previous_version.is_some_and(|version| version < PROTOCOL_VERSION) {
+            // First start of a new protocol version: announce it in the log
+            // too, so devices that only hear of this one through relays
+            // learn its version (`profile_protocol_version`).
+            self.record_local_op(SyncOpPayload::DeviceProfileSet {
+                name: identity.name.clone(),
+                client_version: CLIENT_VERSION.to_string(),
+                endpoint_ticket: endpoint_ticket.to_string(),
+                endpoint_id: endpoint_id.clone(),
+                protocol_version: Some(PROTOCOL_VERSION),
+            })?;
         }
         Ok(DeviceProfileWire {
             device_id: identity.device_id,
@@ -1575,12 +1781,23 @@ impl DeviceSync {
             )
         };
         let _ = self.apply_op(&op)?;
-        tracing::debug!(
-            op_id = %op.op_id,
-            tombstone,
-            payload = %payload_json,
-            "recorded personal-sync op"
-        );
+        if payload_may_hold_private_urls(&op.payload) {
+            // Feed and audio URLs may carry private tokens, and the Logs tab
+            // keeps this crate's debug output: log the kind only.
+            tracing::debug!(
+                op_id = %op.op_id,
+                tombstone,
+                kind = payload_kind(&op.payload),
+                "recorded personal-sync op"
+            );
+        } else {
+            tracing::debug!(
+                op_id = %op.op_id,
+                tombstone,
+                payload = %payload_json,
+                "recorded personal-sync op"
+            );
+        }
         if gc_after_record {
             let _ = self.gc_tombstones();
         }
@@ -1614,6 +1831,7 @@ impl DeviceSync {
             };
             if inserted > 0 {
                 changed |= self.apply_op(&op)?;
+                coalesce_progress_ops(&lock(&self.conn), &op)?;
             }
             let conn = lock(&self.conn);
             conn.execute(
@@ -1627,6 +1845,7 @@ impl DeviceSync {
         if changed {
             self.notify_library_changed();
         }
+        self.flush_podcast_changes();
         Ok(())
     }
 
@@ -1706,19 +1925,27 @@ impl DeviceSync {
                 client_version,
                 endpoint_ticket,
                 endpoint_id,
+                protocol_version,
             } => {
                 let profile = DeviceProfileWire {
                     device_id: op.origin_device_id.clone(),
                     name: name.clone(),
                     client_version: client_version.clone(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: protocol_version
+                        .unwrap_or(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION),
                     endpoint_id: endpoint_id.clone(),
                     endpoint_ticket: endpoint_ticket.clone(),
                     revoked: false,
                     revoke_cutoff_seq: None,
                     updated_at_ms: op.hlc_ms,
                 };
-                self.apply_device_profile(&profile, false)?;
+                // The origin announces its own profile; profiles before v4
+                // carry no version and keep the stored one.
+                self.apply_device_profile(
+                    &profile,
+                    false,
+                    VersionReport::SelfReported(*protocol_version),
+                )?;
                 false
             }
             SyncOpPayload::DeviceTrusted { target_device_id } => {
@@ -1750,6 +1977,16 @@ impl DeviceSync {
             SyncOpPayload::ListenRecorded { event } => self
                 .library
                 .apply_listen_event(event, &op.origin_device_id)?,
+            // Podcast operations (protocol v4) stay in the log, so they are
+            // relayed, and are merged into the podcast store.
+            SyncOpPayload::PodcastSubscriptionSet { .. }
+            | SyncOpPayload::PodcastShareSet { .. }
+            | SyncOpPayload::PodcastFeedAliasesAdded { .. }
+            | SyncOpPayload::PodcastProgressSet { .. }
+            | SyncOpPayload::PodcastListenRecorded { .. } => {
+                self.apply_podcast_op(op)?;
+                false
+            }
         };
         Ok(changed)
     }
@@ -1768,6 +2005,43 @@ impl DeviceSync {
         let Some(authority) = authority else {
             return Ok(());
         };
+        // A peer below v4 does not know podcast items: while this queue has
+        // any, its state would silently drop them. Checked before the
+        // ownership engine sees the command.
+        let peer_version = self.peer_protocol_version(origin)?;
+        let local = lock(&self.playback)
+            .local
+            .as_ref()
+            .map(|snapshot| snapshot.state.clone());
+        if let Some(local) = local
+            && !music_dht::device_sync::playback_command_allowed_from_peer(&local, peer_version)
+        {
+            tracing::info!(
+                origin = %short_id(origin),
+                peer_version,
+                "ignored a playback command from a device without podcast support"
+            );
+            if let Some(tx) = lock(&self.event_tx).as_ref() {
+                let _ = tx.send(AppEvent::StatusMessage(format!(
+                    "ignored playback control from {}: it needs a Furumi update to keep the \
+                     podcast episodes in this queue",
+                    self.device_label(origin)
+                )));
+            }
+            return Ok(());
+        }
+        // Its state may hold the placeholders it was sent, echoed back as
+        // music items: they are left out, never adopted.
+        let mut command = command.clone();
+        let echoed = if music_dht::device_sync::supports_podcasts(peer_version) {
+            0
+        } else {
+            match &mut command {
+                PlaybackCommand::SetState { state, .. }
+                | PlaybackCommand::ActiveChanged { state, .. } => drop_echoed_private_items(state),
+            }
+        };
+        let command = &command;
         let handoff = matches!(command, PlaybackCommand::ActiveChanged { .. });
         if !handoff && target_device_id != identity.device_id {
             return Ok(());
@@ -1803,6 +2077,12 @@ impl DeviceSync {
                 authority: authority.clone(),
                 origin: origin.to_string(),
             });
+            if echoed > 0 {
+                let _ = tx.send(AppEvent::StatusMessage(echoed_private_items_message(
+                    &self.device_label(origin),
+                    echoed,
+                )));
+            }
         }
         Ok(())
     }
@@ -2135,6 +2415,38 @@ impl DeviceSync {
         Ok(visible_changed)
     }
 
+    /// Applies what a peer sent: the music snapshot, the operations, then
+    /// the podcast snapshot sections. Podcast merges are order-independent;
+    /// operations go first so a changed progress register reaches the UI as
+    /// such (it is shown in place) instead of as a generic change.
+    fn apply_received(&self, snapshot: SyncSnapshot, ops: Vec<SyncOpWire>) -> Result<()> {
+        // Called from the async stream handlers; podcast store merges can
+        // wait on a feed refresh holding the store.
+        off_worker(|| self.apply_received_blocking(snapshot, ops))
+    }
+
+    fn apply_received_blocking(
+        &self,
+        mut snapshot: SyncSnapshot,
+        ops: Vec<SyncOpWire>,
+    ) -> Result<()> {
+        let podcast = SyncSnapshot {
+            podcast_subscriptions: std::mem::take(&mut snapshot.podcast_subscriptions),
+            podcast_shares: std::mem::take(&mut snapshot.podcast_shares),
+            podcast_progress: std::mem::take(&mut snapshot.podcast_progress),
+            podcast_listen_sessions: std::mem::take(&mut snapshot.podcast_listen_sessions),
+            ..SyncSnapshot::default()
+        };
+        self.apply_snapshot(snapshot)?;
+        self.apply_ops(ops)?;
+        if podcast.has_podcast_state() {
+            self.apply_podcast_snapshot(&podcast);
+            self.flush_podcast_changes();
+        }
+        Ok(())
+    }
+
+    /// Applies the music sections of a snapshot.
     fn apply_snapshot(&self, snapshot: SyncSnapshot) -> Result<()> {
         let mut changed = false;
         for like in snapshot.likes {
@@ -2196,14 +2508,26 @@ impl DeviceSync {
         Ok(())
     }
 
-    fn apply_device_profiles(&self, devices: &[DeviceProfileWire]) -> Result<()> {
+    /// Stores the profiles of a `devices` list sent by `sender`. The entry
+    /// of the sender itself is its own version report; the others are
+    /// relayed.
+    fn apply_device_profiles(
+        &self,
+        devices: &[DeviceProfileWire],
+        sender: Option<&str>,
+    ) -> Result<()> {
         for profile in devices {
-            self.apply_device_profile(profile, false)?;
+            self.apply_device_profile(profile, false, VersionReport::for_listed(profile, sender))?;
         }
         Ok(())
     }
 
-    fn apply_device_profile(&self, profile: &DeviceProfileWire, trusted: bool) -> Result<()> {
+    fn apply_device_profile(
+        &self,
+        profile: &DeviceProfileWire,
+        trusted: bool,
+        version: VersionReport,
+    ) -> Result<()> {
         let own = self.ensure_identity()?.device_id;
         if profile.device_id == own {
             return Ok(());
@@ -2215,6 +2539,8 @@ impl DeviceSync {
         };
         {
             let conn = lock(&self.conn);
+            let protocol_version =
+                version.resolve(stored_protocol_version(&conn, &profile.device_id)?);
             conn.execute(
                 "INSERT INTO sync_devices
                     (device_id, name, client_version, protocol_version, endpoint_id,
@@ -2250,7 +2576,7 @@ impl DeviceSync {
                     profile.device_id,
                     profile.name,
                     profile.client_version,
-                    profile.protocol_version,
+                    protocol_version,
                     profile.endpoint_id,
                     profile.endpoint_ticket,
                     trusted_at_ms,
@@ -2301,7 +2627,20 @@ impl DeviceSync {
         Ok(())
     }
 
-    fn ops_for_peer(&self, peer_device_id: &str) -> Result<Vec<SyncOpWire>> {
+    /// Operations the peer has not acknowledged and can parse.
+    ///
+    /// Kinds the peer's version does not know are excluded in SQL, so a
+    /// batch of hidden operations cannot stall the per-peer cursor;
+    /// `op_allowed_for_peer` stays the final check (playback commands that
+    /// carry podcast items). Hidden operations are never re-sent after the
+    /// peer upgrades (vectors only grow): snapshots are the recovery path.
+    fn ops_for_peer(&self, peer_device_id: &str, peer_version: u16) -> Result<Vec<SyncOpWire>> {
+        // Every peer of `furumi/sync/2` keeps listen history, even when it
+        // never reported a version (an invite without one, a device known
+        // only from `device_trusted`). Listen events are not part of
+        // snapshots, so skipping them would lose them for good.
+        let peer_version = peer_version.max(SYNC_V2_PROTOCOL_VERSION);
+        let hide_podcasts = !music_dht::device_sync::supports_podcasts(peer_version);
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT o.op_id, o.origin_device_id, o.seq, o.hlc_ms, o.payload_json
@@ -2309,6 +2648,7 @@ impl DeviceSync {
              LEFT JOIN sync_peer_acks a
                ON a.peer_device_id = ?1 AND a.origin_device_id = o.origin_device_id
              WHERE o.seq > COALESCE(a.max_seq, 0)
+               AND NOT (?4 AND substr(o.kind, 1, 8) = 'podcast_')
                AND (
                     o.kind != 'playback_command'
                     OR (
@@ -2323,7 +2663,8 @@ impl DeviceSync {
             params![
                 peer_device_id,
                 now_ms().saturating_sub(PLAYBACK_COMMAND_TTL_MS),
-                MAX_OPS_PER_BATCH as i64
+                MAX_OPS_PER_BATCH as i64,
+                hide_podcasts,
             ],
             |row| {
                 let payload_json: String = row.get(4)?;
@@ -2342,9 +2683,32 @@ impl DeviceSync {
                 })
             },
         )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut ops = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        ops.retain(|op| music_dht::device_sync::op_allowed_for_peer(&op.payload, peer_version));
+        Ok(ops)
     }
 
+    /// The materialized snapshot for a peer: podcast sections (bounded by
+    /// the shared snapshot limits) only for v4 peers.
+    fn snapshot_for(&self, peer_version: u16) -> Result<SyncSnapshot> {
+        let mut snapshot = self.snapshot()?;
+        if music_dht::device_sync::supports_podcasts(peer_version)
+            && let Some(store) = self.podcast_store()
+            && let Err(err) = off_worker(|| {
+                store.fill_snapshot(
+                    &mut snapshot,
+                    music_dht::podcast::MAX_PODCAST_SNAPSHOT_BYTES,
+                )
+            })
+        {
+            // Music sync goes on; podcast state comes with a later sync.
+            tracing::warn!("podcast snapshot export failed: {err:#}");
+            snapshot.strip_podcast_state();
+        }
+        Ok(snapshot.for_peer(peer_version))
+    }
+
+    /// Music sections of the materialized snapshot.
     fn snapshot(&self) -> Result<SyncSnapshot> {
         let like_rows = {
             let conn = lock(&self.conn);
@@ -2496,6 +2860,7 @@ impl DeviceSync {
             playlists,
             deleted_playlists,
             removed_playlist_items,
+            ..SyncSnapshot::default()
         })
     }
 
@@ -2638,7 +3003,7 @@ impl DeviceSync {
         let last_error = get_meta(&conn, "last_error")?;
         let mut stmt = conn.prepare(
             "SELECT device_id, name, client_version, endpoint_id, last_seen_ms,
-                    revoked_at_ms IS NOT NULL
+                    revoked_at_ms IS NOT NULL, protocol_version
              FROM sync_devices
              WHERE trusted_at_ms IS NOT NULL
              ORDER BY revoked_at_ms IS NOT NULL, name COLLATE NOCASE, device_id",
@@ -2654,6 +3019,8 @@ impl DeviceSync {
                     endpoint_id: row.get(3)?,
                     last_seen_ms: row.get(4)?,
                     revoked: row.get::<_, i64>(5)? != 0,
+                    protocol_version: u16::try_from(row.get::<_, i64>(6)?)
+                        .unwrap_or(music_dht::device_sync::UNREPORTED_PROTOCOL_VERSION),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2724,11 +3091,63 @@ impl DeviceSync {
         }
     }
 
-    fn local_playback_snapshot(&self) -> Option<PlaybackSnapshot> {
-        lock(&self.playback).local.clone()
+    /// Refuses to hand a queue with podcast items to a device below v4
+    /// ("that device needs an update"), before ownership changes.
+    pub fn ensure_playback_supported_by(
+        &self,
+        device_id: &str,
+        state: &PlaybackStateWire,
+    ) -> Result<()> {
+        let version = self.peer_protocol_version(device_id)?;
+        anyhow::ensure!(
+            music_dht::device_sync::playback_allowed_for_peer(state, version),
+            "{} needs a Furumi update to play podcast episodes (device sync v{}); update \
+             Furumi there, or remove the episodes from the queue",
+            self.device_label(device_id),
+            music_dht::device_sync::PODCAST_PROTOCOL_VERSION
+        );
+        Ok(())
     }
 
-    fn apply_playback_snapshot(&self, sender: &str, snapshot: PlaybackSnapshot) -> Result<()> {
+    /// Display name of a device, or a short id.
+    fn device_label(&self, device_id: &str) -> String {
+        lock(&self.conn)
+            .query_row(
+                "SELECT name FROM sync_devices WHERE device_id = ?1",
+                [device_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| short_id(device_id))
+    }
+
+    /// The playback snapshot for a peer.
+    ///
+    /// A peer below v4 cannot carry a queue with podcast items
+    /// (`playback_allowed_for_peer`), but it still needs the coordination
+    /// envelope: an engine renews the owner's liveness only from the
+    /// owner's own announcements, so an old device that hears nothing takes
+    /// playback over by automatic failover after `owner_timeout_ms` (two
+    /// minutes by default) and this device would then adopt its queue,
+    /// losing the episodes. Such a peer therefore gets the announcement with
+    /// the queue redacted like for Jam (`redact_for_jam`: every episode
+    /// becomes an opaque "Private item", order and transport kept). The
+    /// episodes are never stripped, and the commands the peer derives from
+    /// that state are refused (`playback_command_allowed_from_peer`).
+    /// FRID's PLAYBACK_PROTOCOL.md rule 1 still says "send `None`"; this is
+    /// reported as a contract gap.
+    fn local_playback_snapshot_for(&self, peer_version: u16) -> Option<PlaybackSnapshot> {
+        let mut snapshot = lock(&self.playback).local.clone()?;
+        if !music_dht::device_sync::playback_allowed_for_peer(&snapshot.state, peer_version) {
+            snapshot.state = music_dht::device_sync::redact_for_jam(snapshot.state);
+        }
+        Some(snapshot)
+    }
+
+    fn apply_playback_snapshot(&self, sender: &str, mut snapshot: PlaybackSnapshot) -> Result<()> {
         let identity = self.ensure_identity()?;
         if snapshot.device_id != sender || snapshot.device_id == identity.device_id {
             return Ok(());
@@ -2736,12 +3155,18 @@ impl DeviceSync {
         let Some(coordination) = &snapshot.coordination else {
             return Ok(());
         };
+        let echoed =
+            if music_dht::device_sync::supports_podcasts(self.peer_protocol_version(sender)?) {
+                0
+            } else {
+                drop_echoed_private_items(&mut snapshot.state)
+            };
         if !self.with_playback_engine(|engine| {
             engine.observe(&snapshot.device_id, coordination, playback_clock())
         })? {
             return Ok(());
         }
-        let should_send = {
+        let (should_send, report_echoed) = {
             let mut shared = lock(&self.playback);
             let changed = shared.remote.get(&snapshot.device_id).is_none_or(|old| {
                 old.coordination.as_ref().is_none_or(|c| {
@@ -2754,10 +3179,17 @@ impl DeviceSync {
                     .remote
                     .insert(snapshot.device_id.clone(), snapshot.clone());
             }
-            changed
+            let reported = shared.echoed.insert(snapshot.device_id.clone(), echoed);
+            (changed, changed && echoed > 0 && reported != Some(echoed))
         };
         if should_send && let Some(tx) = lock(&self.event_tx).as_ref() {
+            let device = snapshot.device_name.clone();
             let _ = tx.send(AppEvent::DevicePlayback(snapshot));
+            if report_echoed {
+                let _ = tx.send(AppEvent::StatusMessage(echoed_private_items_message(
+                    &device, echoed,
+                )));
+            }
         }
         Ok(())
     }
@@ -2796,6 +3228,101 @@ impl DeviceSync {
             [],
         )?;
         Ok(())
+    }
+}
+
+/// Stamp source over the sync log for [`DeviceSync::run_podcast_action`].
+struct PodcastLogStamps<'a> {
+    conn: &'a std::sync::Mutex<Connection>,
+    /// Taken at the first stamp and held until the operations are appended.
+    guard: Option<std::sync::MutexGuard<'a, Connection>>,
+    device_id: String,
+    /// `op_id` -> reserved `seq`.
+    reserved: BTreeMap<String, i64>,
+}
+
+impl PodcastStampSource for PodcastLogStamps<'_> {
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    fn next_stamp(&mut self) -> Result<PodcastOpStamp> {
+        let conn = self.guard.get_or_insert_with(|| lock(self.conn));
+        let seq = get_meta(conn, "local_seq")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let last_hlc = get_meta(conn, "last_hlc_ms")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let hlc_ms = now_ms().max(last_hlc + 1);
+        set_meta(conn, "local_seq", &seq.to_string())?;
+        set_meta(conn, "last_hlc_ms", &hlc_ms.to_string())?;
+        let op_id = format!("{}:{seq}", self.device_id);
+        self.reserved.insert(op_id.clone(), seq);
+        Ok(PodcastOpStamp::new(op_id, self.device_id.clone(), hlc_ms))
+    }
+}
+
+impl PodcastLogStamps<'_> {
+    fn append(mut self, ops: Vec<PodcastLocalOp>) -> Result<()> {
+        if ops.len() != self.reserved.len() {
+            tracing::warn!(
+                reserved = self.reserved.len(),
+                returned = ops.len(),
+                "podcast action reserved stamps it did not return operations for"
+            );
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let conn = self.guard.get_or_insert_with(|| lock(self.conn));
+        for op in ops {
+            let Some(&seq) = self.reserved.get(&op.stamp.op_id) else {
+                anyhow::bail!(
+                    "podcast operation {} was not stamped by this sync log",
+                    op.stamp.op_id
+                );
+            };
+            let op = op.into_wire(seq);
+            let payload = serde_json::to_value(&op.payload)?;
+            let kind = payload_kind(&op.payload);
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_ops
+                    (op_id, origin_device_id, seq, kind, payload_json, hlc_ms,
+                     received_at_ms, tombstone)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    op.op_id,
+                    op.origin_device_id,
+                    op.seq,
+                    kind,
+                    payload.to_string(),
+                    op.hlc_ms,
+                    now_ms(),
+                    i64::from(op.payload.is_tombstone()),
+                ],
+            )?;
+            coalesce_progress_ops(conn, &op)?;
+            conn.execute(
+                "INSERT INTO sync_vectors (device_id, max_seq)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    max_seq = MAX(max_seq, excluded.max_seq)",
+                params![op.origin_device_id, op.seq],
+            )?;
+            tracing::debug!(op_id = %op.op_id, kind, "recorded podcast sync op");
+        }
+        Ok(())
+    }
+}
+
+impl crate::podcasts::OpLog for DeviceSync {
+    fn record(
+        &self,
+        action: &mut dyn FnMut(&mut dyn PodcastStampSource) -> Result<Vec<PodcastLocalOp>>,
+    ) -> Result<()> {
+        self.run_podcast_action(|stamps| Ok(((), action(stamps)?)))
     }
 }
 
@@ -3015,9 +3542,10 @@ async fn handle_pair_request(
                 (request_id, device_id, name, client_version, endpoint_id,
                  endpoint_ticket, invite_id, created_at_ms, status,
                  requester_group_id, requester_group_active_devices,
-                 requester_group_devices_json, use_requester_group)
+                 requester_group_devices_json, use_requester_group,
+                 protocol_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending',
-                     ?9, ?10, ?11, 0)",
+                     ?9, ?10, ?11, 0, ?12)",
             params![
                 request_id,
                 profile.device_id,
@@ -3030,6 +3558,7 @@ async fn handle_pair_request(
                 requester_group_id.as_deref(),
                 requester_group_active_devices as i64,
                 requester_group_devices_json,
+                profile.protocol_version,
             ],
         )?
     };
@@ -3107,14 +3636,17 @@ async fn handle_pair_request(
     {
         sync.set_group_id(group_id)?;
         response_group_id = group_id.to_string();
-        sync.apply_device_profiles(&requester_group_devices)?;
+        sync.apply_device_profiles(&requester_group_devices, Some(&profile.device_id))?;
     }
-    sync.apply_device_profile(&profile, true)?;
+    sync.apply_device_profile(
+        &profile,
+        true,
+        VersionReport::SelfReported(Some(profile.protocol_version)),
+    )?;
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
-    sync.apply_snapshot(snapshot)?;
-    sync.apply_ops(ops)?;
+    sync.apply_received(snapshot, ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     {
         let conn = lock(&sync.conn);
@@ -3126,9 +3658,10 @@ async fn handle_pair_request(
     sync.set_last_sync(Some(format!("paired {}", short_id(&profile.device_id))))?;
     let devices = sync.device_profiles()?;
     let vector = sync.vector()?;
-    let ops = sync.ops_for_peer(&profile.device_id)?;
-    let snapshot = sync.snapshot()?;
-    let playback = sync.local_playback_snapshot();
+    let peer_version = sync.peer_protocol_version(&profile.device_id)?;
+    let ops = sync.ops_for_peer(&profile.device_id, peer_version)?;
+    let snapshot = sync.snapshot_for(peer_version)?;
+    let playback = sync.local_playback_snapshot_for(peer_version);
     write_msg(
         &mut stream,
         &WireMessage::PairResponse {
@@ -3198,13 +3731,16 @@ async fn handle_hello(
         return Ok(());
     }
     profile.endpoint_id = stream.peer_id.to_string();
-    sync.apply_device_profile(&profile, false)?;
-    sync.apply_device_profiles(&devices)?;
+    sync.apply_device_profile(
+        &profile,
+        false,
+        VersionReport::SelfReported(Some(profile.protocol_version)),
+    )?;
+    sync.apply_device_profiles(&devices, Some(&profile.device_id))?;
     if let Some(playback) = playback {
         sync.apply_playback_snapshot(&profile.device_id, playback)?;
     }
-    sync.apply_snapshot(snapshot)?;
-    sync.apply_ops(ops)?;
+    sync.apply_received(snapshot, ops)?;
     sync.note_peer_vector(&profile.device_id, &vector)?;
     sync.mark_seen(&profile.device_id, Some(stream.peer_id.to_string()))?;
     sync.set_last_sync(Some(format!("synced {}", short_id(&profile.device_id))))?;
@@ -3213,9 +3749,10 @@ async fn handle_hello(
     let own_profile = sync.own_profile(&own_ticket)?;
     let devices = sync.device_profiles()?;
     let vector = sync.vector()?;
-    let ops = sync.ops_for_peer(&profile.device_id)?;
-    let snapshot = sync.snapshot()?;
-    let playback = sync.local_playback_snapshot();
+    let peer_version = sync.peer_protocol_version(&profile.device_id)?;
+    let ops = sync.ops_for_peer(&profile.device_id, peer_version)?;
+    let snapshot = sync.snapshot_for(peer_version)?;
+    let playback = sync.local_playback_snapshot_for(peer_version);
     write_msg(
         &mut stream,
         &WireMessage::SyncResponse {
@@ -3412,6 +3949,10 @@ CREATE TABLE IF NOT EXISTS sync_playback_applied (
     op_id         TEXT PRIMARY KEY,
     applied_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sync_podcast_pending (
+    op_id TEXT PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS idx_sync_ops_kind ON sync_ops(kind);
     "#,
     )?;
     ensure_column(
@@ -3440,6 +3981,13 @@ CREATE TABLE IF NOT EXISTS sync_playback_applied (
         "use_requester_group",
         "ALTER TABLE sync_pending_pairing
          ADD COLUMN use_requester_group INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Protocol version the requester reported in its pairing request.
+    ensure_column(
+        conn,
+        "sync_pending_pairing",
+        "protocol_version",
+        "ALTER TABLE sync_pending_pairing ADD COLUMN protocol_version INTEGER",
     )?;
     Ok(())
 }
@@ -3486,6 +4034,41 @@ fn delete_meta(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Keeps only the newest `podcast_progress_set` of an origin per episode in
+/// the log (the periodic checkpoints of a playing episode would grow it
+/// without bound).
+///
+/// Safe because the operations of one origin are ordered: a later one has
+/// a later `hlc_ms` and never a lower progress generation, so it wins every
+/// register comparison against the earlier ones. Peers that have not
+/// received the removed operations get the later one, and their vector
+/// skips the gap as usual.
+fn coalesce_progress_ops(conn: &Connection, op: &SyncOpWire) -> Result<()> {
+    let SyncOpPayload::PodcastProgressSet { episode_id, .. } = &op.payload else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM sync_ops
+         WHERE origin_device_id = ?1
+           AND kind = 'podcast_progress_set'
+           AND seq < ?2
+           AND json_extract(payload_json, '$.episode_id') = ?3",
+        params![op.origin_device_id, op.seq, episode_id.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Podcast operations and playback commands with podcast items carry feed
+/// and audio URLs, which may hold private tokens: never log their payload.
+fn payload_may_hold_private_urls(payload: &SyncOpPayload) -> bool {
+    payload.is_podcast()
+        || matches!(
+            payload,
+            SyncOpPayload::PlaybackCommand { command, .. }
+                if music_dht::device_sync::playback_command_has_podcasts(command)
+        )
+}
+
 fn payload_kind(payload: &SyncOpPayload) -> &'static str {
     match payload {
         SyncOpPayload::TrackLikeSet { .. } => "track_like_set",
@@ -3499,6 +4082,11 @@ fn payload_kind(payload: &SyncOpPayload) -> &'static str {
         SyncOpPayload::DeviceRevoked { .. } => "device_revoked",
         SyncOpPayload::PlaybackCommand { .. } => "playback_command",
         SyncOpPayload::ListenRecorded { .. } => "listen_recorded",
+        SyncOpPayload::PodcastSubscriptionSet { .. } => "podcast_subscription_set",
+        SyncOpPayload::PodcastShareSet { .. } => "podcast_share_set",
+        SyncOpPayload::PodcastFeedAliasesAdded { .. } => "podcast_feed_aliases_added",
+        SyncOpPayload::PodcastProgressSet { .. } => "podcast_progress_set",
+        SyncOpPayload::PodcastListenRecorded { .. } => "podcast_listen_recorded",
     }
 }
 
@@ -3659,55 +4247,47 @@ fn peer_ack_floor_label(conn: &Connection) -> Result<String> {
 }
 
 async fn write_msg(stream: &mut ByteStream, message: &WireMessage) -> Result<()> {
-    let mut payload = serde_json::to_vec(message)?;
-    payload.push(b'\n');
-    stream.send.write_all(&payload).await?;
+    let mut message = message.clone();
+    fit_podcast_snapshot(&mut message);
+    music_dht::device_sync::write_msg(stream, &message).await?;
     Ok(())
 }
 
-async fn finish_send(stream: &mut ByteStream) -> Result<()> {
-    stream.send.finish()?;
-    Ok(())
+fn message_snapshot(message: &mut WireMessage) -> &mut SyncSnapshot {
+    match message {
+        WireMessage::PairRequest { snapshot, .. }
+        | WireMessage::PairResponse { snapshot, .. }
+        | WireMessage::Hello { snapshot, .. }
+        | WireMessage::SyncResponse { snapshot, .. } => snapshot,
+    }
+}
+
+/// Bounds the podcast snapshot sections so the whole line stays under the
+/// protocol limit (`podcast_snapshot_budget`): the operations, music
+/// snapshot and playback queue of the same message come first.
+fn fit_podcast_snapshot(message: &mut WireMessage) {
+    if !message_snapshot(message).has_podcast_state() {
+        return;
+    }
+    let podcast = message_snapshot(message).clone();
+    message_snapshot(message).strip_podcast_state();
+    let other_bytes = serde_json::to_vec(message).map_or(usize::MAX, |bytes| bytes.len());
+    let snapshot = message_snapshot(message);
+    *snapshot = podcast;
+    snapshot.bound_podcast_state_to(music_dht::device_sync::podcast_snapshot_budget(other_bytes));
 }
 
 async fn finish_response(stream: &mut ByteStream) -> Result<()> {
-    stream.send.finish()?;
-    let _ = tokio::time::timeout(RESPONSE_DRAIN_TIMEOUT, stream.send.stopped()).await;
+    music_dht::device_sync::finish_response(stream, RESPONSE_DRAIN_TIMEOUT).await?;
     Ok(())
 }
 
-async fn read_msg(stream: &mut ByteStream) -> Result<WireMessage> {
-    let line = read_line(&mut stream.recv).await?;
-    Ok(serde_json::from_slice(&line)?)
-}
-
-async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let read = reader.read(&mut byte).await?;
-        if read == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        out.push(byte[0]);
-        if out.len() > MAX_LINE {
-            anyhow::bail!("protocol line is too large");
-        }
-    }
-    Ok(out)
-}
-
 fn parse_invite(value: &str) -> Result<InviteWire> {
-    let Some(token) = value.trim().strip_prefix("frid://i/") else {
-        anyhow::bail!("usage: :connect frid://i/<invite>");
-    };
-    let bytes = base64url_decode(token)?;
-    let invite: InviteWire = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(invite.v == 1, "unsupported invite version");
-    Ok(invite)
+    anyhow::ensure!(
+        value.trim().starts_with("frid://i/"),
+        "usage: :connect frid://i/<invite>"
+    );
+    Ok(music_dht::device_sync::parse_invite(value)?)
 }
 
 pub fn invite_network_id(value: &str) -> Result<NetworkId> {
@@ -3719,26 +4299,8 @@ pub fn invite_network_id(value: &str) -> Result<NetworkId> {
     Ok(ticket.network_id)
 }
 
-fn hash_secret(secret: &str) -> String {
-    blake3::hash(secret.as_bytes()).to_hex().to_string()
-}
-
-fn random_hex(bytes: usize) -> String {
-    let key = SecretKey::generate();
-    let mut seed = key.to_bytes().to_vec();
-    while seed.len() < bytes {
-        seed.extend_from_slice(blake3::hash(&seed).as_bytes());
-    }
-    hex_encode(&seed[..bytes])
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn ticket_endpoint_id(ticket: &str) -> Option<String> {
-    let ticket = PeerTicket::from_str(ticket).ok()?;
-    Some(ticket.endpoint_id().to_string())
 }
 
 fn default_device_name(device_id: &str) -> String {
@@ -3754,65 +4316,33 @@ fn short_id(value: &str) -> String {
     value.chars().take(10).collect()
 }
 
-fn base64url_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes.get(i + 1).copied().unwrap_or(0);
-        let b2 = bytes.get(i + 2).copied().unwrap_or(0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < bytes.len() {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if i + 2 < bytes.len() {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        }
-        i += 3;
-    }
-    out
-}
-
-fn base64url_decode(value: &str) -> Result<Vec<u8>> {
-    fn val(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'-' => Some(62),
-            b'_' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes = value.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let a = val(bytes[i]).context("invalid base64url invite")?;
-        let b = val(*bytes.get(i + 1).context("truncated base64url invite")?)
-            .context("invalid base64url invite")?;
-        let c = bytes.get(i + 2).and_then(|byte| val(*byte));
-        let d = bytes.get(i + 3).and_then(|byte| val(*byte));
-        out.push((a << 2) | (b >> 4));
-        if let Some(c) = c {
-            out.push(((b & 0b0000_1111) << 4) | (c >> 2));
-            if let Some(d) = d {
-                out.push(((c & 0b0000_0011) << 6) | d);
-            }
-        }
-        i += 4;
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 #[path = "devices/tests.rs"]
 mod tests;
 
 #[cfg(test)]
 mod interop_tests;
+
+#[cfg(test)]
+mod wire_compat_tests;
+
+#[cfg(test)]
+mod podcast_sync_tests;
+
+/// Runs podcast store work from an async device-sync handler without
+/// stalling a Tokio worker: the store may be busy with a feed refresh (one
+/// transaction, up to about half a second for a very large feed). On the
+/// multi-thread runtime the worker hands its other tasks over while `work`
+/// runs (`block_in_place`); elsewhere (blocking pool, tests without a
+/// runtime, a current-thread runtime) it simply runs.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
 
 fn playback_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

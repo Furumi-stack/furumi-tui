@@ -134,31 +134,124 @@ mod tests {
         assert_eq!((cell.fg, cell.bg), (highlight.fg, highlight.bg));
     }
 
+    use crate::app::podcast_fixtures;
+
     #[test]
-    fn podcasts_tab_shows_placeholder() {
+    fn podcasts_tab_reports_opening_and_failed_store() {
         let mut state = AppState::default();
         state.active_tab = Tab::Podcasts;
         let screen = render(&state, 100, 12);
-        assert!(screen.contains(podcasts::UNAVAILABLE), "{screen}");
-    }
+        assert!(screen.contains("opening the podcast database"), "{screen}");
 
-    #[test]
-    fn podcasts_placeholder_wraps_without_losing_text_on_narrow_terminals() {
-        let mut state = AppState::default();
-        state.active_tab = Tab::Podcasts;
-        for width in [60, 40] {
-            let screen = render(&state, width, 14);
+        state.podcasts.store = crate::app::state::PodcastStoreStatus::Failed(
+            "podcast database schema v9 is newer than this Furumi supports".into(),
+        );
+        for width in [100, 50] {
+            let screen = render(&state, width, 16);
             let words: Vec<&str> = screen
                 .split(|c: char| c.is_whitespace() || c == '│')
                 .filter(|word| !word.is_empty())
                 .collect();
-            for word in ["available", "progress", "appear", "here."] {
-                assert!(
-                    words.contains(&word),
-                    "{word} missing at {width}:\n{screen}"
-                );
+            for word in ["unavailable", "v9", "newer", "unchanged."] {
+                assert!(words.contains(&word), "{word} at {width}:\n{screen}");
             }
         }
+    }
+
+    #[test]
+    fn podcasts_list_shows_actions_counts_and_errors() {
+        let state = podcast_fixtures::ready_state(Vec::new());
+        let screen = render(&state, 100, 14);
+        assert!(screen.contains("+ Add podcast (RSS feed URL)"), "{screen}");
+        assert!(screen.contains("Check all podcasts"), "{screen}");
+        assert!(screen.contains("No subscriptions yet"), "{screen}");
+
+        let mut row = podcast_fixtures::row("Test Show", 2, 3, 0);
+        row.fetch.last_error = Some("HTTP 503 Service Unavailable".into());
+        row.fetch.consecutive_failures = 2;
+        let mut state = podcast_fixtures::ready_state(vec![row]);
+        state.podcasts.selected = crate::app::state::PODCAST_ACTION_ROWS;
+        // Wide: side panel with details; narrow: status below the list.
+        for width in [110, 60] {
+            let screen = render(&state, width, 30);
+            assert!(screen.contains("! Test Show"), "{screen}");
+            assert!(screen.contains("2 unplayed · 3 ep"), "{screen}");
+            assert!(screen.contains("last check failed"), "{screen}");
+            assert!(screen.contains("503"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn podcast_seasons_and_episodes_render_progress() {
+        use music_dht::podcast::ProgressStatus;
+
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 1, 5, 1)]);
+        state.podcasts.opened = Some(crate::app::state::OpenedPodcast {
+            podcast_id: podcast_fixtures::podcast_id(),
+            season_cursor: Some(0),
+            season: None,
+            episode_cursor: 0,
+        });
+        state.podcasts.seasons = Some((
+            podcast_fixtures::podcast_id(),
+            Loadable::Ready(podcast_fixtures::seasons()),
+        ));
+        let screen = render(&state, 100, 14);
+        assert!(screen.contains("All episodes"), "{screen}");
+        assert!(screen.contains("1 unplayed · 5 ep"), "{screen}");
+        assert!(screen.contains("Season 1"), "{screen}");
+        assert!(screen.contains("2021–2022"), "{screen}");
+        assert!(screen.contains("Without a season"), "{screen}");
+
+        let state = podcast_fixtures::with_episodes(
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 1, 3, 0)]),
+            vec![
+                podcast_fixtures::episode(1, "Pilot", Some((ProgressStatus::Completed, 0))),
+                podcast_fixtures::episode(2, "Second", Some((ProgressStatus::InProgress, 754_000))),
+                podcast_fixtures::episode(3, "Third", None),
+            ],
+        );
+        let screen = render(&state, 110, 30);
+        assert!(
+            screen.contains("3 episodes · all episodes · newest first"),
+            "{screen}"
+        );
+        assert!(screen.contains("✓ 2024-06-15  S1E1 Pilot"), "{screen}");
+        assert!(screen.contains("played · 45:00"), "{screen}");
+        assert!(screen.contains("◐ 2024-06-15  S1E2 Second"), "{screen}");
+        assert!(screen.contains("12:34 / 45:00"), "{screen}");
+        assert!(screen.contains("● 2024-06-15  S1E3 Third"), "{screen}");
+        assert!(screen.contains("Notes for Pilot."), "{screen}");
+
+        // The episode playing here shows its live position.
+        let mut state = state;
+        let mut playing = podcast_fixtures::episode_track(3);
+        playing.title = "Third".into();
+        state.player.queue = vec![playing.clone()];
+        state.player.current = Some(playing);
+        state.player.playing = true;
+        state.player.position_secs = 61.0;
+        let screen = render(&state, 110, 30);
+        assert!(screen.contains("▶ 2024-06-15  S1E3 Third"), "{screen}");
+        assert!(screen.contains("1:01 / 45:00"), "{screen}");
+        assert!(screen.contains("◐ 2024-06-15  S1E2 Second"), "{screen}");
+    }
+
+    #[test]
+    fn podcast_unsubscribe_confirmation_says_progress_is_kept() {
+        let mut state =
+            podcast_fixtures::ready_state(vec![podcast_fixtures::row("Test Show", 0, 1, 0)]);
+        state.popup = Some(crate::app::state::Popup::ConfirmPodcastUnsubscribe {
+            podcast_id: podcast_fixtures::podcast_id(),
+            title: "Test Show".into(),
+        });
+        let screen = render(&state, 100, 24);
+        assert!(
+            screen.contains("Unsubscribe from \"Test Show\"?"),
+            "{screen}"
+        );
+        assert!(screen.contains("progress and history are kept"), "{screen}");
     }
 
     #[test]

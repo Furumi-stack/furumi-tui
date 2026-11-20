@@ -128,6 +128,7 @@ fn test_track(id: i64) -> TrackItem {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     }
 }
 
@@ -522,6 +523,7 @@ fn queue_advances_and_respects_repeat() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState::default();
     state.player.queue = vec![track(1), track(2)];
@@ -587,6 +589,7 @@ fn queue_tab_select_and_clear() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState {
         active_tab: Tab::Queue,
@@ -1062,6 +1065,7 @@ fn shuffle_reorders_tail_and_restores() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState::default();
     state.player.queue = (1..=8).map(track).collect();
@@ -1109,6 +1113,7 @@ fn shift_j_opens_release_from_queue() {
         file_size_bytes: None,
         play_count: 0,
         fed: None,
+        podcast: None,
     };
     let mut state = AppState {
         active_tab: Tab::Queue,
@@ -1435,5 +1440,783 @@ fn card_refresh_animates_while_previous_results_stay_visible() {
             .card_enrichment
             .complete(card, now + Duration::from_secs(31));
         assert!(!render_enrichment_card(&state).contains("searching peers"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Podcasts tab
+
+mod podcast_tab {
+    use furumi_library::podcasts::{EpisodeSort, PlayedFilter, SeasonFilter};
+    use music_dht::podcast::{FeedUrl, PodcastId, ProgressStatus};
+
+    use super::*;
+    use crate::app::podcast_fixtures::{self as fx, podcast_id};
+    use crate::app::state::{
+        FedInputField, PODCAST_ACTION_ROWS, PODCAST_EPISODE_PAGE, PodcastStoreStatus, Popup,
+    };
+    use crate::app::update::podcasts;
+    use crate::podcasts::refresh::{RefreshReport, SubscribeReport};
+
+    fn ready(rows: Vec<crate::app::state::PodcastRow>) -> AppState {
+        let mut state = fx::ready_state(rows);
+        state.podcasts.selected = PODCAST_ACTION_ROWS;
+        state
+    }
+
+    fn other_id() -> PodcastId {
+        PodcastId::from_feed_url(&FeedUrl::parse("https://other.test/feed.xml").unwrap())
+    }
+
+    fn episode_request(effect: Option<Effect>) -> (u64, furumi_library::podcasts::EpisodeQuery) {
+        match effect {
+            Some(Effect::PodcastLoadEpisodes { seq, query }) => (seq, query),
+            other => panic!("expected an episode load, got {other:?}"),
+        }
+    }
+
+    fn page(count: u32) -> Vec<furumi_library::podcasts::EpisodeListItem> {
+        (1..=count)
+            .map(|n| fx::episode(n, &format!("Episode {n}"), None))
+            .collect()
+    }
+
+    #[test]
+    fn podcast_actions_wait_for_the_store() {
+        let mut state = AppState {
+            active_tab: Tab::Podcasts,
+            ..AppState::default()
+        };
+        assert_eq!(update(&mut state, Action::AddPodcast), None);
+        assert!(state.popup.is_none());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("still opening"))
+        );
+        state.podcasts.store = PodcastStoreStatus::Failed("newer schema".into());
+        assert_eq!(update(&mut state, Action::RefreshAllPodcasts), None);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("unavailable: newer schema"))
+        );
+        // Opening the store loads the list.
+        assert_eq!(
+            podcasts::store_opened(&mut state, Ok(())),
+            Some(Effect::PodcastsReload)
+        );
+        assert_eq!(state.podcasts.store, PodcastStoreStatus::Ready);
+    }
+
+    #[test]
+    fn podcast_actions_outside_the_tab_only_explain() {
+        let mut state = fx::ready_state(vec![fx::row("Show", 0, 1, 0)]);
+        state.active_tab = Tab::Global;
+        assert_eq!(update(&mut state, Action::RefreshAllPodcasts), None);
+        assert!(state.podcasts.refreshing.is_empty());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("Podcasts tab (4)"))
+        );
+    }
+
+    #[test]
+    fn podcast_opens_seasons_then_a_season_then_goes_back() {
+        let mut state = ready(vec![fx::row("Show", 1, 5, 1)]);
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PodcastLoadSeasons(podcast_id()))
+        );
+        assert!(!state.podcasts.showing_episodes());
+        podcasts::seasons_loaded(&mut state, podcast_id(), Ok(fx::seasons()));
+        // Rows: All, Season 1, Without a season.
+        assert_eq!(state.podcasts.season_rows().len(), 3);
+        update(&mut state, Action::MoveDown);
+        let (seq, query) = episode_request(update(&mut state, Action::Select));
+        assert_eq!(query.season, SeasonFilter::Season(1));
+        assert_eq!(query.limit, Some(PODCAST_EPISODE_PAGE));
+        assert_eq!(query.offset, 0);
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(3)));
+        update(&mut state, Action::MoveDown);
+        assert_eq!(
+            state
+                .podcasts
+                .selected_episode()
+                .map(|item| item.episode.title.as_str()),
+            Some("Episode 2")
+        );
+
+        // Esc: episodes -> seasons (cursor kept) -> list (on the podcast).
+        update(&mut state, Action::Back);
+        let opened = state.podcasts.opened.as_ref().unwrap();
+        assert_eq!((opened.season, opened.season_cursor), (None, Some(1)));
+        update(&mut state, Action::Back);
+        assert!(state.podcasts.opened.is_none());
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS);
+        // A late seasons result for the closed podcast is ignored.
+        podcasts::seasons_loaded(&mut state, podcast_id(), Ok(Vec::new()));
+        assert!(state.podcasts.opened_seasons().is_none());
+    }
+
+    #[test]
+    fn podcast_without_seasons_opens_its_episodes_and_tab_key_resets() {
+        let mut state = ready(vec![fx::row("Show", 1, 2, 0)]);
+        let (_, query) = episode_request(update(&mut state, Action::Select));
+        assert_eq!(query.season, SeasonFilter::Any);
+        assert!(state.podcasts.showing_episodes());
+        // Pressing the tab's number again returns to the list.
+        update(&mut state, Action::GoToTab(Tab::Podcasts.index()));
+        assert!(state.podcasts.opened.is_none());
+    }
+
+    #[test]
+    fn live_search_drops_stale_pages_and_keeps_the_rows_meanwhile() {
+        let mut state = ready(vec![fx::row("Show", 1, 3, 0)]);
+        let (first, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, first, 0, Ok(page(3)));
+
+        update(&mut state, Action::SearchEpisodes);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::FedInput {
+                field: FedInputField::PodcastSearch,
+                ..
+            })
+        ));
+        let (second, query) = episode_request(podcasts::set_search(&mut state, "pilot".into()));
+        assert_eq!(query.search.as_deref(), Some("pilot"));
+        assert!(second > first);
+        // The old rows stay visible while the search runs.
+        let list = state.podcasts.opened_episodes().unwrap();
+        assert!(list.loading);
+        assert_eq!(list.items.len(), 3);
+        // Typing on: the previous request's result arrives late and is dropped.
+        let (third, _) = episode_request(podcasts::set_search(&mut state, "pilot 2".into()));
+        podcasts::episodes_loaded(&mut state, second, 0, Ok(page(2)));
+        assert_eq!(state.podcasts.opened_episodes().unwrap().items.len(), 3);
+        podcasts::episodes_loaded(&mut state, third, 0, Ok(page(1)));
+        let list = state.podcasts.opened_episodes().unwrap();
+        assert_eq!(list.items.len(), 1);
+        assert!(!list.loading && list.complete);
+        // An unchanged search requests nothing.
+        assert_eq!(podcasts::set_search(&mut state, "pilot 2".into()), None);
+        // Search, filter and sort are per opened podcast view.
+        update(&mut state, Action::Back);
+        assert!(state.podcasts.search.is_empty());
+    }
+
+    #[test]
+    fn sort_and_played_filter_reload_from_the_top() {
+        let mut state = ready(vec![fx::row("Show", 1, 3, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(3)));
+        update(&mut state, Action::SelectLast);
+        let (_, query) = episode_request(update(&mut state, Action::CycleEpisodeSort));
+        assert_eq!(query.sort, EpisodeSort::OldestFirst);
+        assert_eq!(state.podcasts.opened.as_ref().unwrap().episode_cursor, 0);
+        let (_, query) = episode_request(update(&mut state, Action::CycleEpisodeFilter));
+        assert_eq!(query.played, PlayedFilter::Unplayed);
+        assert_eq!(query.sort, EpisodeSort::OldestFirst);
+    }
+
+    #[test]
+    fn long_episode_lists_load_page_by_page() {
+        let mut state = ready(vec![fx::row("Show", 600, 600, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(PODCAST_EPISODE_PAGE as u32)));
+        assert!(!state.podcasts.opened_episodes().unwrap().complete);
+        let (more_seq, query) = episode_request(update(&mut state, Action::SelectLast));
+        assert_eq!(more_seq, seq);
+        assert_eq!(query.offset, PODCAST_EPISODE_PAGE);
+        // No duplicate request while the page is in flight.
+        assert_eq!(update(&mut state, Action::MoveUp), None);
+        podcasts::episodes_loaded(&mut state, seq, PODCAST_EPISODE_PAGE, Ok(page(100)));
+        let list = state.podcasts.opened_episodes().unwrap();
+        assert_eq!(list.items.len(), PODCAST_EPISODE_PAGE + 100);
+        assert!(list.complete);
+        assert_eq!(update(&mut state, Action::SelectLast), None);
+    }
+
+    #[test]
+    fn manual_and_scheduled_refreshes_are_deduplicated() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        let url = FeedUrl::parse("https://example.test/feed.xml").unwrap();
+        assert_eq!(
+            update(&mut state, Action::RefreshPodcast),
+            Some(Effect::PodcastRefresh {
+                targets: vec![(podcast_id(), url.clone())],
+                manual: true,
+            })
+        );
+        assert!(state.podcasts.refreshing.contains(&podcast_id()));
+        assert_eq!(update(&mut state, Action::RefreshPodcast), None);
+        assert_eq!(update(&mut state, Action::RefreshAllPodcasts), None);
+        // The scheduler skips feeds already in flight.
+        let due = vec![(podcast_id(), url.clone()), (other_id(), url.clone())];
+        assert_eq!(
+            podcasts::refresh_due(&mut state, due),
+            Some(Effect::PodcastRefresh {
+                targets: vec![(other_id(), url)],
+                manual: false,
+            })
+        );
+        let effects = podcasts::refreshed(
+            &mut state,
+            podcast_id(),
+            Ok(RefreshReport {
+                new_episodes: 2,
+                ..RefreshReport::default()
+            }),
+            true,
+        );
+        assert_eq!(effects, vec![Effect::PodcastsReload]);
+        assert!(!state.podcasts.refreshing.contains(&podcast_id()));
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("2 new episode(s) in \"Show\""))
+        );
+        // A background failure stays out of the status bar.
+        state.status_message = None;
+        podcasts::refreshed(&mut state, other_id(), Err("HTTP 500".into()), false);
+        assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn refreshing_the_opened_podcast_reloads_it_on_the_same_episode() {
+        let mut state = ready(vec![fx::row("Show", 0, 3, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(3)));
+        update(&mut state, Action::MoveDown);
+        let effects = podcasts::refreshed(
+            &mut state,
+            podcast_id(),
+            Ok(RefreshReport {
+                new_episodes: 1,
+                ..RefreshReport::default()
+            }),
+            false,
+        );
+        assert_eq!(effects.len(), 2);
+        let (seq, _) = episode_request(effects.into_iter().nth(1));
+        // A new episode arrived on top: the cursor follows "Episode 2".
+        let mut rows = vec![fx::episode(9, "Newest", None)];
+        rows.extend(page(3));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(rows));
+        assert_eq!(
+            state
+                .podcasts
+                .selected_episode()
+                .map(|item| item.episode.title.as_str()),
+            Some("Episode 2")
+        );
+    }
+
+    #[test]
+    fn adding_a_feed_validates_the_url_then_selects_the_new_podcast() {
+        let mut state = ready(Vec::new());
+        state.podcasts.selected = 0;
+        update(&mut state, Action::Select);
+        assert!(matches!(
+            state.popup,
+            Some(Popup::FedInput {
+                field: FedInputField::PodcastFeedUrl,
+                ..
+            })
+        ));
+        state.popup = None;
+        assert_eq!(podcasts::submit_feed_url(&mut state, "  "), None);
+        assert_eq!(
+            podcasts::submit_feed_url(&mut state, "ftp://example.test/feed"),
+            None
+        );
+        assert!(!state.podcasts.subscribing);
+        assert_eq!(
+            podcasts::submit_feed_url(&mut state, "example.test/feed.xml"),
+            Some(Effect::PodcastSubscribe("example.test/feed.xml".into()))
+        );
+        assert!(state.podcasts.subscribing);
+        // A second add while one is running is refused.
+        update(&mut state, Action::AddPodcast);
+        assert!(state.popup.is_none());
+
+        let effect = podcasts::subscribed(
+            &mut state,
+            Ok(SubscribeReport {
+                podcast_id: podcast_id(),
+                title: "Show".into(),
+                already_subscribed: false,
+                new_episodes: 4,
+            }),
+        );
+        assert_eq!(effect, Some(Effect::PodcastsReload));
+        assert!(!state.podcasts.subscribing);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("subscribed to \"Show\" (4 episode(s); private)"))
+        );
+        let mut other = fx::row("Another", 0, 1, 0);
+        other.summary.podcast_id = other_id();
+        podcasts::list_loaded(&mut state, Ok(vec![other, fx::row("Show", 4, 4, 0)]));
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS + 1);
+        assert_eq!(
+            state.podcasts.current_podcast().map(|row| row.title()),
+            Some("Show")
+        );
+    }
+
+    #[test]
+    fn unsubscribing_asks_first_and_keeps_progress() {
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(page(1)));
+        update(&mut state, Action::UnsubscribePodcast);
+        assert!(matches!(
+            &state.popup,
+            Some(Popup::ConfirmPodcastUnsubscribe { podcast_id: id, title })
+                if *id == podcast_id() && title == "Show"
+        ));
+        state.popup = None;
+        let effect = podcasts::unsubscribed(&mut state, podcast_id(), "Show".into(), Ok(()));
+        assert_eq!(effect, Some(Effect::PodcastsReload));
+        assert!(state.podcasts.opened.is_none());
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("progress and history are kept"))
+        );
+        // Unsubscribed elsewhere: the reloaded list closes an open view.
+        let mut state = ready(vec![fx::row("Show", 0, 1, 0)]);
+        update(&mut state, Action::Select);
+        podcasts::list_loaded(&mut state, Ok(Vec::new()));
+        assert!(state.podcasts.opened.is_none());
+    }
+
+    #[test]
+    fn marking_played_toggles_by_status() {
+        let mut state = ready(vec![fx::row("Show", 1, 2, 0)]);
+        let (seq, _) = episode_request(update(&mut state, Action::Select));
+        let items = vec![
+            fx::episode(1, "Done", Some((ProgressStatus::Completed, 0))),
+            fx::episode(2, "Half", Some((ProgressStatus::InProgress, 60_000))),
+        ];
+        let done = items[0].episode.episode_id.clone();
+        let half = items[1].episode.episode_id.clone();
+        podcasts::episodes_loaded(&mut state, seq, 0, Ok(items));
+        assert_eq!(
+            update(&mut state, Action::ToggleEpisodePlayed),
+            Some(Effect::PodcastSetPlayed {
+                episode_id: done,
+                played: false,
+            })
+        );
+        update(&mut state, Action::MoveDown);
+        assert_eq!(
+            update(&mut state, Action::ToggleEpisodePlayed),
+            Some(Effect::PodcastSetPlayed {
+                episode_id: half,
+                played: true,
+            })
+        );
+        let effects = podcasts::played_set(&mut state, true, Ok(()));
+        assert_eq!(effects[0], Effect::PodcastsReload);
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::PodcastLoadEpisodes { .. })
+        ));
+    }
+}
+
+/// Podcast episodes in the shared queue: identity by episode id (never the
+/// shared sentinel id) and music-only actions that must skip them.
+mod podcast_queue {
+    use super::*;
+    use crate::app::podcast_fixtures::{self as fx, episode_track};
+    use crate::app::state::{PODCAST_ACTION_ROWS, Popup, RepeatMode, track_content_id};
+    use crate::app::update::PODCAST_NOT_MUSIC;
+    use music_dht::podcast::ProgressStatus;
+
+    fn keys(queue: &[TrackItem]) -> Vec<String> {
+        queue.iter().map(track_key).collect()
+    }
+
+    #[test]
+    fn episodes_are_keyed_by_episode_id_not_by_the_sentinel_id() {
+        let (one, two) = (episode_track(1), episode_track(2));
+        assert_eq!(one.id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert_eq!(one.id, two.id);
+        assert!(track_key(&one).starts_with("ep:ep1"), "{}", track_key(&one));
+        assert_ne!(track_key(&one), track_key(&two));
+        assert_eq!(track_key(&one), track_key(&episode_track(1)));
+        // Music keeps its content-first key; a library row without a
+        // content id is keyed by its row, never as `local:` / an episode.
+        assert!(track_key(&test_track(5)).starts_with("content:"));
+        let mut bare = test_track(5);
+        bare.content_id = None;
+        assert_eq!(track_key(&bare), "lib:5");
+    }
+
+    #[test]
+    fn removing_an_episode_keeps_the_other_episode_current() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), test_track(7), episode_track(2)];
+        state.player.queue_pos = 2;
+        state.player.current = Some(episode_track(2));
+        state.player.playing = true;
+        state.active_tab = Tab::Queue;
+        state.queue_tab.cursor = 0;
+        let effect = update(&mut state, Action::RemoveFromQueue);
+        assert_eq!(
+            effect,
+            Some(Effect::RemoveQueueIndices {
+                indices: vec![0],
+                restart_paused: None,
+                stop: false,
+            })
+        );
+        assert_eq!(state.player.queue_pos, 1);
+        assert_eq!(
+            state.player.current.as_ref().map(track_key),
+            Some(track_key(&episode_track(2)))
+        );
+    }
+
+    #[test]
+    fn removing_the_playing_episode_moves_to_the_next_item_not_another_episode() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2), test_track(7)];
+        state.player.queue_pos = 0;
+        state.player.current = Some(episode_track(1));
+        state.player.playing = true;
+        state.active_tab = Tab::Queue;
+        state.queue_tab.cursor = 0;
+        let effect = update(&mut state, Action::RemoveFromQueue);
+        assert!(matches!(
+            effect,
+            Some(Effect::RemoveQueueIndices {
+                restart_paused: Some(false),
+                ..
+            })
+        ));
+        assert_eq!(
+            state.player.current.as_ref().map(track_key),
+            Some(track_key(&episode_track(2)))
+        );
+    }
+
+    #[test]
+    fn shuffle_and_repeat_keep_a_mixed_queue_intact() {
+        let mut state = AppState::default();
+        let queue = vec![
+            test_track(1),
+            episode_track(1),
+            episode_track(2),
+            test_track(2),
+            episode_track(3),
+            test_track(3),
+        ];
+        let original = keys(&queue);
+        state.player.queue = queue;
+        state.player.current = Some(test_track(1));
+        state.player.playing = true;
+        for _ in 0..8 {
+            update(&mut state, Action::ToggleShuffle);
+            let mut shuffled = keys(&state.player.queue);
+            shuffled.sort();
+            let mut expected = original.clone();
+            expected.sort();
+            assert_eq!(shuffled, expected, "no item lost or duplicated");
+            update(&mut state, Action::ToggleShuffle);
+            assert_eq!(keys(&state.player.queue), original);
+        }
+        // Next/previous step through episodes like any other item, and
+        // repeat-all wraps around.
+        state.player.repeat = RepeatMode::All;
+        state.player.queue_pos = 4;
+        state.player.current = Some(episode_track(3));
+        assert_eq!(
+            update(&mut state, Action::NextTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 5);
+        assert_eq!(
+            update(&mut state, Action::NextTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 0);
+        assert_eq!(
+            update(&mut state, Action::PrevTrack),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(state.player.queue_pos, 0);
+    }
+
+    #[test]
+    fn current_track_info_finds_the_playing_episode_among_episodes() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2)];
+        // The queue position points at another episode (same sentinel id).
+        state.player.queue_pos = 0;
+        state.player.current = Some(episode_track(2));
+        state.player.playing = true;
+        update(&mut state, Action::OpenCurrentTrackInfo);
+        let Some(Popup::TrackInfo { tracks, .. }) = &state.popup else {
+            panic!("track info expected");
+        };
+        assert_eq!(track_key(&tracks[0]), track_key(&episode_track(2)));
+    }
+
+    #[test]
+    fn music_only_actions_skip_episodes() {
+        let mut state = fx::ready_state(vec![fx::row("Show", 1, 2, 0)]);
+        state.active_tab = Tab::Queue;
+        state.player.queue = vec![episode_track(1)];
+        state.player.current = Some(episode_track(1));
+        state.player.playing = true;
+
+        assert_eq!(update(&mut state, Action::ToggleLike), None);
+        assert_eq!(state.status_message.as_deref(), Some(PODCAST_NOT_MUSIC));
+        assert_eq!(update(&mut state, Action::AddToPlaylist), None);
+        assert!(state.popup.is_none());
+        assert_eq!(state.status_message.as_deref(), Some(PODCAST_NOT_MUSIC));
+        update(&mut state, Action::NewPlaylist);
+        assert!(matches!(
+            state.popup.take(),
+            Some(Popup::NewPlaylist {
+                for_target: None,
+                ..
+            })
+        ));
+        update(&mut state, Action::EditSelected);
+        assert!(state.popup.is_none(), "episode metadata is not editable");
+        assert_eq!(update(&mut state, Action::DownloadSelected), None);
+
+        // No content id, no share link, no music history; on the wire an
+        // explicit podcast source, never a music item.
+        let episode = episode_track(1);
+        assert_eq!(track_content_id(&episode), None);
+        assert_eq!(crate::share::track_content_id(&episode), None);
+        assert_eq!(crate::share::track_share_link(&episode), None);
+        let wire = <crate::devices::PlaybackTrack as crate::devices::PlaybackTrackExt>::from_track(
+            &episode,
+        );
+        assert_eq!(wire.podcast_episode_ref(), episode.podcast_episode_ref());
+        assert!(wire.file_path.is_empty());
+        assert_eq!((wire.id, wire.content_id, wire.fed), (0, None, None));
+
+        // Shift-J opens the podcast instead of a music release.
+        let effect = update(&mut state, Action::GoToRelease);
+        assert_eq!(state.active_tab, Tab::Podcasts);
+        assert_eq!(state.podcasts.selected, PODCAST_ACTION_ROWS);
+        assert!(state.podcasts.opened.is_some());
+        assert!(matches!(effect, Some(Effect::PodcastLoadEpisodes { .. })));
+    }
+
+    fn episodes_tab(statuses: &[Option<(music_dht::podcast::ProgressStatus, i64)>]) -> AppState {
+        let items = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| {
+                let n = index as u32 + 1;
+                fx::episode(n, &format!("Episode {n}"), *status)
+            })
+            .collect();
+        fx::with_episodes(fx::ready_state(vec![fx::row("Show", 2, 2, 0)]), items)
+    }
+
+    #[test]
+    fn enter_plays_the_episode_right_after_the_current_item() {
+        let mut state = episodes_tab(&[None, None]);
+        state.player.queue = vec![test_track(1), test_track(2)];
+        state.player.queue_pos = 0;
+        state.player.current = Some(test_track(1));
+        state.player.playing = true;
+        state.podcasts.opened.as_mut().unwrap().episode_cursor = 1;
+
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::PlayCurrent)
+        );
+        assert_eq!(
+            keys(&state.player.queue),
+            keys(&[test_track(1), episode_track(2), test_track(2)])
+        );
+        assert_eq!(state.player.queue_pos, 1);
+        let queued = state.player.queue[1].podcast_episode_ref().unwrap();
+        assert_eq!(queued.podcast_title, "Show");
+        assert_eq!(queued.audio_url, "https://example.test/2.mp3");
+
+        // Enter again on the playing episode does not queue it twice.
+        state.player.current = Some(state.player.queue[1].clone());
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert_eq!(state.player.queue.len(), 3);
+        state.player.paused = true;
+        assert_eq!(
+            update(&mut state, Action::Select),
+            Some(Effect::TogglePause)
+        );
+        assert!(!state.player.paused);
+        // "Start over" restarts it in place.
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        assert_eq!(state.player.queue.len(), 3);
+        assert_eq!(state.player.queue_pos, 1);
+    }
+
+    #[test]
+    fn start_over_plays_a_selected_episode_from_the_beginning() {
+        let mut state = episodes_tab(&[Some((
+            music_dht::podcast::ProgressStatus::InProgress,
+            600_000,
+        ))]);
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        assert_eq!(keys(&state.player.queue), keys(&[episode_track(1)]));
+        assert_eq!(state.player.queue_pos, 0);
+        // The queue item carries the generation the list showed (handoff
+        // and start-over order after it).
+        let queued = state.player.queue[0].podcast_episode_ref().unwrap();
+        assert_eq!(queued.progress_generation, Some(1));
+        // On another tab, `b` (if bound there) restarts the playing episode.
+        state.active_tab = Tab::Queue;
+        state.player.current = Some(state.player.queue[0].clone());
+        state.player.playing = true;
+        assert_eq!(
+            update(&mut state, Action::RestartEpisode),
+            Some(Effect::PlayCurrentFromStart)
+        );
+        state.player.current = Some(test_track(3));
+        assert_eq!(update(&mut state, Action::RestartEpisode), None);
+    }
+
+    #[test]
+    fn episodes_are_queued_for_v4_outputs_only() {
+        let mut state = episodes_tab(&[None, None]);
+        assert_eq!(
+            update(&mut state, Action::QueueAddLast),
+            Some(Effect::QueueOrderChanged {
+                restart_current: false
+            })
+        );
+        state.podcasts.opened.as_mut().unwrap().episode_cursor = 1;
+        update(&mut state, Action::QueueAddLast);
+        assert_eq!(
+            keys(&state.player.queue),
+            keys(&[episode_track(1), episode_track(2)])
+        );
+
+        // Controlling a device that has not reported sync v4.
+        state.device_playback.role = crate::app::state::DevicePlaybackRole::Control;
+        state.device_playback.active_device_id = Some("dev_old".into());
+        state.device_playback.active_device_name = Some("Old laptop".into());
+        let row = |version| crate::devices::DeviceStatusRow {
+            device_id: "dev_old".into(),
+            name: "Old laptop".into(),
+            protocol_version: version,
+            ..Default::default()
+        };
+        state.federation.devices = Some(crate::devices::DeviceSyncStatus {
+            devices: vec![row(3)],
+            ..Default::default()
+        });
+        assert_eq!(update(&mut state, Action::QueueAddNext), None);
+        assert_eq!(update(&mut state, Action::Select), None);
+        assert_eq!(state.player.queue.len(), 2);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("podcasts: Old laptop needs a Furumi update to play podcast episodes")
+        );
+        // Once it reports v4, the queue goes there with the episodes.
+        state.federation.devices.as_mut().unwrap().devices = vec![row(4)];
+        assert!(update(&mut state, Action::QueueAddNext).is_some());
+        assert_eq!(state.player.queue.len(), 3);
+
+        // A Jam guest never adds episodes to the host's queue.
+        state.device_playback.role = crate::app::state::DevicePlaybackRole::Jam;
+        state.device_playback.jam_host = false;
+        assert_eq!(update(&mut state, Action::QueueAddNext), None);
+        assert!(
+            state
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("Jam guests")
+        );
+    }
+
+    #[test]
+    fn saved_progress_updates_the_episode_list_in_place() {
+        let mut state = episodes_tab(&[None, None]);
+        let mut record = fx::episode(
+            2,
+            "Episode 2",
+            Some((music_dht::podcast::ProgressStatus::InProgress, 90_000)),
+        )
+        .progress
+        .unwrap();
+        record.generation = 4;
+        assert!(crate::app::update::podcasts::progress_saved(&mut state, record).is_empty());
+        let items = &state.podcasts.episodes.as_ref().unwrap().items;
+        assert!(items[0].progress.is_none());
+        assert_eq!(items[1].resume_position_ms(), 90_000);
+        assert_eq!(items[1].progress.as_ref().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn saved_progress_raises_the_generation_a_handoff_carries() {
+        let mut state = AppState::default();
+        state.player.queue = vec![episode_track(1), episode_track(2), test_track(3)];
+        state.player.current = Some(episode_track(2));
+        let mut record = fx::episode(2, "Episode 2", Some((ProgressStatus::InProgress, 1)))
+            .progress
+            .unwrap();
+        record.generation = 7;
+        crate::app::update::podcasts::progress_saved(&mut state, record.clone());
+        let generation = |track: &TrackItem| track.podcast.as_ref().unwrap().progress_generation;
+        assert_eq!(generation(&state.player.queue[0]), None);
+        assert_eq!(generation(&state.player.queue[1]), Some(7));
+        assert_eq!(generation(state.player.current.as_ref().unwrap()), Some(7));
+        // Never lowered by an older register.
+        record.generation = 3;
+        crate::app::update::podcasts::progress_saved(&mut state, record);
+        assert_eq!(generation(&state.player.queue[1]), Some(7));
+    }
+
+    #[test]
+    fn podcast_changes_from_other_devices_reload_what_is_shown() {
+        let mut state = episodes_tab(&[None, None]);
+        let record = fx::episode(1, "Episode 1", Some((ProgressStatus::InProgress, 5_000)))
+            .progress
+            .unwrap();
+        // A progress register is shown in place; the list counts reload.
+        let effects = crate::app::update::podcasts::synced(&mut state, vec![record], false);
+        assert_eq!(effects, [Effect::PodcastsReload]);
+        let items = &state.podcasts.episodes.as_ref().unwrap().items;
+        assert_eq!(items[0].resume_position_ms(), 5_000);
+        // Anything else reloads the opened podcast too.
+        let effects = crate::app::update::podcasts::synced(&mut state, Vec::new(), true);
+        assert_eq!(effects[0], Effect::PodcastsReload);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PodcastLoadEpisodes { .. })),
+            "{effects:?}"
+        );
+        // Before the store is ready there is nothing to reload.
+        let mut opening = AppState::default();
+        assert!(crate::app::update::podcasts::synced(&mut opening, Vec::new(), true).is_empty());
     }
 }

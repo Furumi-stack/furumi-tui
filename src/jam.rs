@@ -225,10 +225,16 @@ impl JamManager {
         JamStatus::default()
     }
 
+    /// Publishes the host's playback to participants. Podcast episodes are
+    /// private: participants get opaque placeholders (`redact_for_jam`),
+    /// never their titles, feeds or URLs.
     pub fn publish_host_playback(&self, snapshot: PlaybackSnapshot) {
         let mut state = lock(&self.state);
         if state.host.invite.is_some() {
-            state.host.playback = Some(snapshot);
+            state.host.playback = Some(PlaybackSnapshot {
+                state: music_dht::device_sync::redact_for_jam(snapshot.state),
+                ..snapshot
+            });
         }
     }
 
@@ -374,7 +380,15 @@ async fn serve_one(mut stream: ByteStream, manager: Arc<JamManager>) -> Result<(
                         acknowledged.push(command.command_id.clone());
                         if state.host.seen_commands.insert(command.command_id.clone()) {
                             state.host.seen_order.push_back(command.command_id.clone());
-                            let _ = manager.event_tx.send(AppEvent::JamCommand(command.command));
+                            // Participants cannot add podcast episodes to the
+                            // host queue; placeholders are mapped back by the
+                            // host (`restore_jam_private_items`).
+                            if music_dht::device_sync::jam_command_allowed(&command.command) {
+                                let _ =
+                                    manager.event_tx.send(AppEvent::JamCommand(command.command));
+                            } else {
+                                tracing::info!("ignored a Jam command that adds podcast episodes");
+                            }
                         }
                     }
                     while state.host.seen_order.len() > 4096 {
@@ -656,8 +670,14 @@ mod tests {
             .join(&invite, "dev_guest".into(), "Guest".into())
             .unwrap();
 
+        // The host plays a private podcast episode.
+        let episode = crate::app::podcast_fixtures::episode_track(1)
+            .podcast
+            .unwrap();
         let playback_state = crate::devices::PlaybackStateWire {
-            queue: Vec::new(),
+            queue: vec![crate::devices::PlaybackTrack::podcast_episode(
+                episode.clone(),
+            )],
             queue_pos: 0,
             playing: false,
             paused: false,
@@ -666,6 +686,7 @@ mod tests {
             volume: 73,
             shuffle: false,
             repeat: crate::devices::PlaybackRepeat::Off,
+            playback_rate: None,
         };
         host.publish_host_playback(PlaybackSnapshot {
             coordination: None,
@@ -690,12 +711,27 @@ mod tests {
         .unwrap();
         assert_eq!(playback.device_id, "dev_host");
         assert_eq!(playback.state.volume, 73);
+        // Guests get an opaque placeholder: no title, feed or URL.
+        assert!(playback.state.queue[0].is_private_placeholder());
+        let seen = serde_json::to_string(&playback).unwrap();
+        assert!(!seen.contains(&episode.audio_url) && !seen.contains(&episode.episode_title));
 
+        // A guest cannot add an episode to the host's queue; its ordinary
+        // command (with the placeholder) still arrives.
+        guest
+            .submit_command(PlaybackCommand::SetState {
+                state: crate::devices::PlaybackStateWire {
+                    queue: vec![crate::devices::PlaybackTrack::podcast_episode(episode)],
+                    ..playback_state.clone()
+                },
+                seek: false,
+            })
+            .unwrap();
         guest
             .submit_command(PlaybackCommand::SetState {
                 state: crate::devices::PlaybackStateWire {
                     paused: true,
-                    ..playback_state
+                    ..playback.state
                 },
                 seek: false,
             })
@@ -710,13 +746,17 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(matches!(
-            command,
-            PlaybackCommand::SetState {
-                state: crate::devices::PlaybackStateWire { paused: true, .. },
-                seek: false
-            }
-        ));
+        let PlaybackCommand::SetState {
+            state: received,
+            seek: false,
+        } = command
+        else {
+            panic!("expected the guest's set_state");
+        };
+        // The command that adds an episode was sent first; had it been
+        // forwarded, it would have arrived first.
+        assert!(received.paused);
+        assert!(received.queue[0].is_private_placeholder());
 
         server.abort();
         host_drain.abort();
