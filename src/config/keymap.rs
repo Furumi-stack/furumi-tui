@@ -9,6 +9,14 @@ use crate::app::action::Action;
 
 const DEFAULT_KEYMAP: &str = include_str!("default_keymap.toml");
 
+/// Current keymap file format, declared as a top-level `version = 2`.
+///
+/// Version 2 introduced the tab order Library, Playlists, Queue, Podcasts,
+/// Settings, Logs. Files without a version (or with `version = 1`) were
+/// written for the older order and have their `GoToTab` indices remapped in
+/// memory; the user's file itself is never rewritten.
+pub const KEYMAP_VERSION: u32 = 2;
+
 /// Input context a binding applies to. `Global` bindings work everywhere;
 /// view-specific bindings shadow global ones for the same key sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -20,6 +28,7 @@ pub enum KeyContext {
     Search,
     Playlists,
     Queue,
+    Podcasts,
     #[serde(rename = "settings", alias = "federation")]
     Federation,
     Logs,
@@ -33,6 +42,7 @@ impl KeyContext {
             KeyContext::Search => "search",
             KeyContext::Playlists => "playlists",
             KeyContext::Queue => "queue",
+            KeyContext::Podcasts => "podcasts",
             KeyContext::Federation => "settings",
             KeyContext::Logs => "logs",
         }
@@ -52,10 +62,18 @@ struct RawBinding {
     command: Action,
     #[serde(default)]
     context: KeyContext,
+    /// Never valid here: a `version = N` line written after a `[[keymaps]]`
+    /// header lands inside that entry. Caught so the file is not silently
+    /// treated as legacy (and its tab indices remapped) despite the version.
+    #[serde(default)]
+    version: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct KeymapFile {
+    /// Format version; `None` means a legacy (pre-version-2) file.
+    #[serde(default)]
+    version: Option<u32>,
     #[serde(default)]
     keymaps: Vec<RawBinding>,
 }
@@ -87,9 +105,15 @@ impl Keymap {
         {
             match fs::read_to_string(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|text| parse_bindings(&text))
+                .and_then(|text| parse_user_keymap(&text))
             {
-                Ok(user) => merge(&mut bindings, user),
+                Ok(user) => {
+                    if let Some(notice) = user.notice {
+                        tracing::info!(path = %path.display(), "{notice}");
+                        warning = Some(format!("{}: {notice}", path.display()));
+                    }
+                    merge(&mut bindings, user.bindings);
+                }
                 Err(err) => {
                     warning = Some(format!(
                         "{} ignored: {err:#}; using default keybindings",
@@ -104,6 +128,16 @@ impl Keymap {
             format: KeyCombinationFormat::default(),
         };
         (keymap, warning)
+    }
+
+    /// The embedded defaults only, without reading the user's file.
+    #[cfg(test)]
+    pub(crate) fn defaults() -> Self {
+        Self {
+            bindings: parse_bindings(DEFAULT_KEYMAP).expect("embedded default keymap must parse"),
+            pending: Vec::new(),
+            format: KeyCombinationFormat::default(),
+        }
     }
 
     /// Feed one key combination; returns an action, a pending-chord state, or
@@ -275,10 +309,76 @@ pub fn user_keymap_path() -> Option<PathBuf> {
 }
 
 fn parse_bindings(text: &str) -> Result<Vec<Binding>> {
+    parse_file(text).map(|(_, bindings)| bindings)
+}
+
+/// A user keymap after version handling, plus a one-time, non-blocking
+/// notice for the status bar and log when its meaning was adapted.
+struct UserKeymap {
+    bindings: Vec<Binding>,
+    notice: Option<String>,
+}
+
+fn parse_user_keymap(text: &str) -> Result<UserKeymap> {
+    let (version, mut bindings) = parse_file(text)?;
+    let notice = match version {
+        None | Some(1) => {
+            let remapped = remap_legacy_tab_indices(&mut bindings);
+            (remapped > 0).then(|| {
+                format!(
+                    "{remapped} tab shortcut(s) adapted to the new tab order \
+                     (4 Podcasts, 5 Settings, 6 Logs); \
+                     add `version = {KEYMAP_VERSION}` to use indices as written"
+                )
+            })
+        }
+        Some(KEYMAP_VERSION) => None,
+        Some(0) => bail!("unsupported keymap version 0"),
+        Some(newer) => Some(format!(
+            "keymap version {newer} is newer than this build supports \
+             ({KEYMAP_VERSION}); bindings are used as written"
+        )),
+    };
+    Ok(UserKeymap { bindings, notice })
+}
+
+/// Pre-version-2 `GoToTab` index → current index. Index 5 only existed in the
+/// prototype podcast build, where it opened Podcasts.
+fn legacy_tab_index(index: usize) -> usize {
+    match index {
+        3 => 4, // Settings
+        4 => 5, // Logs
+        5 => 3, // Podcasts (prototype)
+        other => other,
+    }
+}
+
+/// Rewrites legacy `GoToTab` indices in memory; returns how many changed.
+fn remap_legacy_tab_indices(bindings: &mut [Binding]) -> usize {
+    let mut remapped = 0;
+    for binding in bindings {
+        if let Action::GoToTab(index) = &mut binding.action {
+            let current = legacy_tab_index(*index);
+            if current != *index {
+                *index = current;
+                remapped += 1;
+            }
+        }
+    }
+    remapped
+}
+
+fn parse_file(text: &str) -> Result<(Option<u32>, Vec<Binding>)> {
     let file: KeymapFile = toml::from_str(text).context("invalid TOML")?;
-    file.keymaps
+    let bindings = file
+        .keymaps
         .into_iter()
         .map(|raw| {
+            if raw.version.is_some() {
+                bail!(
+                    "`version` must be a top-level key placed before the first [[keymaps]] entry"
+                );
+            }
             let keys = parse_sequence(&raw.key_sequence)
                 .with_context(|| format!("bad key_sequence {:?}", raw.key_sequence))?;
             Ok(Binding {
@@ -287,7 +387,8 @@ fn parse_bindings(text: &str) -> Result<Vec<Binding>> {
                 context: raw.context,
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((file.version, bindings))
 }
 
 fn parse_sequence(s: &str) -> Result<Vec<KeyCombination>> {
@@ -595,6 +696,198 @@ mod tests {
             km.resolve(dot, KeyContext::Library),
             KeyResolution::Action(Action::SeekForward { seconds: 10 })
         );
+    }
+
+    #[test]
+    fn default_keymap_declares_current_version() {
+        let (version, _) = parse_file(DEFAULT_KEYMAP).unwrap();
+        assert_eq!(version, Some(KEYMAP_VERSION));
+        assert!(parse_user_keymap(DEFAULT_KEYMAP).unwrap().notice.is_none());
+    }
+
+    #[test]
+    fn default_digit_keys_follow_tab_order() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        for (index, key) in ['1', '2', '3', '4', '5', '6'].into_iter().enumerate() {
+            let combo = KeyCombination::new(KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(
+                km.resolve(combo, KeyContext::Library),
+                KeyResolution::Action(Action::GoToTab(index))
+            );
+        }
+    }
+
+    fn go_to_tab_indices(bindings: &[Binding]) -> Vec<usize> {
+        bindings
+            .iter()
+            .filter_map(|b| match b.action {
+                Action::GoToTab(index) => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const LEGACY_TABS: &str = r#"
+        [[keymaps]]
+        key_sequence = "1"
+        command = { GoToTab = 0 }
+
+        [[keymaps]]
+        key_sequence = "f2"
+        command = { GoToTab = 2 }
+
+        [[keymaps]]
+        key_sequence = "f4"
+        command = { GoToTab = 3 }
+
+        [[keymaps]]
+        key_sequence = "f5"
+        command = { GoToTab = 4 }
+
+        [[keymaps]]
+        key_sequence = "f6"
+        command = { GoToTab = 5 }
+        context = "logs"
+
+        [[keymaps]]
+        key_sequence = "x"
+        command = "ToggleHelp"
+    "#;
+
+    #[test]
+    fn legacy_keymap_tab_indices_are_remapped_in_memory() {
+        let user = parse_user_keymap(LEGACY_TABS).unwrap();
+        // Settings 3 -> 4, Logs 4 -> 5, prototype Podcasts 5 -> 3.
+        assert_eq!(go_to_tab_indices(&user.bindings), [0, 2, 4, 5, 3]);
+        assert_eq!(user.bindings[4].context, KeyContext::Logs);
+        assert_eq!(user.bindings[5].action, Action::ToggleHelp);
+        let notice = user.notice.expect("remap must be reported");
+        assert!(notice.starts_with("3 tab shortcut(s)"), "{notice}");
+        assert!(notice.contains("version = 2"), "{notice}");
+    }
+
+    #[test]
+    fn explicit_version_one_is_treated_as_legacy() {
+        let user = parse_user_keymap(&format!("version = 1\n{LEGACY_TABS}")).unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [0, 2, 4, 5, 3]);
+        assert!(user.notice.is_some());
+    }
+
+    #[test]
+    fn legacy_keymap_without_changed_tab_indices_has_no_notice() {
+        let user = parse_user_keymap(
+            r#"
+            [[keymaps]]
+            key_sequence = "1"
+            command = { GoToTab = 0 }
+
+            [[keymaps]]
+            key_sequence = "q"
+            command = "Back"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [0]);
+        assert!(user.notice.is_none());
+    }
+
+    #[test]
+    fn versioned_keymap_is_taken_literally() {
+        let user = parse_user_keymap(&format!("version = 2\n{LEGACY_TABS}")).unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [0, 2, 3, 4, 5]);
+        assert!(user.notice.is_none());
+    }
+
+    #[test]
+    fn newer_keymap_version_is_used_as_written_with_a_notice() {
+        let user = parse_user_keymap(&format!("version = 3\n{LEGACY_TABS}")).unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [0, 2, 3, 4, 5]);
+        assert!(user.notice.unwrap().contains("newer"));
+    }
+
+    #[test]
+    fn version_inside_a_keymaps_entry_is_rejected() {
+        // Appended at the end, TOML puts `version` into the last entry; the
+        // file must not silently fall back to the legacy remap.
+        let err = parse_user_keymap(
+            "[[keymaps]]\nkey_sequence = \"4\"\ncommand = { GoToTab = 3 }\nversion = 2\n",
+        )
+        .err()
+        .expect("misplaced version must be rejected");
+        assert!(
+            format!("{err:#}").contains("before the first [[keymaps]]"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_keymaps_entries_are_still_ignored() {
+        let user = parse_user_keymap(
+            "version = 2\n[[keymaps]]\nkey_sequence = \"4\"\ncommand = { GoToTab = 3 }\nnote = \"mine\"\n",
+        )
+        .unwrap();
+        assert_eq!(go_to_tab_indices(&user.bindings), [3]);
+    }
+
+    #[test]
+    fn keymap_version_zero_is_rejected() {
+        assert!(parse_user_keymap("version = 0").is_err());
+    }
+
+    #[test]
+    fn legacy_user_digit_override_keeps_its_old_target() {
+        let mut bindings = parse_bindings(DEFAULT_KEYMAP).unwrap();
+        // An old file that swapped "4" and "5" (Settings / Logs).
+        let user = parse_user_keymap(
+            r#"
+            [[keymaps]]
+            key_sequence = "4"
+            command = { GoToTab = 4 }
+
+            [[keymaps]]
+            key_sequence = "5"
+            command = { GoToTab = 3 }
+            "#,
+        )
+        .unwrap();
+        merge(&mut bindings, user.bindings);
+        let mut km = Keymap {
+            bindings,
+            pending: Vec::new(),
+            format: KeyCombinationFormat::default(),
+        };
+        let four = KeyCombination::new(KeyCode::Char('4'), KeyModifiers::NONE);
+        let five = KeyCombination::new(KeyCode::Char('5'), KeyModifiers::NONE);
+        let six = KeyCombination::new(KeyCode::Char('6'), KeyModifiers::NONE);
+        // Still Logs and Settings, now at their new indices.
+        assert_eq!(
+            km.resolve(four, KeyContext::Library),
+            KeyResolution::Action(Action::GoToTab(5))
+        );
+        assert_eq!(
+            km.resolve(five, KeyContext::Library),
+            KeyResolution::Action(Action::GoToTab(4))
+        );
+        // The new default "6" is untouched by the user's file.
+        assert_eq!(
+            km.resolve(six, KeyContext::Library),
+            KeyResolution::Action(Action::GoToTab(5))
+        );
+    }
+
+    #[test]
+    fn podcasts_context_parses() {
+        let bindings = parse_bindings(
+            r#"
+            [[keymaps]]
+            key_sequence = "z"
+            command = "ToggleHelp"
+            context = "podcasts"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(bindings[0].context, KeyContext::Podcasts);
+        assert_eq!(KeyContext::Podcasts.label(), "podcasts");
     }
 
     #[test]

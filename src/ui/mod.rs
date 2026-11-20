@@ -4,6 +4,7 @@ mod federation;
 pub(crate) mod global;
 mod logs;
 mod playlists;
+mod podcasts;
 mod popup;
 #[cfg(test)]
 mod status_tests;
@@ -50,6 +51,126 @@ mod tests {
         assert_eq!(label, "●");
         assert_eq!(style, client_style);
     }
+
+    fn render(state: &AppState, width: u16, height: u16) -> String {
+        let keymap = Keymap::defaults();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, state, &keymap)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tab_bar_numbers_tabs_in_the_new_order() {
+        let screen = render(&AppState::default(), 120, 10);
+        let bar = screen.lines().next().unwrap();
+        let positions: Vec<usize> = [
+            "1 Library",
+            "2 Playlists",
+            "3 Queue",
+            "4 Podcasts",
+            "5 Settings",
+            "6 Logs",
+        ]
+        .iter()
+        .map(|title| {
+            bar.find(title)
+                .unwrap_or_else(|| panic!("{title} in {bar:?}"))
+        })
+        .collect();
+        assert!(positions.is_sorted(), "{bar:?}");
+    }
+
+    /// Each tab's number appears once, in order, and the active tab's label
+    /// is fully on screen.
+    fn assert_tab_bar_fits(width: u16, active: Tab, active_label: &str) {
+        let mut state = AppState::default();
+        state.active_tab = active;
+        let screen = render(&state, width, 10);
+        let bar = screen.lines().next().unwrap();
+        let digits: String = bar.chars().filter(char::is_ascii_digit).collect();
+        assert_eq!(digits, "123456", "width {width}: {bar:?}");
+        assert!(
+            bar.contains(active_label),
+            "width {width}: {active_label} missing in {bar:?}"
+        );
+    }
+
+    #[test]
+    fn tab_bar_keeps_every_tab_visible_on_narrow_terminals() {
+        for width in [80, 77, 76, 70, 65, 60, 48, 40, 30] {
+            assert_tab_bar_fits(width, Tab::Logs, "6 Logs");
+            assert_tab_bar_fits(width, Tab::Global, "1 Lib");
+        }
+        // Full titles while they fit.
+        assert_tab_bar_fits(80, Tab::Global, "5 Settings");
+        assert_tab_bar_fits(65, Tab::Global, "5 Settings");
+        // Numbers only, but the active tab keeps its full title.
+        assert_tab_bar_fits(30, Tab::Federation, "5 Settings");
+        assert_tab_bar_fits(30, Tab::Playlists, "2 Playlists");
+    }
+
+    #[test]
+    fn tab_bar_highlights_active_tab_when_compact() {
+        let mut state = AppState::default();
+        state.active_tab = Tab::Logs;
+        let keymap = Keymap::defaults();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, &keymap)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+        let x = bar.find("6 Logs").expect("active tab on screen") as u16;
+        let highlight = theme::tab_active_for(&state);
+        let cell = buffer[(x, 0)].style();
+        assert_eq!((cell.fg, cell.bg), (highlight.fg, highlight.bg));
+    }
+
+    #[test]
+    fn podcasts_tab_shows_placeholder() {
+        let mut state = AppState::default();
+        state.active_tab = Tab::Podcasts;
+        let screen = render(&state, 100, 12);
+        assert!(screen.contains(podcasts::UNAVAILABLE), "{screen}");
+    }
+
+    #[test]
+    fn podcasts_placeholder_wraps_without_losing_text_on_narrow_terminals() {
+        let mut state = AppState::default();
+        state.active_tab = Tab::Podcasts;
+        for width in [60, 40] {
+            let screen = render(&state, width, 14);
+            let words: Vec<&str> = screen
+                .split(|c: char| c.is_whitespace() || c == '│')
+                .filter(|word| !word.is_empty())
+                .collect();
+            for word in ["available", "progress", "appear", "here."] {
+                assert!(
+                    words.contains(&word),
+                    "{word} missing at {width}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_lists_tab_names_for_digit_shortcuts() {
+        let mut state = AppState::default();
+        state.help_visible = true;
+        let screen = render(&state, 160, 80);
+        for title in ["Go to Podcasts", "Go to Settings", "Go to Logs"] {
+            assert!(screen.contains(title), "{title} missing:\n{screen}");
+        }
+        assert!(!screen.contains("Go to tab"), "{screen}");
+    }
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
@@ -73,6 +194,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
         Tab::Global => global::draw(frame, main_area, state),
         Tab::Playlists => playlists::draw(frame, main_area, state),
         Tab::Queue => draw_queue(frame, main_area, state),
+        Tab::Podcasts => podcasts::draw(frame, main_area, state),
         Tab::Federation => federation::draw(frame, main_area, state),
         Tab::Logs => logs::draw(frame, main_area, state),
     }
@@ -140,15 +262,48 @@ fn is_waiting_message(message: &str) -> bool {
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let titles = Tab::ALL
-        .iter()
-        .map(|tab| format!(" {} {} ", tab.index() + 1, tab.title()));
-    let tabs = Tabs::new(titles)
-        .select(state.active_tab.index())
-        .style(theme::dim())
-        .highlight_style(theme::tab_active_for(state))
-        .divider("");
-    frame.render_widget(tabs, area);
+    frame.render_widget(tab_bar(state, area.width), area);
+}
+
+/// The widest tab bar that fits `width`. Narrow terminals drop the outer
+/// padding, then abbreviate titles, then show only numbers (keeping the
+/// active tab's full title), so all six shortcuts and the highlight stay
+/// visible instead of the last tabs being cut off.
+fn tab_bar(state: &AppState, width: u16) -> Tabs<'static> {
+    use unicode_width::UnicodeWidthStr as _;
+
+    let active = state.active_tab;
+    let build = |label: &dyn Fn(Tab) -> String, padded: bool| {
+        let tabs = Tabs::new(Tab::ALL.iter().map(|&tab| label(tab)))
+            .select(active.index())
+            .style(theme::dim())
+            .highlight_style(theme::tab_active_for(state))
+            .divider("");
+        if padded { tabs } else { tabs.padding("", "") }
+    };
+    let full = |tab: Tab| format!(" {} {} ", tab.index() + 1, tab.title());
+    let short = |tab: Tab| format!(" {} {} ", tab.index() + 1, tab.short_title());
+    let numbers_with_active = |tab: Tab| {
+        if tab == active {
+            full(tab)
+        } else {
+            format!(" {} ", tab.index() + 1)
+        }
+    };
+    let numbers = |tab: Tab| format!(" {} ", tab.index() + 1);
+    let candidates: [(&dyn Fn(Tab) -> String, bool); 4] = [
+        (&full, true),
+        (&full, false),
+        (&short, false),
+        (&numbers_with_active, false),
+    ];
+    for (label, padded) in candidates {
+        let tabs = build(label, padded);
+        if tabs.width() <= usize::from(width) {
+            return tabs;
+        }
+    }
+    build(&numbers, false)
 }
 
 /// One track row used by every track list: ♥ marker for liked tracks, the

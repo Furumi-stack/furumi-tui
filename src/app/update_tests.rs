@@ -187,6 +187,97 @@ fn tab_cycling_wraps() {
 }
 
 #[test]
+fn tabs_follow_the_documented_order() {
+    use crate::config::keymap::KeyContext;
+
+    assert_eq!(
+        Tab::ALL,
+        [
+            Tab::Global,
+            Tab::Playlists,
+            Tab::Queue,
+            Tab::Podcasts,
+            Tab::Federation,
+            Tab::Logs,
+        ]
+    );
+    let titles: Vec<_> = Tab::ALL.iter().map(|tab| tab.title()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Library",
+            "Playlists",
+            "Queue",
+            "Podcasts",
+            "Settings",
+            "Logs"
+        ]
+    );
+    for (index, tab) in Tab::ALL.iter().enumerate() {
+        assert_eq!(tab.index(), index);
+        assert_eq!(Tab::from_index(index), Some(*tab));
+    }
+    assert_eq!(Tab::from_index(Tab::ALL.len()), None);
+    assert_eq!(Tab::Podcasts.key_context(), KeyContext::Podcasts);
+    assert_eq!(Tab::Federation.key_context(), KeyContext::Federation);
+}
+
+#[test]
+fn next_and_prev_tab_visit_every_tab_in_order() {
+    let mut state = AppState::default();
+    for expected in Tab::ALL.iter().cycle().skip(1).take(Tab::ALL.len()) {
+        update(&mut state, Action::NextTab);
+        assert_eq!(state.active_tab, *expected);
+    }
+    assert_eq!(state.active_tab, Tab::Global);
+    for expected in Tab::ALL.iter().rev() {
+        update(&mut state, Action::PrevTab);
+        assert_eq!(state.active_tab, *expected);
+    }
+    assert_eq!(state.active_tab, Tab::Global);
+}
+
+#[test]
+fn go_to_tab_uses_the_new_numbering() {
+    let mut state = AppState::default();
+    for (index, tab) in [
+        (3, Tab::Podcasts),
+        (4, Tab::Federation),
+        (5, Tab::Logs),
+        (2, Tab::Queue),
+    ] {
+        update(&mut state, Action::GoToTab(index));
+        assert_eq!(state.active_tab, tab);
+    }
+    // Out-of-range indices are ignored.
+    update(&mut state, Action::GoToTab(6));
+    assert_eq!(state.active_tab, Tab::Queue);
+    // Re-selecting the placeholder tab is a harmless reset.
+    update(&mut state, Action::GoToTab(3));
+    update(&mut state, Action::GoToTab(3));
+    assert_eq!(state.active_tab, Tab::Podcasts);
+}
+
+#[test]
+fn help_names_tabs_for_go_to_tab() {
+    let labels: Vec<_> = (0..Tab::ALL.len())
+        .map(|index| Action::GoToTab(index).describe())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Go to Library",
+            "Go to Playlists",
+            "Go to Queue",
+            "Go to Podcasts",
+            "Go to Settings",
+            "Go to Logs",
+        ]
+    );
+    assert_eq!(Action::GoToTab(6).describe(), "Go to tab 7");
+}
+
+#[test]
 fn volume_clamps() {
     let mut state = AppState::default();
     for _ in 0..30 {

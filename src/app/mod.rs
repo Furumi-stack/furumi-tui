@@ -93,6 +93,17 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Joins two optional startup status messages with `; `, keeping both.
+pub(crate) fn join_status_messages(
+    first: Option<String>,
+    second: Option<String>,
+) -> Option<String> {
+    match (first, second) {
+        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+        (left, right) => left.or(right),
+    }
+}
+
 fn err_string(err: anyhow::Error) -> String {
     format!("{err:#}")
 }
@@ -394,11 +405,7 @@ pub async fn run(
     tracing::info!(path = %db_path.display(), "library opened");
 
     let (settings, settings_warning) = crate::config::settings::load();
-    let status_message = match (startup_warning, settings_warning) {
-        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
-        (Some(message), None) | (None, Some(message)) => Some(message),
-        (None, None) => None,
-    };
+    let status_message = join_status_messages(startup_warning, settings_warning);
     let mut state = AppState {
         status_message,
         ..AppState::default()
@@ -4489,5 +4496,31 @@ fn push_media_metadata(state: &AppState, runtime: &Runtime) {
             album: track.release_title.clone(),
             duration_secs: track.duration_seconds,
         });
+    }
+}
+
+#[cfg(test)]
+mod status_message_tests {
+    use super::join_status_messages;
+
+    #[test]
+    fn startup_messages_are_joined_not_dropped() {
+        assert_eq!(
+            join_status_messages(
+                Some("keymap notice".into()),
+                Some("logging disabled: x".into())
+            )
+            .as_deref(),
+            Some("keymap notice; logging disabled: x")
+        );
+        assert_eq!(
+            join_status_messages(None, Some("only".into())).as_deref(),
+            Some("only")
+        );
+        assert_eq!(
+            join_status_messages(Some("only".into()), None).as_deref(),
+            Some("only")
+        );
+        assert_eq!(join_status_messages(None, None), None);
     }
 }
