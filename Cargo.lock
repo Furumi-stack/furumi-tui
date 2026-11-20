@@ -1559,7 +1559,7 @@ dependencies = [
 [[package]]
 name = "federation-net"
 version = "0.3.1"
-source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fstore#d2530dca6ca0905cab2704615b89c8b89c70c7cf"
+source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fdiscovery#9c82f6d91691a66d0a559caba06e13a1293f06be"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1698,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "furumi-library"
 version = "0.3.0"
-source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fstore#d2530dca6ca0905cab2704615b89c8b89c70c7cf"
+source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fdiscovery#9c82f6d91691a66d0a559caba06e13a1293f06be"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "music-dht"
 version = "0.6.0"
-source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fstore#d2530dca6ca0905cab2704615b89c8b89c70c7cf"
+source = "git+https://gt.hexor.cy/Sanapach/frid.git?branch=podcasts%2Fdiscovery#9c82f6d91691a66d0a559caba06e13a1293f06be"
 dependencies = [
  "async-trait",
  "blake3",

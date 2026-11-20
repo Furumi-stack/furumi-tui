@@ -57,9 +57,9 @@ unicode-width = "0.2.2"
 # souvlaki 0.8.3 still depends on the unmaintained block 0.1.6. Keep its API
 # intact while using an opaque inhabited FFI type accepted by current Rust.
 block = { path = "vendor/block" }
-# Unpublished frid (MR-F1, MR-F2); remove once music-dht 0.6.0 and furumi-library 0.3.0 are on crates.io.
-music-dht = { git = "https://gt.hexor.cy/Sanapach/frid.git", branch = "podcasts/store" }
-furumi-library = { git = "https://gt.hexor.cy/Sanapach/frid.git", branch = "podcasts/store" }
+# Unpublished frid (MR-F1, MR-F2, MR-F3); remove once music-dht 0.6.0 and furumi-library 0.3.0 are on crates.io.
+music-dht = { git = "https://gt.hexor.cy/Sanapach/frid.git", branch = "podcasts/discovery" }
+furumi-library = { git = "https://gt.hexor.cy/Sanapach/frid.git", branch = "podcasts/discovery" }
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.1"
