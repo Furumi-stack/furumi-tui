@@ -13,7 +13,7 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const REPOSITORY: &str = "https://api.github.com/repos/house-of-vanity/furumi_tui";
+const REPOSITORY: &str = "https://api.github.com/repos/Furumi-stack/furumi-tui";
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -98,7 +98,7 @@ furumi
 ### Linux, Windows, and other platforms
 
 Download a prebuilt archive from the
-[GitHub releases](https://github.com/house-of-vanity/furumi_tui/releases), or
+[GitHub releases](https://github.com/Furumi-stack/furumi-tui/releases), or
 build Furumi from source with Rust 1.97 or newer:
 
 The repository selects the stable Rust toolchain. With rustup, run
@@ -458,8 +458,8 @@ owner_timeout_ms = 120000
 
 All clients must support the new coordination envelope for eventual single
 output ownership. frid's `PLAYBACK_PROTOCOL.md` describes the protocol, adapter
-contract and rollout. Local Cargo patches are only for development; publish
-frid and bump the client dependency versions before releasing these changes.
+contract and rollout. This release uses the published FRID crates
+`music-dht 0.6.0` and `furumi-library 0.3.0` from crates.io.
 
 Run the local protocol checks from the TUI repository:
 

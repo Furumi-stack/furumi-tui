@@ -1241,6 +1241,29 @@ fn only_bare_music_items_from_old_devices_count_as_echoed_placeholders() {
 /// the Logs tab) never prints them.
 #[test]
 fn podcast_payloads_are_not_written_to_the_debug_log() {
+    // Tracing caches callsite interest globally. Other tests can change it
+    // while this thread-local subscriber is active, making an expected
+    // event disappear. Keep the real log assertions in an isolated process.
+    const ISOLATED: &str = "FURUMI_TEST_ISOLATED_PODCAST_LOG";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "devices::podcast_sync_tests::podcast_payloads_are_not_written_to_the_debug_log",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated log capture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
     use std::io::Write;
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;

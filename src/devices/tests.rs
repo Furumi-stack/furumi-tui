@@ -482,6 +482,29 @@ fn test_sync() -> DeviceSync {
 
 #[test]
 fn device_identity_has_one_coordinator_across_installation_paths() {
+    // Other tests spawn processes in parallel. A child can briefly inherit
+    // this test's locked file before exec closes it, delaying release after
+    // drop(first). Keep the lock lifecycle in its own test process.
+    const ISOLATED: &str = "FURUMI_TEST_ISOLATED_IDENTITY_LOCK";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "devices::tests::device_identity_has_one_coordinator_across_installation_paths",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated identity lock test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sync.sqlite3");
     let first = acquire_identity_lock(&path).unwrap();

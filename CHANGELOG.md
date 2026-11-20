@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - unreleased
+## [0.5.0] - 2026-11-20
 
 ### Added
 
@@ -51,15 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the Podcasts tab instead, also when this device follows the feed under
   the newer address it moved to (known once the feed was read), and
   subscribing to such an older address adds no second subscription.
-
-### Changed
-
-- `furumi-tui` 0.5.0.
-
-## [0.4.0] - unreleased
-
-### Added
-
 - A Podcasts tab on `4`: subscribe to RSS/Atom feeds by URL, browse
   podcast → seasons → episodes with saved position, played state, duration and
   date, search episodes, filter by listening state, change the order, mark
@@ -100,7 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `music-dht` 0.6.0 and `furumi-library` 0.3.0.
+- `furumi-tui` 0.5.0.
+- Use published `music-dht` 0.6.0 and `furumi-library` 0.3.0 from crates.io;
+  remove the temporary FRID fork patches.
+- Self-update and release download links use the canonical
+  `Furumi-stack/furumi-tui` GitHub repository.
 - Queue items are keyed by their source: podcast episodes by episode id,
   library rows as `lib:<id>` instead of `local:<id>`. Likes, playlists,
   music history, similarity, share links and metadata edits skip episodes.
@@ -138,6 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Isolate log privacy and identity-lock lifecycle tests from process-wide
+  state and descriptor inheritance in parallel tests.
 - The protocol version stored for another device came from this build's own
   constant (on profile announcements and accepted pairings), not from the
   device. Versions now come from the device's own reports; relayed profiles
