@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 7,
+        version: 8,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
@@ -425,6 +425,13 @@ fn insert_meter(input: &mut Map, analysis: &crate::player::AudioAnalysisSnapshot
     insert_float(input, "level_r", analysis.level_r);
     insert_float(input, "peak_l", analysis.peak_l);
     insert_float(input, "peak_r", analysis.peak_r);
+    insert_float(input, "level_side", analysis.level_side);
+    let channel_mode = match analysis.stereo {
+        Some(true) => "stereo",
+        Some(false) => "mono",
+        None => "",
+    };
+    input.insert("channel_mode".into(), channel_mode.into());
     insert_int(input, "sample_rate", i64::from(analysis.sample_rate));
 }
 
@@ -2226,6 +2233,8 @@ mod tests {
         state.player.playing = true;
         state.player.audio_analysis.spectrum = vec![0.5; crate::player::BAND_CENTERS_HZ.len()];
         state.player.audio_analysis.level_l = 0.25;
+        state.player.audio_analysis.level_side = 0.125;
+        state.player.audio_analysis.stereo = Some(true);
         state.player.audio_analysis.sample_rate = 44_100;
 
         let input = input_map(Rect::new(0, 0, 80, 24), &state);
@@ -2243,6 +2252,8 @@ mod tests {
         assert_eq!(text("audio_format"), "flac");
         assert!(input["playing"].as_bool().unwrap());
         assert_eq!(float("level_l"), 0.25);
+        assert_eq!(float("level_side"), 0.125);
+        assert_eq!(text("channel_mode"), "stereo");
         assert_eq!(float("spectrum_floor_db"), -60.0);
         let spectrum = input["spectrum"].clone().into_array().unwrap();
         let hz = input["spectrum_hz"].clone().into_array().unwrap();

@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thin segment digits, a stereo peak level meter (bars or needle VU meters),
   a 25-band analyzer with three levels of glow, a nonlinear scale and peak
   hold, a peak frequency readout with hold, tone fans, a signal path
-  schematic with a travelling pulse, the transport word in segment letters,
+  schematic with a travelling pulse (source, format, volume, sample rate,
+  stereo or mono, and the output level in dBFS), the transport word in segment letters,
   mode lamps (REPEAT, SHUFFLE, source, LOUDNESS, MUTE, SEARCH, OVER), a tape
   counter and a dot-matrix title line (Latin and Cyrillic). Effects: a
   power-on segment test, a counter "search" on track changes, static on
@@ -36,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Shift+M` in the fullscreen visualizer switches its display mode; the
   choice is saved in `visualizations.toml`.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
-  peak hold, left/right RMS and held peaks, the sample rate, and track,
+  peak hold, left/right RMS and held peaks, the side-signal level
+  (`level_side`, the floor for mono) and `channel_mode` ("stereo" or
+  "mono"), the sample rate, and track,
   queue and transport details in the script input; `render` may return
   `#{ commands, state }` to keep state between frames (with `dt` and
   `frame`); new braille `dots` and `line` commands for thin drawing; bold,

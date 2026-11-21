@@ -1,6 +1,6 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 7
+// bundle-version: 8
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
@@ -63,6 +63,10 @@ fn DECK_LAMPS() { true }          // AMS / NR / AUTO REVERSE / REW-FF lamps in d
 //                                 20 kHz), 0.0..1.0 over spectrum_floor_db..0
 //                                 dBFS, with analyzer fall and peak hold
 //   level_l, level_r              channel RMS on the same scale
+//   level_side                    RMS of (L - R) / 2 on the same scale: the
+//                                 floor when both channels carry one signal
+//   channel_mode                  "stereo" or "mono" (decided on loud
+//                                 passages, kept through silence), "" unknown
 //   peak_l, peak_r                held channel sample peaks on the same scale
 //   sample_rate                   analyzed sample rate in Hz (0 = none)
 //   duration, track_number, disc_number, year, release_title
@@ -797,10 +801,53 @@ fn sbox(x, y, label, fg) {
 
 fn sbox_width(label) { label.len() + 5 }
 
+// What leaves the player, for the lower row of the signal path: the held
+// output peak in dBFS after the volume stage (the analyzer measures before
+// it; the player's gain is volume cubed, 60 * log10(volume) dB), refreshed
+// four times a second like a hardware readout,
+// and whether the two channels differ (STEREO) or carry the same signal
+// (MONO), from the host's channel_mode. Stereo in the last second keeps
+// STEREO, so a near-mono moment in a stereo track does not flip it.
+fn update_output(st, input, hot, dt) {
+    if !("out_t" in st) { st.out_t = 0.0; st.out_db = -99; st.stereo_t = 0.0; st.chan = ""; }
+    st.out_t -= dt;
+    if st.out_t <= 0.0 {
+        st.out_t = 0.25;
+        let vol = input.volume;
+        // -99 means silent; a live level is clamped to the readout's -60
+        st.out_db = if hot > 0.0 && vol > 0.0 {
+            mx(to_int(dbfs(input, hot) + 60.0 * ln(vol) / ln(10.0) - 0.5), -60)
+        } else { -99 };
+    }
+    st.stereo_t -= dt;
+    let mode = get(input, "channel_mode", "");
+    if mode == "stereo" { st.stereo_t = 1.0; }
+    if mode != "" { st.chan = if st.stereo_t > 0.0 { "STEREO" } else { "MONO" }; }
+    st
+}
+
+// Labels of the lower row, from the volume stage to the output: sample rate,
+// channels, output level. Short forms for narrow panels.
+fn output_labels(input, st, short) {
+    let sr = get(input, "sample_rate", 0);
+    if sr <= 0 { sr = get(input, "audio_sample_rate", 0); }
+    let khz = if sr > 0 { "" + (sr / 1000) + "." + ((sr % 1000) / 100) } else { "--" };
+    let chan = if "chan" in st && st.chan != "" { st.chan } else { "--" };
+    let live = get(input, "playing", false) && "out_db" in st && st.out_db > -99;
+    let db = if live { "" + st.out_db } else { "--" };
+    while db.len() < 3 { db = " " + db; }
+    if short {
+        [khz + "K", if chan == "STEREO" { "ST" } else if chan == "MONO" { "MO" } else { "--" }, db + "DB"]
+    } else {
+        [khz + " KHZ", chan, "OUT " + db + " DB"]
+    }
+}
+
 // Signal path drawn as a schematic: boxes on a bus line that runs along their
 // bottom edges, nodes between them, and a wire from the end of the upper row
-// down to the lower row. The active path is lit; now and then a bright pulse
-// travels along it from the source to the speakers.
+// down to the lower row. Every box is a live value: source, format and
+// volume above; sample rate, channels and output level below. The active path
+// is lit; now and then a bright pulse travels along it to the output.
 fn draw_schematic(input, st, x, y, w) {
     let p = st.pal;
     let playing = get(input, "playing", !input.paused && input.track_title != "");
@@ -837,17 +884,21 @@ fn draw_schematic(input, st, x, y, w) {
     let low_y = ty + 2;
     this.vl(xr, bus_y, low_y - bus_y, "▎", bus);
 
-    // lower row, right-aligned: tone, amplifier, speakers
-    let speakers = "SPEAKERS A";
-    let bottom = [speakers, "AMP", "TONE"];
-    let bw_ = sbox_width(speakers) + sbox_width("AMP") + sbox_width("TONE");
-    if bw_ + 4 > xr - x { speakers = "SPK A"; bottom = [speakers, "AMP", "TONE"]; bw_ = sbox_width(speakers) + sbox_width("AMP") + sbox_width("TONE"); }
+    // lower row, right-aligned and read right to left: sample rate, channels,
+    // output level (red near full scale)
+    // the form follows the widest values, so live readings do not switch it
+    let widest = sbox_width("192.0 KHZ") + sbox_width("STEREO") + sbox_width("OUT -60 DB");
+    let labels = output_labels(input, st, widest + 4 > xr - x);
+    let bw_ = 0;
+    for l in labels { bw_ += sbox_width(l); }
+    let bottom = [labels[2], labels[1], labels[0]];
+    let hot_out = lit && "out_db" in st && st.out_db >= -1;
     let gap2 = clamp((xr - x - bw_) / 3, 2, 12);
     let start = xr - 1 - bw_ - 2 * (gap2 - 1);
     this.hl(start, low_y, xr - start, "▔", bus);
     let cx2 = start;
     for k in 0..3 {
-        let next = this.sbox(cx2, ty, bottom[k], on);
+        let next = this.sbox(cx2, ty, bottom[k], if k == 0 && hot_out { p.red } else { on });
         if k < 2 { this.txt(next + (gap2 - 1) / 2, low_y, "▀", on); }
         cx2 = next + gap2 - 1;
     }
@@ -888,7 +939,8 @@ fn draw_transport(input, st, x, y) {
     let w = transport_width();
     let ly = y + 6;
     let caption = whiten(p.cyan_mid, 0.25);
-    let stereo = get(input, "level_l", 0.0) > 0.0 && (get(input, "level_l", 0.0) - get(input, "level_r", 0.0)).abs() > 0.001;
+    // the same detection as the signal path (see update_output)
+    let stereo = "chan" in st && st.chan == "STEREO" && get(input, "playing", false);
     this.txt(x, ly, "TRACK", caption);
     this.txt(x + 15, ly, "STEREO", if stereo || boot { p.cyan } else { p.cyan_lamp_off });
     this.txt(x + w - 7, ly, "VOLUME", caption);
@@ -962,6 +1014,7 @@ fn advance_state(input) {
     st.last_pos = input.position;
     let hot = mx(get(input, "peak_l", 0.0), get(input, "peak_r", 0.0));
     if dbfs(input, hot) > -0.5 && hot > 0.0 { st.over = 1.0; }
+    st = update_output(st, input, hot, dt);
     // the panel brightens while the power-on test runs
     st.pal = make_palette(input, if st.boot > 0.0 { 0.1 } else { 0.0 }, if st.boot > 0.0 { 0.0 } else { st.fade });
     st
@@ -1063,7 +1116,8 @@ fn draw_strip(input, st, x, y, w) {
     this.txt(cx, y, ts, p.cyan_mid); cx += ts.len() + 3;
     let vs = "VOL " + vol + "%";
     this.txt(cx, y, vs, p.cyan_mid); cx += vs.len() + 3;
-    let path = src + " › " + (if fmt == "" { "DECODE" } else { fmt }) + " › VOL › TONE › AMP › A";
+    let out = output_labels(input, st, true);
+    let path = src + " › " + (if fmt == "" { "DECODE" } else { fmt }) + " › " + out[0] + " › " + out[1] + " › OUT " + out[2];
     if cx + path.len() < x + w { this.txt(cx, y, path, p.cyan_mid); }
 }
 

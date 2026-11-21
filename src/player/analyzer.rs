@@ -33,6 +33,12 @@ pub struct AudioAnalysisSnapshot {
     pub level_r: f64,
     pub peak_l: f64,
     pub peak_r: f64,
+    /// RMS of the side signal (L - R) / 2 on the same scale: the floor for
+    /// mono sources and for stereo files that carry the same signal twice.
+    pub level_side: f64,
+    /// Whether the channels carry different signals: decided on loud windows
+    /// only (side within 30 dB of the louder channel), `None` until then.
+    pub stereo: Option<bool>,
     /// Sample rate of the analyzed stream in Hz (0 when nothing has played
     /// since the player last stopped).
     pub sample_rate: u32,
@@ -56,6 +62,7 @@ pub struct AnalyzerShared {
     /// with `fetch_max` until the meter consumes them.
     rms_l: AtomicU32,
     rms_r: AtomicU32,
+    rms_side: AtomicU32,
     peak_l: AtomicU32,
     peak_r: AtomicU32,
     /// Ballistics and FFT state. Only snapshot readers (the UI side) lock it;
@@ -79,6 +86,7 @@ impl Default for AnalyzerShared {
             sample_rate: AtomicU32::new(0),
             rms_l: AtomicU32::new(0),
             rms_r: AtomicU32::new(0),
+            rms_side: AtomicU32::new(0),
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
             meter: Mutex::new(Meter::default()),
@@ -108,7 +116,13 @@ impl AnalyzerShared {
         for sample in self.pcm.iter() {
             sample.store(0, Ordering::Relaxed);
         }
-        for level in [&self.rms_l, &self.rms_r, &self.peak_l, &self.peak_r] {
+        for level in [
+            &self.rms_l,
+            &self.rms_r,
+            &self.rms_side,
+            &self.peak_l,
+            &self.peak_r,
+        ] {
             level.store(0, Ordering::Relaxed);
         }
         self.sequence.store(0, Ordering::Relaxed);
@@ -143,6 +157,7 @@ impl AnalyzerShared {
         let stereo = StereoReading {
             rms_l: load_norm(&self.rms_l) as f32,
             rms_r: load_norm(&self.rms_r) as f32,
+            rms_side: load_norm(&self.rms_side) as f32,
             peak_l: f64::from(self.peak_l.swap(0, Ordering::Relaxed)) as f32 / LEVEL_SCALE,
             peak_r: f64::from(self.peak_r.swap(0, Ordering::Relaxed)) as f32 / LEVEL_SCALE,
         };
@@ -170,6 +185,8 @@ impl AnalyzerShared {
             level_r: reading.level_r,
             peak_l: reading.peak_l,
             peak_r: reading.peak_r,
+            level_side: reading.level_side,
+            stereo: reading.stereo,
             sample_rate,
         }
     }
@@ -205,11 +222,12 @@ impl AnalyzerShared {
         self.pcm[index].store(value, Ordering::Relaxed);
     }
 
-    fn store_channels(&self, sample_rate: f32, rms: [f32; 2], peak: [f32; 2]) {
+    fn store_channels(&self, sample_rate: f32, rms: [f32; 3], peak: [f32; 2]) {
         self.sample_rate
             .store(sample_rate.round() as u32, Ordering::Relaxed);
         store_norm(&self.rms_l, rms[0]);
         store_norm(&self.rms_r, rms[1]);
+        store_norm(&self.rms_side, rms[2]);
         self.peak_l.fetch_max(norm_bits(peak[0]), Ordering::Relaxed);
         self.peak_r.fetch_max(norm_bits(peak[1]), Ordering::Relaxed);
     }
@@ -302,6 +320,8 @@ struct AnalyzerState {
     /// Left/right of the current frame (mono feeds both).
     frame_lr: [f32; 2],
     channel_sq: [f32; 2],
+    /// Sum of squared side samples (L - R) / 2 in the current window.
+    side_sq: f32,
     channel_peak: [f32; 2],
     frame_count: usize,
     window_frames: usize,
@@ -332,6 +352,7 @@ impl AnalyzerState {
             frame_sum: 0.0,
             frame_lr: [0.0; 2],
             channel_sq: [0.0; 2],
+            side_sq: 0.0,
             channel_peak: [0.0; 2],
             frame_count: 0,
             window_frames: 0,
@@ -379,6 +400,7 @@ impl AnalyzerState {
         self.frame_sum = 0.0;
         self.frame_lr = [0.0; 2];
         self.channel_sq = [0.0; 2];
+        self.side_sq = 0.0;
         self.channel_peak = [0.0; 2];
         self.frame_count = 0;
         self.scope_counter = 0;
@@ -418,6 +440,8 @@ impl AnalyzerState {
             self.channel_sq[channel] += value * value;
             self.channel_peak[channel] = self.channel_peak[channel].max(value.abs());
         }
+        let side = (self.frame_lr[0] - self.frame_lr[1]) * 0.5;
+        self.side_sq += side * side;
 
         let mono = self.frame_sum / self.channels as f32;
         self.channel_index = 0;
@@ -484,6 +508,7 @@ impl AnalyzerState {
             [
                 (self.channel_sq[0] / frames).sqrt(),
                 (self.channel_sq[1] / frames).sqrt(),
+                (self.side_sq / frames).sqrt(),
             ],
             self.channel_peak,
         );
@@ -493,6 +518,7 @@ impl AnalyzerState {
         self.mid_sq = 0.0;
         self.treble_sq = 0.0;
         self.channel_sq = [0.0; 2];
+        self.side_sq = 0.0;
         self.channel_peak = [0.0; 2];
         self.frame_count = 0;
     }
@@ -536,19 +562,24 @@ mod tests {
 
     impl TestSource {
         fn sine(frames: usize, channels: u16, sample_rate: u32, frequency: f32) -> Self {
-            let channels_count = channels.max(1);
-            let mut samples = Vec::with_capacity(frames * usize::from(channels_count));
+            let gains = vec![1.0; usize::from(channels.max(1))];
+            Self::sine_gains(frames, sample_rate, frequency, &gains)
+        }
+
+        /// A sine with a gain per channel (one entry per channel).
+        fn sine_gains(frames: usize, sample_rate: u32, frequency: f32, gains: &[f32]) -> Self {
+            let mut samples = Vec::with_capacity(frames * gains.len());
             for frame in 0..frames {
                 let time = frame as f32 / sample_rate as f32;
                 let sample = (std::f32::consts::TAU * frequency * time).sin() * 0.5;
-                for _ in 0..channels_count {
-                    samples.push(sample as Sample);
+                for gain in gains {
+                    samples.push((sample * gain) as Sample);
                 }
             }
             Self {
                 samples,
                 cursor: 0,
-                channels: ChannelCount::new(channels_count).unwrap(),
+                channels: ChannelCount::new(u16::try_from(gains.len()).unwrap()).unwrap(),
                 sample_rate: SampleRate::new(sample_rate).unwrap(),
             }
         }
@@ -625,7 +656,32 @@ mod tests {
             .map(|(index, _)| index);
         assert_eq!(loudest, Some(at_1k));
         assert!(snapshot.level_l > 0.5 && (snapshot.level_l - snapshot.level_r).abs() < 1e-6);
+        // the same signal in both channels has no side component
+        assert_eq!(snapshot.level_side, 0.0);
+        assert_eq!(snapshot.stereo, Some(false));
         assert!(snapshot.peak_l >= snapshot.level_l);
+    }
+
+    #[test]
+    fn analyzed_source_measures_the_side_signal() {
+        let measure = |gains: &[f32]| {
+            let shared = Arc::new(AnalyzerShared::default());
+            let source = TestSource::sine_gains(48_000, 48_000, 1_000.0, gains);
+            for _ in AnalyzedSource::new(source, Arc::clone(&shared)) {}
+            shared.snapshot()
+        };
+        // R = -L: the side signal (L - R) / 2 equals L
+        let opposite = measure(&[1.0, -1.0]);
+        assert!(opposite.level_side > 0.5);
+        assert!((opposite.level_side - opposite.level_l).abs() < 1e-3);
+        assert_eq!(opposite.stereo, Some(true));
+        // mono duplicates L into R
+        let mono = measure(&[1.0]);
+        assert_eq!(mono.level_side, 0.0);
+        assert_eq!(mono.stereo, Some(false));
+        // a third channel only feeds the mono sum
+        let surround = measure(&[1.0, 0.0, 1.0]);
+        assert!(surround.level_side > 0.0 && surround.level_side < surround.level_l);
     }
 
     #[test]

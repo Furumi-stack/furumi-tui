@@ -39,6 +39,14 @@ const PEAK_HOLD_SECS: f32 = 1.2;
 const PEAK_FALL_DB_PER_SEC: f32 = 18.0;
 const LEVEL_ATTACK_SECS: f32 = 0.05;
 const LEVEL_RELEASE_SECS: f32 = 0.3;
+/// A window counts as stereo when its side signal (L - R) / 2 is no more
+/// than this far below the louder channel: lossy coding of a mono recording
+/// leaves a side signal far below that, real stereo mixes sit well above it.
+const STEREO_SIDE_DB: f32 = -30.0;
+/// Only windows this far above the floor decide; quieter ones keep the last
+/// decision, since their side signal is lost in the floor.
+const STEREO_DECIDE_ABOVE_FLOOR_DB: f32 = 30.0;
+
 /// Longest step applied at once; a stalled reader must not fast-forward a
 /// whole second of decay in one frame.
 const MAX_STEP_SECS: f32 = 0.25;
@@ -64,6 +72,8 @@ fn exact_center(index: usize) -> f32 {
 pub struct StereoReading {
     pub rms_l: f32,
     pub rms_r: f32,
+    /// RMS of the side signal (L - R) / 2.
+    pub rms_side: f32,
     /// Highest sample peaks since the previous reading.
     pub peak_l: f32,
     pub peak_r: f32,
@@ -77,6 +87,10 @@ pub struct MeterReading {
     pub level_r: f64,
     pub peak_l: f64,
     pub peak_r: f64,
+    pub level_side: f64,
+    /// Whether the two channels carry different signals (see
+    /// `STEREO_SIDE_DB`); `None` until a loud enough window was measured.
+    pub stereo: Option<bool>,
 }
 
 struct Hold {
@@ -204,7 +218,8 @@ pub struct Meter {
     analysis: Option<Analysis>,
     bands_db: [f32; BANDS],
     band_peaks: [Hold; BANDS],
-    level_db: [f32; 2],
+    /// Left, right and side RMS levels.
+    level_db: [f32; 3],
     level_peaks: [Hold; 2],
     last_update: Option<Instant>,
     last_write: usize,
@@ -212,7 +227,9 @@ pub struct Meter {
     /// between device callbacks until `STALL_SECS` pass.
     last_fresh: Option<Instant>,
     held_targets: [f32; BANDS],
-    held_rms: [f32; 2],
+    held_rms: [f32; 3],
+    /// Last stereo decision; kept through silence, pauses and stalls.
+    stereo: Option<bool>,
 }
 
 impl std::fmt::Debug for Meter {
@@ -230,13 +247,14 @@ impl Default for Meter {
             analysis: None,
             bands_db: [FLOOR_DB; BANDS],
             band_peaks: std::array::from_fn(|_| Hold::new()),
-            level_db: [FLOOR_DB; 2],
+            level_db: [FLOOR_DB; 3],
             level_peaks: std::array::from_fn(|_| Hold::new()),
             last_update: None,
             last_write: 0,
             last_fresh: None,
             held_targets: [FLOOR_DB; BANDS],
-            held_rms: [0.0; 2],
+            held_rms: [0.0; 3],
+            stereo: None,
         }
     }
 }
@@ -275,7 +293,13 @@ impl Meter {
             let analysis = self.analysis.as_mut().expect("analysis was just set");
             fill_pcm(&mut analysis.pcm);
             self.held_targets = analysis.band_targets();
-            self.held_rms = [stereo.rms_l, stereo.rms_r];
+            self.held_rms = [stereo.rms_l, stereo.rms_r, stereo.rms_side];
+            // decided on the raw window, before ballistics: smoothed levels
+            // converge on the floor together and would read as stereo
+            let loud = stereo.rms_l.max(stereo.rms_r);
+            if to_db(loud) > FLOOR_DB + STEREO_DECIDE_ABOVE_FLOOR_DB {
+                self.stereo = Some(to_db(stereo.rms_side) > to_db(loud) + STEREO_SIDE_DB);
+            }
             self.last_fresh = Some(now);
             (
                 self.held_targets,
@@ -288,7 +312,7 @@ impl Meter {
         {
             (self.held_targets, self.held_rms, [0.0; 2])
         } else {
-            ([FLOOR_DB; BANDS], [0.0; 2], [0.0; 2])
+            ([FLOOR_DB; BANDS], [0.0; 3], [0.0; 2])
         };
 
         for ((current, target), peak) in self
@@ -300,9 +324,11 @@ impl Meter {
             *current = follow_band(*current, target, dt);
             peak.update(*current, dt);
         }
-        for channel in 0..2 {
-            self.level_db[channel] = follow_level(self.level_db[channel], to_db(rms[channel]), dt);
-            self.level_peaks[channel].update(to_db(peaks[channel]), dt);
+        for (level, value) in self.level_db.iter_mut().zip(rms) {
+            *level = follow_level(*level, to_db(value), dt);
+        }
+        for (hold, value) in self.level_peaks.iter_mut().zip(peaks) {
+            hold.update(to_db(value), dt);
         }
 
         MeterReading {
@@ -316,6 +342,8 @@ impl Meter {
             level_r: normalize(self.level_db[1]),
             peak_l: normalize(self.level_peaks[0].db),
             peak_r: normalize(self.level_peaks[1].db),
+            level_side: normalize(self.level_db[2]),
+            stereo: self.stereo,
         }
     }
 }
@@ -467,6 +495,7 @@ mod tests {
         let tone = StereoReading {
             rms_l: 0.35,
             rms_r: 0.35,
+            rms_side: 0.0,
             peak_l: 0.5,
             peak_r: 0.5,
         };
@@ -534,6 +563,7 @@ mod tests {
         let loud_left = StereoReading {
             rms_l: 0.5,
             rms_r: 0.05,
+            rms_side: 0.2,
             peak_l: 0.9,
             peak_r: 0.1,
         };
@@ -551,6 +581,52 @@ mod tests {
         assert!((reading.level_l - normalize(to_db(0.5))).abs() < 0.02);
         assert!((reading.peak_l - normalize(to_db(0.9))).abs() < 0.01);
         assert!(reading.peak_l >= reading.level_l);
+        assert!((reading.level_side - normalize(to_db(0.2))).abs() < 0.02);
+        assert_eq!(reading.stereo, Some(true));
+    }
+
+    #[test]
+    fn stereo_is_decided_on_loud_windows_and_kept_through_silence() {
+        let mut meter = Meter::default();
+        let start = Instant::now();
+        let mut read = |step: u64, stereo: StereoReading| {
+            meter.update(
+                start + Duration::from_millis(50 * step),
+                step as usize,
+                48_000,
+                stereo,
+                |out| out.fill(0.0),
+            )
+        };
+        let quiet = StereoReading {
+            rms_l: 0.0005,
+            rms_r: 0.0001,
+            rms_side: 0.0002,
+            ..StereoReading::default()
+        };
+        assert_eq!(read(1, quiet).stereo, None);
+        let near_mono = StereoReading {
+            rms_l: 0.3,
+            rms_r: 0.3,
+            rms_side: 0.003,
+            ..StereoReading::default()
+        };
+        assert_eq!(read(2, near_mono).stereo, Some(false));
+        // silence and then a stall keep the decision
+        assert_eq!(read(3, StereoReading::default()).stereo, Some(false));
+        let wide = StereoReading {
+            rms_side: 0.1,
+            ..near_mono
+        };
+        assert_eq!(read(4, wide).stereo, Some(true));
+        let later = meter.update(
+            start + Duration::from_secs(5),
+            4,
+            48_000,
+            StereoReading::default(),
+            |out| out.fill(0.0),
+        );
+        assert_eq!(later.stereo, Some(true));
     }
 
     #[test]
@@ -559,6 +635,7 @@ mod tests {
         let reading = meter.update(Instant::now(), 1, 0, StereoReading::default(), |_| {});
         assert!(reading.spectrum.iter().all(|value| *value == 0.0));
         assert_eq!(reading.level_l, 0.0);
+        assert_eq!(reading.level_side, 0.0);
         assert_eq!(reading.spectrum.len(), BAND_CENTERS_HZ.len());
     }
 

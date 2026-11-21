@@ -505,7 +505,8 @@ ratatui frame or audio engine directly.
 Protocol v3 adds what front-panel displays need: a third-octave spectrum
 (31 bands, 20 Hz to 20 kHz, nominal ISO labels with exact base-2 edges that
 partition the FFT bins) with per-band peak hold, left/right RMS and held
-sample peaks, the analyzed sample rate, and track, queue and transport
+sample peaks, the RMS of the side signal (L - R) / 2 and a
+stereo/mono decision made on loud windows, the analyzed sample rate, and track, queue and transport
 details (format, bit depth, bitrate, track number, queue position, repeat,
 shuffle, source), and the local wall-clock time. The audio thread only appends mono samples to a lock-free
 ring and accumulates per-window channel levels; the FFT (an ~85 ms window
