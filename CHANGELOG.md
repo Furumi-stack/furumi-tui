@@ -10,15 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - "VFD panel" visualization: a vacuum-fluorescent hi-fi front panel with
-  thin segment digits, a stereo peak level meter, a 25-band analyzer with
-  peak hold, tone fans, a routing diagram and transport lamps, plus a
-  power-on segment test, a counter "search" on track changes and an OVER
-  lamp. It also has a dot-matrix title line (Latin and Cyrillic), palettes
-  ("classic", "green", "amber", "ice"), needle VU meters as an option, a
-  night dimmer, a slow filament "breath", slightly uneven digit brightness,
-  a tape counter, LOUDNESS / MUTE / SEARCH
-  lamps, a burst of static on track changes and a standby clock when
-  nothing is loaded.
+  thin segment digits, a stereo peak level meter (bars or needle VU meters),
+  a 25-band analyzer with three levels of glow, a nonlinear scale and peak
+  hold, a peak frequency readout with hold, tone fans, a signal path
+  schematic with a travelling pulse, the transport word in segment letters,
+  mode lamps (REPEAT, SHUFFLE, source, LOUDNESS, MUTE, SEARCH, OVER), a tape
+  counter and a dot-matrix title line (Latin and Cyrillic). Effects: a
+  power-on segment test, a counter "search" on track changes, static on
+  track and source changes, a source block that relights with its new
+  value, colours that fade into unlit phosphor on pause, a night dimmer, a
+  slow filament "breath", slightly uneven digit brightness and a standby
+  clock when nothing is loaded. Palettes ("classic", "green", "amber",
+  "ice") and compositions ("full", "spectrum", "tape", or "auto" by screen
+  size) are options at the top of the script.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
   peak hold, left/right RMS and held peaks, the sample rate, and track,
   queue and transport details in the script input; `render` may return

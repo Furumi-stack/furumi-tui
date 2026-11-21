@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 3,
+        version: 4,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
@@ -2008,6 +2008,24 @@ mod tests {
                     let area = Rect::new(0, 0, width as u16, height as u16);
                     let mut buffer = Buffer::empty(area);
                     render_commands_to_buffer(&mut buffer, area, &commands);
+                    // nothing is laid out past the bottom of the frame
+                    for command in &commands {
+                        let bottom = match command {
+                            DrawCommand::Text { y, .. }
+                            | DrawCommand::Cell { y, .. }
+                            | DrawCommand::HLine { y, .. } => Some(*y),
+                            DrawCommand::VLine { y, h, .. } | DrawCommand::Rect { y, h, .. } => {
+                                Some(y + h.saturating_sub(1))
+                            }
+                            _ => None,
+                        };
+                        if let Some(bottom) = bottom {
+                            assert!(
+                                i64::from(bottom) < height,
+                                "{width}x{height} {title:?}: drawn at row {bottom}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2037,13 +2055,26 @@ mod tests {
                 r#"fn PALETTE() { "ice" }"#,
                 1,
             ),
+            base.replacen(r#"fn LAYOUT() { "auto" }"#, r#"fn LAYOUT() { "tape" }"#, 1),
+            base.replacen(
+                r#"fn LAYOUT() { "auto" }"#,
+                r#"fn LAYOUT() { "spectrum" }"#,
+                1,
+            ),
         ];
         assert_ne!(variants[0], variants[1]);
         assert_ne!(variants[0], variants[2]);
         for source in variants {
             let file = tempfile::NamedTempFile::new().unwrap();
             std::fs::write(file.path(), &source).unwrap();
-            for (width, height) in [(30, 8), (80, 24), (160, 45), (240, 70)] {
+            for (width, height) in [
+                (30, 8),
+                (80, 24),
+                (100, 30),
+                (110, 40),
+                (160, 45),
+                (240, 70),
+            ] {
                 for title in ["", "Даже не думай — Ёлка", "Track"] {
                     let mut runtime = ScriptRuntime::default();
                     // Past the power-on test, with static and a seek pending.

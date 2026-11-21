@@ -1,25 +1,41 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 3
+// bundle-version: 4
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
-// analyzer with peak hold, tone fans, a routing diagram, transport lamps and
-// a dot-matrix title line. Everything is drawn thin (eighth blocks and
+// analyzer with three levels of glow and peak hold, a peak frequency readout
+// with hold, tone fans, a signal path schematic, the transport word, mode
+// lamps and a dot-matrix title line. Everything is drawn thin (eighth blocks and
 // braille dots); only level bars are thicker.
+//
+// Typography: numbers (time, frequency, volume) in 7-segment digits, the
+// transport word (PLAY / PAUSE / STOP) in segment letters with centre strokes,
+// the title in a 5x7 dot matrix, service labels in plain thin text, mode lamps
+// as a label over a short bar.
 //
 // Effects, most of them keeping a little state between frames:
 //   power-on segment test, counter "search" on track changes, OVER lamp with
-//   hold, blinking pause point, slightly uneven digit brightness (an aged tube), a slow filament "breath", a
-//   brighter panel on loud passages and a dimmer at night, a short burst of
-//   static when the track or source changes, LOUDNESS / MUTE / SEARCH lamps,
-//   a running tape counter, and a standby clock with a sweep every minute
-//   when nothing is loaded.
+//   hold, blinking pause point, slightly uneven digit brightness (an aged
+//   tube), a slow filament "breath", phosphor that glows brighter only where a
+//   column is loud, a dimmer at night, colours that fade into unlit phosphor
+//   on pause, a source block that goes dark and relights with its new value,
+//   a short burst of static when the track or source changes, a pulse that
+//   now and then travels the signal path, LOUDNESS / MUTE / SEARCH lamps, a
+//   running tape counter, and a standby clock with a sweep every minute when
+//   nothing is loaded.
 //
-// Options: edit the three functions below.
+// Options: edit the functions below.
 fn PALETTE() { "classic" }        // "classic" | "green" | "amber" | "ice"
 fn METER_STYLE() { "bars" }       // "bars" | "needles"
 fn NIGHT_DIMMER() { true }        // dim the panel from 22:00 to 07:00
+fn LAYOUT() { "auto" }            // "auto" | "full" | "spectrum" | "tape"
+//   full      everything: meters, analyzer, tone, signal path, transport
+//   spectrum  a taller analyzer; the lower modules shrink to one line
+//   tape      large counter, tape counter and L/R meters, a small analyzer
+//   auto      full on large screens, spectrum on medium ones, compact below
+//             (auto never picks tape; a chosen layout that does not fit
+//             falls back to compact)
 //
 // Script entry point:
 //   fn render(input) -> Array<Map>                  (stateless)
@@ -121,8 +137,10 @@ fn dots(points, fg) {
 
 // ---------- palette and brightness ----------
 // Four colour zones like the filters over a real VFD: text, analyzer,
-// auxiliary (tone / routing / transport) and warnings. Each frame the zones
-// get one brightness: night dimmer x filament breath x loudness.
+// auxiliary (tone / signal path / transport) and warnings. Each frame the
+// zones get one brightness: night dimmer x filament breath (plus a boost during
+// the power-on test). Loud analyzer columns glow brighter on their own, and
+// pause fades lit colours into unlit phosphor.
 
 fn zone_bases() {
     switch PALETTE() {
@@ -138,18 +156,32 @@ fn night(input) {
     NIGHT_DIMMER() && (h >= 22 || h < 7)
 }
 
-fn make_palette(input, boost) {
+// An unlit, desaturated phosphor tone of `c`: what a segment looks like when
+// the grid voltage drops. `t` blends towards it (0 = lit colour).
+fn phosphor(c, t) {
+    let r = to_float((c >> 16) & 255); let g = to_float((c >> 8) & 255); let b = to_float(c & 255);
+    let l = (0.3 * r + 0.59 * g + 0.11 * b) * 0.45;
+    rgb(r + (l * 0.92 - r) * t, g + (l - g) * t, b + (l * 0.96 - b) * t)
+}
+
+fn glow(c, b, fade) { phosphor(scale(c, b), fade) }
+
+// `boost` brightens the whole panel (power-on test); `fade` (0..1) moves the
+// lit colours towards unlit phosphor (pause, stop).
+fn make_palette(input, boost, fade) {
     let z = zone_bases();
     let dim = if night(input) { 0.72 } else { 1.0 };
     let breath = 0.955 + 0.045 * sin(input.time * 0.9);
-    let loud = 1.0 + 0.07 * input.energy;
-    let b = clamp(dim * breath * loud + boost, 0.3, 1.15);
+    let b = clamp(dim * breath + boost, 0.3, 1.15);
+    let amber = glow(z[1], b, fade);
     #{
-        white: scale(z[0], b), white_mid: scale(z[0], 0.6 * b), white_ghost: scale(z[0], 0.095),
-        amber: scale(z[1], b), amber_hot: whiten(scale(z[1], b), 0.45),
-        amber_ghost: scale(z[1], 0.16), amber_text: scale(z[1], 0.8 * b),
-        red: scale(z[3], b), red_ghost: scale(z[3], 0.18),
-        cyan: scale(z[2], b), cyan_mid: scale(z[2], 0.55 * b), cyan_ghost: scale(z[2], 0.13),
+        white: glow(z[0], b, fade), white_mid: glow(z[0], 0.6 * b, fade), white_ghost: scale(z[0], 0.095),
+        amber: amber, amber_low: glow(z[1], 0.68 * b, fade), amber_hot: whiten(amber, 0.5),
+        peak: whiten(amber, 0.8), amber_ghost: scale(z[1], 0.17), amber_text: glow(z[1], 0.8 * b, fade),
+        amber_rule: scale(z[1], 0.3),
+        red: glow(z[3], b, fade * 0.6), red_ghost: scale(z[3], 0.18),
+        cyan: glow(z[2], b, fade), cyan_mid: glow(z[2], 0.55 * b, fade), cyan_hot: whiten(glow(z[2], b, fade), 0.6),
+        cyan_ghost: scale(z[2], 0.13),
         // unlit segments of the thin digits: fainter than the analyzer's,
         // so a lit digit never reads as an 8
         white_seg: scale(z[0], 0.055), amber_seg: scale(z[1], 0.075), cyan_seg: scale(z[2], 0.07),
@@ -161,22 +193,29 @@ fn make_palette(input, boost) {
 // Segments are thin lines on cell edges, all about equally thick: horizontals
 // are eighth blocks ("▁", 1/8 of the cell height) along the bottom of a row,
 // verticals are quarter blocks ("▎", 1/4 of the narrower cell width) along
-// the left edge of the first and the last column. A glyph is cw cells wide
-// (cw - 1 between its verticals) and 2*rh+1 rows tall.
+// the left edge of the first and the last column. A cell holds one stroke,
+// so where a horizontal would share the left column with a vertical (middle
+// and bottom bars) the vertical keeps the cell and the bar starts one column
+// later: a small joint gap like on a real segment display. A glyph is cw cells
+// wide and 2*rh+1 rows tall. Letters add centre strokes (i above, l below the middle) and a
+// short middle bar (h), a 7-segment subset of a 14-segment display.
 
 fn seg_mask(ch) {
     let s = switch ch {
         "0" => "abcdef", "1" => "bc", "2" => "abged", "3" => "abgcd",
         "4" => "fgbc", "5" => "afgcd", "S" => "afgcd", "6" => "afgedc",
         "7" => "abc", "8" => "abcdefg", "9" => "abcdfg", "P" => "abefg",
-        "L" => "def", "A" => "abcefg", "Y" => "bcdfg", "U" => "bcdef",
-        "E" => "adefg", "t" => "defg", "o" => "cdeg", "H" => "bcefg",
+        "L" => "def", "A" => "abcefg", "Y" => "bfgl", "U" => "bcdef",
+        "E" => "adefh", "T" => "ail", "O" => "abcdef", "H" => "bcefg",
         "C" => "adef", "r" => "eg", "n" => "ceg", "d" => "bcdeg",
         "-" => "g", _ => ""
     };
     let m = 0;
     for c in s.chars() {
-        m = m | switch c { 'a' => 1, 'b' => 2, 'c' => 4, 'd' => 8, 'e' => 16, 'f' => 32, 'g' => 64, _ => 0 };
+        m = m | switch c {
+            'a' => 1, 'b' => 2, 'c' => 4, 'd' => 8, 'e' => 16, 'f' => 32, 'g' => 64,
+            'i' => 128, 'l' => 256, 'h' => 512, _ => 0
+        };
     }
     m
 }
@@ -184,14 +223,22 @@ fn seg_mask(ch) {
 fn pick(mask, bit, on, off) { if (mask & bit) != 0 { on } else { off } }
 
 fn seg(x, y, mask, cw, rh, on, off) {
-    let inner = cw - 1;
-    this.hl(x, y, inner, "▁", pick(mask, 1, on, off));
+    let inner = mx(cw - 2, 1);
+    this.hl(x, y, cw - 1, "▁", pick(mask, 1, on, off));
     this.vl(x, y + 1, rh, "▎", pick(mask, 32, on, off));
     this.vl(x + cw - 1, y + 1, rh, "▎", pick(mask, 2, on, off));
-    this.hl(x, y + rh, inner, "▁", pick(mask, 64, on, off));
+    if (mask & 512) != 0 {
+        this.hl(x + 1, y + rh, mx(inner / 2, 1), "▁", on);
+    } else {
+        this.hl(x + 1, y + rh, inner, "▁", pick(mask, 64, on, off));
+    }
     this.vl(x, y + rh + 1, rh, "▎", pick(mask, 16, on, off));
     this.vl(x + cw - 1, y + rh + 1, rh, "▎", pick(mask, 4, on, off));
-    this.hl(x, y + 2 * rh, inner, "▁", pick(mask, 8, on, off));
+    this.hl(x + 1, y + 2 * rh, inner, "▁", pick(mask, 8, on, off));
+    // centre strokes only exist on letters that use them
+    let m = x + (cw - 1) / 2;
+    if (mask & 128) != 0 { this.vl(m, y + 1, rh, "▎", on); }
+    if (mask & 256) != 0 { this.vl(m, y + rh + 1, rh, "▎", on); }
 }
 
 // An aged tube: every digit position is a little brighter or dimmer.
@@ -218,9 +265,13 @@ fn seg_text(x, y, s, cw, rh, on, off, point_on) {
 // Normalized meter value -> dBFS.
 fn dbfs(input, v) { get(input, "spectrum_floor_db", -60.0) * (1.0 - v) }
 
-// Display range of the analyzer: ordinary music sits around -45..-15 dBFS
-// per third-octave band; the panel shows -50..-10 dBFS.
-fn band_display(input, v) { clamp((dbfs(input, v) + 50.0) / 40.0, 0.0, 1.0) }
+// Display curve of the analyzer: -50..-8 dBFS per third-octave band, raised to
+// a power so quiet music sits lower and loud passages reach the top; the shape
+// of the spectrum then changes visibly between quiet and loud fragments.
+fn band_display(input, v) {
+    let lin = clamp((dbfs(input, v) + 50.0) / 42.0, 0.0, 1.0);
+    if lin <= 0.0 { 0.0 } else { pow(lin, 1.3) }
+}
 
 // The 25 panel bands 63 Hz .. 16 kHz are spectrum entries 5..29.
 fn panel_bands(input) {
@@ -267,7 +318,7 @@ fn tape_counter(position) {
 
 // ---------- panels ----------
 
-fn draw_counter(input, st, x, y) {
+fn draw_counter(input, st, x, y, cw, rh) {
     let p = st.pal;
     let secs = clamp(to_int(input.position), 0, 99 * 60 + 59);
     let text = "" + (secs / 60) + "." + pad2(secs % 60);
@@ -279,14 +330,14 @@ fn draw_counter(input, st, x, y) {
     let lit = if input.paused { p.white_mid } else { p.white };
     let off = if st.boot > 0.0 { lit } else { p.white_seg };
     let blink = !input.paused || (to_int(input.time * 2.0) % 2 == 0);
-    let end = this.seg_text(x, y, text, 6, 2, lit, off, blink);
+    let end = this.seg_text(x, y, text, cw, rh, lit, off, blink);
     let n = get(input, "track_number", 0);
     let q = get(input, "queue_index", 0);
     let tn = if n > 0 { n } else { q };
     let ts = if tn <= 0 { "-" } else if tn > 99 { "--" } else { "" + tn };
-    let te = this.seg_text(end + 3, y, ts, 6, 2, lit, off, false);
-    this.txt(x, y + 6, "TIME", p.white_mid);
-    this.txt(end + 3, y + 6, "TRACK", p.white_mid);
+    let te = this.seg_text(end + 3, y, ts, cw, rh, lit, off, false);
+    this.txt(x, y + 2 * rh + 2, "TIME", p.white_mid);
+    this.txt(end + 3, y + 2 * rh + 2, "TRACK", p.white_mid);
     te
 }
 
@@ -405,8 +456,11 @@ fn draw_lamps(input, st, bands, x, y) {
     this.txt(x + 4, y + 5, if st.boot > 0.0 { "8888" } else { pad4(tape_counter(input.position)) }, p.white);
 }
 
+// A mode lamp: the label with a short indicator bar under it.
 fn lamp(x, y, label, on, lit, ghost) {
-    this.txt(x, y, label, if on { lit } else { ghost });
+    let fg = if on { lit } else { ghost };
+    this.txt(x, y, label, fg);
+    this.hl(x, y + 1, label.len(), "▔", fg);
     x + label.len() + 3
 }
 
@@ -500,6 +554,10 @@ fn title_label(input) {
 }
 
 // Segment analyzer: thin dashes stacked per band, a dark gap between bands.
+// Three levels of glow: lit segments (dimmer at the foot of a column, the top
+// one nearly white), unlit segments that stay visible but faint, and a light
+// peak-hold mark above the column. Louder columns burn brighter on their own
+// instead of the whole panel brightening.
 fn draw_analyzer(input, st, bands, x, y, bw, h) {
     let p = st.pal;
     let n = bands.len();
@@ -515,46 +573,64 @@ fn draw_analyzer(input, st, bands, x, y, bw, h) {
         this.txt(right, y + r, "·", fg);
         r += 1;
     }
+    let boot = st.boot > 0.0;
     for i in 0..n {
         let bx = x + 2 + i * bw;
-        let v = if st.boot > 0.0 { 1.0 } else { bands[i][0] };
+        let v = if boot { 1.0 } else { bands[i][0] };
         let lit = clamp(to_int(v * to_float(h) + 0.5), 0, h);
+        let g = if boot { 1.0 } else { 0.78 + 0.34 * v };
         if lit < h { this.fill(bx, y, bar, h - lit, "▂", p.amber_ghost); }
-        if lit > 1 { this.fill(bx, y + h - lit + 1, bar, lit - 1, "▂", p.amber); }
-        if lit > 0 { this.hl(bx, y + h - lit, bar, "▂", p.amber_hot); }
+        if lit > 0 {
+            let low = to_int(to_float(lit) * 0.45);
+            if low > 0 { this.fill(bx, y + h - low, bar, low, "▂", scale(p.amber_low, g)); }
+            let body = lit - low - 1;
+            if body > 0 { this.fill(bx, y + h - lit + 1, bar, body, "▂", scale(p.amber, g)); }
+            this.hl(bx, y + h - lit, bar, "▂", p.amber_hot);
+        }
         let cap = clamp(to_int(bands[i][1] * to_float(h) + 0.5), 0, h);
-        if cap > lit && st.boot <= 0.0 { this.hl(bx, y + h - cap, bar, "▂", p.amber_hot); }
+        if cap > lit && !boot { this.hl(bx, y + h - cap, bar, "▂", p.peak); }
         let label = band_label(i);
-        let lx = mx(bx + (bar - label.len()) / 2, x + 1);
-        if lx >= free {
-            this.txt(lx, y + h + 1, label, p.amber_text);
-            free = lx + label.len() + 1;
+        // narrow bars: keep only the dot halfway between two frequencies, so
+        // dots never push the frequencies out
+        if label != "·" || bar >= 2 || i % 4 == 2 {
+            let lx = mx(bx + (bar - label.len()) / 2, x + 1);
+            if lx >= free {
+                this.txt(lx, y + h + 1, label, p.amber_text);
+                free = lx + label.len() + 1;
+            }
         }
     }
     right
 }
 
-fn draw_readout(input, st, bands, x, y) {
+// Peak frequency as one measuring module with a fixed vertical structure:
+// caption and HOLD lamp, the value, a rule, then the sample rate. The value
+// is held (HOLD lit) while the loudest band is weaker than the held one.
+fn draw_measure(input, st, x, y, w) {
     let p = st.pal;
-    let best = 0;
-    for i in 1..bands.len() { if bands[i][0] > bands[best][0] { best = i; } }
-    let live = st.boot > 0.0 || bands[best][0] > 0.08;
-    let hz = band_hz(best);
+    let boot = st.boot > 0.0;
+    let live = boot || st.hold_v > 0.05;
+    let holding = !boot && live && st.hold_i != st.best_i;
+    this.txt(x, y, "PEAK FREQUENCY", p.amber_text);
+    this.txt(x + w - 4, y, "HOLD", if holding || boot { p.amber } else { p.amber_ghost });
+    let hz = band_hz(st.hold_i);
     let digits = ""; let unit = "";
-    if hz < 1000 { digits = "" + hz; unit = "HZ"; }
-    else if hz < 10000 { digits = "" + (hz / 1000) + "." + ((hz % 1000) / 100); unit = "KHZ"; }
-    else { digits = "" + (hz / 1000); unit = "KHZ"; }
+    if hz < 1000 { digits = "" + hz; unit = "Hz"; }
+    else if hz < 10000 { digits = "" + (hz / 1000) + "." + ((hz % 1000) / 100); unit = "kHz"; }
+    else { digits = "" + (hz / 1000); unit = "kHz"; }
     if !live { digits = "--"; }
-    let off = if st.boot > 0.0 { p.amber } else { p.amber_seg };
-    let end = this.seg_text(x, y, digits, 6, 2, p.amber, off, true);
-    this.txt(end + 1, y + 4, unit, if live { p.amber } else { p.amber_ghost });
-    this.txt(x, y + 7, "PEAK BAND", p.amber_text);
-    this.txt(x + 12, y + 7, "HOLD", p.amber);
+    let off = if boot { p.amber } else { p.amber_seg };
+    let end = this.seg_text(x, y + 2, digits, 6, 2, p.amber, off, true);
+    this.txt(end + 1, y + 6, unit, if live { p.amber_text } else { p.amber_ghost });
+    this.hl(x, y + 8, w, "▁", p.amber_rule);
     let sr = get(input, "sample_rate", 0);
-    let srt = if sr > 0 { "" + (sr / 1000) + "." + ((sr % 1000) / 100) + "k" } else { "--" };
-    this.txt(x, y + 9, "RATE", p.amber_text);
-    this.txt(x + 5, y + 9, "[" + srt + "]", p.amber);
+    let srt = if sr > 0 { "" + (sr / 1000) + "." + ((sr % 1000) / 100) + " kHz" } else { "--" };
+    this.txt(x, y + 10, "RATE", p.amber_text);
+    this.txt(x + w - srt.len(), y + 10, srt, p.amber);
 }
+
+// Height of the measuring module.
+fn measure_height() { 11 }
 
 // Bass / treble fans as thin stepped strokes: each range's line runs from its
 // level at the edge (+10 .. -10) into the flat 0 line in the middle; only the
@@ -611,79 +687,123 @@ fn draw_balance(input, st, x, y, w) {
     this.txt(pos, y + 1, "▮", p.cyan);
 }
 
-// A label plate: a thin line above and below the label, no sides.
-// Returns the x after the plate (3 rows tall, the label on row y+1).
-fn plate(x, y, label, fg) {
-    let w = label.len() + 2;
+// A framed box: "▁" above, "▔" below, "▎" sides on the left edges of the
+// first column and of the column after the label, so the frame lines are all
+// equally thin and every corner meets. Returns the column after its right
+// side. 3 rows tall, the label on row y+1.
+fn sbox(x, y, label, fg) {
+    let w = label.len() + 4;
     this.hl(x, y, w, "▁", fg);
-    this.txt(x + 1, y + 1, label, fg);
+    this.txt(x, y + 1, "▎", fg);
+    this.txt(x + 2, y + 1, label, fg);
+    this.txt(x + w, y + 1, "▎", fg);
     this.hl(x, y + 2, w, "▔", fg);
-    x + w
+    x + w + 1
 }
 
-// Signal path like a receiver's routing display. The top row runs source ->
-// decoder -> volume; a wire leaves the volume plate along its bottom edge,
-// turns down at its right end and comes back along the top edge of the tone
-// plate, so every corner sits on a cell edge and joins cleanly. The bottom
-// row runs tone -> amplifier -> speakers.
-fn draw_routing(input, st, x, y) {
+fn sbox_width(label) { label.len() + 5 }
+
+// Signal path drawn as a schematic: boxes on a bus line that runs along their
+// bottom edges, nodes between them, and a wire from the end of the upper row
+// down to the lower row. The active path is lit; now and then a bright pulse
+// travels along it from the source to the speakers.
+fn draw_schematic(input, st, x, y, w) {
     let p = st.pal;
     let playing = get(input, "playing", !input.paused && input.track_title != "");
     let lit = playing || st.boot > 0.0;
     let on = if lit { p.cyan } else { p.cyan_mid };
-    let dim = if lit { p.cyan_mid } else { p.cyan_ghost };
+    let bus = if lit { p.cyan_mid } else { p.cyan_ghost };
     let fmt = get(input, "audio_format", "").to_upper();
     let vol = to_int(input.volume * 100.0 + 0.5);
     let src = switch get(input, "source", "") { "federated" => "NETWORK", "podcast" => "PODCAST", _ => "LIBRARY" };
+    let mid = if fmt == "" { "DECODE" } else { fmt };
+    let vol_label = "VOL " + vol;
 
-    let x1 = this.plate(x, y, src, on);
-    this.hl(x1 + 1, y + 1, 2, "─", dim);
-    let x2 = this.plate(x1 + 4, y, if fmt == "" { "DECODE" } else { fmt }, on);
-    this.hl(x2 + 1, y + 1, 2, "─", dim);
-    let x3 = this.plate(x2 + 4, y, "VOL " + vol, on);
+    // upper row: source, decoder, volume; the wire leaves at column xr
+    let top = [src, mid, vol_label];
+    let tw = 0;
+    for l in top { tw += sbox_width(l); }
+    let xr = x + w - 2;
+    let gap = clamp((w - 2 - tw) / 2, 2, 12);
+    let bus_y = y + 2;
+    this.hl(x, bus_y, xr - x, "▔", bus);
+    let cx = x;
+    for k in 0..3 {
+        let fg = on;
+        // a new source goes dark for a moment, then lights with its value
+        if k == 0 && st.src_flash > 0.25 { fg = p.cyan_ghost; }
+        let next = this.sbox(cx, y, top[k], fg);
+        if k < 2 { this.txt(next + (gap - 1) / 2, bus_y, "▀", on); }
+        cx = next + gap - 1;
+    }
 
-    // bottom row, right-aligned so the tone plate ends under the wire
+    // the wire down to the lower bus
     let ty = y + 4;
-    let tone_x = x3 - 6;
-    let amp_x = tone_x - 4 - 5;
-    let speakers = if amp_x - 4 - 12 >= x { "SPEAKERS A" } else { "SPK A" };
-    let sp_x = amp_x - 4 - (speakers.len() + 2);
-    this.plate(sp_x, ty, speakers, on);
-    this.hl(amp_x - 3, ty + 1, 2, "─", dim);
-    this.plate(amp_x, ty, "AMP", on);
-    this.hl(tone_x - 3, ty + 1, 2, "─", dim);
-    this.plate(tone_x, ty, "TONE", on);
+    let low_y = ty + 2;
+    this.vl(xr, bus_y, low_y - bus_y, "▎", bus);
 
-    // the wire: from the volume plate's bottom-right corner straight down to
-    // the tone plate's top-right corner (both on the left edge of column x3)
-    this.vl(x3, y + 2, ty - y - 1, "▎", dim);
-    x3
+    // lower row, right-aligned: tone, amplifier, speakers
+    let speakers = "SPEAKERS A";
+    let bottom = [speakers, "AMP", "TONE"];
+    let bw_ = sbox_width(speakers) + sbox_width("AMP") + sbox_width("TONE");
+    if bw_ + 4 > xr - x { speakers = "SPK A"; bottom = [speakers, "AMP", "TONE"]; bw_ = sbox_width(speakers) + sbox_width("AMP") + sbox_width("TONE"); }
+    let gap2 = clamp((xr - x - bw_) / 3, 2, 12);
+    let start = xr - 1 - bw_ - 2 * (gap2 - 1);
+    this.hl(start, low_y, xr - start, "▔", bus);
+    let cx2 = start;
+    for k in 0..3 {
+        let next = this.sbox(cx2, ty, bottom[k], on);
+        if k < 2 { this.txt(next + (gap2 - 1) / 2, low_y, "▀", on); }
+        cx2 = next + gap2 - 1;
+    }
+
+    // the pulse: every 7 s it runs once along bus, wire and lower bus
+    if playing && st.boot <= 0.0 {
+        let phase = (input.time % 7.0) / 2.2;
+        if phase < 1.0 {
+            let n1 = xr - x; let n2 = low_y - bus_y; let n3 = xr - start;
+            let total = n1 + n2 + n3;
+            let at = to_int(phase * to_float(total));
+            for tail in 0..3 {
+                let k = at - tail;
+                if k < 0 { continue; }
+                let fg = if tail == 0 { p.cyan_hot } else { p.cyan };
+                if k < n1 { this.txt(x + k, bus_y, "▔", fg); }
+                else if k < n1 + n2 { this.txt(xr, bus_y + (k - n1), "▎", fg); }
+                else if k < total { this.txt(xr - 1 - (k - n1 - n2), low_y, "▔", fg); }
+            }
+        }
+    }
+
+    let state = if !playing { if input.track_title == "" { "STANDBY" } else { "PAUSED" } }
+                else if vol == 0 { "MUTE" } else { "ACTIVE" };
+    this.txt(x, y + 8, "SIGNAL PATH / " + state, p.cyan_mid);
 }
 
 fn draw_transport(input, st, x, y) {
     let p = st.pal;
-    let word = if input.track_title == "" { "StoP" } else if input.paused { "PAUSE" } else { "PLAY" };
+    let word = if input.track_title == "" { "STOP" } else if input.paused { "PAUSE" } else { "PLAY" };
     let off = if st.boot > 0.0 { p.cyan } else { p.cyan_seg };
-    this.seg_text(x, y, word, 6, 2, p.cyan, off, false);
+    this.seg_text(x, y, word, 7, 2, p.cyan, off, false);
     let ly = y + 6;
     let stereo = get(input, "level_l", 0.0) > 0.0 && (get(input, "level_l", 0.0) - get(input, "level_r", 0.0)).abs() > 0.001;
     this.txt(x, ly, "TRACK", p.cyan_mid);
-    this.txt(x + 11, ly, "STEREO", if stereo || st.boot > 0.0 { p.cyan } else { p.cyan_ghost });
+    this.txt(x + 13, ly, "STEREO", if stereo || st.boot > 0.0 { p.cyan } else { p.cyan_ghost });
     this.txt(x + transport_width() - 5, ly, "VOL", p.cyan_mid);
     let q = get(input, "queue_index", 0);
     let qn = get(input, "queue_length", 0);
     let qs = if q <= 0 { "-" } else if q > 99 { "--" } else { "" + q };
-    let end = this.seg_text(x, ly + 1, qs, 4, 1, p.cyan, off, false);
+    let end = this.seg_text(x, ly + 1, qs, 5, 1, p.cyan, off, false);
     this.txt(end + 1, ly + 2, "/" + (if qn > 99 { "99+" } else { "" + qn }), p.cyan_mid);
     // volume right-aligned to the block's edge, "%" in the last column
     let vs = "" + to_int(input.volume * 100.0 + 0.5);
-    let vx = x + transport_width() - 2 - (vs.len() * 5 - 1) - 1;
-    this.seg_text(vx, ly + 1, vs, 4, 1, p.cyan, off, false);
+    let vx = x + transport_width() - 2 - (vs.len() * 6 - 1) - 1;
+    this.seg_text(vx, ly + 1, vs, 5, 1, p.cyan, off, false);
     this.txt(x + transport_width() - 2, ly + 2, "%", p.cyan);
 }
 
-// "PAUSE" in the segment font is the widest transport word.
-fn transport_width() { 35 }
+// "PAUSE" in the segment letters is the widest transport word.
+fn transport_width() { 40 }
 
 // Static on the display for a moment after the track or source changes.
 fn draw_noise(input, st) {
@@ -709,11 +829,17 @@ fn advance_state(input) {
     // the same title still count as a change
     let key = input.track_title + "|" + get(input, "queue_index", 0) + "|" + input.seed;
     if !("boot" in st) || !("key" in st) {
-        st = #{ boot: 0.9, spin: 0.0, over: 0.0, noise: 0.0, search: 0.0,
+        st = #{ boot: 0.9, spin: 0.0, over: 0.0, noise: 0.0, search: 0.0, src_flash: 0.0,
+                fade: 0.0, hold_i: 0, hold_v: 0.0, hold_t: 0.0, best_i: 0,
                 key: key, source: get(input, "source", ""), last_pos: input.position };
     }
+    if !("fade" in st) { st.fade = 0.0; st.src_flash = 0.0; st.hold_i = 0; st.hold_v = 0.0; st.hold_t = 0.0; st.best_i = 0; }
     let dt = get(input, "dt", 0.05);
-    st.boot -= dt; st.spin -= dt; st.over -= dt; st.noise -= dt; st.search -= dt;
+    st.boot -= dt; st.spin -= dt; st.over -= dt; st.noise -= dt; st.search -= dt; st.src_flash -= dt;
+    // lit colours fade into unlit phosphor while paused (the standby clock
+    // stays lit)
+    let target = if input.paused && input.track_title != "" { 1.0 } else { 0.0 };
+    st.fade = if target > st.fade { mn(st.fade + dt / 0.8, target) } else { mx(st.fade - dt / 0.3, target) };
     let source = get(input, "source", "");
     if st.key != key {
         st.key = key;
@@ -729,79 +855,189 @@ fn advance_state(input) {
             st.search = 0.8;
         }
     }
-    if st.source != source { st.source = source; st.noise = 0.35; }
+    if st.source != source { st.source = source; st.noise = 0.35; st.src_flash = 0.5; }
     st.last_pos = input.position;
     let hot = mx(get(input, "peak_l", 0.0), get(input, "peak_r", 0.0));
     if dbfs(input, hot) > -0.5 && hot > 0.0 { st.over = 1.0; }
     // the panel brightens while the power-on test runs
-    st.pal = make_palette(input, if st.boot > 0.0 { 0.1 } else { 0.0 });
+    st.pal = make_palette(input, if st.boot > 0.0 { 0.1 } else { 0.0 }, if st.boot > 0.0 { 0.0 } else { st.fade });
+    st
+}
+
+// Peak-frequency hold: the readout keeps the strongest band for a moment, and
+// a new band takes over when it is at least as loud as the held one has
+// decayed to.
+fn update_hold(st, bands, dt) {
+    let best = 0;
+    for i in 1..bands.len() { if bands[i][0] > bands[best][0] { best = i; } }
+    st.best_i = best;
+    st.hold_t -= dt;
+    st.hold_v -= 0.35 * dt;
+    if bands[best][0] >= st.hold_v || st.hold_t <= 0.0 {
+        st.hold_i = best;
+        st.hold_v = bands[best][0];
+        st.hold_t = 1.2;
+    }
     st
 }
 
 // ---------- layouts ----------
 
-fn render_full(input, st) {
+fn draw_top_band(input, st, bands, x0, y, cw) {
+    let lamps_w = 18;
+    this.draw_counter(input, st, x0, y, 6, 2);
+    let meter_x = x0 + counter_width() + 4;
+    let meter_w = x0 + cw - lamps_w - 4 - meter_x;
+    if METER_STYLE() == "needles" {
+        this.draw_needles(input, st, meter_x, y, meter_w);
+    } else {
+        this.draw_meter(input, st, meter_x, y, meter_w);
+    }
+    this.draw_lamps(input, st, bands, x0 + cw - lamps_w + 2, y);
+}
+
+fn draw_title_rows(input, st, x0, y, cw) {
+    this.draw_status_row(input, st, x0, y, cw);
+    this.txt(x0, y + 2, "▸", st.pal.white_mid);
+    this.draw_matrix_title(input, st, x0 + 2, y + 2, cw - 2, title_label(input));
+}
+
+// FULL PANEL: meters, analyzer with its measuring module, tone, signal path
+// and transport.
+fn render_full(input, st, bands) {
     let cmds = [];
     let p = st.pal;
     let W = input.width;
     let H = input.height;
     let cw = mn(W - 4, 170);
     let x0 = (W - cw) / 2;
-    let bands = panel_bands(input);
 
-    let spec_h = clamp(H - 28, 8, 14);
-    let used = 7 + 1 + 2 + spec_h + 2 + 9;
-    let gap = clamp((H - used) / 5, 1, 2);
     // row 0 stays free for the optional clock
-    let y = clamp((H - used - gap * 4) / 2, if input.show_clock { 1 } else { 0 }, 3);
+    let top = if input.show_clock { 1 } else { 0 };
+    let spec_h = clamp(H - top - 30, 8, 16);
+    // top band 7, status and title 4, analyzer spec_h + 2 labels, lower block 10
+    let used = 7 + 4 + spec_h + 2 + 10;
+    let gap = clamp((H - top - used) / 3, 0, 2);
+    let y = clamp((H - used - gap * 3 - top) / 2 + top, top, 3);
 
-    let lamps_w = 18;
-    cmds.draw_counter(input, st, x0, y);
-    let meter_x = x0 + counter_width() + 4;
-    let meter_w = x0 + cw - lamps_w - 4 - meter_x;
-    if METER_STYLE() == "needles" {
-        cmds.draw_needles(input, st, meter_x, y, meter_w);
-    } else {
-        cmds.draw_meter(input, st, meter_x, y, meter_w);
-    }
-    cmds.draw_lamps(input, st, bands, x0 + cw - lamps_w + 2, y);
-
+    cmds.draw_top_band(input, st, bands, x0, y, cw);
     y += 7 + gap;
-    cmds.draw_status_row(input, st, x0, y, cw);
-    y += 1;
-    cmds.txt(x0, y, "▸", p.white_mid);
-    cmds.draw_matrix_title(input, st, x0 + 2, y, cw - 2, title_label(input));
+    cmds.draw_title_rows(input, st, x0, y, cw);
 
-    y += 2 + gap;
-    let readout_w = 30;
-    let bw = clamp((cw - readout_w - 6) / 25, 3, 5);
+    y += 4 + gap;
+    let module_w = 26;
+    let bw = clamp((cw - module_w - 8) / 25, 3, 5);
     let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
-    let rx = right + mx((x0 + cw - right - 22) / 2, 3);
-    cmds.draw_readout(input, st, bands, rx, y + mx((spec_h - 10) / 2, 0));
+    let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
+    cmds.draw_measure(input, st, mx_, y + mx((spec_h + 2 - measure_height()) / 2, 0), mn(module_w, x0 + cw - mx_));
 
     y += spec_h + 2 + gap;
     cmds.draw_balance(input, st, x0, y, 28);
     cmds.draw_fans(input, st, bands, x0, y + 3, 28);
-    let routing_w = 40;
     let tr_w = transport_width();
-    let rx2 = x0 + 32 + mx((cw - 32 - routing_w - tr_w) / 2, 0);
-    cmds.draw_routing(input, st, rx2, y);
+    let sx = x0 + 32;
+    let sw = cw - 32 - tr_w - 4;
+    cmds.draw_schematic(input, st, sx, y, sw);
     cmds.draw_transport(input, st, x0 + cw - tr_w, y);
 
     if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
     cmds
 }
 
-fn render_compact(input, st) {
+// One-line summary of transport and signal path for the compact modes.
+fn draw_strip(input, st, x, y, w) {
+    let p = st.pal;
+    let word = if input.track_title == "" { "STOP" } else if input.paused { "PAUSE" } else { "PLAY" };
+    let q = get(input, "queue_index", 0);
+    let qn = get(input, "queue_length", 0);
+    let vol = to_int(input.volume * 100.0 + 0.5);
+    let fmt = get(input, "audio_format", "").to_upper();
+    let src = switch get(input, "source", "") { "federated" => "NETWORK", "podcast" => "PODCAST", _ => "LIBRARY" };
+    let cx = x;
+    this.txt(cx, y, word, p.cyan); cx += word.len() + 3;
+    let ts = "TRACK " + (if q > 999 { "999+" } else { "" + q }) + "/" + (if qn > 999 { "999+" } else { "" + qn });
+    this.txt(cx, y, ts, p.cyan_mid); cx += ts.len() + 3;
+    let vs = "VOL " + vol + "%";
+    this.txt(cx, y, vs, p.cyan_mid); cx += vs.len() + 3;
+    let path = src + " › " + (if fmt == "" { "DECODE" } else { fmt }) + " › VOL › TONE › AMP › A";
+    if cx + path.len() < x + w { this.txt(cx, y, path, p.cyan_mid); }
+}
+
+// SPECTRUM FOCUS: the analyzer takes the height; the lower modules shrink to
+// one line.
+fn render_spectrum(input, st, bands) {
     let cmds = [];
     let p = st.pal;
     let W = input.width;
     let H = input.height;
-    let bands = panel_bands(input);
+    let cw = mn(W - 4, 170);
+    let x0 = (W - cw) / 2;
+    let y = if input.show_clock { 1 } else { 0 };
+    cmds.draw_top_band(input, st, bands, x0, y, cw);
+    y += 8;
+    cmds.draw_title_rows(input, st, x0, y, cw);
+    y += 5;
+    let spec_h = clamp(H - y - 4, 6, 30);
+    let module_w = 26;
+    let bw = clamp((cw - module_w - 8) / 25, 2, 5);
+    let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
+    if mx_ + module_w <= x0 + cw && spec_h + 2 >= measure_height() {
+        cmds.draw_measure(input, st, mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
+    }
+    cmds.draw_strip(input, st, x0, y + spec_h + 3, cw);
+    if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
+    cmds
+}
+
+// TAPE DECK: a large counter, the tape counter and wide L/R meters, with a
+// small analyzer underneath.
+fn render_tape(input, st, bands) {
+    let cmds = [];
+    let p = st.pal;
+    let W = input.width;
+    let H = input.height;
+    let cw = mn(W - 4, 170);
+    let x0 = (W - cw) / 2;
+    let cw0 = mn(W - 4, 170);
+    // big digits only where the widest counter, track and tape counter still
+    // end before the lamps
+    let big = H >= 36 && cw0 >= 116;
+    let rh = if big { 4 } else { 2 };
+    let dw = if big { 9 } else { 6 };
+    // centre the whole deck vertically
+    let spec_h = clamp(H - (2 * rh + 4) - 6 - 5 - 6, 3, 10);
+    let content = (2 * rh + 4) + 6 + 5 + spec_h + 4;
+    let y = clamp((H - content) / 2, if input.show_clock { 1 } else { 0 }, 6);
+    cmds.draw_counter(input, st, x0, y, dw, rh);
+    // tape counter in segment digits at a fixed place after the widest
+    // counter ("88.88" and a two-digit track), and the lamps on the right
+    let cx = x0 + (6 * dw + 11) + 6;
+    let off = if st.boot > 0.0 { p.white } else { p.white_seg };
+    cmds.seg_text(cx, y, if st.boot > 0.0 { "8888" } else { pad4(tape_counter(input.position)) }, 6, 2, p.white, off, false);
+    cmds.txt(cx, y + 6, "TAPE COUNTER", p.white_mid);
+    cmds.draw_lamps(input, st, bands, x0 + cw - 16, y);
+    y += 2 * rh + 4;
+    if METER_STYLE() == "needles" { cmds.draw_needles(input, st, x0, y, cw); } else { cmds.draw_meter(input, st, x0, y, cw); }
+    y += 6;
+    cmds.draw_title_rows(input, st, x0, y, cw);
+    y += 5;
+    let bw = clamp((cw - 4) / 25, 2, 6);
+    cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    if y + spec_h + 3 < H { cmds.draw_strip(input, st, x0, y + spec_h + 3, cw); }
+    if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
+    cmds
+}
+
+fn render_compact(input, st, bands) {
+    let cmds = [];
+    let p = st.pal;
+    let W = input.width;
+    let H = input.height;
     let top = 0;
     let clock_w = if input.show_clock { input.clock.len() + 2 } else { 0 };
     if H >= 18 {
-        let end = cmds.draw_counter(input, st, 1, 0);
+        let end = cmds.draw_counter(input, st, 1, 0, 6, 2);
         cmds.draw_matrix_title(input, st, end + 3, 2, W - end - 4, title_label(input));
         top = 8;
         if input.show_clock {
@@ -831,7 +1067,7 @@ fn render_standby(input, st) {
     let h = get(input, "clock_hour", 0);
     let m = get(input, "clock_minute", 0);
     let s = get(input, "clock_second", 0);
-    if W < 42 || H < 10 { return render_compact(input, st); }
+    if W < 42 || H < 10 { return render_compact(input, st, panel_bands(input)); }
     let big = W >= 70 && H >= 20;
     let cw = if big { 9 } else { 6 };
     let rh = if big { 4 } else { 2 };
@@ -853,7 +1089,7 @@ fn render_standby(input, st) {
         cmds.seg_text(cx, y, digits.sub_string(i, 1), cw, rh, on, p.white_seg, false);
         cx += cw + 1;
     }
-    cmds.seg_text(cx + 1, y + 2 * rh - 2, pad2(s), 4, 1, p.white_mid, p.white_seg, false);
+    cmds.seg_text(cx + 1, y + 2 * rh - 2, pad2(s), if big { 5 } else { 4 }, 1, p.white_mid, p.white_seg, false);
     let ly = y + 2 * rh + 2;
     cmds.txt(x, ly, "STANDBY", p.red);
     cmds.txt(x + 10, ly, if night(input) { "DIMMER" } else { "" }, p.white_mid);
@@ -870,17 +1106,35 @@ fn colon(x, y, rh, fg) {
     this.txt(x + 1, y + rh + 1, "▪", fg);
 }
 
+// Smallest screens for each composition (FULL needs a row more with the clock).
+fn full_height(input) { if input.show_clock { 35 } else { 34 } }
+
 fn render(input) {
     let st = advance_state(input);
+    let bands = panel_bands(input);
+    st = update_hold(st, bands, get(input, "dt", 0.05));
     let cmds = [#{ op: "clear", bg: 0 }];
-    if input.width >= 20 && input.height >= 6 {
+    let W = input.width; let H = input.height;
+    if W >= 20 && H >= 6 {
         cmds.draw_noise(input, st);
+        let mode = LAYOUT();
+        if mode == "auto" {
+            mode = if W >= 120 && H >= full_height(input) { "full" } else if W >= 100 && H >= 26 { "spectrum" } else { "compact" };
+        }
+        // a chosen layout that does not fit falls back to the compact one
+        if (mode == "full" && (W < 120 || H < full_height(input))) || (mode == "spectrum" && (W < 100 || H < 26))
+            || (mode == "tape" && (W < 100 || H < 30)) {
+            mode = "compact";
+        }
         let body = if input.track_title == "" && st.boot <= 0.0 {
             render_standby(input, st)
-        } else if input.width >= 120 && input.height >= 34 {
-            render_full(input, st)
         } else {
-            render_compact(input, st)
+            switch mode {
+                "full" => render_full(input, st, bands),
+                "spectrum" => render_spectrum(input, st, bands),
+                "tape" => render_tape(input, st, bands),
+                _ => render_compact(input, st, bands)
+            }
         };
         for c in body { cmds.push(c); }
     }
