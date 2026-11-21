@@ -1,16 +1,18 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 5
+// bundle-version: 6
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
 // analyzer with three levels of glow and peak hold, a peak frequency readout
 // with hold, tone fans, a signal path schematic, the transport word, mode
-// lamps and a dot-matrix title line. Everything is drawn thin (eighth blocks and
-// braille dots); only level bars are thicker.
+// lamps and a dot-matrix title line. Everything is drawn thin (eighth blocks,
+// braille dots and box-drawing slashes for the 14-segment diagonals); only
+// level bars are thicker.
 //
 // Typography: numbers (time, frequency, volume) in 7-segment digits, the
-// transport word (PLAY / PAUSE / STOP) in segment letters with centre strokes,
+// transport word (PLAY / PAUSE / STOP) in 14-segment letters with faint unlit
+// segments,
 // the title in a 5x7 dot matrix, service labels in plain thin text, mode lamps
 // as a label over a short bar.
 //
@@ -201,6 +203,9 @@ fn make_palette(input, boost, fade) {
         // unlit segments of the thin digits: fainter than the analyzer's,
         // so a lit digit never reads as an 8
         white_seg: scale(z[0], 0.055), amber_seg: scale(z[1], 0.075), cyan_seg: scale(z[2], 0.07),
+        // unlit lamps: visible without being read as lit, the same at night
+        lamp_off: scale(z[0], 0.17), red_lamp_off: scale(z[3], 0.26),
+        amber_lamp_off: scale(z[1], 0.22), cyan_lamp_off: scale(z[2], 0.2),
         noise: scale(z[0], 0.32 * b)
     }
 }
@@ -213,27 +218,21 @@ fn make_palette(input, boost, fade) {
 // so where a horizontal would share the left column with a vertical (middle
 // and bottom bars) the vertical keeps the cell and the bar starts one column
 // later: a small joint gap like on a real segment display. A glyph is cw cells
-// wide and 2*rh+1 rows tall. Letters for the transport word use a
-// 14-segment alphabet: centre strokes (i above, l below the middle), a short
-// middle bar (h) and thin braille diagonals for the upper half: a peak (k,
-// as in A) or a V (v, as in Y).
+// wide and 2*rh+1 rows tall. It covers digits and the few letters in
+// seg_mask; the transport word uses the 14-segment letters below (seg14_*).
 
 fn seg_mask(ch) {
     let s = switch ch {
         "0" => "abcdef", "1" => "bc", "2" => "abged", "3" => "abgcd",
         "4" => "fgbc", "5" => "afgcd", "S" => "afgcd", "6" => "afgedc",
         "7" => "abc", "8" => "abcdefg", "9" => "abcdfg", "P" => "abefg",
-        "L" => "def", "A" => "cegk", "Y" => "vl", "U" => "bcdef",
-        "E" => "adefh", "T" => "ail", "O" => "abcdef", "H" => "bcefg",
-        "C" => "adef", "r" => "eg", "n" => "ceg", "d" => "bcdeg",
-        "-" => "g", _ => ""
+        "L" => "def", "A" => "abcefg", "U" => "bcdef", "E" => "adefg",
+        "O" => "abcdef", "H" => "bcefg", "C" => "adef", "r" => "eg", "n" => "ceg",
+        "d" => "bcdeg", "-" => "g", _ => ""
     };
     let m = 0;
     for c in s.chars() {
-        m = m | switch c {
-            'a' => 1, 'b' => 2, 'c' => 4, 'd' => 8, 'e' => 16, 'f' => 32, 'g' => 64,
-            'i' => 128, 'l' => 256, 'h' => 512, 'k' => 1024, 'v' => 2048, _ => 0
-        };
+        m = m | switch c { 'a' => 1, 'b' => 2, 'c' => 4, 'd' => 8, 'e' => 16, 'f' => 32, 'g' => 64, _ => 0 };
     }
     m
 }
@@ -242,31 +241,73 @@ fn pick(mask, bit, on, off) { if (mask & bit) != 0 { on } else { off } }
 
 fn seg(x, y, mask, cw, rh, on, off) {
     let inner = mx(cw - 2, 1);
-    // letters with diagonals draw only their lit strokes: unlit verticals
-    // would cover the diagonal's cells
-    if (mask & 3072) != 0 { off = -1; }
-    let X0 = x * 2; let X1 = (x + cw - 1) * 2; let XC = (x + (cw - 1) / 2) * 2;
-    let Y0 = y * 4 + 3; let YM = (y + rh) * 4 + 3;
-    if (mask & 1024) != 0 { this.ln(X0, YM, XC, Y0, on); this.ln(XC, Y0, X1, YM, on); }
-    if (mask & 2048) != 0 { this.ln(X0, Y0, XC, YM, on); this.ln(X1, Y0, XC, YM, on); }
     this.hl(x, y, cw - 1, "▁", pick(mask, 1, on, off));
     this.vl(x, y + 1, rh, "▎", pick(mask, 32, on, off));
     this.vl(x + cw - 1, y + 1, rh, "▎", pick(mask, 2, on, off));
-    if (mask & 512) != 0 {
-        this.hl(x + 1, y + rh, mx(inner / 2, 1), "▁", on);
-    } else if (mask & 1024) != 0 {
-        // the crossbar of an A leaves the cells where the diagonals end
-        this.hl(x + 2, y + rh, inner - 2, "▁", pick(mask, 64, on, off));
-    } else {
-        this.hl(x + 1, y + rh, inner, "▁", pick(mask, 64, on, off));
-    }
+    this.hl(x + 1, y + rh, inner, "▁", pick(mask, 64, on, off));
     this.vl(x, y + rh + 1, rh, "▎", pick(mask, 16, on, off));
     this.vl(x + cw - 1, y + rh + 1, rh, "▎", pick(mask, 4, on, off));
     this.hl(x + 1, y + 2 * rh, inner, "▁", pick(mask, 8, on, off));
-    // centre strokes only exist on letters that use them
-    let m = x + (cw - 1) / 2;
-    if (mask & 128) != 0 { this.vl(m, y + 1, rh, "▎", on); }
-    if (mask & 256) != 0 { this.vl(m, y + rh + 1, rh, "▎", on); }
+}
+
+// ---------- 14-segment letters (transport word) ----------
+// A fixed 7 x 5 cell glyph: the outline as in the 7-segment font, a middle
+// bar split in two halves (g1, g2), centre strokes above and below (i, l) and
+// four diagonals drawn with box-drawing slashes, two cells each. Unlit
+// segments glow faintly, like the counter's. Lit strokes are drawn last, so a
+// lit stroke wins a cell it shares with an unlit one.
+
+fn seg14_mask(ch) {
+    let s = switch ch {
+        "P" => "a b f e g1 g2", "L" => "f e d", "A" => "a b c e f g1 g2",
+        "Y" => "h j l", "U" => "b c d e f", "S" => "a f g1 g2 c d",
+        "E" => "a f e d g1", "T" => "a i l", "O" => "a b c d e f", _ => ""
+    };
+    let m = 0;
+    for part in s.split(" ") {
+        m = m | switch part {
+            "a" => 1, "b" => 2, "c" => 4, "d" => 8, "e" => 16, "f" => 32,
+            "g1" => 64, "g2" => 128, "h" => 256, "i" => 512, "j" => 1024,
+            "k" => 2048, "l" => 4096, "m" => 8192, _ => 0
+        };
+    }
+    m
+}
+
+fn seg14_stroke(x, y, bit, fg) {
+    switch bit {
+        1 => this.hl(x, y, 6, "▁", fg),
+        2 => this.vl(x + 6, y + 1, 2, "▎", fg),
+        4 => this.vl(x + 6, y + 3, 2, "▎", fg),
+        8 => this.hl(x + 1, y + 4, 5, "▁", fg),
+        16 => this.vl(x, y + 3, 2, "▎", fg),
+        32 => this.vl(x, y + 1, 2, "▎", fg),
+        64 => this.hl(x + 1, y + 2, 2, "▁", fg),
+        128 => this.hl(x + 4, y + 2, 2, "▁", fg),
+        256 => { this.txt(x + 1, y + 1, "╲", fg); this.txt(x + 2, y + 2, "╲", fg); },
+        512 => this.vl(x + 3, y + 1, 2, "▎", fg),
+        1024 => { this.txt(x + 4, y + 1, "╱", fg); this.txt(x + 3, y + 2, "╱", fg); },
+        2048 => { this.txt(x + 2, y + 3, "╱", fg); this.txt(x + 1, y + 4, "╱", fg); },
+        4096 => this.vl(x + 3, y + 3, 2, "▎", fg),
+        8192 => { this.txt(x + 3, y + 3, "╲", fg); this.txt(x + 4, y + 4, "╲", fg); },
+        _ => ()
+    }
+}
+
+// Draws a word in 14-segment letters; returns the x after it.
+fn seg14_text(x, y, s, on, off) {
+    let cx = x;
+    // unlit diagonals last, so the faint X of a 14-segment display stays whole
+    // (unlit straight strokes give up the cells they share with it)
+    let off_bits = [1, 2, 4, 8, 16, 32, 64, 128, 512, 4096, 256, 1024, 2048, 8192];
+    let bits = [256, 1024, 2048, 8192, 1, 2, 4, 8, 16, 32, 64, 128, 512, 4096];
+    for ch in s.chars() {
+        let mask = seg14_mask("" + ch);
+        for b in off_bits { if (mask & b) == 0 { this.seg14_stroke(cx, y, b, off); } }
+        for b in bits { if (mask & b) != 0 { this.seg14_stroke(cx, y, b, on); } }
+        cx += 8;
+    }
+    cx
 }
 
 // An aged tube: every digit position is a little brighter or dimmer.
@@ -455,7 +496,7 @@ fn draw_needles(input, st, x, y, w) {
         this.ln(to_int(tip_x), to_int(tip_y), to_int(foot_x), bottom, if level >= 8.0 { p.red } else { p.white });
         this.txt(left, y + 5, chans[k][0], p.white);
         let peak_on = chans[k][2] > 0.0 && meter_pos(dbfs(input, chans[k][2])) >= 8.0;
-        this.txt(left + mw - 4, y + 5, "PEAK", if peak_on || st.boot > 0.0 { p.red } else { p.red_ghost });
+        this.txt(left + mw - 4, y + 5, "PEAK", if peak_on || st.boot > 0.0 { p.red } else { p.red_lamp_off });
     }
 }
 
@@ -476,12 +517,12 @@ fn draw_lamps(input, st, bands, x, y) {
     let cx = x;
     for i in 0..3 {
         let on = st.boot > 0.0 || (i == best && avg[best] > 0.05);
-        this.txt(cx, y, names[i], if on { p.red } else { p.red_ghost });
-        this.hl(cx, y + 1, names[i].len(), "▔", if on { p.red } else { p.red_ghost });
+        this.txt(cx, y, names[i], if on { p.red } else { p.red_lamp_off });
+        this.hl(cx, y + 1, names[i].len(), "▔", if on { p.red } else { p.red_lamp_off });
         cx += names[i].len() + 3;
     }
     let over = st.boot > 0.0 || st.over > 0.0;
-    this.txt(x, y + 3, "OVER", if over { p.red } else { p.red_ghost });
+    this.txt(x, y + 3, "OVER", if over { p.red } else { p.red_lamp_off });
     this.txt(x, y + 5, "CNT", p.white_mid);
     this.txt(x + 4, y + 5, if st.boot > 0.0 { "8888" } else { pad4(tape_counter(input.position)) }, p.white);
 }
@@ -501,18 +542,18 @@ fn draw_status_row(input, st, x, y, w) {
     let source = get(input, "source", "");
     let vol = to_int(input.volume * 100.0 + 0.5);
     let cx = x;
-    cx = this.lamp(cx, y, "REPEAT", boot || repeat != "off", p.white, p.white_ghost);
+    cx = this.lamp(cx, y, "REPEAT", boot || repeat != "off", p.white, p.lamp_off);
     if repeat == "one" || boot { this.txt(cx - 2, y, "1", p.white); }
-    cx = this.lamp(cx, y, "SHUFFLE", boot || get(input, "shuffle", false), p.white, p.white_ghost);
-    cx = this.lamp(cx, y, "LOCAL", boot || source == "local", p.white, p.white_ghost);
-    cx = this.lamp(cx, y, "FED", boot || source == "federated", p.white, p.white_ghost);
-    cx = this.lamp(cx, y, "PODCAST", boot || source == "podcast", p.white, p.white_ghost);
+    cx = this.lamp(cx, y, "SHUFFLE", boot || get(input, "shuffle", false), p.white, p.lamp_off);
+    cx = this.lamp(cx, y, "LOCAL", boot || source == "local", p.white, p.lamp_off);
+    cx = this.lamp(cx, y, "FED", boot || source == "federated", p.white, p.lamp_off);
+    cx = this.lamp(cx, y, "PODCAST", boot || source == "podcast", p.white, p.lamp_off);
     cx += 2;
     // automatic modes: loudness at low volume, mute at zero, search on seeks
-    cx = this.lamp(cx, y, "LOUDNESS", boot || (vol > 0 && vol <= 30), p.white, p.white_ghost);
-    cx = this.lamp(cx, y, "MUTE", boot || vol == 0, p.red, p.red_ghost);
+    cx = this.lamp(cx, y, "LOUDNESS", boot || (vol > 0 && vol <= 30), p.white, p.lamp_off);
+    cx = this.lamp(cx, y, "MUTE", boot || vol == 0, p.red, p.red_lamp_off);
     let blink = to_int(input.time * 6.0) % 2 == 0;
-    this.lamp(cx, y, "SEARCH", boot || (st.search > 0.0 && blink), p.white, p.white_ghost);
+    this.lamp(cx, y, "SEARCH", boot || (st.search > 0.0 && blink), p.white, p.lamp_off);
 
     // format badge, like a noise-reduction lamp with its boxed letter
     let fmt = get(input, "audio_format", "").to_upper();
@@ -522,7 +563,7 @@ fn draw_status_row(input, st, x, y, w) {
     let box_ = if depth > 0 { "" + depth + "BIT" } else if kbps > 0 { "" + kbps + "K" } else { "--" };
     let bx = x + w - badge.len() - box_.len() - 4;
     if bx > cx + 6 {
-        this.txt(bx, y, badge, if fmt != "" || boot { p.white } else { p.white_ghost });
+        this.txt(bx, y, badge, if fmt != "" || boot { p.white } else { p.lamp_off });
         this.txt(bx + badge.len() + 2, y, "[" + box_ + "]", p.white);
     }
 }
@@ -644,7 +685,7 @@ fn draw_measure(input, st, x, y, w) {
     let live = boot || st.hold_v > 0.05;
     let holding = !boot && live && st.hold_i != st.best_i;
     this.txt(x, y, "PEAK FREQUENCY", p.amber_text);
-    this.txt(x + w - 4, y, "HOLD", if holding || boot { p.amber } else { p.amber_ghost });
+    this.txt(x + w - 4, y, "HOLD", if holding || boot { p.amber } else { p.amber_lamp_off });
     let hz = band_hz(st.hold_i);
     let digits = ""; let unit = "";
     if hz < 1000 { digits = "" + hz; unit = "Hz"; }
@@ -715,8 +756,11 @@ fn draw_balance(input, st, x, y, w) {
     while d < mid - 4 { this.txt(d, y, "·", p.cyan_mid); d += 2; }
     d = mid + 5;
     while d < x + w - 2 { this.txt(d, y, "·", p.cyan_mid); d += 2; }
-    let pos = clamp(mid + to_int(bal * to_float(w / 2 - 2) * 4.0), x + 2, x + w - 3);
-    this.txt(pos, y + 1, "▮", p.cyan);
+    // a bright centre mark, and the marker as two thin vertical segments
+    this.txt(mid, y + 1, "▎", p.cyan_mid);
+    let pos = clamp(mid + to_int(bal * to_float(w / 2 - 2) * 4.0), x + 2, x + w - 4);
+    this.txt(pos, y + 1, "▎", p.cyan_hot);
+    this.txt(pos + 1, y + 1, "▎", p.cyan_hot);
 }
 
 // A framed box: "▁" above, "▔" below, "▎" sides on the left edges of the
@@ -813,26 +857,33 @@ fn draw_schematic(input, st, x, y, w) {
     this.txt(x, y + 8, "SIGNAL PATH / " + state, p.cyan_mid);
 }
 
+// The transport module: the word in 14-segment letters, then one row of
+// captions and one row of equally tall digits under them, aligned to the
+// module's edges: track number (with the queue length) on the left, the
+// STEREO lamp in the middle, volume on the right.
 fn draw_transport(input, st, x, y) {
     let p = st.pal;
     let word = if input.track_title == "" { "STOP" } else if input.paused { "PAUSE" } else { "PLAY" };
-    let off = if st.boot > 0.0 { p.cyan } else { p.cyan_seg };
-    this.seg_text(x, y, word, 7, 2, p.cyan, off, false);
+    let boot = st.boot > 0.0;
+    let off = if boot { p.cyan } else { p.cyan_seg };
+    this.seg14_text(x, y, word, p.cyan, off);
+    let w = transport_width();
     let ly = y + 6;
+    let caption = whiten(p.cyan_mid, 0.25);
     let stereo = get(input, "level_l", 0.0) > 0.0 && (get(input, "level_l", 0.0) - get(input, "level_r", 0.0)).abs() > 0.001;
-    this.txt(x, ly, "TRACK", p.cyan_mid);
-    this.txt(x + 13, ly, "STEREO", if stereo || st.boot > 0.0 { p.cyan } else { p.cyan_ghost });
-    this.txt(x + transport_width() - 5, ly, "VOL", p.cyan_mid);
+    this.txt(x, ly, "TRACK", caption);
+    this.txt(x + 15, ly, "STEREO", if stereo || boot { p.cyan } else { p.cyan_lamp_off });
+    this.txt(x + w - 7, ly, "VOLUME", caption);
     let q = get(input, "queue_index", 0);
     let qn = get(input, "queue_length", 0);
-    let qs = if q <= 0 { "-" } else if q > 99 { "--" } else { "" + q };
+    let qs = if q <= 0 || q > 99 { "--" } else { pad2(q) };
     let end = this.seg_text(x, ly + 1, qs, 5, 1, p.cyan, off, false);
-    this.txt(end + 1, ly + 2, "/" + (if qn > 99 { "99+" } else { "" + qn }), p.cyan_mid);
-    // volume right-aligned to the block's edge, "%" in the last column
+    this.txt(end + 1, ly + 3, "OF " + (if qn > 999 { "1K+" } else { "" + qn }), caption);
+    // volume digits end where the module ends, "%" on their baseline
     let vs = "" + to_int(input.volume * 100.0 + 0.5);
-    let vx = x + transport_width() - 2 - (vs.len() * 6 - 1) - 1;
+    let vx = x + w - 3 - (vs.len() * 6 - 1);
     this.seg_text(vx, ly + 1, vs, 5, 1, p.cyan, off, false);
-    this.txt(x + transport_width() - 2, ly + 2, "%", p.cyan);
+    this.txt(x + w - 2, ly + 3, "%", caption);
 }
 
 // "PAUSE" in the segment letters is the widest transport word.
@@ -1208,13 +1259,22 @@ fn pick_mode(input) {
 }
 
 // Bar inertia: a column follows a rise at once, but when the energy drops it
-// starts falling slowly and gathers speed, like a real display settling. This
-// is separate from the peak-hold marks, which the host keeps.
+// starts falling slowly and gathers speed, like a real display settling. The
+// peak marks have their own physics: a hold, then a fall that accelerates.
 fn update_inertia(st, bands, dt) {
     let n = bands.len();
     let bars = if "bars" in st { st.bars } else { [] };
     let vel = if "vel" in st { st.vel } else { [] };
     if bars.len() != n { bars = []; vel = []; for i in 0..n { bars.push(0.0); vel.push(0.0); } }
+    // peak marks: held for a moment, then they start falling slowly and
+    // speed up, like a light object under gravity
+    let caps = if "caps" in st { st.caps } else { [] };
+    let cap_vel = if "cap_vel" in st { st.cap_vel } else { [] };
+    let cap_hold = if "cap_hold" in st { st.cap_hold } else { [] };
+    if caps.len() != n {
+        caps = []; cap_vel = []; cap_hold = [];
+        for i in 0..n { caps.push(0.0); cap_vel.push(0.0); cap_hold.push(0.0); }
+    }
     let out = [];
     for i in 0..n {
         let v = bands[i][0];
@@ -1224,9 +1284,18 @@ fn update_inertia(st, bands, dt) {
             vel[i] = vel[i] + 2.4 * dt;
             bars[i] = mx(v, bars[i] - vel[i] * dt);
         }
-        out.push([bars[i], bands[i][1]]);
+        if bars[i] >= caps[i] {
+            caps[i] = bars[i]; cap_vel[i] = 0.0; cap_hold[i] = 0.9;
+        } else if cap_hold[i] > 0.0 {
+            cap_hold[i] = cap_hold[i] - dt;
+        } else {
+            cap_vel[i] = cap_vel[i] + 1.6 * dt;
+            caps[i] = mx(bars[i], caps[i] - cap_vel[i] * dt);
+        }
+        out.push([bars[i], caps[i]]);
     }
     st.bars = bars; st.vel = vel;
+    st.caps = caps; st.cap_vel = cap_vel; st.cap_hold = cap_hold;
     st.shown = out;
     st
 }
@@ -1244,7 +1313,7 @@ fn draw_mode_lamps(input, st, mode) {
     this.txt(x, y, "DISPLAY", p.white_mid);
     let cx = x + 9;
     for k in 0..names.len() {
-        cx = this.lamp(cx, y, names[k], keys[k] == mode, p.white, p.white_ghost);
+        cx = this.lamp(cx, y, names[k], keys[k] == mode, p.white, p.lamp_off);
     }
 }
 

@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   choice for a moment) or can be pinned at the top of the script, like the
   palettes ("classic", "green", "amber", "ice"); a mode that does not fit
   the window steps down. Bars settle with a little inertia, the analyzer's
-  tint runs from warm amber in the bass to light yellow in the treble, and
-  the transport letters use a 14-segment alphabet.
+  tint runs from warm amber in the bass to light yellow in the treble, peak
+  marks fall with a little gravity after their hold, and the transport word
+  uses 14-segment letters with faint unlit segments.
 - `Shift+M` in the fullscreen visualizer switches its display mode; the
   choice is saved in `visualizations.toml`.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
