@@ -389,6 +389,18 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
             None
         }
+        Action::CycleVisualizerMode => {
+            if state.visualizer.active {
+                if let Err(err) = state.visualizer.cycle_mode() {
+                    // the fullscreen visualizer hides the status line
+                    tracing::warn!(error = %format!("{err:#}"), "saving the visualizer mode failed");
+                    state.status_message = Some(format!("visualization settings: {err:#}"));
+                }
+            } else {
+                state.status_message = Some("open the visualizer first (Shift+L)".into());
+            }
+            None
+        }
         Action::Select => select_current(state),
         Action::Back if state.visualizer.active => {
             state.visualizer.close();

@@ -224,6 +224,10 @@ key_sequence = "shift-l"
 command = "ToggleVisualizer"
 
 [[keymaps]]
+key_sequence = "shift-m"
+command = "CycleVisualizerMode"
+
+[[keymaps]]
 key_sequence = "shift-h"
 command = "OpenListenHistory"
 

@@ -20,9 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   track and source changes, a source block that relights with its new
   value, colours that fade into unlit phosphor on pause, a night dimmer, a
   slow filament "breath", slightly uneven digit brightness and a standby
-  clock when nothing is loaded. Palettes ("classic", "green", "amber",
-  "ice") and compositions ("full", "spectrum", "tape", or "auto" by screen
-  size) are options at the top of the script.
+  clock when nothing is loaded. Display modes "classic", "focus",
+  "minimal" and "tape" switch with Shift+M (a row of mode lamps shows the
+  choice for a moment) or can be pinned at the top of the script, like the
+  palettes ("classic", "green", "amber", "ice"); a mode that does not fit
+  the window steps down. Bars settle with a little inertia, the analyzer's
+  tint runs from warm amber in the bass to light yellow in the treble, and
+  the transport letters use a 14-segment alphabet.
+- `Shift+M` in the fullscreen visualizer switches its display mode; the
+  choice is saved in `visualizations.toml`.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
   peak hold, left/right RMS and held peaks, the sample rate, and track,
   queue and transport details in the script input; `render` may return
@@ -30,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `frame`); new braille `dots` and `line` commands for thin drawing; bold,
   dim, italic, underline and reversed attributes on any command. v2 scripts
   keep working unchanged. Scripts also get the local time as
-  `clock_hour`, `clock_minute`, `clock_second` and `clock_millis`.
+  `clock_hour`, `clock_minute`, `clock_second` and `clock_millis`, and the
+  display mode as `mode`, a counter each script takes modulo its own number
+  of modes.
 
 ### Fixed
 

@@ -1,6 +1,6 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 4
+// bundle-version: 5
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
@@ -29,13 +29,16 @@
 fn PALETTE() { "classic" }        // "classic" | "green" | "amber" | "ice"
 fn METER_STYLE() { "bars" }       // "bars" | "needles"
 fn NIGHT_DIMMER() { true }        // dim the panel from 22:00 to 07:00
-fn LAYOUT() { "auto" }            // "auto" | "full" | "spectrum" | "tape"
-//   full      everything: meters, analyzer, tone, signal path, transport
-//   spectrum  a taller analyzer; the lower modules shrink to one line
+fn LAYOUT() { "auto" }            // "auto" | "classic" | "focus" | "minimal" | "tape"
+//   classic   everything: meters, analyzer, tone, signal path, transport
+//   focus     a taller analyzer; the lower modules shrink to one line
+//   minimal   time, title, L/R meter and the analyzer, no signal path
 //   tape      large counter, tape counter and L/R meters, a small analyzer
-//   auto      full on large screens, spectrum on medium ones, compact below
-//             (auto never picks tape; a chosen layout that does not fit
-//             falls back to compact)
+//   auto      Shift+M in the visualizer steps through classic, focus,
+//             minimal and tape; a fixed value pins one of them
+// A display mode that does not fit the window steps down: classic -> focus
+// -> minimal -> compact ("full" and "spectrum" are old names of classic and
+// focus).
 //
 // Script entry point:
 //   fn render(input) -> Array<Map>                  (stateless)
@@ -65,6 +68,7 @@ fn LAYOUT() { "auto" }            // "auto" | "full" | "spectrum" | "tape"
 //   queue_index, queue_length     1-based position (0 = none) and length
 //   shuffle, repeat               bool and "off" / "one" / "all"
 //   clock_hour, clock_minute, clock_second, clock_millis   local time
+//   mode                          display mode counter (Shift+M), use modulo
 //   dt, frame                     seconds since the last frame, frame count
 //   state                         what the last frame returned as `state`
 //                                 (empty when the visualizer opens or the
@@ -102,6 +106,13 @@ fn whiten(c, t) {
     rgb(r + (255.0 - r) * t, g + (255.0 - g) * t, b + (255.0 - b) * t)
 }
 
+// Blend two colours: t = 0 gives a, 1 gives b.
+fn mixc(a, b, t) {
+    let ar = to_float((a >> 16) & 255); let ag = to_float((a >> 8) & 255); let ab = to_float(a & 255);
+    let br = to_float((b >> 16) & 255); let bg = to_float((b >> 8) & 255); let bb = to_float(b & 255);
+    rgb(ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t)
+}
+
 fn pad2(n) { if n < 10 { "0" + n } else { "" + n } }
 fn pad4(n) { let s = "" + n; while s.len() < 4 { s = "0" + s; } s }
 
@@ -115,10 +126,10 @@ fn txt(x, y, s, fg) {
     }
 }
 fn hl(x, y, w, ch, fg) {
-    if x >= 0 && y >= 0 && w > 0 { this.push(#{ op: "hline", x: x, y: y, w: w, ch: ch, fg: fg, bg: 0 }); }
+    if x >= 0 && y >= 0 && w > 0 && fg >= 0 { this.push(#{ op: "hline", x: x, y: y, w: w, ch: ch, fg: fg, bg: 0 }); }
 }
 fn vl(x, y, h, ch, fg) {
-    if x >= 0 && y >= 0 && h > 0 { this.push(#{ op: "vline", x: x, y: y, h: h, ch: ch, fg: fg, bg: 0 }); }
+    if x >= 0 && y >= 0 && h > 0 && fg >= 0 { this.push(#{ op: "vline", x: x, y: y, h: h, ch: ch, fg: fg, bg: 0 }); }
 }
 fn fill(x, y, w, h, ch, fg) {
     if x >= 0 && y >= 0 && w > 0 && h > 0 {
@@ -174,13 +185,18 @@ fn make_palette(input, boost, fade) {
     let breath = 0.955 + 0.045 * sin(input.time * 0.9);
     let b = clamp(dim * breath + boost, 0.3, 1.15);
     let amber = glow(z[1], b, fade);
+    // the analyzer's tint runs from warm amber in the bass to light yellow
+    // in the treble, a small shift that keeps the panel one colour
+    let warm_base = if PALETTE() == "classic" || PALETTE() == "amber" { mixc(z[1], rgb(255, 120, 16), 0.3) } else { scale(z[1], 0.9) };
     #{
         white: glow(z[0], b, fade), white_mid: glow(z[0], 0.6 * b, fade), white_ghost: scale(z[0], 0.095),
         amber: amber, amber_low: glow(z[1], 0.68 * b, fade), amber_hot: whiten(amber, 0.5),
         peak: whiten(amber, 0.8), amber_ghost: scale(z[1], 0.17), amber_text: glow(z[1], 0.8 * b, fade),
         amber_rule: scale(z[1], 0.3),
-        red: glow(z[3], b, fade * 0.6), red_ghost: scale(z[3], 0.18),
+        amber_warm: glow(warm_base, b, fade), amber_light: glow(whiten(z[1], 0.32), b, fade),
+        red: glow(z[3], b, fade * 0.6), red_mid: glow(z[3], 0.34 * b, fade * 0.6), red_ghost: scale(z[3], 0.18),
         cyan: glow(z[2], b, fade), cyan_mid: glow(z[2], 0.55 * b, fade), cyan_hot: whiten(glow(z[2], b, fade), 0.6),
+        cyan_line: glow(z[2], 0.4 * b, fade),
         cyan_ghost: scale(z[2], 0.13),
         // unlit segments of the thin digits: fainter than the analyzer's,
         // so a lit digit never reads as an 8
@@ -197,15 +213,17 @@ fn make_palette(input, boost, fade) {
 // so where a horizontal would share the left column with a vertical (middle
 // and bottom bars) the vertical keeps the cell and the bar starts one column
 // later: a small joint gap like on a real segment display. A glyph is cw cells
-// wide and 2*rh+1 rows tall. Letters add centre strokes (i above, l below the middle) and a
-// short middle bar (h), a 7-segment subset of a 14-segment display.
+// wide and 2*rh+1 rows tall. Letters for the transport word use a
+// 14-segment alphabet: centre strokes (i above, l below the middle), a short
+// middle bar (h) and thin braille diagonals for the upper half: a peak (k,
+// as in A) or a V (v, as in Y).
 
 fn seg_mask(ch) {
     let s = switch ch {
         "0" => "abcdef", "1" => "bc", "2" => "abged", "3" => "abgcd",
         "4" => "fgbc", "5" => "afgcd", "S" => "afgcd", "6" => "afgedc",
         "7" => "abc", "8" => "abcdefg", "9" => "abcdfg", "P" => "abefg",
-        "L" => "def", "A" => "abcefg", "Y" => "bfgl", "U" => "bcdef",
+        "L" => "def", "A" => "cegk", "Y" => "vl", "U" => "bcdef",
         "E" => "adefh", "T" => "ail", "O" => "abcdef", "H" => "bcefg",
         "C" => "adef", "r" => "eg", "n" => "ceg", "d" => "bcdeg",
         "-" => "g", _ => ""
@@ -214,7 +232,7 @@ fn seg_mask(ch) {
     for c in s.chars() {
         m = m | switch c {
             'a' => 1, 'b' => 2, 'c' => 4, 'd' => 8, 'e' => 16, 'f' => 32, 'g' => 64,
-            'i' => 128, 'l' => 256, 'h' => 512, _ => 0
+            'i' => 128, 'l' => 256, 'h' => 512, 'k' => 1024, 'v' => 2048, _ => 0
         };
     }
     m
@@ -224,11 +242,21 @@ fn pick(mask, bit, on, off) { if (mask & bit) != 0 { on } else { off } }
 
 fn seg(x, y, mask, cw, rh, on, off) {
     let inner = mx(cw - 2, 1);
+    // letters with diagonals draw only their lit strokes: unlit verticals
+    // would cover the diagonal's cells
+    if (mask & 3072) != 0 { off = -1; }
+    let X0 = x * 2; let X1 = (x + cw - 1) * 2; let XC = (x + (cw - 1) / 2) * 2;
+    let Y0 = y * 4 + 3; let YM = (y + rh) * 4 + 3;
+    if (mask & 1024) != 0 { this.ln(X0, YM, XC, Y0, on); this.ln(XC, Y0, X1, YM, on); }
+    if (mask & 2048) != 0 { this.ln(X0, Y0, XC, YM, on); this.ln(X1, Y0, XC, YM, on); }
     this.hl(x, y, cw - 1, "▁", pick(mask, 1, on, off));
     this.vl(x, y + 1, rh, "▎", pick(mask, 32, on, off));
     this.vl(x + cw - 1, y + 1, rh, "▎", pick(mask, 2, on, off));
     if (mask & 512) != 0 {
         this.hl(x + 1, y + rh, mx(inner / 2, 1), "▁", on);
+    } else if (mask & 1024) != 0 {
+        // the crossbar of an A leaves the cells where the diagonals end
+        this.hl(x + 2, y + rh, inner - 2, "▁", pick(mask, 64, on, off));
     } else {
         this.hl(x + 1, y + rh, inner, "▁", pick(mask, 64, on, off));
     }
@@ -360,13 +388,15 @@ fn draw_meter(input, st, x, y, w) {
     for r in rows {
         this.txt(x, r[3], r[0], p.white);
         this.hl(bx, r[3], hot, "▃", if st.boot > 0.0 { p.white_mid } else { p.white_ghost });
-        this.hl(bx + hot, r[3], mw - hot, "▃", if st.boot > 0.0 { p.red } else { p.red_ghost });
+        // the red zone glows at a middle level even when unlit, so it reads as a zone
+        this.hl(bx + hot, r[3], mw - hot, "▃", if st.boot > 0.0 { p.red } else { p.red_mid });
         let cells = if r[1] > 0.0 { clamp(to_int(meter_pos(dbfs(input, r[1])) / n * to_float(mw) + 0.5), 0, mw) } else { 0 };
         this.hl(bx, r[3], mn(cells, hot), "▃", p.white);
         if cells > hot { this.hl(bx + hot, r[3], cells - hot, "▃", p.red); }
         if r[2] > 0.0 {
-            let pk = clamp(to_int(meter_pos(dbfs(input, r[2])) / n * to_float(mw)), 0, mw - 1);
-            this.txt(bx + pk, r[3], "▃", if pk >= hot { p.red } else { p.white });
+            // a two-cell peak mark, brighter than the bar
+            let pk = clamp(to_int(meter_pos(dbfs(input, r[2])) / n * to_float(mw)), 1, mw - 1);
+            this.hl(bx + pk - 1, r[3], 2, "▃", if pk >= hot { whiten(p.red, 0.25) } else { whiten(p.white, 0.3) });
         }
     }
     this.txt(x, y + 3, "dB", p.white);
@@ -579,12 +609,14 @@ fn draw_analyzer(input, st, bands, x, y, bw, h) {
         let v = if boot { 1.0 } else { bands[i][0] };
         let lit = clamp(to_int(v * to_float(h) + 0.5), 0, h);
         let g = if boot { 1.0 } else { 0.78 + 0.34 * v };
+        let t = to_float(i) / to_float(mx(n - 1, 1));
+        let col = if t < 0.5 { mixc(p.amber_warm, p.amber, t * 2.0) } else { mixc(p.amber, p.amber_light, (t - 0.5) * 2.0) };
         if lit < h { this.fill(bx, y, bar, h - lit, "▂", p.amber_ghost); }
         if lit > 0 {
             let low = to_int(to_float(lit) * 0.45);
-            if low > 0 { this.fill(bx, y + h - low, bar, low, "▂", scale(p.amber_low, g)); }
+            if low > 0 { this.fill(bx, y + h - low, bar, low, "▂", scale(col, 0.68 * g)); }
             let body = lit - low - 1;
-            if body > 0 { this.fill(bx, y + h - lit + 1, bar, body, "▂", scale(p.amber, g)); }
+            if body > 0 { this.fill(bx, y + h - lit + 1, bar, body, "▂", scale(col, g)); }
             this.hl(bx, y + h - lit, bar, "▂", p.amber_hot);
         }
         let cap = clamp(to_int(bands[i][1] * to_float(h) + 0.5), 0, h);
@@ -712,7 +744,8 @@ fn draw_schematic(input, st, x, y, w) {
     let playing = get(input, "playing", !input.paused && input.track_title != "");
     let lit = playing || st.boot > 0.0;
     let on = if lit { p.cyan } else { p.cyan_mid };
-    let bus = if lit { p.cyan_mid } else { p.cyan_ghost };
+    // lines and wires stay quiet; boxes and nodes carry the light
+    let bus = if lit { p.cyan_line } else { p.cyan_ghost };
     let fmt = get(input, "audio_format", "").to_upper();
     let vol = to_int(input.volume * 100.0 + 0.5);
     let src = switch get(input, "source", "") { "federated" => "NETWORK", "podcast" => "PODCAST", _ => "LIBRARY" };
@@ -1029,6 +1062,40 @@ fn render_tape(input, st, bands) {
     cmds
 }
 
+// MINIMAL: time, the L/R meter, the title and a tall analyzer with its
+// measuring module; no lamps, tone, signal path or transport.
+fn render_minimal(input, st, bands) {
+    let cmds = [];
+    let p = st.pal;
+    let W = input.width;
+    let H = input.height;
+    let cw = mn(W - 4, 170);
+    let x0 = (W - cw) / 2;
+    let y = if input.show_clock { 1 } else { 0 };
+    cmds.draw_counter(input, st, x0, y, 6, 2);
+    let meter_x = x0 + counter_width() + 4;
+    let meter_w = x0 + cw - meter_x;
+    if METER_STYLE() == "needles" {
+        cmds.draw_needles(input, st, meter_x, y, meter_w);
+    } else {
+        cmds.draw_meter(input, st, meter_x, y, meter_w);
+    }
+    y += 8;
+    cmds.txt(x0, y, "▸", p.white_mid);
+    cmds.draw_matrix_title(input, st, x0 + 2, y, cw - 2, title_label(input));
+    y += 3;
+    let spec_h = clamp(H - y - 3, 6, 30);
+    let module_w = 26;
+    let bw = clamp((cw - module_w - 8) / 25, 2, 5);
+    let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
+    if mx_ + module_w <= x0 + cw && spec_h + 2 >= measure_height() {
+        cmds.draw_measure(input, st, mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
+    }
+    if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
+    cmds
+}
+
 fn render_compact(input, st, bands) {
     let cmds = [];
     let p = st.pal;
@@ -1106,37 +1173,111 @@ fn colon(x, y, rh, fg) {
     this.txt(x + 1, y + rh + 1, "▪", fg);
 }
 
-// Smallest screens for each composition (FULL needs a row more with the clock).
+// Smallest screens for each composition (classic needs a row more with the
+// clock).
 fn full_height(input) { if input.show_clock { 35 } else { 34 } }
+
+fn mode_fits(mode, input) {
+    let W = input.width; let H = input.height;
+    switch mode {
+        "classic" => W >= 120 && H >= full_height(input),
+        "focus" => W >= 100 && H >= 26,
+        "minimal" => W >= 80 && H >= 20,
+        "tape" => W >= 100 && H >= 30,
+        _ => true
+    }
+}
+
+fn mode_names() { ["classic", "focus", "minimal", "tape"] }
+
+// The display mode: Shift+M picks it unless LAYOUT() pins one; a mode that
+// does not fit the window steps down.
+fn pick_mode(input) {
+    let mode = LAYOUT();
+    if mode == "full" { mode = "classic"; }
+    if mode == "spectrum" { mode = "focus"; }
+    if mode == "auto" {
+        let names = mode_names();
+        mode = names[get(input, "mode", 0) % names.len()];
+    }
+    if mode == "tape" && !mode_fits("tape", input) { mode = "focus"; }
+    if mode == "classic" && !mode_fits("classic", input) { mode = "focus"; }
+    if mode == "focus" && !mode_fits("focus", input) { mode = "minimal"; }
+    if mode == "minimal" && !mode_fits("minimal", input) { mode = "compact"; }
+    mode
+}
+
+// Bar inertia: a column follows a rise at once, but when the energy drops it
+// starts falling slowly and gathers speed, like a real display settling. This
+// is separate from the peak-hold marks, which the host keeps.
+fn update_inertia(st, bands, dt) {
+    let n = bands.len();
+    let bars = if "bars" in st { st.bars } else { [] };
+    let vel = if "vel" in st { st.vel } else { [] };
+    if bars.len() != n { bars = []; vel = []; for i in 0..n { bars.push(0.0); vel.push(0.0); } }
+    let out = [];
+    for i in 0..n {
+        let v = bands[i][0];
+        if v >= bars[i] {
+            bars[i] = v; vel[i] = 0.0;
+        } else {
+            vel[i] = vel[i] + 2.4 * dt;
+            bars[i] = mx(v, bars[i] - vel[i] * dt);
+        }
+        out.push([bars[i], bands[i][1]]);
+    }
+    st.bars = bars; st.vel = vel;
+    st.shown = out;
+    st
+}
+
+// For two seconds after Shift+M, a row of mode lamps along the bottom edge.
+fn draw_mode_lamps(input, st, mode) {
+    let p = st.pal;
+    let names = ["CLASSIC", "FOCUS", "MINIMAL", "TAPE"];
+    let keys = mode_names();
+    let total = 9;
+    for n in names { total += n.len() + 3; }
+    let x = mx((input.width - total) / 2, 0);
+    let y = input.height - 2;
+    this.fill(x - 1, y, total + 2, 2, " ", 0);
+    this.txt(x, y, "DISPLAY", p.white_mid);
+    let cx = x + 9;
+    for k in 0..names.len() {
+        cx = this.lamp(cx, y, names[k], keys[k] == mode, p.white, p.white_ghost);
+    }
+}
 
 fn render(input) {
     let st = advance_state(input);
-    let bands = panel_bands(input);
-    st = update_hold(st, bands, get(input, "dt", 0.05));
+    let raw = panel_bands(input);
+    let dt = get(input, "dt", 0.05);
+    st = update_hold(st, raw, dt);
+    st = update_inertia(st, raw, dt);
+    let bands = st.shown;
+    // the mode lamps light up for a moment when Shift+M changes the mode
+    let mode_in = get(input, "mode", 0);
+    if !("mode_seen" in st) { st.mode_seen = mode_in; st.mode_flash = 0.0; }
+    st.mode_flash -= dt;
+    if st.mode_seen != mode_in { st.mode_seen = mode_in; st.mode_flash = 2.0; }
     let cmds = [#{ op: "clear", bg: 0 }];
     let W = input.width; let H = input.height;
     if W >= 20 && H >= 6 {
         cmds.draw_noise(input, st);
-        let mode = LAYOUT();
-        if mode == "auto" {
-            mode = if W >= 120 && H >= full_height(input) { "full" } else if W >= 100 && H >= 26 { "spectrum" } else { "compact" };
-        }
-        // a chosen layout that does not fit falls back to the compact one
-        if (mode == "full" && (W < 120 || H < full_height(input))) || (mode == "spectrum" && (W < 100 || H < 26))
-            || (mode == "tape" && (W < 100 || H < 30)) {
-            mode = "compact";
-        }
+        let mode = pick_mode(input);
         let body = if input.track_title == "" && st.boot <= 0.0 {
             render_standby(input, st)
         } else {
             switch mode {
-                "full" => render_full(input, st, bands),
-                "spectrum" => render_spectrum(input, st, bands),
+                "classic" => render_full(input, st, bands),
+                "focus" => render_spectrum(input, st, bands),
+                "minimal" => render_minimal(input, st, bands),
                 "tape" => render_tape(input, st, bands),
                 _ => render_compact(input, st, bands)
             }
         };
         for c in body { cmds.push(c); }
+        if st.mode_flash > 0.0 && mode != "compact" && W >= 60 && H >= 8 { cmds.draw_mode_lamps(input, st, mode); }
     }
     #{ commands: cmds, state: st }
 }

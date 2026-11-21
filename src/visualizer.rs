@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 4,
+        version: 5,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
@@ -76,6 +76,10 @@ pub struct VisualizerConfig {
     pub selected: String,
     #[serde(default)]
     pub show_clock: bool,
+    /// Display mode the script interprets (`input.mode`), cycled with
+    /// `CycleVisualizerMode` while the visualizer is open.
+    #[serde(default)]
+    pub mode: u32,
 }
 
 impl Default for VisualizerConfig {
@@ -83,6 +87,7 @@ impl Default for VisualizerConfig {
         Self {
             selected: default_script_id(),
             show_clock: false,
+            mode: 0,
         }
     }
 }
@@ -189,6 +194,13 @@ impl VisualizerState {
             anyhow::bail!("visualization script not found");
         };
         self.config.selected = script.id.clone();
+        self.save_config()
+    }
+
+    /// Moves to the next display mode; scripts take it modulo their own
+    /// number of modes.
+    pub fn cycle_mode(&mut self) -> Result<()> {
+        self.config.mode = self.config.mode.wrapping_add(1);
         self.save_config()
     }
 
@@ -357,6 +369,7 @@ fn input_map_with_features(area: Rect, state: &AppState, features: AudioFeatures
     insert_int(&mut input, "clock_minute", i64::from(minute));
     insert_int(&mut input, "clock_second", i64::from(second));
     insert_int(&mut input, "clock_millis", i64::from(millis));
+    insert_int(&mut input, "mode", i64::from(state.visualizer.config.mode));
     let (title, artist) = state
         .player
         .current
@@ -2058,7 +2071,7 @@ mod tests {
             base.replacen(r#"fn LAYOUT() { "auto" }"#, r#"fn LAYOUT() { "tape" }"#, 1),
             base.replacen(
                 r#"fn LAYOUT() { "auto" }"#,
-                r#"fn LAYOUT() { "spectrum" }"#,
+                r#"fn LAYOUT() { "minimal" }"#,
                 1,
             ),
         ];
