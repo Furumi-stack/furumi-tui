@@ -1,6 +1,6 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 2
+// bundle-version: 3
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
@@ -10,8 +10,7 @@
 //
 // Effects, most of them keeping a little state between frames:
 //   power-on segment test, counter "search" on track changes, OVER lamp with
-//   hold, blinking pause point, faint mesh behind the big digits, slightly
-//   uneven digit brightness (an aged tube), a slow filament "breath", a
+//   hold, blinking pause point, slightly uneven digit brightness (an aged tube), a slow filament "breath", a
 //   brighter panel on loud passages and a dimmer at night, a short burst of
 //   static when the track or source changes, LOUDNESS / MUTE / SEARCH lamps,
 //   a running tape counter, and a standby clock with a sweep every minute
@@ -151,14 +150,19 @@ fn make_palette(input, boost) {
         amber_ghost: scale(z[1], 0.16), amber_text: scale(z[1], 0.8 * b),
         red: scale(z[3], b), red_ghost: scale(z[3], 0.18),
         cyan: scale(z[2], b), cyan_mid: scale(z[2], 0.55 * b), cyan_ghost: scale(z[2], 0.13),
-        mesh: scale(z[0], 0.05), noise: scale(z[0], 0.32 * b)
+        // unlit segments of the thin digits: fainter than the analyzer's,
+        // so a lit digit never reads as an 8
+        white_seg: scale(z[0], 0.055), amber_seg: scale(z[1], 0.075), cyan_seg: scale(z[2], 0.07),
+        noise: scale(z[0], 0.32 * b)
     }
 }
 
 // ---------- thin segment font ----------
-// Segments are eighth-block lines on cell edges: horizontals "▁" at the
-// bottom of a row, verticals "▕" / "▏" on the inner edges of the outer
-// columns. A glyph is cw cells wide and 2*rh+1 rows tall.
+// Segments are thin lines on cell edges, all about equally thick: horizontals
+// are eighth blocks ("▁", 1/8 of the cell height) along the bottom of a row,
+// verticals are quarter blocks ("▎", 1/4 of the narrower cell width) along
+// the left edge of the first and the last column. A glyph is cw cells wide
+// (cw - 1 between its verticals) and 2*rh+1 rows tall.
 
 fn seg_mask(ch) {
     let s = switch ch {
@@ -180,31 +184,28 @@ fn seg_mask(ch) {
 fn pick(mask, bit, on, off) { if (mask & bit) != 0 { on } else { off } }
 
 fn seg(x, y, mask, cw, rh, on, off) {
-    let inner = cw - 2;
-    this.hl(x + 1, y, inner, "▁", pick(mask, 1, on, off));
-    this.vl(x, y + 1, rh, "▕", pick(mask, 32, on, off));
-    this.vl(x + cw - 1, y + 1, rh, "▏", pick(mask, 2, on, off));
-    this.hl(x + 1, y + rh, inner, "▁", pick(mask, 64, on, off));
-    this.vl(x, y + rh + 1, rh, "▕", pick(mask, 16, on, off));
-    this.vl(x + cw - 1, y + rh + 1, rh, "▏", pick(mask, 4, on, off));
-    this.hl(x + 1, y + 2 * rh, inner, "▁", pick(mask, 8, on, off));
+    let inner = cw - 1;
+    this.hl(x, y, inner, "▁", pick(mask, 1, on, off));
+    this.vl(x, y + 1, rh, "▎", pick(mask, 32, on, off));
+    this.vl(x + cw - 1, y + 1, rh, "▎", pick(mask, 2, on, off));
+    this.hl(x, y + rh, inner, "▁", pick(mask, 64, on, off));
+    this.vl(x, y + rh + 1, rh, "▎", pick(mask, 16, on, off));
+    this.vl(x + cw - 1, y + rh + 1, rh, "▎", pick(mask, 4, on, off));
+    this.hl(x, y + 2 * rh, inner, "▁", pick(mask, 8, on, off));
 }
 
 // An aged tube: every digit position is a little brighter or dimmer.
 fn wear(x) { 0.84 + 0.16 * frac(abs(sin(to_float(x) * 12.9898)) * 43758.5453) }
 
 // Text in the segment font. "." is a point, " " a blank digit. `point_on`
-// lets the caller blink points. Big digits (rh >= 2) get a faint mesh behind
-// them, like the grid in front of real VFD segments. Returns the x after the
-// last glyph.
-fn seg_text(x, y, s, cw, rh, on, off, point_on, mesh) {
+// lets the caller blink points. Returns the x after the last glyph.
+fn seg_text(x, y, s, cw, rh, on, off, point_on) {
     let cx = x;
     for ch in s.chars() {
         if ch == '.' {
             this.txt(cx, y + 2 * rh, "▖", if point_on { scale(on, wear(cx)) } else { off });
             cx += 2;
         } else {
-            if rh >= 2 && mesh != 0 { this.fill(cx, y, cw, 2 * rh + 1, "⠂", mesh); }
             if ch != ' ' { this.seg(cx, y, seg_mask("" + ch), cw, rh, scale(on, wear(cx)), off); }
             cx += cw + 1;
         }
@@ -276,14 +277,14 @@ fn draw_counter(input, st, x, y) {
         text = "" + (f % 10) + "." + ((f * 7) % 10) + "" + ((f * 3) % 10);
     }
     let lit = if input.paused { p.white_mid } else { p.white };
-    let off = if st.boot > 0.0 { lit } else { p.white_ghost };
+    let off = if st.boot > 0.0 { lit } else { p.white_seg };
     let blink = !input.paused || (to_int(input.time * 2.0) % 2 == 0);
-    let end = this.seg_text(x, y, text, 6, 2, lit, off, blink, p.mesh);
+    let end = this.seg_text(x, y, text, 6, 2, lit, off, blink);
     let n = get(input, "track_number", 0);
     let q = get(input, "queue_index", 0);
     let tn = if n > 0 { n } else { q };
     let ts = if tn <= 0 { "-" } else if tn > 99 { "--" } else { "" + tn };
-    let te = this.seg_text(end + 3, y, ts, 6, 2, lit, off, false, p.mesh);
+    let te = this.seg_text(end + 3, y, ts, 6, 2, lit, off, false);
     this.txt(x, y + 6, "TIME", p.white_mid);
     this.txt(end + 3, y + 6, "TRACK", p.white_mid);
     te
@@ -544,8 +545,8 @@ fn draw_readout(input, st, bands, x, y) {
     else if hz < 10000 { digits = "" + (hz / 1000) + "." + ((hz % 1000) / 100); unit = "KHZ"; }
     else { digits = "" + (hz / 1000); unit = "KHZ"; }
     if !live { digits = "--"; }
-    let off = if st.boot > 0.0 { p.amber } else { p.amber_ghost };
-    let end = this.seg_text(x, y, digits, 6, 2, p.amber, off, true, p.mesh);
+    let off = if st.boot > 0.0 { p.amber } else { p.amber_seg };
+    let end = this.seg_text(x, y, digits, 6, 2, p.amber, off, true);
     this.txt(end + 1, y + 4, unit, if live { p.amber } else { p.amber_ghost });
     this.txt(x, y + 7, "PEAK BAND", p.amber_text);
     this.txt(x + 12, y + 7, "HOLD", p.amber);
@@ -555,8 +556,9 @@ fn draw_readout(input, st, bands, x, y) {
     this.txt(x + 5, y + 9, "[" + srt + "]", p.amber);
 }
 
-// Bass / treble fans: thin lines converging on the 0 line; the line closest
-// to the current balance of that range against the mids is lit.
+// Bass / treble fans as thin stepped strokes: each range's line runs from its
+// level at the edge (+10 .. -10) into the flat 0 line in the middle; only the
+// line that matches the current balance against the mids is drawn.
 fn draw_fans(input, st, bands, x, y, w) {
     let p = st.pal;
     let lo = (bands[1][0] + bands[2][0] + bands[3][0] + bands[4][0]) / 4.0;
@@ -568,22 +570,28 @@ fn draw_fans(input, st, bands, x, y, w) {
     this.txt(x, y, "BASS", p.cyan);
     this.txt(x + w - 6, y, "TREBLE", p.cyan);
     let gy = y + 1;
-    let gh = 4;                         // rows: +10 .. -10
+    let gh = 4;                          // rows for +10 .. -10
     this.txt(x, gy, "+10", p.cyan_mid);
-    this.txt(x, gy + 2, "  0", p.cyan_mid);
+    this.txt(x, gy + gh / 2, "  0", p.cyan_mid);
     this.txt(x, gy + gh - 1, "-10", p.cyan_mid);
-    let X0 = (x + 4) * 2;
-    let W = (w - 4) * 2;
-    let Y0 = gy * 4 + 1;
-    let H = gh * 4 - 3;
-    let ymid = Y0 + H / 2;
-    let half = W / 2;
-    for i in 0..5 {
-        let yy = Y0 + i * H / 4;
-        this.ln(X0, yy, X0 + half * 6 / 10, ymid, if i == bass_line { p.cyan } else { p.cyan_ghost });
-        this.ln(X0 + W - 1, yy, X0 + W - 1 - half * 6 / 10, ymid, if i == treble_line { p.cyan } else { p.cyan_ghost });
+    let gx = x + 4;
+    let gw = w - 4;
+    // three thin strokes per row: top "▔", middle "─", bottom "▁"
+    let levels = 3 * gh - 1;
+    let zero = levels / 2;
+    let ramp = gw * 3 / 10;
+    let lines = [[bass_line, 0, 1], [treble_line, gw - 1, -1]];
+    for l in lines {
+        let start = l[0] * levels / 4;
+        for c in 0..ramp {
+            let t = to_float(c) / to_float(mx(ramp - 1, 1));
+            let lv = to_int(to_float(start) + (to_float(zero) - to_float(start)) * t + 0.5);
+            let ch = switch lv % 3 { 0 => "▔", 1 => "─", _ => "▁" };
+            this.txt(gx + l[1] + l[2] * c, gy + lv / 3, ch, p.cyan);
+        }
     }
-    this.ln(X0 + half * 6 / 10, ymid, X0 + W - 1 - half * 6 / 10, ymid, p.cyan);
+    let flat = switch zero % 3 { 0 => "▔", 1 => "─", _ => "▁" };
+    this.hl(gx + ramp, gy + zero / 3, gw - 2 * ramp, flat, p.cyan_mid);
 }
 
 fn draw_balance(input, st, x, y, w) {
@@ -603,28 +611,21 @@ fn draw_balance(input, st, x, y, w) {
     this.txt(pos, y + 1, "▮", p.cyan);
 }
 
-// Small speaker icon (box and cone) in braille, one cell wide plus the cone.
-fn speaker(x, y, fg) {
-    let X = x * 2; let Y = y * 4;
-    this.ln(X, Y + 1, X, Y + 3, fg);
-    this.ln(X + 1, Y + 1, X + 1, Y + 3, fg);
-    this.ln(X + 1, Y + 1, X + 3, Y, fg);
-    this.ln(X + 1, Y + 3, X + 3, Y + 4, fg);
-    this.ln(X + 3, Y, X + 3, Y + 4, fg);
-}
-
-// Thin box around a label: "▁" above, "▔" below, "▕" / "▏" at the sides.
-// Returns the x after the box. The box is 3 rows tall, the label on row y+1.
-fn tbox(x, y, label, fg) {
-    let w = label.len() + 4;
-    this.hl(x + 1, y, w - 2, "▁", fg);
-    this.txt(x, y + 1, "▕", fg);
-    this.txt(x + 2, y + 1, label, fg);
-    this.txt(x + w - 1, y + 1, "▏", fg);
-    this.hl(x + 1, y + 2, w - 2, "▔", fg);
+// A label plate: a thin line above and below the label, no sides.
+// Returns the x after the plate (3 rows tall, the label on row y+1).
+fn plate(x, y, label, fg) {
+    let w = label.len() + 2;
+    this.hl(x, y, w, "▁", fg);
+    this.txt(x + 1, y + 1, label, fg);
+    this.hl(x, y + 2, w, "▔", fg);
     x + w
 }
 
+// Signal path like a receiver's routing display. The top row runs source ->
+// decoder -> volume; a wire leaves the volume plate along its bottom edge,
+// turns down at its right end and comes back along the top edge of the tone
+// plate, so every corner sits on a cell edge and joins cleanly. The bottom
+// row runs tone -> amplifier -> speakers.
 fn draw_routing(input, st, x, y) {
     let p = st.pal;
     let playing = get(input, "playing", !input.paused && input.track_title != "");
@@ -635,43 +636,35 @@ fn draw_routing(input, st, x, y) {
     let vol = to_int(input.volume * 100.0 + 0.5);
     let src = switch get(input, "source", "") { "federated" => "NETWORK", "podcast" => "PODCAST", _ => "LIBRARY" };
 
-    // source -> decoder -> volume
-    let x1 = this.tbox(x, y, src, on);
-    this.hl(x1, y + 1, 3, "─", dim);
-    let x2 = this.tbox(x1 + 3, y, if fmt == "" { "DECODE" } else { fmt }, on);
-    this.hl(x2, y + 1, 3, "─", dim);
-    let x3 = this.tbox(x2 + 3, y, "VOL " + vol, on);
+    let x1 = this.plate(x, y, src, on);
+    this.hl(x1 + 1, y + 1, 2, "─", dim);
+    let x2 = this.plate(x1 + 4, y, if fmt == "" { "DECODE" } else { fmt }, on);
+    this.hl(x2 + 1, y + 1, 2, "─", dim);
+    let x3 = this.plate(x2 + 4, y, "VOL " + vol, on);
 
-    // volume -> tone -> amplifier -> speakers A / B
+    // bottom row, right-aligned so the tone plate ends under the wire
     let ty = y + 4;
-    let drop_x = x3 - 3;
-    this.vl(drop_x, y + 3, ty - y - 2, "▏", dim);
-    this.hl(x + 24, ty + 1, drop_x - x - 24, "─", dim);
-    this.txt(drop_x, ty + 1, "┘", dim);
-    let tone_end = this.tbox(x + 16, ty, "TONE", on);
-    this.hl(tone_end, ty + 1, x + 24 - tone_end, "─", dim);
+    let tone_x = x3 - 6;
+    let amp_x = tone_x - 4 - 5;
+    let speakers = if amp_x - 4 - 12 >= x { "SPEAKERS A" } else { "SPK A" };
+    let sp_x = amp_x - 4 - (speakers.len() + 2);
+    this.plate(sp_x, ty, speakers, on);
+    this.hl(amp_x - 3, ty + 1, 2, "─", dim);
+    this.plate(amp_x, ty, "AMP", on);
+    this.hl(tone_x - 3, ty + 1, 2, "─", dim);
+    this.plate(tone_x, ty, "TONE", on);
 
-    // amplifier: a thin braille triangle pointing at the speakers
-    let AX = (x + 6) * 2; let AY = (ty + 1) * 4 + 2;
-    this.ln(AX, AY, AX + 16, AY - 6, on);
-    this.ln(AX, AY, AX + 16, AY + 6, on);
-    this.ln(AX + 16, AY - 6, AX + 16, AY + 6, on);
-    this.txt(x + 10, ty + 1, "AMP", on);
-    this.hl(x + 15, ty + 1, 1, "─", dim);
-    this.speaker(x, ty, on);
-    this.txt(x + 3, ty, "A", on);
-    this.speaker(x, ty + 2, dim);
-    this.txt(x + 3, ty + 2, "B", dim);
-    this.ln((x + 2) * 2, ty * 4 + 2, AX, AY, dim);
-    this.ln((x + 2) * 2, (ty + 2) * 4 + 2, AX, AY, dim);
+    // the wire: from the volume plate's bottom-right corner straight down to
+    // the tone plate's top-right corner (both on the left edge of column x3)
+    this.vl(x3, y + 2, ty - y - 1, "▎", dim);
     x3
 }
 
 fn draw_transport(input, st, x, y) {
     let p = st.pal;
     let word = if input.track_title == "" { "StoP" } else if input.paused { "PAUSE" } else { "PLAY" };
-    let off = if st.boot > 0.0 { p.cyan } else { p.cyan_ghost };
-    this.seg_text(x, y, word, 6, 2, p.cyan, off, false, 0);
+    let off = if st.boot > 0.0 { p.cyan } else { p.cyan_seg };
+    this.seg_text(x, y, word, 6, 2, p.cyan, off, false);
     let ly = y + 6;
     let stereo = get(input, "level_l", 0.0) > 0.0 && (get(input, "level_l", 0.0) - get(input, "level_r", 0.0)).abs() > 0.001;
     this.txt(x, ly, "TRACK", p.cyan_mid);
@@ -680,12 +673,12 @@ fn draw_transport(input, st, x, y) {
     let q = get(input, "queue_index", 0);
     let qn = get(input, "queue_length", 0);
     let qs = if q <= 0 { "-" } else if q > 99 { "--" } else { "" + q };
-    let end = this.seg_text(x, ly + 1, qs, 4, 1, p.cyan, off, false, 0);
+    let end = this.seg_text(x, ly + 1, qs, 4, 1, p.cyan, off, false);
     this.txt(end + 1, ly + 2, "/" + (if qn > 99 { "99+" } else { "" + qn }), p.cyan_mid);
     // volume right-aligned to the block's edge, "%" in the last column
     let vs = "" + to_int(input.volume * 100.0 + 0.5);
     let vx = x + transport_width() - 2 - (vs.len() * 5 - 1) - 1;
-    this.seg_text(vx, ly + 1, vs, 4, 1, p.cyan, off, false, 0);
+    this.seg_text(vx, ly + 1, vs, 4, 1, p.cyan, off, false);
     this.txt(x + transport_width() - 2, ly + 2, "%", p.cyan);
 }
 
@@ -857,10 +850,10 @@ fn render_standby(input, st) {
         }
         let boost = clamp(1.0 - abs(to_float(i) - sweep), 0.0, 1.0);
         let on = whiten(p.white, 0.55 * boost);
-        cmds.seg_text(cx, y, digits.sub_string(i, 1), cw, rh, on, p.white_ghost, false, p.mesh);
+        cmds.seg_text(cx, y, digits.sub_string(i, 1), cw, rh, on, p.white_seg, false);
         cx += cw + 1;
     }
-    cmds.seg_text(cx + 1, y + 2 * rh - 2, pad2(s), 4, 1, p.white_mid, p.white_ghost, false, 0);
+    cmds.seg_text(cx + 1, y + 2 * rh - 2, pad2(s), 4, 1, p.white_mid, p.white_seg, false);
     let ly = y + 2 * rh + 2;
     cmds.txt(x, ly, "STANDBY", p.red);
     cmds.txt(x + 10, ly, if night(input) { "DIMMER" } else { "" }, p.white_mid);

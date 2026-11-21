@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 2,
+        version: 3,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];

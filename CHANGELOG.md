@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lamp. It also has a dot-matrix title line (Latin and Cyrillic), palettes
   ("classic", "green", "amber", "ice"), needle VU meters as an option, a
   night dimmer, a slow filament "breath", slightly uneven digit brightness,
-  a mesh behind the big digits, a tape counter, LOUDNESS / MUTE / SEARCH
+  a tape counter, LOUDNESS / MUTE / SEARCH
   lamps, a burst of static on track changes and a standby clock when
   nothing is loaded.
 - Visualization protocol v3: a real third-octave spectrum (31 bands) with
