@@ -58,7 +58,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "vfd_panel",
         file_name: "vfd_panel.rhai",
         display_name: "VFD panel",
-        version: 6,
+        version: 7,
         source: include_str!("visualizations/vfd_panel.rhai"),
     },
 ];
@@ -2068,10 +2068,14 @@ mod tests {
                 r#"fn PALETTE() { "ice" }"#,
                 1,
             ),
-            base.replacen(r#"fn LAYOUT() { "auto" }"#, r#"fn LAYOUT() { "tape" }"#, 1),
             base.replacen(
-                r#"fn LAYOUT() { "auto" }"#,
-                r#"fn LAYOUT() { "minimal" }"#,
+                r#"fn DISPLAY_MODE() { "auto" }"#,
+                r#"fn DISPLAY_MODE() { "deck" }"#,
+                1,
+            ),
+            base.replacen(
+                r#"fn DISPLAY_MODE() { "auto" }"#,
+                r#"fn DISPLAY_MODE() { "minimal" }"#,
                 1,
             ),
         ];

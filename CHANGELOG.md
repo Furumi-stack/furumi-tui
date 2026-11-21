@@ -20,11 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   track and source changes, a source block that relights with its new
   value, colours that fade into unlit phosphor on pause, a night dimmer, a
   slow filament "breath", slightly uneven digit brightness and a standby
-  clock when nothing is loaded. Display modes "classic", "focus",
-  "minimal" and "tape" switch with Shift+M (a row of mode lamps shows the
-  choice for a moment) or can be pinned at the top of the script, like the
-  palettes ("classic", "green", "amber", "ice"); a mode that does not fit
-  the window steps down. Bars settle with a little inertia, the analyzer's
+  clock when nothing is loaded. Display modes "full", "spectrum",
+  "minimal" and "deck" switch with Shift+M or can be pinned with
+  `DISPLAY_MODE()` at the top of the script, like the palettes ("classic",
+  "green", "amber", "ice"); a mode that does not fit the window steps down.
+  A switch looks like hardware: the time and L/R meters stay lit, the other
+  sections go dark and light up one by one, and a row of mode lamps shows
+  the choice for a moment. The analyzer's display range follows the
+  loudness of the music (the measurements stay absolute), and deck mode has
+  AMS, NR, AUTO REVERSE and REW/FF lamps with a counter that races during a
+  seek. Bars settle with a little inertia, the analyzer's
   tint runs from warm amber in the bass to light yellow in the treble, peak
   marks fall with a little gravity after their hold, and the transport word
   uses 14-segment letters with faint unlit segments.

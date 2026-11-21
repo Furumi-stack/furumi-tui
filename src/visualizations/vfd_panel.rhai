@@ -1,6 +1,6 @@
 // name: VFD panel
 // protocol: furumi-visualizer-v3
-// bundle-version: 6
+// bundle-version: 7
 //
 // A hi-fi front panel in the style of a vacuum fluorescent display: thin
 // segment digits, a peak level meter (bars or needles), a third-octave
@@ -31,16 +31,18 @@
 fn PALETTE() { "classic" }        // "classic" | "green" | "amber" | "ice"
 fn METER_STYLE() { "bars" }       // "bars" | "needles"
 fn NIGHT_DIMMER() { true }        // dim the panel from 22:00 to 07:00
-fn LAYOUT() { "auto" }            // "auto" | "classic" | "focus" | "minimal" | "tape"
-//   classic   everything: meters, analyzer, tone, signal path, transport
-//   focus     a taller analyzer; the lower modules shrink to one line
+fn DISPLAY_MODE() { "auto" }      // "auto" | "full" | "spectrum" | "minimal" | "deck"
+//   full      everything: meters, analyzer, tone, signal path, transport
+//   spectrum  a taller analyzer; the lower modules shrink to one line
 //   minimal   time, title, L/R meter and the analyzer, no signal path
-//   tape      large counter, tape counter and L/R meters, a small analyzer
-//   auto      Shift+M in the visualizer steps through classic, focus,
-//             minimal and tape; a fixed value pins one of them
-// A display mode that does not fit the window steps down: classic -> focus
-// -> minimal -> compact ("full" and "spectrum" are old names of classic and
-// focus).
+//   deck      a cassette deck: large counter, tape counter, wide L/R meters
+//   auto      Shift+M in the visualizer steps through full, spectrum,
+//             minimal and deck; a fixed value pins one of them
+// A display mode that does not fit the window steps down: full -> spectrum
+// -> minimal -> compact. On a change the panel switches like hardware: the
+// time and L/R meters stay lit, the other sections go dark and light up one
+// after another.
+fn DECK_LAMPS() { true }          // AMS / NR / AUTO REVERSE / REW-FF lamps in deck mode
 //
 // Script entry point:
 //   fn render(input) -> Array<Map>                  (stateless)
@@ -334,23 +336,39 @@ fn seg_text(x, y, s, cw, rh, on, off, point_on) {
 // Normalized meter value -> dBFS.
 fn dbfs(input, v) { get(input, "spectrum_floor_db", -60.0) * (1.0 - v) }
 
-// Display curve of the analyzer: -50..-8 dBFS per third-octave band, raised to
-// a power so quiet music sits lower and loud passages reach the top; the shape
-// of the spectrum then changes visibly between quiet and loud fragments.
-fn band_display(input, v) {
-    let lin = clamp((dbfs(input, v) + 50.0) / 42.0, 0.0, 1.0);
+// Display curve of the analyzer: a 42 dB window per third-octave band that
+// ends at `top` dBFS, raised to a power so quiet passages sit lower and loud
+// ones reach the top. `top` follows the music (see update_range): the window
+// moves, the measurements do not.
+fn band_display(input, v, top) {
+    // the window never reaches below the analyzer floor: silence stays dark
+    let lo = mx(top - 42.0, get(input, "spectrum_floor_db", -60.0));
+    let lin = clamp((dbfs(input, v) - lo) / (top - lo), 0.0, 1.0);
     if lin <= 0.0 { 0.0 } else { pow(lin, 1.3) }
 }
 
+// Top of the analyzer window: rises at once with the loudest band, falls
+// slowly (4 dB/s), and stays within -26..-6 dBFS, so quiet music fills more
+// of the analyzer and loud music does not pin it to the top.
+fn update_range(st, input, dt) {
+    let s = get(input, "spectrum", []);
+    let loudest = -60.0;
+    for i in 5..30 { if i < s.len() { loudest = mx(loudest, dbfs(input, s[i])); } }
+    if !("agc" in st) { st.agc = -14.0; }
+    st.agc = if loudest > st.agc { loudest } else { st.agc - 4.0 * dt };
+    st.top_db = clamp(st.agc + 4.0, -26.0, -6.0);
+    st
+}
+
 // The 25 panel bands 63 Hz .. 16 kHz are spectrum entries 5..29.
-fn panel_bands(input) {
+fn panel_bands(input, top) {
     let s = get(input, "spectrum", []);
     let p = get(input, "spectrum_peaks", []);
     let out = [];
     for i in 5..30 {
         let v = if i < s.len() { s[i] } else { 0.0 };
         let pk = if i < p.len() { p[i] } else { 0.0 };
-        out.push([band_display(input, v), band_display(input, pk)]);
+        out.push([band_display(input, v, top), band_display(input, pk, top)]);
     }
     out
 }
@@ -937,6 +955,7 @@ fn advance_state(input) {
         } else if abs(input.position - expected) > 1.5 {
             // a jump that playback alone cannot explain is a seek
             st.search = 0.8;
+            st.seek_dir = if input.position > expected { 1 } else { -1 };
         }
     }
     if st.source != source { st.source = source; st.noise = 0.35; st.src_flash = 0.5; }
@@ -977,7 +996,8 @@ fn draw_top_band(input, st, bands, x0, y, cw) {
     } else {
         this.draw_meter(input, st, meter_x, y, meter_w);
     }
-    this.draw_lamps(input, st, bands, x0 + cw - lamps_w + 2, y);
+    // the lamp block is not shared between modes: it relights with section 1
+    this.draw_lamps(input, section(st, 1), bands, x0 + cw - lamps_w + 2, y);
 }
 
 fn draw_title_rows(input, st, x0, y, cw) {
@@ -1006,23 +1026,23 @@ fn render_full(input, st, bands) {
 
     cmds.draw_top_band(input, st, bands, x0, y, cw);
     y += 7 + gap;
-    cmds.draw_title_rows(input, st, x0, y, cw);
+    cmds.draw_title_rows(input, section(st, 1), x0, y, cw);
 
     y += 4 + gap;
     let module_w = 26;
     let bw = clamp((cw - module_w - 8) / 25, 3, 5);
-    let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    let right = cmds.draw_analyzer(input, section(st, 2), bands, x0, y, bw, spec_h);
     let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
-    cmds.draw_measure(input, st, mx_, y + mx((spec_h + 2 - measure_height()) / 2, 0), mn(module_w, x0 + cw - mx_));
+    cmds.draw_measure(input, section(st, 3), mx_, y + mx((spec_h + 2 - measure_height()) / 2, 0), mn(module_w, x0 + cw - mx_));
 
     y += spec_h + 2 + gap;
-    cmds.draw_balance(input, st, x0, y, 28);
-    cmds.draw_fans(input, st, bands, x0, y + 3, 28);
+    cmds.draw_balance(input, section(st, 4), x0, y, 28);
+    cmds.draw_fans(input, section(st, 4), bands, x0, y + 3, 28);
     let tr_w = transport_width();
     let sx = x0 + 32;
     let sw = cw - 32 - tr_w - 4;
-    cmds.draw_schematic(input, st, sx, y, sw);
-    cmds.draw_transport(input, st, x0 + cw - tr_w, y);
+    cmds.draw_schematic(input, section(st, 5), sx, y, sw);
+    cmds.draw_transport(input, section(st, 6), x0 + cw - tr_w, y);
 
     if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
     cmds
@@ -1056,20 +1076,22 @@ fn render_spectrum(input, st, bands) {
     let H = input.height;
     let cw = mn(W - 4, 170);
     let x0 = (W - cw) / 2;
-    let y = if input.show_clock { 1 } else { 0 };
+    let top = if input.show_clock { 1 } else { 0 };
+    // the analyzer is tall but capped, and the panel is centred vertically
+    let spec_h = clamp(H - top - 17, 6, 18);
+    let y = top + mx((H - top - (13 + spec_h + 4)) / 2, 0);
     cmds.draw_top_band(input, st, bands, x0, y, cw);
     y += 8;
-    cmds.draw_title_rows(input, st, x0, y, cw);
+    cmds.draw_title_rows(input, section(st, 1), x0, y, cw);
     y += 5;
-    let spec_h = clamp(H - y - 4, 6, 30);
     let module_w = 26;
     let bw = clamp((cw - module_w - 8) / 25, 2, 5);
-    let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    let right = cmds.draw_analyzer(input, section(st, 2), bands, x0, y, bw, spec_h);
     let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
     if mx_ + module_w <= x0 + cw && spec_h + 2 >= measure_height() {
-        cmds.draw_measure(input, st, mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
+        cmds.draw_measure(input, section(st, 3), mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
     }
-    cmds.draw_strip(input, st, x0, y + spec_h + 3, cw);
+    cmds.draw_strip(input, section(st, 4), x0, y + spec_h + 3, cw);
     if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
     cmds
 }
@@ -1098,19 +1120,47 @@ fn render_tape(input, st, bands) {
     // counter ("88.88" and a two-digit track), and the lamps on the right
     let cx = x0 + (6 * dw + 11) + 6;
     let off = if st.boot > 0.0 { p.white } else { p.white_seg };
-    cmds.seg_text(cx, y, if st.boot > 0.0 { "8888" } else { pad4(tape_counter(input.position)) }, 6, 2, p.white, off, false);
-    cmds.txt(cx, y + 6, "TAPE COUNTER", p.white_mid);
-    cmds.draw_lamps(input, st, bands, x0 + cw - 16, y);
+    // during a seek the counter races like a deck winding the tape
+    let counter = if st.boot > 0.0 { "8888" }
+                  else if st.search > 0.0 { pad4((tape_counter(input.position) + input.frame * 37) % 10000) }
+                  else { pad4(tape_counter(input.position)) };
+    // the tape counter belongs to the deck section and relights with it
+    let tp = section(st, 1).pal;
+    cmds.seg_text(cx, y, counter, 6, 2, tp.white, off, false);
+    cmds.txt(cx, y + 6, "TAPE COUNTER", tp.white_mid);
+    let lamps_x = x0 + cw - 16;
+    cmds.draw_lamps(input, section(st, 1), bands, lamps_x, y);
+    if DECK_LAMPS() && lamps_x - (cx + 28) >= 18 {
+        cmds.draw_deck_lamps(input, section(st, 1), cx + 31, y);
+    }
     y += 2 * rh + 4;
     if METER_STYLE() == "needles" { cmds.draw_needles(input, st, x0, y, cw); } else { cmds.draw_meter(input, st, x0, y, cw); }
     y += 6;
-    cmds.draw_title_rows(input, st, x0, y, cw);
+    cmds.draw_title_rows(input, section(st, 2), x0, y, cw);
     y += 5;
     let bw = clamp((cw - 4) / 25, 2, 6);
-    cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
-    if y + spec_h + 3 < H { cmds.draw_strip(input, st, x0, y + spec_h + 3, cw); }
+    cmds.draw_analyzer(input, section(st, 3), bands, x0, y, bw, spec_h);
+    if y + spec_h + 3 < H { cmds.draw_strip(input, section(st, 4), x0, y + spec_h + 3, cw); }
     if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
     cmds
+}
+
+// Cassette deck lamps: AMS lights while the counter searches on a track
+// change, NR [B] while playing (decorative), AUTO REVERSE with repeat all,
+// and REW / FF in the direction of a seek.
+fn draw_deck_lamps(input, st, x, y) {
+    let p = st.pal;
+    let boot = st.boot > 0.0;
+    let playing = get(input, "playing", false);
+    let blink = to_int(input.time * 6.0) % 2 == 0;
+    this.lamp(x, y, "AMS", boot || (st.spin > 0.0 && blink), p.white, p.lamp_off);
+    let nx = this.lamp(x + 6, y, "NR", boot || playing, p.white, p.lamp_off);
+    this.txt(nx - 2, y, "[B]", if boot || playing { p.white } else { p.lamp_off });
+    this.lamp(x, y + 2, "AUTO REVERSE", boot || get(input, "repeat", "off") == "all", p.white, p.lamp_off);
+    let dir = if "seek_dir" in st { st.seek_dir } else { 0 };
+    let seeking = st.search > 0.0;
+    this.lamp(x, y + 4, "<< REW", boot || (seeking && dir < 0), p.white, p.lamp_off);
+    this.lamp(x + 9, y + 4, "FF >>", boot || (seeking && dir > 0), p.white, p.lamp_off);
 }
 
 // MINIMAL: time, the L/R meter, the title and a tall analyzer with its
@@ -1120,9 +1170,13 @@ fn render_minimal(input, st, bands) {
     let p = st.pal;
     let W = input.width;
     let H = input.height;
-    let cw = mn(W - 4, 170);
+    // a narrower composition keeps its balance on wide screens
+    let cw = mn(W - 4, 132);
     let x0 = (W - cw) / 2;
-    let y = if input.show_clock { 1 } else { 0 };
+    let top = if input.show_clock { 1 } else { 0 };
+    // the analyzer is capped, so a tall window centres the panel instead
+    let spec_h = clamp(H - top - 14, 6, 22);
+    let y = top + mx((H - top - (13 + spec_h)) / 2, 0);
     cmds.draw_counter(input, st, x0, y, 6, 2);
     let meter_x = x0 + counter_width() + 4;
     let meter_w = x0 + cw - meter_x;
@@ -1132,16 +1186,16 @@ fn render_minimal(input, st, bands) {
         cmds.draw_meter(input, st, meter_x, y, meter_w);
     }
     y += 8;
-    cmds.txt(x0, y, "▸", p.white_mid);
-    cmds.draw_matrix_title(input, st, x0 + 2, y, cw - 2, title_label(input));
+    let ts = section(st, 1);
+    cmds.txt(x0, y, "▸", ts.pal.white_mid);
+    cmds.draw_matrix_title(input, ts, x0 + 2, y, cw - 2, title_label(input));
     y += 3;
-    let spec_h = clamp(H - y - 3, 6, 30);
     let module_w = 26;
     let bw = clamp((cw - module_w - 8) / 25, 2, 5);
-    let right = cmds.draw_analyzer(input, st, bands, x0, y, bw, spec_h);
+    let right = cmds.draw_analyzer(input, section(st, 2), bands, x0, y, bw, spec_h);
     let mx_ = right + mx((x0 + cw - right - module_w) / 2, 3);
     if mx_ + module_w <= x0 + cw && spec_h + 2 >= measure_height() {
-        cmds.draw_measure(input, st, mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
+        cmds.draw_measure(input, section(st, 3), mx_, y + (spec_h + 2 - measure_height()) / 2, module_w);
     }
     if input.show_clock { cmds.txt(W - input.clock.len() - 1, 0, input.clock, p.white_mid); }
     cmds
@@ -1185,7 +1239,7 @@ fn render_standby(input, st) {
     let h = get(input, "clock_hour", 0);
     let m = get(input, "clock_minute", 0);
     let s = get(input, "clock_second", 0);
-    if W < 42 || H < 10 { return render_compact(input, st, panel_bands(input)); }
+    if W < 42 || H < 10 { return render_compact(input, st, panel_bands(input, -8.0)); }
     let big = W >= 70 && H >= 20;
     let cw = if big { 9 } else { 6 };
     let rh = if big { 4 } else { 2 };
@@ -1224,36 +1278,67 @@ fn colon(x, y, rh, fg) {
     this.txt(x + 1, y + rh + 1, "▪", fg);
 }
 
-// Smallest screens for each composition (classic needs a row more with the
+// Mode switch like a hardware display: section 0 (time, L/R meters) stays
+// lit; the other sections are dark for a moment, then light up one after
+// another with a brief overshoot as each comes on.
+fn section(st, k) {
+    if k == 0 || !("mode_t" in st) { return st; }
+    let t = st.mode_t;
+    let on_at = 0.12 + to_float(k) * 0.11;
+    if t >= on_at + 0.08 { return st; }
+    let s2 = st;
+    let p = st.pal;
+    let keys = ["white", "white_mid", "amber", "amber_low", "amber_hot", "peak", "amber_text",
+                "amber_warm", "amber_light", "red", "red_mid", "cyan", "cyan_mid", "cyan_hot", "cyan_line"];
+    if t < on_at {
+        let ghost = #{ white: p.white_ghost, white_mid: p.white_ghost, amber: p.amber_ghost,
+                       amber_low: p.amber_ghost, amber_hot: p.amber_ghost, peak: p.amber_ghost,
+                       amber_text: p.amber_ghost, amber_warm: p.amber_ghost, amber_light: p.amber_ghost,
+                       red: p.red_ghost, red_mid: p.red_ghost, cyan: p.cyan_ghost, cyan_mid: p.cyan_ghost,
+                       cyan_hot: p.cyan_ghost, cyan_line: p.cyan_ghost };
+        for key in keys { p[key] = ghost[key]; }
+        // unlit lamps and rules go down with them, so nothing reads as lit
+        p.lamp_off = p.white_ghost;
+        p.red_lamp_off = p.red_ghost;
+        p.amber_lamp_off = p.amber_ghost;
+        p.cyan_lamp_off = p.cyan_ghost;
+        p.amber_rule = p.amber_ghost;
+    } else {
+        for key in keys { p[key] = whiten(p[key], 0.35); }
+    }
+    s2.pal = p;
+    s2
+}
+
+// Smallest screens for each composition (full needs a row more with the
 // clock).
 fn full_height(input) { if input.show_clock { 35 } else { 34 } }
 
 fn mode_fits(mode, input) {
     let W = input.width; let H = input.height;
     switch mode {
-        "classic" => W >= 120 && H >= full_height(input),
-        "focus" => W >= 100 && H >= 26,
+        "full" => W >= 120 && H >= full_height(input),
+        "spectrum" => W >= 100 && H >= 26,
         "minimal" => W >= 80 && H >= 20,
-        "tape" => W >= 100 && H >= 30,
+        "deck" => W >= 100 && H >= 30,
         _ => true
     }
 }
 
-fn mode_names() { ["classic", "focus", "minimal", "tape"] }
+fn mode_names() { ["full", "spectrum", "minimal", "deck"] }
 
-// The display mode: Shift+M picks it unless LAYOUT() pins one; a mode that
-// does not fit the window steps down.
+// The display mode: Shift+M picks it unless DISPLAY_MODE() pins one; a mode
+// that does not fit the window steps down. Earlier names still work.
 fn pick_mode(input) {
-    let mode = LAYOUT();
-    if mode == "full" { mode = "classic"; }
-    if mode == "spectrum" { mode = "focus"; }
+    let mode = DISPLAY_MODE();
+    mode = switch mode { "classic" => "full", "focus" => "spectrum", "tape" => "deck", _ => mode };
     if mode == "auto" {
         let names = mode_names();
         mode = names[get(input, "mode", 0) % names.len()];
     }
-    if mode == "tape" && !mode_fits("tape", input) { mode = "focus"; }
-    if mode == "classic" && !mode_fits("classic", input) { mode = "focus"; }
-    if mode == "focus" && !mode_fits("focus", input) { mode = "minimal"; }
+    if mode == "deck" && !mode_fits("deck", input) { mode = "spectrum"; }
+    if mode == "full" && !mode_fits("full", input) { mode = "spectrum"; }
+    if mode == "spectrum" && !mode_fits("spectrum", input) { mode = "minimal"; }
     if mode == "minimal" && !mode_fits("minimal", input) { mode = "compact"; }
     mode
 }
@@ -1303,7 +1388,7 @@ fn update_inertia(st, bands, dt) {
 // For two seconds after Shift+M, a row of mode lamps along the bottom edge.
 fn draw_mode_lamps(input, st, mode) {
     let p = st.pal;
-    let names = ["CLASSIC", "FOCUS", "MINIMAL", "TAPE"];
+    let names = ["FULL", "SPECTRUM", "MINIMAL", "DECK"];
     let keys = mode_names();
     let total = 9;
     for n in names { total += n.len() + 3; }
@@ -1319,29 +1404,41 @@ fn draw_mode_lamps(input, st, mode) {
 
 fn render(input) {
     let st = advance_state(input);
-    let raw = panel_bands(input);
     let dt = get(input, "dt", 0.05);
+    st = update_range(st, input, dt);
+    let raw = panel_bands(input, st.top_db);
     st = update_hold(st, raw, dt);
     st = update_inertia(st, raw, dt);
     let bands = st.shown;
-    // the mode lamps light up for a moment when Shift+M changes the mode
+    // the mode lamps light up for a moment on every Shift+M; the sections
+    // switch over (mode_t, see section) only when the layout really changes,
+    // not for a pinned DISPLAY_MODE() or a fallback to the same layout
+    let mode = pick_mode(input);
     let mode_in = get(input, "mode", 0);
-    if !("mode_seen" in st) { st.mode_seen = mode_in; st.mode_flash = 0.0; }
+    if !("mode_seen" in st) { st.mode_seen = mode_in; st.mode_flash = 0.0; st.mode_shown = mode; }
     st.mode_flash -= dt;
-    if st.mode_seen != mode_in { st.mode_seen = mode_in; st.mode_flash = 2.0; }
+    if "mode_t" in st {
+        st.mode_t += dt;
+        if st.mode_t > 1.5 { st.remove("mode_t"); }
+    }
+    if st.mode_seen != mode_in {
+        st.mode_seen = mode_in;
+        st.mode_flash = 2.0;
+        if st.mode_shown != mode { st.mode_t = 0.0; }
+    }
+    st.mode_shown = mode;
     let cmds = [#{ op: "clear", bg: 0 }];
     let W = input.width; let H = input.height;
     if W >= 20 && H >= 6 {
         cmds.draw_noise(input, st);
-        let mode = pick_mode(input);
         let body = if input.track_title == "" && st.boot <= 0.0 {
             render_standby(input, st)
         } else {
             switch mode {
-                "classic" => render_full(input, st, bands),
-                "focus" => render_spectrum(input, st, bands),
+                "full" => render_full(input, st, bands),
+                "spectrum" => render_spectrum(input, st, bands),
                 "minimal" => render_minimal(input, st, bands),
-                "tape" => render_tape(input, st, bands),
+                "deck" => render_tape(input, st, bands),
                 _ => render_compact(input, st, bands)
             }
         };
