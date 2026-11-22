@@ -2827,3 +2827,54 @@ mod podcast_discovery {
         ));
     }
 }
+
+#[test]
+fn episode_download_requires_explicit_action_and_deduplicates_requests() {
+    use crate::app::podcast_fixtures as fx;
+    let mut state = fx::with_episodes(
+        fx::ready_state(vec![fx::row("Show", 1, 1, 0)]),
+        vec![fx::episode(1, "Episode", None)],
+    );
+    assert!(state.podcast_downloading.is_empty());
+    let expected = state
+        .podcasts
+        .selected_episode_track()
+        .unwrap()
+        .podcast_episode_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        update(&mut state, Action::DownloadSelected),
+        Some(Effect::PodcastDownload(expected.clone()))
+    );
+    assert_eq!(update(&mut state, Action::DownloadSelected), None);
+    assert_eq!(state.podcast_downloading.len(), 1);
+    state.podcast_downloading.clear();
+    state
+        .podcast_downloads
+        .insert(crate::podcasts::offline::key(expected.episode_id.as_str()));
+    assert_eq!(update(&mut state, Action::DownloadSelected), None);
+    assert!(state.podcast_downloading.is_empty());
+}
+
+#[test]
+fn podcast_retention_opens_a_numeric_editor_in_additional_settings() {
+    use crate::app::state::{FedInputField, Popup, SettingsRow, additional_settings_rows};
+    let mut state = AppState {
+        additional_settings_open: true,
+        podcast_retention_days: 30,
+        ..Default::default()
+    };
+    state.additional_settings_cursor = additional_settings_rows(&state)
+        .iter()
+        .position(|row| *row == SettingsRow::PodcastRetention)
+        .unwrap();
+    assert_eq!(update(&mut state, Action::Select), None);
+    assert!(matches!(
+        state.popup,
+        Some(Popup::FedInput {
+            field: FedInputField::PodcastRetention,
+            ..
+        })
+    ));
+}

@@ -923,6 +923,7 @@ impl StatusDetailFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FedInputField {
     MusicDirectory,
+    PodcastRetention,
     SimilarityWorkers,
     SimilarityMinimumScore,
     SimilarityMaxTracksPerArtist,
@@ -940,6 +941,7 @@ pub enum FedInputField {
 impl FedInputField {
     pub fn title(self) -> &'static str {
         match self {
+            FedInputField::PodcastRetention => "Keep podcast downloads (days)",
             FedInputField::MusicDirectory => "Music save directory",
             FedInputField::SimilarityWorkers => "Similarity background workers",
             FedInputField::SimilarityMinimumScore => "Minimum similarity score",
@@ -956,6 +958,9 @@ impl FedInputField {
 
     pub fn help(self) -> &'static str {
         match self {
+            FedInputField::PodcastRetention => {
+                "Enter 1–36500 days. Downloads expire from the time they finish. Default: 30 days. Only this device is affected."
+            }
             FedInputField::MusicDirectory => {
                 "Federated tracks saved to your library use this directory. The directory is checked for write access before anything changes."
             }
@@ -1047,6 +1052,7 @@ pub enum SettingsRow {
     CheckUpdate,
     InstallUpdate,
     MusicDirectory,
+    PodcastRetention,
     Similarity(SimilarityRow),
     Federation(FedRow),
     StatusDetails,
@@ -1188,6 +1194,7 @@ pub fn device_status_order(state: &AppState) -> Vec<usize> {
 pub fn additional_settings_rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = vec![
         SettingsRow::MusicDirectory,
+        SettingsRow::PodcastRetention,
         SettingsRow::CheckUpdate,
         SettingsRow::InstallUpdate,
     ];
@@ -1958,6 +1965,9 @@ pub struct AppState {
     /// Root for music permanently downloaded from federation peers.
     pub music_dir: std::path::PathBuf,
     pub music_dir_changing: bool,
+    pub podcast_retention_days: u32,
+    pub podcast_downloads: std::collections::HashSet<String>,
+    pub podcast_downloading: std::collections::HashSet<String>,
     pub player: PlayerBar,
     pub device_playback: DevicePlaybackState,
     pub jam: crate::jam::JamStatus,

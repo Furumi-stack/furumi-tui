@@ -41,7 +41,7 @@ pub enum Action {
     QueueAddLast,
     MoveQueueUp,
     MoveQueueDown,
-    /// Download the selected federated track(s) into the local library.
+    /// Download selected federated tracks, or a podcast episode for offline playback.
     DownloadSelected,
     RemoveFromQueue,
     ClearQueue,
@@ -239,7 +239,7 @@ impl Action {
             Action::QueueAddLast => "Queue: add to end".into(),
             Action::MoveQueueUp => "Queue: move track/selection up".into(),
             Action::MoveQueueDown => "Queue: move track/selection down".into(),
-            Action::DownloadSelected => "Federation: download to library".into(),
+            Action::DownloadSelected => "Download selected music / podcast episode".into(),
             Action::RemoveFromQueue => "Queue: remove selected".into(),
             Action::ClearQueue => "Queue: clear".into(),
             Action::OpenConnectedDevices => "Connected devices…".into(),

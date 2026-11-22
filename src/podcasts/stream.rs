@@ -162,7 +162,7 @@ pub enum StreamEnd {
 /// Read-only view of a stream's state that outlives handing the reader to
 /// the decoder.
 #[derive(Clone)]
-pub struct StreamProbe(Arc<Shared>);
+pub struct StreamProbe(Option<Arc<Shared>>);
 
 impl std::fmt::Debug for StreamProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,8 +171,14 @@ impl std::fmt::Debug for StreamProbe {
 }
 
 impl StreamProbe {
+    pub fn local() -> Self {
+        Self(None)
+    }
     pub fn end(&self) -> StreamEnd {
-        let state = self.0.lock();
+        let Some(shared) = &self.0 else {
+            return StreamEnd::Complete;
+        };
+        let state = shared.lock();
         if state.read_failed {
             StreamEnd::Failed
         } else if state.declared_total {
@@ -385,7 +391,7 @@ pub fn open_with(url: &str, cancel: CancelToken) -> Result<OpenedStream> {
         .spawn(move || downloader.run(response))
         .context("spawning the podcast stream thread")?;
     Ok(OpenedStream {
-        probe: StreamProbe(Arc::clone(&shared)),
+        probe: StreamProbe(Some(Arc::clone(&shared))),
         reader: HttpStream { pos: 0, shared },
         byte_len: opened.total,
         mime_type,

@@ -273,6 +273,11 @@ pub enum AppEvent {
     },
     /// Scheduler timer: ask the store which feeds are due.
     PodcastRefreshTick,
+    PodcastDownloads(Result<std::collections::HashSet<String>, String>),
+    PodcastDownloaded {
+        id: String,
+        result: Result<(), String>,
+    },
     /// Feeds due for a background refresh.
     PodcastsDue(Result<Vec<(music_dht::podcast::PodcastId, music_dht::podcast::FeedUrl)>, String>),
     /// What sharing a podcast would publish (`Effect::PodcastPrepareShare`).

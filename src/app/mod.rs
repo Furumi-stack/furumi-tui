@@ -422,6 +422,7 @@ pub async fn run(
         status_message,
         ..AppState::default()
     };
+    state.podcast_retention_days = settings.podcast_retention_days;
     state.player.volume = settings.volume;
     state.global.filters = settings.library;
     state.music_dir = settings.music_dir.clone();
@@ -1728,7 +1729,9 @@ fn perform_effect(state: &mut AppState, runtime: &mut Runtime, effect: Effect) {
             });
         }
         // Executed by podcast_runtime::perform above.
-        Effect::PodcastsReload
+        Effect::SavePodcastSettings
+        | Effect::PodcastDownload(_)
+        | Effect::PodcastsReload
         | Effect::PodcastLoadSeasons(_)
         | Effect::PodcastLoadEpisodes { .. }
         | Effect::PodcastSubscribe(_)
@@ -3133,14 +3136,19 @@ fn refresh_artists(state: &mut AppState, runtime: &Runtime) {
     });
 }
 
-fn save_app_settings(state: &AppState) {
-    let settings = crate::config::settings::AppSettings {
+fn app_settings(state: &AppState) -> crate::config::settings::AppSettings {
+    crate::config::settings::AppSettings {
+        podcast_retention_days: state.podcast_retention_days,
         playback: state.device_playback.config.clone(),
         volume: state.player.volume,
         library: state.global.filters,
         music_dir: state.music_dir.clone(),
         similarity: state.similarity.settings.clone(),
-    };
+    }
+}
+
+fn save_app_settings(state: &AppState) {
+    let settings = app_settings(state);
     if let Err(err) = crate::config::settings::save(&settings) {
         tracing::warn!(%err, "saving app settings failed");
     }
@@ -3535,6 +3543,8 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         | AppEvent::PodcastProgress(_)
         | AppEvent::PodcastEpisodeStarted { .. }
         | AppEvent::PodcastEpisodeFailed { .. }
+        | AppEvent::PodcastDownloads(_)
+        | AppEvent::PodcastDownloaded { .. }
         | AppEvent::PodcastRefreshTick
         | AppEvent::PodcastsDue(_)
         | AppEvent::PodcastSharePrepared { .. }

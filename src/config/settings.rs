@@ -50,6 +50,8 @@ impl Default for SimilaritySettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default = "default_podcast_retention_days")]
+    pub podcast_retention_days: u32,
     #[serde(default)]
     pub playback: music_dht::playback::Config,
     #[serde(default = "default_volume")]
@@ -66,6 +68,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            podcast_retention_days: 30,
             playback: music_dht::playback::Config::default(),
             volume: default_volume(),
             library: LibraryFilters::default(),
@@ -77,6 +80,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn normalized(mut self) -> Self {
+        self.podcast_retention_days = self.podcast_retention_days.clamp(1, 36500);
         self.volume = self.volume.min(100);
         if self.music_dir.as_os_str().is_empty() {
             self.music_dir = default_music_dir();
@@ -95,6 +99,10 @@ impl AppSettings {
         self.similarity.max_tracks_per_artist = self.similarity.max_tracks_per_artist.clamp(1, 50);
         self
     }
+}
+
+fn default_podcast_retention_days() -> u32 {
+    30
 }
 
 fn default_volume() -> u8 {
@@ -186,6 +194,7 @@ hide_featured_only = true
         let settings = settings.normalized();
 
         assert_eq!(settings.volume, 100);
+        assert_eq!(settings.podcast_retention_days, 30);
         assert!(settings.library.hide_featured_only);
         assert_eq!(settings.library.source_mode, LibrarySourceMode::Global);
         assert_eq!(settings.music_dir, default_music_dir());

@@ -652,6 +652,17 @@ fn draw_episode_row(
         _ => String::new(),
     };
     let mut title = episode.title.clone();
+    if state
+        .podcast_downloading
+        .contains(episode.episode_id.as_str())
+    {
+        title.push_str(" [downloading]");
+    } else if state
+        .podcast_downloads
+        .contains(&crate::podcasts::offline::key(episode.episode_id.as_str()))
+    {
+        title.push_str(" [offline]");
+    }
     if !item.in_feed {
         title.push_str(" (no longer in the feed)");
     }

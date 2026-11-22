@@ -25,10 +25,11 @@
 //!   "already subscribed" mark, an episode preview read from the feed and
 //!   subscribing from a card.
 //!
-//! Only RSS metadata is stored. Audio stays on the publisher's server.
+//! Audio is streamed unless the user explicitly downloads an episode.
 
 pub mod discovery;
 pub mod fetch;
+pub mod offline;
 pub mod playback;
 pub mod progress;
 pub mod publication;
@@ -125,6 +126,7 @@ pub fn open_services(db_path: &Path, covers_dir: PathBuf, log: Arc<dyn OpLog>) -
     let confirmations =
         publication::ShareConfirmations::open(publication::confirmations_path(db_path));
     Ok(Services {
+        downloads_dir: db_path.with_file_name("podcast-downloads"),
         store: Arc::new(store),
         fetcher: Arc::new(Fetcher::new(covers_dir)?),
         log,

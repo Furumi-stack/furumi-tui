@@ -163,6 +163,9 @@ pub fn open_at(
     start_ms: i64,
     cancel: &CancelToken,
 ) -> Result<PreparedEpisode> {
+    if cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
     let opened = stream::open_with(&episode.audio_url, cancel.clone())?;
     let seekable = opened.seekable;
     let probe = opened.probe.clone();
@@ -218,6 +221,43 @@ pub fn open_at(
     })
 }
 
+/// Decode a completed local download. Blocking; no HTTP requests.
+pub fn open_local(
+    episode: &PodcastEpisodeRef,
+    start_ms: i64,
+    file: std::fs::File,
+) -> Result<PreparedEpisode> {
+    let len = file.metadata()?.len();
+    let mut source = decode_source_with(
+        Box::new(file),
+        Some(len),
+        episode.mime.as_deref(),
+        true,
+        true,
+    )
+    .map_err(|e| anyhow!(e))?;
+    if start_ms > 0 {
+        source
+            .try_seek(Duration::from_millis(start_ms as u64))
+            .map_err(|_| CannotResume {
+                position_ms: start_ms,
+            })?;
+    }
+    let measured = source
+        .total_duration()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .filter(|ms| *ms > 0);
+    Ok(PreparedEpisode {
+        episode: episode.clone(),
+        source,
+        start_ms,
+        duration_ms: measured.or(episode.duration_ms),
+        duration_measured: measured.is_some(),
+        seekable: true,
+        probe: StreamProbe::local(),
+    })
+}
+
 /// [`resolve`] + [`open_at`], refreshing the feed once when the audio URL
 /// answers with a client error (moved or expired file).
 pub async fn prepare(
@@ -233,8 +273,25 @@ pub async fn prepare(
     let lookup = queued.clone();
     let (episode, start_ms) = blocking(move || resolve(store.as_deref(), &lookup, start)).await?;
     let attempt = episode.clone();
+    let downloads_dir = services.as_ref().map(|s| s.downloads_dir.clone());
     let attempt_cancel = cancel.clone();
-    let error = match blocking(move || open_at(&attempt, start_ms, &attempt_cancel)).await {
+    let error = match blocking(move || {
+        if attempt_cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        let local = downloads_dir
+            .as_ref()
+            .map(|dir| super::offline::open(dir, &attempt))
+            .transpose()?
+            .flatten();
+        if let Some(file) = local {
+            open_local(&attempt, start_ms, file)
+        } else {
+            open_at(&attempt, start_ms, &attempt_cancel)
+        }
+    })
+    .await
+    {
         Ok(prepared) => return Ok(prepared),
         Err(error) => error,
     };

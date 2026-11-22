@@ -54,6 +54,31 @@ pub(super) fn handle(state: &mut AppState, action: &Action) -> Option<Option<Eff
             open_add(state);
             None
         }
+        Action::DownloadSelected => {
+            if !store_ready(state) {
+                return Some(None);
+            }
+            let Some(track) = state.podcasts.selected_episode_track() else {
+                return Some(None);
+            };
+            let episode = track.podcast_episode_ref().unwrap().clone();
+            if state
+                .podcast_downloads
+                .contains(&crate::podcasts::offline::key(episode.episode_id.as_str()))
+            {
+                state.status_message =
+                    Some("podcasts: episode is already available offline".into());
+                return Some(None);
+            }
+            if !state
+                .podcast_downloading
+                .insert(episode.episode_id.as_str().to_owned())
+            {
+                return Some(None);
+            }
+            state.status_message = Some("podcasts: downloading episode…".into());
+            Some(Effect::PodcastDownload(episode))
+        }
         Action::RefreshPodcast => refresh_current(state),
         Action::RefreshAllPodcasts => refresh_all(state),
         Action::CycleEpisodeSort => cycle_sort(state),

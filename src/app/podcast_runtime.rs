@@ -41,6 +41,8 @@ const PUBLICATION_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
 pub struct PodcastRuntime {
     pub services: Services,
     refresh_slots: Arc<tokio::sync::Semaphore>,
+    download_slots: Arc<tokio::sync::Semaphore>,
+    downloads_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Writes progress in order on its own thread; `None` if it could not
     /// start (episodes then play without saving progress).
     progress: Option<ProgressWriter>,
@@ -187,6 +189,18 @@ fn services(runtime: &Runtime) -> Option<Services> {
 
 /// Executes a podcast [`Effect`]; any other effect is handed back.
 pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> Option<Effect> {
+    if matches!(effect, Effect::SavePodcastSettings) {
+        let settings = super::app_settings(state);
+        let tx = runtime.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let message = match crate::config::settings::save(&settings) {
+                Ok(()) => "podcasts: download retention saved".to_string(),
+                Err(_) => "podcasts: could not save download retention".to_string(),
+            };
+            let _ = tx.send(AppEvent::StatusMessage(message));
+        });
+        return None;
+    }
     let Some(services) = services(runtime) else {
         if is_podcast_effect(&effect) {
             if let Effect::PodcastRefresh { targets, .. } = &effect {
@@ -219,6 +233,30 @@ pub fn perform(state: &mut AppState, runtime: &mut Runtime, effect: Effect) -> O
     };
     let tx = runtime.event_tx.clone();
     match effect {
+        Effect::SavePodcastSettings => unreachable!("handled before store lookup"),
+        Effect::PodcastDownload(episode) => {
+            let slots = Arc::clone(&runtime.podcasts.as_ref().unwrap().download_slots);
+            let cancelled = Arc::clone(&runtime.podcasts.as_ref().unwrap().downloads_cancelled);
+            tokio::spawn(async move {
+                let Ok(permit) = slots.acquire_owned().await else {
+                    return;
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let id = episode.episode_id.as_str().to_owned();
+                    let result = crate::podcasts::offline::download_with_cancel(
+                        &services.downloads_dir,
+                        &episode,
+                        CancelToken::new(move || {
+                            cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                        }),
+                    )
+                    .map_err(|_| "could not download episode audio".to_string());
+                    let _ = tx.send(AppEvent::PodcastDownloaded { id, result });
+                })
+                .await;
+            });
+        }
         Effect::PodcastsReload => {
             tokio::task::spawn_blocking(move || {
                 let result = load_rows(&services.store).map_err(err_string);
@@ -411,7 +449,9 @@ fn set_shared(
 fn is_podcast_effect(effect: &Effect) -> bool {
     matches!(
         effect,
-        Effect::PodcastsReload
+        Effect::SavePodcastSettings
+            | Effect::PodcastDownload(_)
+            | Effect::PodcastsReload
             | Effect::PodcastLoadSeasons(_)
             | Effect::PodcastLoadEpisodes { .. }
             | Effect::PodcastSubscribe(_)
@@ -477,6 +517,8 @@ pub fn handle_event(
                 runtime.podcasts = Some(PodcastRuntime {
                     services,
                     refresh_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES)),
+                    download_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+                    downloads_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     progress,
                     publication,
                 });
@@ -599,7 +641,34 @@ pub fn handle_event(
             episode_failed(state, runtime, generation, message);
             Vec::new()
         }
+        AppEvent::PodcastDownloaded { id, result } => {
+            state.podcast_downloading.remove(&id);
+            state.status_message = Some(match result {
+                Ok(()) => "podcasts: episode downloaded".into(),
+                Err(e) => e,
+            });
+            let _ = runtime.event_tx.send(AppEvent::PodcastRefreshTick);
+            Vec::new()
+        }
+        AppEvent::PodcastDownloads(result) => {
+            if let Ok(downloads) = result {
+                state.podcast_downloads = downloads;
+            }
+            Vec::new()
+        }
         AppEvent::PodcastRefreshTick => {
+            let offline_services = services(runtime)?;
+            let days = state.podcast_retention_days.max(1);
+            let tx = runtime.event_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = crate::podcasts::offline::cleanup(
+                    &offline_services.downloads_dir,
+                    days,
+                    std::time::SystemTime::now(),
+                )
+                .map_err(err_string);
+                let _ = tx.send(AppEvent::PodcastDownloads(result));
+            });
             if let Some(services) = services(runtime) {
                 let tx = runtime.event_tx.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1148,6 +1217,12 @@ fn progress_event(
 /// also one still being written) reach the overlay. Logs a warning when a
 /// card of a private podcast may still be live.
 pub(crate) async fn shutdown(runtime: &mut Runtime) {
+    if let Some(podcasts) = &runtime.podcasts {
+        podcasts
+            .downloads_cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        podcasts.download_slots.close();
+    }
     end_playback(runtime);
     let Some(podcasts) = runtime.podcasts.as_mut() else {
         return;

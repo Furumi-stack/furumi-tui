@@ -834,3 +834,98 @@ fn a_superseded_resume_stops_reading_up_to_its_offset() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn downloaded_episode_plays_and_seeks_without_publisher() {
+    let f = fixture();
+    let (_, mut episode) = subscribed(&f).await;
+    f.server
+        .set("/offline.wav", Route::new(wav(8), "audio/wav"));
+    episode.audio_url = f.server.url("/offline.wav");
+    let download_dir = f.services.downloads_dir.clone();
+    let download_episode = episode.clone();
+    tokio::task::spawn_blocking(move || super::offline::download(&download_dir, &download_episode))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        super::offline::available(&f.services.downloads_dir)
+            .unwrap()
+            .contains(&super::offline::key(episode.episode_id.as_str()))
+    );
+    // No store lookup can replace this reference with the fixture's old URL.
+    episode.audio_url = "http://127.0.0.1:1/unavailable".into();
+    let file = super::offline::open(&f.services.downloads_dir, &episode)
+        .unwrap()
+        .unwrap();
+    let prepared = playback::open_local(&episode, 2000, file).unwrap();
+    assert_eq!(prepared.start_ms, 2000);
+    assert!(prepared.seekable);
+    assert_eq!(prepared.probe.end(), StreamEnd::Complete);
+    assert!(prepared.source.take(100).count() > 0);
+    // Prepare must prefer the same local file even though resolve finds the old HTTP URL.
+    let prepared = playback::prepare(
+        Some(f.services.clone()),
+        episode,
+        StartAt::Position { ms: 2000 },
+        NOW,
+        CancelToken::never(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.start_ms, 2000);
+}
+
+#[test]
+fn download_cleanup_expires_only_completed_files_at_the_boundary() {
+    use std::fs::{File, FileTimes};
+    use std::time::SystemTime;
+    let dir = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    let expired = dir.path().join(super::offline::key("old"));
+    let fresh = dir.path().join(super::offline::key("new"));
+    File::create(&expired)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(now - Duration::from_secs(30 * 86400)))
+        .unwrap();
+    File::create(&fresh)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(now - Duration::from_secs(29 * 86400)))
+        .unwrap();
+    let unrelated = dir.path().join("notes.txt");
+    std::fs::write(&unrelated, b"keep").unwrap();
+    let remaining = super::offline::cleanup(dir.path(), 30, now).unwrap();
+    assert!(!expired.exists());
+    assert!(fresh.exists());
+    assert!(unrelated.exists());
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        super::offline::cleanup(dir.path(), 30, now).unwrap(),
+        remaining
+    );
+}
+
+#[tokio::test]
+async fn failed_download_never_becomes_available_offline() {
+    let f = fixture();
+    let (_, mut episode) = subscribed(&f).await;
+    episode.audio_url = f.server.url("/missing-audio");
+    let download_dir = f.services.downloads_dir.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || super::offline::download(&download_dir, &episode))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        super::offline::available(&f.services.downloads_dir)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read_dir(&f.services.downloads_dir)
+            .unwrap()
+            .count(),
+        0
+    );
+}

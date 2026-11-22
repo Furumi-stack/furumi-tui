@@ -28,6 +28,7 @@ pub const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone)]
 pub struct Services {
     pub store: Arc<PodcastStore>,
+    pub downloads_dir: std::path::PathBuf,
     pub fetcher: Arc<Fetcher>,
     pub log: Arc<dyn OpLog>,
     /// Device-local privacy confirmations for sharing (never synced).

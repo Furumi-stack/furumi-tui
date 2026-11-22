@@ -57,6 +57,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             selected = items.len();
         }
         let (label, value, enabled) = match row {
+            SettingsRow::PodcastRetention => (
+                "Podcast downloads: keep days".into(),
+                state.podcast_retention_days.to_string(),
+                true,
+            ),
             SettingsRow::MusicDirectory => (
                 "Music save directory".into(),
                 if state.music_dir_changing {

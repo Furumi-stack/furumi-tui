@@ -699,3 +699,14 @@ Future changes should preserve these rules:
 5. Network and storage work must remain outside the interactive UI path.
 6. More peers should improve availability; losing peers should only reduce
    remote capabilities.
+
+### Device-local podcast audio
+
+Episode downloads are explicit local actions. Completed files live beside the
+podcast database in `podcast-downloads`, keyed by a hash of the shared episode
+id. Temporary files become visible only after a complete response is saved.
+Playback checks this directory on the blocking pool before opening HTTP and
+uses the same progress and queue model for local audio. Downloads and retention
+settings never enter the podcast store registers or device-sync protocol.
+A background maintenance pass removes downloads after the configured age
+(default 30 days from completion); catalog, progress and subscriptions remain.

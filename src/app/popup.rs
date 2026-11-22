@@ -614,6 +614,20 @@ fn handle_fed_input(
                         !state.federation.settings.network_id.is_empty();
                     super::fed_apply_settings(state, runtime);
                 }
+                FedInputField::PodcastRetention => match value.parse::<u32>() {
+                    Ok(days) if (1..=36500).contains(&days) => {
+                        state.podcast_retention_days = days;
+                        super::perform_effect(
+                            state,
+                            runtime,
+                            crate::app::update::Effect::SavePodcastSettings,
+                        );
+                    }
+                    _ => {
+                        state.status_message =
+                            Some("enter a retention period from 1 to 36500 days".into())
+                    }
+                },
                 FedInputField::MusicDirectory => {
                     if value.is_empty() {
                         state.status_message = Some("music directory is empty".into());

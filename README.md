@@ -186,9 +186,16 @@ take them literally and silence the notice.
 
 ### Podcasts
 
-The Podcasts tab (`4`) follows RSS and Atom podcast feeds. Furumi stores only
-the feed's episode information; audio stays on the publisher's server and is
-never imported into the music library or offered to other peers.
+The Podcasts tab (`4`) follows RSS and Atom podcast feeds. Audio streams from
+the publisher unless you download an episode. Downloads stay on this device,
+are never imported into the music library or offered to other peers.
+
+- Press `y` on an episode to download it; `[offline]` marks a complete local
+  copy. Playback uses that copy, including resume and seeking, without HTTP.
+- Settings → Additional settings → Podcast downloads: keep days controls
+  automatic cleanup (default 30 days from download completion). Cleanup runs
+  while Furumi is open; expired files can be downloaded again. No episodes
+  are downloaded automatically.
 
 - **Add podcast** (`o`, or the first row) takes a feed URL; `feed://`,
   `podcast://` and URLs without a scheme are accepted. Nothing is stored unless

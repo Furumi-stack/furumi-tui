@@ -112,6 +112,8 @@ pub enum Effect {
     LoadListenHistory,
     /// Reload the subscribed podcasts with their fetch state.
     PodcastsReload,
+    PodcastDownload(music_dht::podcast::PodcastEpisodeRef),
+    SavePodcastSettings,
     /// Load the season groups of a podcast.
     PodcastLoadSeasons(music_dht::podcast::PodcastId),
     /// Load one page of episodes; `seq` drops stale results.
@@ -3066,6 +3068,13 @@ fn select_settings_row(state: &mut AppState, row: super::state::SettingsRow) -> 
             state.updater.busy = true;
             state.updater.message = "Downloading update...".into();
             Some(Effect::InstallUpdate(update))
+        }
+        SettingsRow::PodcastRetention => {
+            state.popup = Some(Popup::FedInput {
+                field: FedInputField::PodcastRetention,
+                input: crate::app::input::LineEdit::new(state.podcast_retention_days.to_string()),
+            });
+            None
         }
         SettingsRow::MusicDirectory => {
             if state.music_dir_changing {
