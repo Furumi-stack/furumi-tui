@@ -584,6 +584,11 @@ mod tests {
             km.resolve(shift_l, KeyContext::Library),
             KeyResolution::Action(Action::ToggleVisualizer)
         );
+        let shift_m = KeyCombination::new(KeyCode::Char('M'), KeyModifiers::SHIFT);
+        assert_eq!(
+            km.resolve(shift_m, KeyContext::Library),
+            KeyResolution::Action(Action::CycleVisualizerMode)
+        );
     }
 
     #[test]

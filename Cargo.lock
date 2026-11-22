@@ -1715,11 +1715,12 @@ dependencies = [
 
 [[package]]
 name = "furumi_tui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "base64",
  "blake3",
+ "chrono",
  "core-foundation 0.10.1",
  "crokey",
  "crossterm",

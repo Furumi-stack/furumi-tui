@@ -777,6 +777,20 @@ fn visualizer_requires_current_track() {
 }
 
 #[test]
+fn visualizer_mode_needs_an_open_visualizer() {
+    let mut state = AppState::default();
+    let mode = state.visualizer.config.mode;
+
+    assert_eq!(update(&mut state, Action::CycleVisualizerMode), None);
+
+    assert_eq!(state.visualizer.config.mode, mode);
+    assert_eq!(
+        state.status_message.as_deref(),
+        Some("open the visualizer first (Shift+L)")
+    );
+}
+
+#[test]
 fn visualizer_toggles_and_back_closes_it() {
     let mut state = AppState::default();
     state.player.current = Some(test_track(7));

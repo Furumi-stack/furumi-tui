@@ -6,6 +6,7 @@
 
 mod analyzer;
 mod opus;
+mod spectrum;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use std::time::Duration;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, stream::MixerDeviceSink};
 
 pub use analyzer::AudioAnalysisSnapshot;
+pub use spectrum::{BAND_CENTERS_HZ, FLOOR_DB};
 
 pub trait TrackReadSeek: std::io::Read + std::io::Seek + Send + Sync {}
 
@@ -453,7 +455,7 @@ fn handle(
             if let Some(out) = output.take() {
                 out.player.stop();
             }
-            shared.analysis.clear();
+            shared.analysis.reset();
             playing.track_loaded = false;
             playing.base = Duration::ZERO;
         }

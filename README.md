@@ -67,7 +67,10 @@ context-aware bindings, and user-defined rebinding through TOML. Built-in
 audio visualizations, OS media controls, gapless queue playback, and local
 library management are included. Visualizations are runtime-loadable Rhai
 scripts executed in a resource-limited sandbox, so they can be added or edited
-without rebuilding the player.
+without rebuilding the player. The bundled "VFD panel" preset draws a hi-fi
+front panel from a real third-octave spectrum and stereo level meter; scripts
+can use the same spectrum, levels, track details, thin braille lines and
+per-frame state.
 
 Optional similarity search calculates versioned embeddings for local tracks
 in the background and keeps them in SQLite. It works offline; after a separate

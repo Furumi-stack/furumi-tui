@@ -495,15 +495,16 @@ mod tests {
 
     #[test]
     fn loud_recordings_use_multiple_heights_instead_of_a_solid_row() {
-        let file = tempfile::NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("braille.rhai");
         let mut runtime = ScriptRuntime::default();
-        std::fs::write(file.path(), LEGACY_SOURCE).unwrap();
-        let old = prepare(&mut runtime, file.path(), input(64, 1.0), 64).unwrap();
+        std::fs::write(&path, LEGACY_SOURCE).unwrap();
+        let old = prepare(&mut runtime, &path, input(64, 1.0), 64).unwrap();
         assert!(old.content.iter().all(|cell| cell.symbol() == "⣿"));
-        install_script_at(file.path()).unwrap();
+        install_script_at(&path).unwrap();
         // A fresh runtime also models a restart installing the new default.
         let mut runtime = ScriptRuntime::default();
-        let new = prepare(&mut runtime, file.path(), input(64, 1.0), 64).unwrap();
+        let new = prepare(&mut runtime, &path, input(64, 1.0), 64).unwrap();
         let symbols: std::collections::HashSet<_> =
             new.content.iter().map(|cell| cell.symbol()).collect();
         assert!(symbols.len() >= 4, "{symbols:?}");
@@ -524,23 +525,24 @@ mod tests {
                 .collect::<Array>()
                 .into(),
         );
-        let silent = prepare(&mut runtime, file.path(), silence, 64).unwrap();
+        let silent = prepare(&mut runtime, &path, silence, 64).unwrap();
         assert!(silent.content.iter().all(|cell| cell.symbol() == "⠀"));
     }
 
     #[test]
     fn only_the_untouched_previous_default_is_upgraded() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), LEGACY_SOURCE).unwrap();
-        install_script_at(file.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), SOURCE);
-        install_script_at(file.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), SOURCE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("braille.rhai");
+        std::fs::write(&path, LEGACY_SOURCE).unwrap();
+        install_script_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SOURCE);
+        install_script_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SOURCE);
         for stock in [LEGACY_SOURCE, SOURCE] {
             let custom = format!("{stock}\n// user customization\n");
-            std::fs::write(file.path(), &custom).unwrap();
-            install_script_at(file.path()).unwrap();
-            assert_eq!(std::fs::read_to_string(file.path()).unwrap(), custom);
+            std::fs::write(&path, &custom).unwrap();
+            install_script_at(&path).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
         }
     }
 

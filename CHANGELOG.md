@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-22
+
+### Added
+
+- "VFD panel" visualization: a vacuum-fluorescent hi-fi front panel with
+  thin segment digits, a stereo peak level meter (bars or needle VU meters),
+  a 25-band analyzer with three levels of glow, a nonlinear scale and peak
+  hold, a peak frequency readout with hold, tone fans, a signal path
+  schematic with a travelling pulse (source, format, volume, sample rate,
+  stereo or mono, and the output level in dBFS), the transport word in segment letters,
+  mode lamps (REPEAT, SHUFFLE, source, LOUDNESS, MUTE, SEARCH, OVER), a tape
+  counter and a dot-matrix title line (Latin and Cyrillic). Effects: a
+  power-on segment test, a counter "search" on track changes, static on
+  track and source changes, a source block that relights with its new
+  value, colours that fade into unlit phosphor on pause, a night dimmer, a
+  slow filament "breath", slightly uneven digit brightness and a standby
+  clock when nothing is loaded. Display modes "full", "spectrum",
+  "minimal" and "deck" switch with Shift+M or can be pinned with
+  `DISPLAY_MODE()` at the top of the script, like the palettes ("classic",
+  "green", "amber", "ice"); a mode that does not fit the window steps down.
+  A switch looks like hardware: the time and L/R meters stay lit, the other
+  sections go dark and light up one by one, and a row of mode lamps shows
+  the choice for a moment. The analyzer's display range follows the
+  loudness of the music (the measurements stay absolute), and deck mode has
+  AMS, NR, AUTO REVERSE and REW/FF lamps with a counter that races during a
+  seek. Bars settle with a little inertia, the analyzer's
+  tint runs from warm amber in the bass to light yellow in the treble, peak
+  marks fall with a little gravity after their hold, and the transport word
+  uses 14-segment letters with faint unlit segments.
+- `Shift+M` in the fullscreen visualizer switches its display mode; the
+  choice is saved in `visualizations.toml`.
+- Visualization protocol v3: a real third-octave spectrum (31 bands) with
+  peak hold, left/right RMS and held peaks, the side-signal level
+  (`level_side`, the floor for mono) and `channel_mode` ("stereo" or
+  "mono"), the sample rate, and track,
+  queue and transport details in the script input; `render` may return
+  `#{ commands, state }` to keep state between frames (with `dt` and
+  `frame`); new braille `dots` and `line` commands for thin drawing; bold,
+  dim, italic, underline and reversed attributes on any command. v2 scripts
+  keep working unchanged. Scripts also get the local time as
+  `clock_hour`, `clock_minute`, `clock_second` and `clock_millis`, and the
+  display mode as `mode`, a counter each script takes modulo its own number
+  of modes.
+
+### Fixed
+
+- The visualization clock shows local time instead of UTC.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added
@@ -212,6 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Music-directory validation and migration now reject overlapping changes,
   resolve canonical paths, and produce Windows-portable managed filenames.
 
-[Unreleased]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.8...HEAD
+[Unreleased]: https://gt.hexor.cy/Furumi/furumi-tui/compare/v0.5.1...HEAD
+[0.5.1]: https://gt.hexor.cy/Furumi/furumi-tui/compare/v0.5.0...v0.5.1
 [0.2.8]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.7...v0.2.8
 [0.2.5]: https://gt.hexor.cy/ab/furumi_tui/compare/v0.2.4...v0.2.5
