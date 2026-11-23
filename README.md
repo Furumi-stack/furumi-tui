@@ -2,6 +2,8 @@
 
 ![furumi](furumi.png)
 
+[![asciicast](https://asciinema.org/a/xSCEn090SS4gk8Hk.svg)](https://asciinema.org/a/xSCEn090SS4gk8Hk)
+
 **Your music. Your devices. Your network.**
 
 Furumi is a federated P2P player for your personal music library. Every
