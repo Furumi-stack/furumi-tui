@@ -1,9 +1,9 @@
 // name: Lyrics in motion
 // protocol: furumi-visualizer-v3
-// bundle-version: 1
+// bundle-version: 2
 //
-// Incoming and outgoing text are driven by playback timestamps. Rhai caches
-// the two dot-matrix rasters across frames and only draws sparse accents.
+// Playback timestamps drive the entrance and highlight. The active glyphs
+// are cached across frames and rebuilt when the terminal changes size.
 
 fn clamp(value, low, high) {
     if value < low { low } else if value > high { high } else { value }
@@ -32,43 +32,68 @@ fn center(text, dx, y, w, h, fg) {
     this.text_at(text, (w - cell_width(text)) / 2 + dx, y, w, h, fg);
 }
 
-fn verse(text, glyph, dx, y, w, h, fg) {
-    if glyph.len() == 2 {
-        this.center(glyph[0], dx, y, w, h, fg);
-        this.center(glyph[1], dx, y + 1, w, h, fg);
-    } else {
-        this.center(text, dx, y, w, h, fg);
+fn stage(input, w, h, tint, arrival) {
+    if w < 20 || h < 12 { return; }
+    let band = max(1, h / 40);
+    for y in range(3, h - 3, band) {
+        let distance = abs(to_float(2 * y - h)) / to_float(h);
+        let level = 0.04 + pow(1.0 - distance, 3.0) * (0.12 + input.bass * 0.12 + arrival * 0.08);
+        this.push(#{ op: "rect", x: 0, y: y, w: w, h: min(band, h - 3 - y), bg: glow(tint, level) });
+    }
+    let stars = [];
+    for i in 0..64 {
+        let angle = to_float(i) * 2.399963 + input.time * 0.09;
+        let radius = 0.48 + 0.46 * abs(sin(to_float(i) * 8.17 + input.time * 0.24));
+        let x = w + to_int(cos(angle) * to_float(w - 2) * radius);
+        let y = h * 2 + to_int(sin(angle) * to_float(h * 2 - 12) * radius);
+        if abs(2 * x - 2 * w) > w || abs(y - h * 2) > h {
+            stars.push(x); stars.push(y);
+        }
+    }
+    this.push(#{ op: "dots", points: stars, fg: glow(tint, 0.48 + input.treble * 0.40), bg: glow(tint, 0.09) });
+
+    let samples = min(24, w / 4);
+    for i in 0..samples {
+        let wave = 0.5 + 0.5 * sin(input.time * 5.0 + to_float(i) * 0.67);
+        let rise = min(max(1, h / 5 - 3), 1 + to_int(wave * (2.0 + 4.0 * input.bass + 3.0 * input.beat)));
+        let x = 2 + i * (w / 2 - 3) / samples;
+        let fg = glow(tint, 0.27 + wave * 0.25 + input.energy * 0.26);
+        this.push(#{ op: "vline", x: x, y: h - 3 - rise, h: rise, ch: "▌", fg: fg, bg: 0x080b18 });
+        this.push(#{ op: "vline", x: w - 1 - x, y: h - 3 - rise, h: rise, ch: "▐", fg: fg, bg: 0x080b18 });
     }
 }
 
-fn atmosphere(input, w, h, phase, tint) {
-    if w < 20 || h < 8 { return; }
-    let points = [];
-    let stride = if w < 65 { 3 } else { 2 };
-    let cx = w;
-    let cy = h * 2;
-    for i in 0..22 {
-        let base = to_float(i) * 2.399963 + input.time * (0.13 + input.treble * 0.08);
-        let spread = 0.66 + 0.26 * sin(to_float(i) * 18.67 + phase * 1.8);
-        let x = cx + to_int(cos(base) * to_float(w - 6) * spread);
-        let y = cy + to_int(sin(base) * to_float(h * 2 - 4) * spread);
-        if abs(to_float(y - cy)) > 8.0 || abs(to_float(x - cx)) > to_float(w / 2) {
-            points.push(x); points.push(y);
-        }
+fn phrase(glyph, slot, total, mode, p, progress, y, w, h, tint, beat) {
+    let drift = pow(1.0 - p, 3.0);
+    let side = if slot % 2 == 0 { -1 } else { 1 };
+    let height = glyph.len();
+    let headline = height >= 10 || total == 1;
+    for i in 0..height {
+        let row = glyph[i];
+        if row == "" { continue; }
+        let width = cell_width(row);
+        let space = w - width;
+        let anchor = if total == 1 { space / 2 }
+                     else if (slot + mode) % 2 == 0 { space / 5 }
+                     else { space * 4 / 5 };
+        let dx = if mode == 0 { side * to_int(drift * to_float(min(22, w / 5))) }
+                 else if mode == 2 { to_int(drift * to_float(i * 2 - height)) }
+                 else { 0 };
+        let dy = if mode == 1 { to_int(drift * to_float(min(5, h / 6))) } else { 0 };
+        let x = anchor + dx;
+        let brightness = if headline { 1.0 } else { 0.72 };
+        let shade = brightness * (1.0 - 0.27 * to_float(i) / to_float(height));
+        // Reveal from opposing edges in the third entrance.
+        let shown = if mode == 2 { max(1, to_int(to_float(width) * (1.0 - drift))) } else { width };
+        let start = if mode == 2 && side > 0 { width - shown } else { 0 };
+        let visible = cut_cells(row, start, shown);
+        let lift = y + i + dy;
+        this.text_at(visible, x + start + 1, lift, w, h, glow(tint, 0.40 + beat * 0.22));
+        this.text_at(visible, x + start, lift, w, h, glow(tint, shade * (0.76 + 0.24 * p)));
+        let sweep = to_int(to_float(width) * progress);
+        this.text_at(cut_cells(row, start, max(0, min(shown, sweep - start))), x + start, lift,
+                     w, h, glow(0xfff6ff, shade + 0.20));
     }
-    this.push(#{ op: "dots", points: points, fg: glow(tint, 0.25 + input.beat * 0.28), bg: 0x080b18 });
-
-    let rails = [];
-    for i in 0..18 {
-        let x = i * stride;
-        if x + 4 < w {
-            let wave = sin(input.time * 3.0 + to_float(i) * 0.76);
-            let rise = to_int((1.0 + wave) * (2.0 + 6.0 * input.bass));
-            rails.push(4 + x); rails.push(h * 4 - 8 - rise);
-            rails.push(w * 2 - 5 - x); rails.push(h * 4 - 8 - rise);
-        }
-    }
-    this.push(#{ op: "dots", points: rails, fg: glow(tint, 0.34 + input.energy * 0.30), bg: 0x080b18 });
 }
 
 fn render(input) {
@@ -81,65 +106,73 @@ fn render(input) {
            active: "", previous: "", next: "", index: -1, elapsed: 0.0, progress: 0.0, until_next: -1.0 }
     };
     let st = if type_of(input.state) == "map" { input.state } else { #{} };
-    let tint = if l.index % 2 == 0 { 0xa8baff } else { 0xffb795 };
-    let y = h / 2 - 1;
-    let p = clamp(l.elapsed / 0.48, 0.0, 1.0);
-    commands.atmosphere(input, w, h, p, tint);
+    let tint = if l.index % 2 == 0 { 0x93c5ff } else { 0xffa5da };
+    let p = clamp(l.elapsed / 0.40, 0.0, 1.0);
+    let arrival = if l.index >= 0 { pow(1.0 - p, 3.0) } else { 0.0 };
+    commands.stage(input, w, h, tint, arrival);
 
     if h > 7 {
-        commands.center(input.track_title, 0, 1, w, h, glow(tint, 0.62));
-        if input.show_clock && w >= 24 {
-            commands.text_at(input.clock, w - 10, 1, w, h, glow(tint, 0.55));
+        let title_width = if input.show_clock && w >= 32 { w - 24 } else { w };
+        let title = if cell_width(input.track_title) <= title_width { input.track_title }
+                    else { cut_cells(input.track_title, 0, title_width - 1) + "…" };
+        commands.center(title, 0, 1, w, h, glow(tint, 0.78));
+        if input.show_clock && w >= 32 {
+            commands.text_at(input.clock, w - 10, 1, w, h, glow(tint, 0.72));
         }
     }
+
     if l.index >= 0 {
-        let font_width = if h >= 10 { w - 6 } else { 0 };
-        if !("active" in st) || st.active != l.active || st.width != font_width {
+        let font_width = w - 8;
+        let font_height = if h >= 12 { min(32, h * 3 / 5) } else { 0 };
+        if !("active" in st) || st.active != l.active || st.width != font_width || st.height != font_height {
             st.active = l.active;
             st.width = font_width;
-            st.glyph = matrix_text(l.active, font_width);
+            st.height = font_height;
+            st.phrases = lyric_layout(l.active, font_width, font_height);
         }
-        if p < 1.0 && l.previous != "" {
-            if !("previous" in st) || st.previous != l.previous || st.prev_width != font_width {
-                st.previous = l.previous;
-                st.prev_width = font_width;
-                st.prev_glyph = matrix_text(l.previous, font_width);
-            }
-            let exit = p * p;
-            let side = if l.index % 2 == 0 { 1 } else { -1 };
-            commands.verse(l.previous, st.prev_glyph, to_int(exit * to_float(w / 2)) * side,
-                  y - 2 - to_int(exit * to_float(h / 2)), w, h, glow(tint, (1.0 - p) * 0.55));
+        let total = st.phrases.len();
+        let rows = max(1, total - 1);
+        if total > 0 {
+            rows = total - 1;
+            for glyph in st.phrases { rows += glyph.len(); }
         }
-
-        // Alternate diagonal entries, a horizontal slide and a cut.
-        let remaining = pow(1.0 - p, 3.0);
-        let mode = l.index % 5;
-        let dx = if mode == 0 || mode == 2 { -to_int(remaining * to_float(w / 3)) }
-                 else if mode == 1 || mode == 4 { to_int(remaining * to_float(w / 3)) }
-                 else { 0 };
-        let dy = if mode == 0 { -to_int(remaining * to_float(h / 3)) }
-                 else if mode == 1 { to_int(remaining * to_float(h / 3)) }
-                 else if mode == 4 { -to_int(remaining * to_float(h / 4)) }
-                 else { 0 };
-        let intensity = if mode == 3 { 1.0 } else { 0.72 + p * 0.28 };
-        commands.verse(l.active, st.glyph, dx, y + dy, w, h, glow(tint, intensity));
+        let top = (h - rows) / 2;
+        let y = top;
+        if total == 0 {
+            commands.center(l.active, 0, y, w, h, 0xf6f3ff);
+        }
+        let mode = l.index % 3;
+        let duration = if l.until_next >= 0.0 { l.elapsed + l.until_next } else { 2.0 };
+        let entrance = clamp(duration * 0.28, 0.08, 0.60);
+        for slot in 0..total {
+            let glyph = st.phrases[slot];
+            let phase = clamp(l.elapsed / entrance * 1.5 - 0.5 * to_float(slot), 0.0, 1.0);
+            let progress = clamp(l.progress * to_float(total) - to_float(slot), 0.0, 1.0);
+            commands.phrase(glyph, slot, total, mode, phase, progress, y, w, h, tint, input.beat);
+            y += glyph.len() + 1;
+        }
+        if h >= 12 {
+            let exit = 1.0 - arrival;
+            let side = if mode == 1 { -1 } else { 1 };
+            commands.center(l.previous, side * to_int(exit * to_float(w / 12)),
+                            top - 2, w, h, glow(tint, 0.32 + arrival * 0.38));
+            commands.center(l.next, 0, min(h - 3, top + rows + 3), w, h, glow(tint, 0.66));
+        }
     } else {
         let message = if l.instrumental { "Instrumental" }
                       else if l.timed { "Waiting for the first line" }
                       else if l.available { "Plain lyrics · l to read" }
                       else if l.loading { "Looking for lyrics…" }
                       else { "No lyrics found" };
-        commands.center(message, 0, y, w, h, glow(tint, 0.72));
+        commands.center(message, 0, h / 2, w, h, glow(tint, 0.82));
     }
 
-    if h >= 10 {
-        if l.next != "" { commands.center(l.next, 0, y + 4, w, h, glow(tint, 0.38)); }
-        if l.index >= 0 && l.until_next >= 0.0 && w >= 14 {
-            let count = clamp(to_int(to_float(w - 8) * l.progress), 0, w - 8);
-            commands.push(#{ op: "hline", x: 4, y: h - 2, w: w - 8, ch: "─", fg: 0x26304b, bg: 0x080b18 });
-            if count > 0 {
-                commands.push(#{ op: "hline", x: 4, y: h - 2, w: count, ch: "━", fg: glow(tint, 0.70), bg: 0x080b18 });
-            }
+    if h >= 10 && l.index >= 0 && l.until_next >= 0.0 && w >= 14 {
+        let count = clamp(to_int(to_float(w - 8) * l.progress), 0, w - 8);
+        commands.push(#{ op: "hline", x: 4, y: h - 2, w: w - 8, ch: "─", fg: 0x394568, bg: 0x080b18 });
+        if count > 0 {
+            commands.push(#{ op: "hline", x: 4, y: h - 2, w: count, ch: "━", fg: tint, bg: 0x080b18 });
+            commands.text_at("◆", min(w - 5, 4 + count), h - 2, w, h, 0xfff6ff);
         }
     }
     #{ commands: commands, state: st }

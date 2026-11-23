@@ -36,6 +36,129 @@ pub(super) fn matrix_text(text: &str, width: i64) -> Array {
     vec![Dynamic::from(top), Dynamic::from(bottom)]
 }
 
+/// Fit the largest block glyphs that leave room for the surrounding UI.
+pub(super) fn lyric_layout(text: &str, width: i64, height: i64) -> Array {
+    let words: Vec<_> = text.split_whitespace().collect();
+    if words.len() >= 3 && width >= 60 && height >= 16 {
+        // Pick a substantial word that fits the headline scale. Keep reading order.
+        let focus = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word.chars().count() as i64 * 9 <= width - 8)
+            .max_by_key(|(index, word)| (word.chars().count(), usize::MAX - index));
+        if let Some((index, word)) = focus {
+            let headline = lyric_blocks(word, width - 8, 11, 3);
+            let before = words[..index].join(" ");
+            let after = words[index + 1..].join(" ");
+            let supporting = |phrase: &str| lyric_blocks(phrase, width - 8, 9, 1);
+            let above = supporting(&before);
+            let below = supporting(&after);
+            let fits = !headline.is_empty()
+                && (before.is_empty() || !above.is_empty())
+                && (after.is_empty() || !below.is_empty())
+                && (headline.len() + above.len() + below.len() + 2) as i64 <= height;
+            if fits {
+                return [above, headline, below]
+                    .into_iter()
+                    .filter(|rows| !rows.is_empty())
+                    .map(Dynamic::from)
+                    .collect();
+            }
+        }
+    }
+    let rows = lyric_blocks(text, width, height, 3);
+    if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![Dynamic::from(rows)]
+    }
+}
+
+fn lyric_blocks(text: &str, width: i64, height: i64, max_scale: usize) -> Array {
+    let width = width.clamp(0, 512) as usize;
+    let height = height.clamp(0, 32) as usize;
+    let Some(words) = text
+        .split_whitespace()
+        .map(|word| {
+            word.chars()
+                .map(|ch| {
+                    let mut uppercase = ch.to_uppercase();
+                    let first = uppercase.next()?;
+                    if uppercase.next().is_some() {
+                        return None;
+                    }
+                    glyph(first)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Vec::new();
+    };
+    if words.is_empty() {
+        return Vec::new();
+    }
+    // 2×2 pixels per terminal cell, with a blank pixel column per letter.
+    const BLOCKS: [char; 16] = [
+        ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+    ];
+    for scale in (1..=max_scale).rev() {
+        let columns = width / (3 * scale);
+        let rows = (7 * scale).div_ceil(2);
+        let max_lines = ((height + 1) / (rows + 1)).min(3);
+        if max_lines == 0 {
+            continue;
+        }
+        let mut lines: Vec<Vec<[u8; 7]>> = vec![Vec::new()];
+        for word in &words {
+            let line = lines.last_mut().unwrap();
+            if word.len() > columns {
+                lines.clear();
+                break;
+            }
+            if line.is_empty() {
+                line.extend(word);
+            } else if line.len() + word.len() < columns {
+                line.push([0; 7]);
+                line.extend(word);
+            } else {
+                lines.push(word.clone());
+            }
+        }
+        if lines.is_empty() || lines.len() > max_lines {
+            continue;
+        }
+
+        let mut result = Vec::new();
+        for line in lines {
+            if !result.is_empty() {
+                result.push(Dynamic::from(String::new()));
+            }
+            for y in 0..rows {
+                let mut row = String::new();
+                for letter in &line {
+                    for x in 0..3 * scale {
+                        let mut mask = 0;
+                        for dy in 0..2 {
+                            let pixel_y = (2 * y + dy) / scale;
+                            for dx in 0..2 {
+                                let pixel_x = (2 * x + dx) / scale;
+                                if pixel_y < 7 && letter[pixel_y] & (32 >> (pixel_x + 1)) != 0 {
+                                    mask |= 1 << (2 * dy + dx);
+                                }
+                            }
+                        }
+                        row.push(BLOCKS[mask]);
+                    }
+                }
+                result.push(Dynamic::from(row));
+            }
+        }
+        return result;
+    }
+    Vec::new()
+}
+
 pub(super) fn cut_cells(text: &str, skip: i64, width: i64) -> String {
     let start = skip.max(0) as usize;
     let end = start.saturating_add(width.clamp(0, 512) as usize);

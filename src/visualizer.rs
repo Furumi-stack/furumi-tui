@@ -66,7 +66,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "lyrics_in_motion",
         file_name: "lyrics_in_motion.rhai",
         display_name: "Lyrics in motion",
-        version: 1,
+        version: 2,
         source: include_str!("visualizations/lyrics_in_motion.rhai"),
     },
 ];
@@ -701,6 +701,7 @@ impl Default for ScriptRuntime {
         engine.register_fn("abs", |value: FLOAT| value.abs());
         engine.register_fn("pow", |value: FLOAT, power: FLOAT| value.powf(power));
         engine.register_fn("matrix_text", matrix::matrix_text);
+        engine.register_fn("lyric_layout", matrix::lyric_layout);
         engine.register_fn("cut_cells", matrix::cut_cells);
         engine.register_fn("cell_width", |text: &str| {
             unicode_width::UnicodeWidthStr::width(text) as i64
@@ -1566,13 +1567,17 @@ mod tests {
         .unwrap();
         let mut runtime = ScriptRuntime::default();
         let mut state = AppState::default();
-        let version =
-            crate::lyrics::manual_version("Timed", "[00:01]FIRST\n[00:05]SECOND\n[00:09]歌詞")
-                .unwrap();
+        let version = crate::lyrics::manual_version(
+            "Timed",
+            "[00:01]FIRST\n[00:05]SECOND\n[00:09]歌詞\n[00:13]Снова над городом встаёт солнце",
+        )
+        .unwrap();
         state.lyrics.document = crate::lyrics::Document::new(&version);
         state.lyrics.versions.push(version);
-        let mut render = |position| {
+        let mut render = |position, width, height| {
             let mut input = test_input();
+            insert_int(&mut input, "width", width);
+            insert_int(&mut input, "height", height);
             input.insert("lyrics".into(), lyrics_input(&state, position).into());
             runtime.render(file.path(), input).unwrap()
         };
@@ -1581,26 +1586,54 @@ mod tests {
                 .iter()
                 .find_map(|command| match command {
                     DrawCommand::Text { x, y, text, .. }
-                        if text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)) =>
+                        if text.chars().any(|c| ('▀'..='▟').contains(&c)) =>
                     {
                         Some((*x, *y))
                     }
                     _ => None,
                 })
-                .expect("Braille lyric spans")
+                .expect("block lyric spans")
         };
-        assert_ne!(matrix_start(&render(1.05)), matrix_start(&render(1.75)));
+        assert_ne!(
+            matrix_start(&render(1.05, 80, 24)),
+            matrix_start(&render(1.75, 80, 24))
+        );
         assert!(
-            render(5.1)
+            render(5.1, 80, 24)
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Dots { .. }))
         );
         assert!(
-            render(10.0)
+            render(10.0, 80, 24)
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Text { text, .. } if text == "歌詞"))
         );
-        assert_ne!(matrix_start(&render(2.0)), (0, 0));
+        let wide = render(14.0, 180, 45);
+        let block_widths: std::collections::BTreeSet<_> = wide
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { text, .. }
+                    if text.chars().any(|c| ('▀'..='▟').contains(&c)) =>
+                {
+                    Some(text.chars().count())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            block_widths.contains(&63),
+            "expected a large Cyrillic headline"
+        );
+        assert!(
+            block_widths.contains(&27),
+            "expected smaller supporting text"
+        );
+        assert!(
+            render(14.0, 34, 8)
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Text { text, .. }
+                    if text.starts_with("Снова над городом")))
+        );
     }
 
     #[test]
