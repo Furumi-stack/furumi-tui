@@ -457,6 +457,19 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_keys_distinguish_selected_and_playing_track() {
+        let mut km = keymap_from(DEFAULT_KEYMAP);
+        assert_eq!(
+            km.resolve(key!(l), KeyContext::Library),
+            KeyResolution::Action(Action::OpenLyrics)
+        );
+        assert_eq!(
+            km.resolve(key!(ctrl - l), KeyContext::Library),
+            KeyResolution::Action(Action::OpenCurrentLyrics)
+        );
+    }
+
+    #[test]
     fn chord_sequence_resolves() {
         let mut km = keymap_from(DEFAULT_KEYMAP);
         assert!(matches!(

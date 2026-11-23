@@ -140,6 +140,10 @@ key_sequence = "l"
 command = "OpenLyrics"
 
 [[keymaps]]
+key_sequence = "ctrl-l"
+command = "OpenCurrentLyrics"
+
+[[keymaps]]
 key_sequence = "right"
 command = "MoveRight"
 

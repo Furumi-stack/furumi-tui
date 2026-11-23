@@ -28,11 +28,16 @@ pub(crate) fn prepare_reader(state: &mut AppState, screen: Rect) {
         let area = popup_area(screen);
         reader.viewport_height = usize::from(area.height.saturating_sub(4));
         let width = usize::from(area.width.saturating_sub(4)).max(1);
-        let key = (state.lyrics.document_revision, width);
+        let key = (reader.lyrics(&state.lyrics).document_revision, width);
         if reader.layout_key != Some(key) {
             reader.layout_key = Some(key);
             reader.rows.clear();
-            for (index, line) in state.lyrics.document.lines.iter().enumerate() {
+            let document = &reader
+                .preview
+                .as_ref()
+                .map_or(&state.lyrics, |preview| &preview.1)
+                .document;
+            for (index, line) in document.lines.iter().enumerate() {
                 let mut row = String::new();
                 let mut columns = 0;
                 for ch in line.chars() {
@@ -72,7 +77,7 @@ fn row(area: Rect, index: u16) -> Rect {
 }
 
 pub(super) fn draw_reader(frame: &mut Frame, state: &AppState, reader: &Reader) {
-    let playback = &state.lyrics;
+    let playback = reader.lyrics(&state.lyrics);
     let title = if playback.title.is_empty() {
         " Lyrics ".into()
     } else {
@@ -83,7 +88,7 @@ pub(super) fn draw_reader(frame: &mut Frame, state: &AppState, reader: &Reader) 
         return;
     }
     let body = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, inner.height - 2);
-    let active = playback.document.line_at(state.player.position_secs);
+    let active = reader.active_line(&state.lyrics, &state.player);
     let version = playback.versions.get(playback.selected);
     if let Some(version) = version {
         let label = crate::lyrics::clean_text(&version.label).replace('\n', " ");

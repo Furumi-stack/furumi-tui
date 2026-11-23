@@ -2878,3 +2878,25 @@ fn podcast_retention_opens_a_numeric_editor_in_additional_settings() {
         })
     ));
 }
+
+#[test]
+fn lyrics_preview_uses_queue_cursor_and_current_action_follows_playback() {
+    let mut state = AppState {
+        active_tab: Tab::Queue,
+        ..Default::default()
+    };
+    state.player.current = Some(test_track(1));
+    state.player.queue = vec![test_track(1), test_track(2)];
+    state.queue_tab.cursor = 1;
+    update(&mut state, Action::OpenLyrics);
+    let Some(crate::app::state::Popup::Lyrics(reader)) = &state.popup else {
+        panic!("expected lyrics preview")
+    };
+    assert_eq!(reader.preview.as_ref().unwrap().0.id, 2);
+    update(&mut state, Action::OpenCurrentLyrics);
+    let Some(crate::app::state::Popup::Lyrics(reader)) = &state.popup else {
+        panic!("expected now-playing lyrics")
+    };
+    assert!(reader.preview.is_none());
+    assert_eq!(state.player.current.as_ref().unwrap().id, 1);
+}

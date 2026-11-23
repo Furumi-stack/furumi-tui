@@ -1,6 +1,6 @@
 // name: Lyrics in motion
 // protocol: furumi-visualizer-v3
-// bundle-version: 2
+// bundle-version: 3
 //
 // Playback timestamps drive the entrance and highlight. The active glyphs
 // are cached across frames and rebuilt when the terminal changes size.
@@ -40,17 +40,25 @@ fn stage(input, w, h, tint, arrival) {
         let level = 0.04 + pow(1.0 - distance, 3.0) * (0.12 + input.bass * 0.12 + arrival * 0.08);
         this.push(#{ op: "rect", x: 0, y: y, w: w, h: min(band, h - 3 - y), bg: glow(tint, level) });
     }
-    let stars = [];
+    let dots = [];
+    let shapes = ["✦", "✧", "⋄", "⟡", "+", "∙"];
     for i in 0..64 {
         let angle = to_float(i) * 2.399963 + input.time * 0.09;
         let radius = 0.48 + 0.46 * abs(sin(to_float(i) * 8.17 + input.time * 0.24));
         let x = w + to_int(cos(angle) * to_float(w - 2) * radius);
         let y = h * 2 + to_int(sin(angle) * to_float(h * 2 - 12) * radius);
         if abs(2 * x - 2 * w) > w || abs(y - h * 2) > h {
-            stars.push(x); stars.push(y);
+            if i % 5 == 0 {
+                let twinkle = 0.5 + 0.5 * sin(input.time * 2.4 + to_float(i) * 1.83);
+                let ch = shapes[(i / 5) % shapes.len()];
+                let fg = glow(tint, 0.28 + twinkle * 0.38 + input.treble * 0.25);
+                this.push(#{ op: "cell", x: x / 2, y: y / 4, ch: ch, fg: fg, preserve_bg: true });
+            } else {
+                dots.push(x); dots.push(y);
+            }
         }
     }
-    this.push(#{ op: "dots", points: stars, fg: glow(tint, 0.48 + input.treble * 0.40), bg: glow(tint, 0.09) });
+    this.push(#{ op: "dots", points: dots, fg: glow(tint, 0.48 + input.treble * 0.40), preserve_bg: true });
 
     let samples = min(24, w / 4);
     for i in 0..samples {
@@ -161,7 +169,7 @@ fn render(input) {
     } else {
         let message = if l.instrumental { "Instrumental" }
                       else if l.timed { "Waiting for the first line" }
-                      else if l.available { "Plain lyrics · l to read" }
+                      else if l.available { "Plain lyrics · Ctrl+L to read" }
                       else if l.loading { "Looking for lyrics…" }
                       else { "No lyrics found" };
         commands.center(message, 0, h / 2, w, h, glow(tint, 0.82));

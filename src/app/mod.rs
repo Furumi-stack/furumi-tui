@@ -4296,6 +4296,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         }
         AppEvent::Player(player::PlayerEvent::Started) => {
             runtime.player_start_pending = false;
+            state.lyrics.refresh_local();
         }
         AppEvent::Player(player::PlayerEvent::TrackFinished { has_next }) => {
             // An episode that played to the end is complete; one whose

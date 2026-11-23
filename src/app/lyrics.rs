@@ -23,6 +23,8 @@ pub(crate) struct Playback {
     pub document_revision: u64,
     pub loading: bool,
     track: Option<(i64, Option<String>)>,
+    local_at: Option<Instant>,
+    local_reading: bool,
     serial: u64,
     hidden: HashSet<String>,
     retry_at: Option<Instant>,
@@ -30,6 +32,18 @@ pub(crate) struct Playback {
 }
 
 impl Playback {
+    pub(super) fn refresh_local(&mut self) {
+        self.local_at = Some(Instant::now());
+    }
+
+    fn local_changed(&mut self, content_id: &str) {
+        if self.content_id.as_deref() == Some(content_id)
+            || self.track.as_ref().and_then(|(_, id)| id.as_deref()) == Some(content_id)
+        {
+            self.refresh_local();
+        }
+    }
+
     fn select(&mut self, index: usize) {
         self.document_revision = self.document_revision.wrapping_add(1);
         self.selected = index.min(self.versions.len().saturating_sub(1));
@@ -49,6 +63,9 @@ impl Playback {
     }
 
     fn saved(&mut self, saved: SavedLyrics) {
+        if self.hidden == saved.hidden && self.versions.starts_with(&saved.versions) {
+            return;
+        }
         let selected = self
             .versions
             .get(self.selected)
@@ -68,12 +85,48 @@ impl Playback {
 pub(crate) struct Reader {
     pub top: Option<usize>,
     pub viewport_height: usize,
-    pub fallback: Option<Box<TrackItem>>,
+    pub preview: Option<Box<(TrackItem, Playback)>>,
     pub rows: Vec<(usize, String)>,
     pub layout_key: Option<(u64, usize)>,
 }
 
 impl Reader {
+    pub fn preview(track: TrackItem) -> Self {
+        Self {
+            preview: Some(Box::new((track, Playback::default()))),
+            ..Self::default()
+        }
+    }
+
+    pub fn lyrics<'a>(&'a self, playback: &'a Playback) -> &'a Playback {
+        self.preview.as_ref().map_or(playback, |preview| &preview.1)
+    }
+
+    pub fn active_line(
+        &self,
+        playback: &Playback,
+        player: &super::state::PlayerBar,
+    ) -> Option<usize> {
+        if let Some(preview) = &self.preview
+            && !player.current.as_ref().is_some_and(|track| {
+                super::state::track_key(track) == super::state::track_key(&preview.0)
+            })
+        {
+            return None;
+        }
+        self.lyrics(playback).document.line_at(player.position_secs)
+    }
+
+    fn cancel_preview(&mut self) {
+        if let Some(task) = self
+            .preview
+            .as_mut()
+            .and_then(|preview| preview.1.task.take())
+        {
+            task.abort();
+        }
+    }
+
     pub fn follow_top(&self, active: Option<usize>) -> usize {
         active
             .map(|active| self.rows.partition_point(|(index, _)| *index < active))
@@ -112,6 +165,11 @@ pub(crate) enum Event {
         content_id: Option<String>,
         saved: SavedLyrics,
     },
+    Saved(String),
+    Polled {
+        serial: u64,
+        saved: Option<SavedLyrics>,
+    },
     Found {
         serial: u64,
         versions: Vec<LyricsVersion>,
@@ -134,45 +192,66 @@ fn send(tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>, event: Event) {
 }
 
 pub(super) fn refresh(state: &mut AppState, runtime: &Runtime) {
-    let track = state
-        .player
-        .current
-        .as_ref()
-        .or(match &state.popup {
-            Some(Popup::Lyrics(reader)) => reader.fallback.as_deref(),
-            _ => None,
-        })
-        .filter(|track| !track.is_podcast());
+    let changed = refresh_one(&mut state.lyrics, state.player.current.as_ref(), runtime);
+    if let Some(Popup::Lyrics(reader)) = state.popup.as_mut() {
+        let changed = match reader.preview.as_deref_mut() {
+            Some((track, lyrics)) => refresh_one(lyrics, Some(track), runtime),
+            None => changed,
+        };
+        if changed {
+            reader.top = None;
+            reader.layout_key = None;
+        }
+    }
+}
+
+fn refresh_one(playback: &mut Playback, track: Option<&TrackItem>, runtime: &Runtime) -> bool {
+    let track = track.filter(|track| !track.is_podcast());
     let key = track.map(|track| (track.id, track_content_id(track)));
-    let playback = &mut state.lyrics;
-    // The pending, streaming and imported copies can change row id during one song.
     let same = playback.track == key
         || matches!((&playback.track, &key),
         (Some((_, Some(old))), Some((_, Some(new)))) if old == new);
-    if same {
-        if playback.loading || playback.retry_at.is_none_or(|at| at > Instant::now()) {
-            return;
-        }
-    } else {
+    if !same {
         if let Some(task) = playback.task.take() {
             task.abort();
         }
         *playback = Playback {
-            track: key,
-            serial: playback.serial.wrapping_add(1),
             title: track.map(|track| track.title.clone()).unwrap_or_default(),
             ..Playback::default()
         };
     }
-    let Some(track) = track else {
-        if !same && let Some(Popup::Lyrics(reader)) = state.popup.as_mut() {
-            reader.top = None;
-            reader.layout_key = None;
+    playback.track = key;
+    let Some(track) = track else { return !same };
+
+    let now = Instant::now();
+    if same && (playback.loading || playback.retry_at.is_none_or(|at| at > now)) {
+        if !playback.local_reading
+            && playback.local_at.is_some_and(|at| at <= now)
+            && let Some(content_id) = playback.content_id.clone()
+        {
+            playback.local_reading = true;
+            playback.local_at = None;
+            let serial = playback.serial;
+            let library = Arc::clone(&runtime.library);
+            let tx = runtime.event_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let saved = library
+                    .lyrics(&content_id)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "could not refresh local lyrics");
+                    })
+                    .ok();
+                send(&tx, Event::Polled { serial, saved });
+            });
         }
-        return;
-    };
+        return false;
+    }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    playback.serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     playback.loading = true;
     playback.retry_at = None;
+    playback.local_reading = false;
+    playback.local_at = None;
     let serial = playback.serial;
     let id = track.id;
     let content_id = playback
@@ -180,10 +259,6 @@ pub(super) fn refresh(state: &mut AppState, runtime: &Runtime) {
         .clone()
         .or_else(|| track_content_id(track));
     let owner = track.fed.as_ref().map(|fed| fed.owner.clone());
-    if !same && let Some(Popup::Lyrics(reader)) = state.popup.as_mut() {
-        reader.top = None;
-        reader.layout_key = None;
-    }
     let library = Arc::clone(&runtime.library);
     let federation = Arc::clone(&runtime.federation);
     let tx = runtime.event_tx.clone();
@@ -233,6 +308,7 @@ pub(super) fn refresh(state: &mut AppState, runtime: &Runtime) {
                                     Arc::clone(&library),
                                     content_id.clone(),
                                     versions.clone(),
+                                    tx.clone(),
                                 );
                             }
                             send(&tx, Event::Found { serial, versions });
@@ -246,18 +322,19 @@ pub(super) fn refresh(state: &mut AppState, runtime: &Runtime) {
         send(&tx, Event::Done { serial });
     });
     playback.task = Some(task.abort_handle());
+    !same
 }
 
 fn store_found(
     library: Arc<crate::library::Library>,
     content_id: String,
     versions: Vec<LyricsVersion>,
+    tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) {
     if !versions.is_empty() {
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = library.merge_lyrics(&content_id, versions) {
-                tracing::warn!(%error, %content_id, "could not save peer lyrics");
-            }
+        tokio::task::spawn_blocking(move || match library.merge_lyrics(&content_id, versions) {
+            Ok(()) => send(&tx, Event::Saved(content_id)),
+            Err(error) => tracing::warn!(%error, %content_id, "could not save peer lyrics"),
         });
     }
 }
@@ -272,11 +349,13 @@ pub(super) fn on_import(state: &AppState, runtime: &Runtime, track: &TrackItem) 
             Arc::clone(&runtime.library),
             content_id,
             state.lyrics.versions.clone(),
+            runtime.event_tx.clone(),
         );
     } else if runtime.federation.settings().save_on_listen {
         // The queue could have advanced while the audio was still downloading.
         let federation = Arc::clone(&runtime.federation);
         let library = Arc::clone(&runtime.library);
+        let tx = runtime.event_tx.clone();
         tokio::spawn(async move {
             let mut versions = Vec::new();
             let _ = federation
@@ -284,24 +363,61 @@ pub(super) fn on_import(state: &AppState, runtime: &Runtime, track: &TrackItem) 
                     lyrics::merge(&mut versions, incoming, &HashSet::new());
                 })
                 .await;
-            store_found(library, content_id, versions);
+            store_found(library, content_id, versions, tx);
         });
     }
 }
 
 pub(super) fn handle_event(state: &mut AppState, event: Event) {
-    let playback = &mut state.lyrics;
+    let preview = match &mut state.popup {
+        Some(Popup::Lyrics(reader)) => reader.preview.as_deref_mut().map(|preview| &mut preview.1),
+        _ => None,
+    };
+    if let Event::Saved(content_id) = &event {
+        state.lyrics.local_changed(content_id);
+        if let Some(preview) = preview {
+            preview.local_changed(content_id);
+        }
+        return;
+    }
+    let serial = match &event {
+        Event::Local { serial, .. }
+        | Event::Polled { serial, .. }
+        | Event::Found { serial, .. }
+        | Event::Done { serial } => Some(*serial),
+        _ => None,
+    };
+    let playback = match serial {
+        Some(serial) if state.lyrics.serial != serial => {
+            let Some(preview) = preview.filter(|preview| preview.serial == serial) else {
+                return;
+            };
+            preview
+        }
+        _ => &mut state.lyrics,
+    };
     match event {
         Event::Local {
-            serial,
-            content_id,
-            saved,
-        } if playback.serial == serial => {
+            content_id, saved, ..
+        } => {
             playback.content_id = content_id;
+            playback
+                .local_at
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
             playback.saved(saved);
         }
-        Event::Found { serial, versions } if playback.serial == serial => playback.add(versions),
-        Event::Done { serial } if playback.serial == serial => {
+        Event::Polled { saved, .. } => {
+            playback.local_reading = false;
+            // A write notification may have arrived while this read was in flight.
+            playback
+                .local_at
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+            if let Some(saved) = saved {
+                playback.saved(saved);
+            }
+        }
+        Event::Found { versions, .. } => playback.add(versions),
+        Event::Done { .. } => {
             playback.task = None;
             playback.loading = false;
             playback.retry_at = Some(Instant::now() + Duration::from_secs(60));
@@ -331,19 +447,39 @@ pub(super) fn handle_event(state: &mut AppState, event: Event) {
                 }
             }
         }
-        _ => {}
+        Event::Saved(_) => {}
     }
 }
 
 pub(super) fn reader_key(state: &mut AppState, mut reader: Reader, key: KeyEvent) {
-    let playback = &mut state.lyrics;
+    if key.code == KeyCode::Char('l') {
+        match key.modifiers {
+            KeyModifiers::CONTROL if reader.preview.is_some() => {
+                reader.cancel_preview();
+                let _ = super::update::update(state, super::action::Action::OpenCurrentLyrics);
+                return;
+            }
+            KeyModifiers::NONE if reader.preview.is_none() => {
+                let _ = super::update::update(state, super::action::Action::OpenLyrics);
+                return;
+            }
+            _ => {}
+        }
+    }
     let last = reader.rows.len().saturating_sub(reader.viewport_height);
-    let top = reader.top.unwrap_or_else(|| {
-        reader.follow_top(playback.document.line_at(state.player.position_secs))
-    });
+    let top = reader
+        .top
+        .unwrap_or_else(|| reader.follow_top(reader.active_line(&state.lyrics, &state.player)));
+    let playback = reader
+        .preview
+        .as_deref_mut()
+        .map_or(&mut state.lyrics, |preview| &mut preview.1);
     let page = reader.viewport_height.saturating_sub(1).max(1);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('l' | 'q') => return,
+        KeyCode::Esc | KeyCode::Char('l' | 'q') => {
+            reader.cancel_preview();
+            return;
+        }
         KeyCode::Up | KeyCode::Char('k') => reader.top = Some(top.saturating_sub(1)),
         KeyCode::Down | KeyCode::Char('j') => reader.top = Some((top + 1).min(last)),
         KeyCode::PageUp => reader.top = Some(top.saturating_sub(page)),
@@ -599,6 +735,34 @@ mod tests {
         );
         assert_eq!(state.lyrics.document.line_at(1.0), Some(0));
         assert_eq!(state.lyrics.document.lines, ["Timed song"]);
+    }
+
+    #[test]
+    fn saved_lyrics_refresh_playback_even_after_network_lookup_ended() {
+        let mut state = AppState::default();
+        let content_id = format!("b3:{}", "a".repeat(64));
+        state.lyrics.content_id = Some(content_id.clone());
+        state.lyrics.serial = 2;
+        handle_event(&mut state, Event::Done { serial: 2 });
+        let retry_at = state.lyrics.retry_at;
+        handle_event(&mut state, Event::Saved(content_id));
+        assert!(state.lyrics.local_at.unwrap() <= Instant::now());
+
+        // The local read is independent of the pending network retry.
+        let version = lyrics::manual_version("Saved", "[00:01]Received words").unwrap();
+        handle_event(
+            &mut state,
+            Event::Polled {
+                serial: 2,
+                saved: Some(SavedLyrics {
+                    versions: vec![version],
+                    ..Default::default()
+                }),
+            },
+        );
+        assert_eq!(state.lyrics.document.lines, ["Received words"]);
+        assert_eq!(state.lyrics.document.line_at(1.0), Some(0));
+        assert_eq!(state.lyrics.retry_at, retry_at);
     }
 
     #[test]

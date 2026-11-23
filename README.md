@@ -154,7 +154,7 @@ Esc to return to Settings. Long lists scroll with the selection.
 
 ### Lyrics
 
-Press **l** for the playing track's lyrics. Saved text opens immediately while
+Press **l** for the selected track's lyrics or **Ctrl+L** for the playing track. Saved text opens immediately while
 Furumi looks for more versions on peers. Use **←/→** to select a version,
 **↑/↓** or **Page Up/Down** to read, and **f** to resume following timed lines.
 Federated lyrics are stored alongside local audio when **Save on listen** is

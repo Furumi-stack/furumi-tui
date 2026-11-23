@@ -392,17 +392,18 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             None
         }
         Action::OpenLyrics => {
-            let fallback = if state.player.current.is_none() {
-                selected_track(state)
-                    .filter(|track| !track.is_podcast())
-                    .map(Box::new)
+            if let Some(track) = selected_track(state).filter(|track| !track.is_podcast()) {
+                state.popup = Some(super::state::Popup::Lyrics(super::lyrics::Reader::preview(
+                    track,
+                )));
             } else {
-                None
-            };
-            state.popup = Some(super::state::Popup::Lyrics(super::lyrics::Reader {
-                fallback,
-                ..Default::default()
-            }));
+                state.status_message = Some("Select a music track to view its lyrics".into());
+            }
+            None
+        }
+        Action::OpenCurrentLyrics => {
+            state.lyrics.refresh_local();
+            state.popup = Some(super::state::Popup::Lyrics(super::lyrics::Reader::default()));
             None
         }
         Action::CycleVisualizerMode => {

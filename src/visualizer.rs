@@ -66,7 +66,7 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         id: "lyrics_in_motion",
         file_name: "lyrics_in_motion.rhai",
         display_name: "Lyrics in motion",
-        version: 2,
+        version: 3,
         source: include_str!("visualizations/lyrics_in_motion.rhai"),
     },
 ];
@@ -822,7 +822,7 @@ enum DrawCommand {
         y: u16,
         ch: String,
         fg: Color,
-        bg: Color,
+        bg: Option<Color>,
         mods: Modifier,
     },
     HLine {
@@ -877,7 +877,7 @@ enum DrawCommand {
     Dots {
         points: Vec<(u16, u16)>,
         fg: Color,
-        bg: Color,
+        bg: Option<Color>,
         mods: Modifier,
     },
     /// A thin straight line of braille dots between two dot coordinates.
@@ -902,6 +902,11 @@ impl DrawCommand {
             .ok_or_else(|| "missing op".to_string())?;
         let fg = map_color(&map, "fg").unwrap_or(Color::White);
         let bg = map_color(&map, "bg").unwrap_or(Color::Black);
+        let preserve_bg = map
+            .get("preserve_bg")
+            .and_then(|value| value.as_bool().ok())
+            .unwrap_or(false);
+        let overlay_bg = (!preserve_bg).then_some(bg);
         let mods = map_modifiers(&map);
         match op.as_str() {
             "clear" => Ok(DrawCommand::Clear { bg }),
@@ -910,7 +915,7 @@ impl DrawCommand {
                 y: map_u16(&map, "y").ok_or_else(|| "cell.y must be an integer".to_string())?,
                 ch: map_string(&map, "ch").unwrap_or_else(|| " ".to_string()),
                 fg,
-                bg,
+                bg: overlay_bg,
                 mods,
             }),
             "hline" => Ok(DrawCommand::HLine {
@@ -974,7 +979,7 @@ impl DrawCommand {
                         .map(|[x, y]| (*x, *y))
                         .collect(),
                     fg,
-                    bg,
+                    bg: overlay_bg,
                     mods,
                 })
             }
@@ -999,12 +1004,17 @@ fn render_commands(frame: &mut Frame, area: Rect, commands: &[DrawCommand]) {
 fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCommand]) {
     // Each command sets the cell's whole attribute set, so a plain command
     // drawn over a bold or dim one does not inherit its attributes.
-    let styled = |fg: Color, bg: Color, mods: Modifier| {
+    let foreground = |fg: Color, mods: Modifier| {
         Style::new()
             .fg(fg)
-            .bg(bg)
             .add_modifier(mods)
             .remove_modifier(Modifier::all().difference(mods))
+    };
+    let styled = |fg, bg, mods| foreground(fg, mods).bg(bg);
+    // Leaving Style.bg unset preserves the background already drawn into a cell.
+    let overlay = |fg, bg: Option<Color>, mods| {
+        let style = foreground(fg, mods);
+        bg.map_or(style, |bg| style.bg(bg))
     };
     for command in commands {
         match command {
@@ -1022,7 +1032,7 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 bg,
                 mods,
             } => {
-                write_cell(buffer, area, *x, *y, ch, styled(*fg, *bg, *mods));
+                write_cell(buffer, area, *x, *y, ch, overlay(*fg, *bg, *mods));
             }
             DrawCommand::HLine {
                 x,
@@ -1142,7 +1152,7 @@ fn render_commands_to_buffer(buffer: &mut Buffer, area: Rect, commands: &[DrawCo
                 bg,
                 mods,
             } => {
-                let style = styled(*fg, *bg, *mods);
+                let style = overlay(*fg, *bg, *mods);
                 for (dot_x, dot_y) in points {
                     plot_dot(buffer, area, *dot_x, *dot_y, style);
                 }
@@ -2325,6 +2335,38 @@ mod tests {
                 "{width}x{height}: lamps overdrawn"
             );
         }
+    }
+
+    #[test]
+    fn particle_overlays_preserve_the_background_under_dots_and_shapes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+            fn render(input) {
+                [
+                    #{op: "rect", x: 0, y: 1, w: 4, h: 1, bg: 0x254368},
+                    #{op: "dots", points: [0, 4, 1, 4], fg: 0xcceeff, preserve_bg: true},
+                    #{op: "cell", x: 1, y: 1, ch: "✦", fg: 0xffffff, preserve_bg: true},
+                    #{op: "cell", x: 2, y: 1, ch: "+", fg: 0xffffff}
+                ]
+            }
+        "#,
+        )
+        .unwrap();
+        let commands = ScriptRuntime::default()
+            .render(file.path(), test_input())
+            .unwrap();
+        let area = Rect::new(0, 0, 4, 3);
+        let mut buffer = Buffer::empty(area);
+        render_commands_to_buffer(&mut buffer, area, &commands);
+
+        for (column, symbol) in [(0, "⠉"), (1, "✦")] {
+            let cell = buffer.cell((column, 1)).unwrap();
+            assert_eq!(cell.symbol(), symbol);
+            assert_eq!(cell.bg, Color::Rgb(0x25, 0x43, 0x68));
+        }
+        assert_eq!(buffer.cell((2, 1)).unwrap().bg, Color::Black);
     }
 
     #[test]
