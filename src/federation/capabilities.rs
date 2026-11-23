@@ -67,7 +67,11 @@ pub struct ObservedVersions {
 /// peers never dial an overlay that failed to open here.
 fn local_manifest(podcast_dht: bool) -> CapabilityManifest {
     let manifest = CapabilityManifest::frid("furumi", env!("CARGO_PKG_VERSION"))
-        .with_protocol("audio", super::audio::AUDIO_PROTOCOL_VERSION);
+        .with_protocol("audio", super::audio::AUDIO_PROTOCOL_VERSION)
+        .with_protocol(
+            music_dht::lyrics::LYRICS_ID,
+            music_dht::lyrics::LYRICS_PROTOCOL_VERSION,
+        );
     if podcast_dht {
         manifest.with_podcast_dht()
     } else {

@@ -32,6 +32,7 @@ pub enum Action {
     ToggleShuffle,
     CycleRepeat,
     ToggleVisualizer,
+    OpenLyrics,
     CycleVisualizerMode,
     ToggleLike,
     ToggleTrackSelection,
@@ -129,6 +130,7 @@ impl Action {
             | Action::VolumeDown
             | Action::ToggleShuffle
             | Action::CycleRepeat
+            | Action::OpenLyrics
             | Action::ToggleVisualizer
             | Action::CycleVisualizerMode
             | Action::OpenConnectedDevices
@@ -229,6 +231,7 @@ impl Action {
             Action::VolumeDown => "Volume down".into(),
             Action::ToggleShuffle => "Toggle shuffle".into(),
             Action::CycleRepeat => "Cycle repeat mode".into(),
+            Action::OpenLyrics => "Show track lyrics".into(),
             Action::ToggleVisualizer => "Toggle fullscreen visualizer".into(),
             Action::CycleVisualizerMode => "Next visualizer display mode".into(),
             Action::ToggleLike => "Like / unlike".into(),

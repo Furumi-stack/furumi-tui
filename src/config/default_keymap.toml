@@ -137,7 +137,7 @@ command = "MoveLeft"
 
 [[keymaps]]
 key_sequence = "l"
-command = "MoveRight"
+command = "OpenLyrics"
 
 [[keymaps]]
 key_sequence = "right"

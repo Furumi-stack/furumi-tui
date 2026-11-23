@@ -15,6 +15,7 @@
 mod audio;
 mod capabilities;
 pub mod catalog;
+mod lyrics;
 mod similarity;
 
 use std::collections::{HashMap, VecDeque};
@@ -780,6 +781,7 @@ impl Federation {
             .schema_independent_stream_protocol(PODCAST_DHT_ALPN)
             // Informational application/protocol versions.
             .schema_independent_stream_protocol(capabilities::CAPABILITIES_ALPN)
+            .schema_independent_stream_protocol(music_dht::lyrics::LYRICS_ALPN)
             .build()
             .map_err(|err| anyhow::anyhow!("invalid federation config: {err}"))?;
         let (service, mut events) = MusicDhtService::start(config)
@@ -905,11 +907,15 @@ impl Federation {
             podcast_dht.clone(),
         ));
 
+        let lyrics_acceptor = service.stream_acceptor(music_dht::lyrics::LYRICS_ALPN)?;
+        let lyrics_task = tokio::spawn(lyrics::serve(lyrics_acceptor, Arc::clone(&self.library)));
+
         let mut tasks = podcast_dht_tasks;
         tasks.extend([
             event_task,
             sync_task,
             audio_task,
+            lyrics_task,
             catalog_task,
             similarity_task,
             device_sync_task,

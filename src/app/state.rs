@@ -740,6 +740,8 @@ impl PlaylistAddTarget {
 /// Modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Popup {
+    Lyrics(super::lyrics::Reader),
+    LyricsEditor(Box<super::lyrics::Editor>),
     /// Pick one of the playlists (last row = "create new"); the target is
     /// added on Enter (federated tracks are downloaded first).
     AddToPlaylist {
@@ -762,7 +764,10 @@ pub enum Popup {
         error: Option<String>,
     },
     /// Delete confirmation; Enter/y deletes, Esc/n cancels.
-    ConfirmDelete { target: DeleteTarget, label: String },
+    ConfirmDelete {
+        target: DeleteTarget,
+        label: String,
+    },
     /// Unsubscribe confirmation; progress and history are kept.
     ConfirmPodcastUnsubscribe {
         podcast_id: music_dht::podcast::PodcastId,
@@ -795,11 +800,15 @@ pub enum Popup {
         max_scroll: std::cell::Cell<u16>,
     },
     /// Enabling network similarity reveals an embedding query to peers.
-    SimilarityPrivacyConsent { enable_federation: bool },
+    SimilarityPrivacyConsent {
+        enable_federation: bool,
+    },
     /// Derived data is safe to recreate but potentially expensive.
     ConfirmClearEmbeddings,
     /// Library-home filters. Cursor is kept for the next filters added here.
-    LibraryFilters { cursor: usize },
+    LibraryFilters {
+        cursor: usize,
+    },
     /// Track metadata viewer; left/right switch between selected tracks.
     TrackInfo {
         tracks: Vec<TrackItem>,
@@ -822,7 +831,10 @@ pub enum Popup {
         input: LineEdit,
     },
     /// Wrapped read-only text (this peer's connection ticket).
-    FedText { title: String, text: String },
+    FedText {
+        title: String,
+        text: String,
+    },
     /// Wrapped text that can be copied to the system clipboard.
     FedCopyText {
         title: String,
@@ -834,10 +846,14 @@ pub enum Popup {
     /// The app loop temporarily leaves the alternate screen while this is
     /// active so terminal selection does not acquire TUI borders or hard
     /// line breaks.
-    PlainText { text: String },
+    PlainText {
+        text: String,
+    },
     /// The destination is already write-tested; Enter/y migrates managed
     /// files, while n changes only the destination for future downloads.
-    ConfirmMusicDirectory { path: std::path::PathBuf },
+    ConfirmMusicDirectory {
+        path: std::path::PathBuf,
+    },
     /// Incoming trusted-device pairing request.
     DevicePairing {
         request_id: String,
@@ -848,13 +864,20 @@ pub enum Popup {
         requester_group_active_devices: usize,
     },
     /// Confirmation before revoking a trusted device.
-    ConfirmDeviceRevoke { device_id: String, name: String },
+    ConfirmDeviceRevoke {
+        device_id: String,
+        name: String,
+    },
     /// Confirmation before this device leaves the trusted-device group.
     ConfirmDeviceLeave,
     /// Connected playback devices and their current role/status.
-    ConnectedDevices { cursor: usize },
+    ConnectedDevices {
+        cursor: usize,
+    },
     /// Qualified listening history from every trusted device.
-    ListenHistory { cursor: usize },
+    ListenHistory {
+        cursor: usize,
+    },
     /// Full federation, transport and device status details.
     FederationStatusDetails {
         focus: StatusDetailFocus,
@@ -1969,6 +1992,7 @@ pub struct AppState {
     pub podcast_downloads: std::collections::HashSet<String>,
     pub podcast_downloading: std::collections::HashSet<String>,
     pub player: PlayerBar,
+    pub(crate) lyrics: super::lyrics::Playback,
     pub device_playback: DevicePlaybackState,
     pub jam: crate::jam::JamStatus,
     pub visualizer: crate::visualizer::VisualizerState,

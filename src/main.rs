@@ -5,6 +5,7 @@ mod devices;
 mod federation;
 mod jam;
 mod library;
+mod lyrics;
 mod media;
 mod player;
 mod podcasts;

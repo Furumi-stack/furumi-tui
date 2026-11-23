@@ -152,6 +152,19 @@ The **Additional settings** window also contains the music save directory and
 visualization controls. Use Up/Down (or j/k) to navigate, Enter to select, and
 Esc to return to Settings. Long lists scroll with the selection.
 
+### Lyrics
+
+Press **l** for the playing track's lyrics. Saved text opens immediately while
+Furumi looks for more versions on peers. Use **←/→** to select a version,
+**↑/↓** or **Page Up/Down** to read, and **f** to resume following timed lines.
+Federated lyrics are stored alongside local audio when **Save on listen** is
+enabled. A saved version can be served to peers that request the same audio.
+
+In a local track's metadata editor, **F3** opens its lyrics versions. Use **a**
+to add a version, paste plain text or LRC, and save with **Ctrl+S** or **F2**.
+Select **Lyrics in motion** in the visualization settings for animated timed
+lyrics using the same selected alternative.
+
 ### Tabs and key bindings
 
 The number keys open the tabs in the order they are shown, and Tab /
@@ -469,7 +482,7 @@ owner_timeout_ms = 120000
 All clients must support the new coordination envelope for eventual single
 output ownership. frid's `PLAYBACK_PROTOCOL.md` describes the protocol, adapter
 contract and rollout. This release uses the published FRID crates
-`music-dht 0.6.0` and `furumi-library 0.3.0` from crates.io.
+`music-dht 0.7.0` and `furumi-library 0.4.0` from crates.io.
 
 Run the local protocol checks from the TUI repository:
 

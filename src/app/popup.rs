@@ -97,6 +97,8 @@ pub fn handle_key(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
         return;
     };
     match popup {
+        Popup::Lyrics(reader) => super::lyrics::reader_key(state, reader, key),
+        Popup::LyricsEditor(editor) => super::lyrics::editor_key(state, runtime, editor, key),
         Popup::AddToPlaylist { target, cursor } => {
             handle_picker(state, runtime, target, cursor, key);
         }
@@ -850,6 +852,10 @@ fn handle_device_leave(state: &mut AppState, runtime: &mut Runtime, key: KeyEven
 
 /// Pasted text goes into the focused text field when one is open.
 pub fn handle_paste(state: &mut AppState, runtime: &mut Runtime, pasted: &str) {
+    if let Some(Popup::LyricsEditor(editor)) = &mut state.popup {
+        super::lyrics::paste(editor, pasted);
+        return;
+    }
     let cleaned: String = pasted.chars().filter(|c| !c.is_control()).collect();
     let mut search = None;
     match &mut state.popup {
@@ -894,6 +900,17 @@ fn handle_edit(
 ) {
     match key.code {
         KeyCode::Esc => return,
+        KeyCode::F(3) if let EditTarget::Track(id) = target => {
+            let parent = Popup::Edit {
+                target,
+                title,
+                fields,
+                focus,
+                error,
+            };
+            super::lyrics::open_editor(state, runtime, parent, id);
+            return;
+        }
         KeyCode::Enter => {
             match save_edit(runtime, target, &fields) {
                 Ok(message) => {

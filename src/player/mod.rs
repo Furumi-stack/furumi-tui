@@ -6,6 +6,7 @@
 
 mod analyzer;
 mod opus;
+mod output;
 mod spectrum;
 
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source, stream::MixerDeviceSink};
+use output::Output;
+use rodio::{Decoder, Source};
 
 pub use analyzer::AudioAnalysisSnapshot;
 pub use spectrum::{BAND_CENTERS_HZ, FLOOR_DB};
@@ -266,12 +268,6 @@ struct Generations {
     start_paused: Arc<AtomicBool>,
 }
 
-struct Output {
-    /// Keeps the audio device open; dropping it stops the mixer.
-    _device: MixerDeviceSink,
-    player: Player,
-}
-
 /// Audio-thread state besides the output device.
 struct Playing {
     track_loaded: bool,
@@ -395,9 +391,7 @@ fn handle(
             seekable,
             volume,
         } => {
-            let Some(out) = ensure_output(output, on_event) else {
-                return;
-            };
+            let out = output.get_or_insert_with(Output::new);
             match decode_source(reader, byte_len, mime_type.as_deref(), seekable) {
                 Ok(source) => start_source(out, source, volume, false, shared, on_event),
                 Err(err) => {
@@ -414,9 +408,7 @@ fn handle(
             start,
             generation: _,
         } => {
-            let Some(out) = ensure_output(output, on_event) else {
-                return;
-            };
+            let out = output.get_or_insert_with(Output::new);
             let paused = start_paused.load(Ordering::SeqCst);
             start_source(out, source, volume, paused, shared, on_event);
             playing.track_loaded = true;
@@ -461,7 +453,7 @@ fn handle(
         }
         Command::Seek(position) => {
             let result = match output {
-                Some(out) => out.player.try_seek(position).map_err(|err| err.to_string()),
+                Some(out) => out.seek(position),
                 None => Err("nothing is playing".to_string()),
             };
             match &result {
@@ -484,33 +476,9 @@ fn handle(
     }
 }
 
-/// The device is opened lazily on first playback so the app works on
-/// machines with no audio output until you actually press play.
-fn ensure_output<'a>(
-    output: &'a mut Option<Output>,
-    on_event: &impl Fn(PlayerEvent),
-) -> Option<&'a Output> {
-    if output.is_none() {
-        match DeviceSinkBuilder::open_default_sink() {
-            Ok(device) => {
-                let player = Player::connect_new(device.mixer());
-                *output = Some(Output {
-                    _device: device,
-                    player,
-                });
-            }
-            Err(err) => {
-                on_event(PlayerEvent::Failed(format!("no audio device: {err}")));
-                return None;
-            }
-        }
-    }
-    output.as_ref()
-}
-
 /// Replace whatever is playing with `source`.
 fn start_source(
-    out: &Output,
+    out: &mut Output,
     source: DecodedSource,
     volume: f32,
     paused: bool,
@@ -518,7 +486,7 @@ fn start_source(
     on_event: &impl Fn(PlayerEvent),
 ) {
     shared.analysis.clear();
-    out.player.stop();
+    out.reset_player();
     out.player.set_volume(volume);
     out.player.append(analyzer::AnalyzedSource::new(
         source,

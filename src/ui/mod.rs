@@ -3,6 +3,7 @@ pub mod art;
 mod federation;
 pub(crate) mod global;
 mod logs;
+pub(crate) mod lyrics;
 mod playlists;
 mod podcast_card;
 mod podcasts;
@@ -561,6 +562,7 @@ mod tests {
 pub fn draw(frame: &mut Frame, state: &AppState, keymap: &Keymap) {
     if state.visualizer.active {
         crate::visualizer::draw(frame, state);
+        popup::draw(frame, state);
         if state.shutting_down {
             draw_shutdown(frame, state);
         }

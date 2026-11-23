@@ -470,6 +470,21 @@ The TUI owns what the contract leaves to clients:
   progress generation this device saw, so a handoff target starts its
   session above it.
 
+## Lyrics
+
+Furumi loads saved lyrics from the library by canonical audio content ID.
+The playback runtime queries the optional `furumi/lyrics/1` stream in the
+background and adds distinct alternatives without changing the active version.
+Only tracks with local audio can be served. Save on listen persists discovered
+versions after the audio is imported. Track edits write directly to the local
+library, which keeps exclusions for deleted alternatives.
+
+A single parsed LRC timeline supplies both the reader and the Rhai
+`input.lyrics` map. The map contains the current, previous and next line with
+timing and availability information. The text sent to a script is bounded on
+each frame. The bundled preset combines the `matrix_text` dot-matrix renderer
+with Unicode text, sparse Braille particles and timestamp-driven transitions.
+
 ## Scripted visualizations
 
 Visualizations are an extension boundary rather than hard-coded rendering

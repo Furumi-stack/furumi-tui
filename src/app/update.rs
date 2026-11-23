@@ -391,6 +391,20 @@ pub fn update(state: &mut AppState, action: Action) -> Option<Effect> {
             }
             None
         }
+        Action::OpenLyrics => {
+            let fallback = if state.player.current.is_none() {
+                selected_track(state)
+                    .filter(|track| !track.is_podcast())
+                    .map(Box::new)
+            } else {
+                None
+            };
+            state.popup = Some(super::state::Popup::Lyrics(super::lyrics::Reader {
+                fallback,
+                ..Default::default()
+            }));
+            None
+        }
         Action::CycleVisualizerMode => {
             if state.visualizer.active {
                 if let Err(err) = state.visualizer.cycle_mode() {

@@ -4,6 +4,7 @@ pub mod command;
 mod enrichment;
 pub mod event;
 pub mod input;
+pub(crate) mod lyrics;
 #[cfg(test)]
 pub(crate) mod podcast_fixtures;
 pub(crate) mod podcast_runtime;
@@ -547,22 +548,30 @@ pub async fn run(
                 terminal.clear()?;
                 runtime.force_redraw = false;
             }
+            ui::lyrics::prepare_reader(&mut state, terminal.get_frame().area());
             terminal.draw(|frame| ui::draw(frame, &state, &keymap))?;
         }
 
         redraw = true;
         tokio::select! {
             maybe_event = input.next() => match maybe_event {
-                Some(Ok(event)) => handle_terminal_event(&mut state, &mut keymap, &mut runtime, event),
+                Some(Ok(event)) => {
+                    handle_terminal_event(&mut state, &mut keymap, &mut runtime, event);
+                    lyrics::refresh(&mut state, &runtime);
+                },
                 Some(Err(err)) => return Err(err.into()),
                 None => state.should_quit = true,
             },
-            Some(app_event) = event_rx.recv() => handle_app_event(&mut state, &mut runtime, app_event),
+            Some(app_event) = event_rx.recv() => {
+                handle_app_event(&mut state, &mut runtime, app_event);
+                lyrics::refresh(&mut state, &runtime);
+            },
             _ = tick.tick() => {
                 reconcile_personal_playback(&mut state, &mut runtime);
                 state.advance_spinner();
                 expire_quit_confirmation(&mut state);
                 sync_player_shared(&mut state, &runtime);
+                lyrics::refresh(&mut state, &runtime);
                 podcast_runtime::tick(&state, &mut runtime);
                 runtime
                     .status_publisher
@@ -3531,6 +3540,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
         return;
     };
     match event {
+        AppEvent::Lyrics(event) => lyrics::handle_event(state, event),
         // Folded in by podcast_runtime::handle_event above.
         AppEvent::PodcastStoreOpened(_)
         | AppEvent::PodcastsSynced { .. }
@@ -3923,6 +3933,7 @@ fn handle_app_event(state: &mut AppState, runtime: &mut Runtime, event: AppEvent
             match result {
                 Ok(playable) => {
                     if playable.imported {
+                        lyrics::on_import(state, runtime, &playable.track);
                         if let Some(content_id) = state::track_content_id(&playable.track) {
                             state.local_content_ids.insert(content_id.clone());
                             let _ = runtime

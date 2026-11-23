@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 
+mod matrix;
 pub mod status;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -60,6 +61,13 @@ const BUNDLED_SCRIPTS: &[BundledScript] = &[
         display_name: "VFD panel",
         version: 8,
         source: include_str!("visualizations/vfd_panel.rhai"),
+    },
+    BundledScript {
+        id: "lyrics_in_motion",
+        file_name: "lyrics_in_motion.rhai",
+        display_name: "Lyrics in motion",
+        version: 1,
+        source: include_str!("visualizations/lyrics_in_motion.rhai"),
     },
 ];
 
@@ -380,7 +388,62 @@ fn input_map_with_features(area: Rect, state: &AppState, features: AudioFeatures
     input.insert("track_artist".into(), artist.into());
     insert_meter(&mut input, &state.player.audio_analysis);
     insert_track_details(&mut input, state);
+    input.insert(
+        "lyrics".into(),
+        lyrics_input(state, features.position_secs).into(),
+    );
     input
+}
+
+fn lyrics_input(state: &AppState, position: f64) -> Map {
+    let playback = &state.lyrics;
+    let doc = &playback.document;
+    let active = doc.line_at(position);
+    let previous = active.and_then(|index| index.checked_sub(1));
+    let next = if doc.timed() {
+        Some(active.map_or(0, |index| index + 1))
+    } else {
+        None
+    };
+    let line = |index: Option<usize>| {
+        index
+            .and_then(|index| doc.lines.get(index))
+            .map(|line| line.chars().take(512).collect::<String>())
+            .unwrap_or_default()
+    };
+    let mut lyrics = Map::new();
+    lyrics.insert("loading".into(), playback.loading.into());
+    lyrics.insert("timed".into(), doc.timed().into());
+    lyrics.insert("instrumental".into(), doc.instrumental.into());
+    lyrics.insert("available".into(), (!playback.versions.is_empty()).into());
+    lyrics.insert("active".into(), line(active).into());
+    lyrics.insert("previous".into(), line(previous).into());
+    lyrics.insert("next".into(), line(next).into());
+    insert_int(
+        &mut lyrics,
+        "index",
+        active.map_or(-1, |index| index as i64),
+    );
+    let start = active.and_then(|index| doc.time(index));
+    let end = next.and_then(|index| doc.time(index));
+    insert_float(
+        &mut lyrics,
+        "elapsed",
+        start.map_or(0.0, |start| (position - start).max(0.0)),
+    );
+    insert_float(
+        &mut lyrics,
+        "until_next",
+        end.map_or(-1.0, |end| (end - position).max(0.0)),
+    );
+    insert_float(
+        &mut lyrics,
+        "progress",
+        start.zip(end).map_or(0.0, |(start, end)| {
+            ((position - start) / (end - start)).clamp(0.0, 1.0)
+        }),
+    );
+    lyrics
 }
 
 /// Analyzer meter fields (protocol v3). They report the decoded signal as a
@@ -637,6 +700,11 @@ impl Default for ScriptRuntime {
         engine.register_fn("sqrt", |value: FLOAT| value.sqrt());
         engine.register_fn("abs", |value: FLOAT| value.abs());
         engine.register_fn("pow", |value: FLOAT, power: FLOAT| value.powf(power));
+        engine.register_fn("matrix_text", matrix::matrix_text);
+        engine.register_fn("cut_cells", matrix::cut_cells);
+        engine.register_fn("cell_width", |text: &str| {
+            unicode_width::UnicodeWidthStr::width(text) as i64
+        });
         Self {
             engine,
             cached_path: None,
@@ -1486,6 +1554,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lyric_preset_animates_timed_lines_and_uses_unicode_fallback() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            include_str!("visualizations/lyrics_in_motion.rhai"),
+        )
+        .unwrap();
+        let mut runtime = ScriptRuntime::default();
+        let mut state = AppState::default();
+        let version =
+            crate::lyrics::manual_version("Timed", "[00:01]FIRST\n[00:05]SECOND\n[00:09]歌詞")
+                .unwrap();
+        state.lyrics.document = crate::lyrics::Document::new(&version);
+        state.lyrics.versions.push(version);
+        let mut render = |position| {
+            let mut input = test_input();
+            input.insert("lyrics".into(), lyrics_input(&state, position).into());
+            runtime.render(file.path(), input).unwrap()
+        };
+        let matrix_start = |commands: &[DrawCommand]| {
+            commands
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::Text { x, y, text, .. }
+                        if text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)) =>
+                    {
+                        Some((*x, *y))
+                    }
+                    _ => None,
+                })
+                .expect("Braille lyric spans")
+        };
+        assert_ne!(matrix_start(&render(1.05)), matrix_start(&render(1.75)));
+        assert!(
+            render(5.1)
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Dots { .. }))
+        );
+        assert!(
+            render(10.0)
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Text { text, .. } if text == "歌詞"))
+        );
+        assert_ne!(matrix_start(&render(2.0)), (0, 0));
     }
 
     #[test]

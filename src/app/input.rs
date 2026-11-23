@@ -36,6 +36,47 @@ impl LineEdit {
             .unwrap_or(self.value.len())
     }
 
+    pub fn line_cursor(&self) -> (usize, usize) {
+        let before = &self.value[..self.byte_index(self.cursor)];
+        (
+            before.bytes().filter(|&byte| byte == b'\n').count(),
+            before
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count(),
+        )
+    }
+
+    pub fn move_line(&mut self, direction: isize) {
+        let (row, column) = self.line_cursor();
+        self.move_to_line(row.saturating_add_signed(direction), column);
+    }
+
+    pub fn line_edge(&mut self, end: bool) {
+        let (row, _) = self.line_cursor();
+        self.move_to_line(row, if end { usize::MAX } else { 0 });
+    }
+
+    fn move_to_line(&mut self, row: usize, column: usize) {
+        let mut start = 0;
+        for (index, line) in self.value.split('\n').enumerate() {
+            let len = line.chars().count();
+            if index == row {
+                self.cursor = start + column.min(len);
+                return;
+            }
+            start += len + 1;
+        }
+    }
+
+    pub fn with_cursor(value: impl Into<String>, cursor: usize) -> Self {
+        let mut edit = Self::new(value);
+        edit.cursor = edit.cursor.min(cursor);
+        edit
+    }
+
     pub fn clear(&mut self) {
         self.value.clear();
         self.cursor = 0;

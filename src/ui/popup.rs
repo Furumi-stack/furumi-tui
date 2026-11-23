@@ -13,6 +13,8 @@ use crate::library::models::{ArtistRef, TrackItem};
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
     match state.popup.as_ref() {
+        Some(Popup::Lyrics(reader)) => super::lyrics::draw_reader(frame, state, reader),
+        Some(Popup::LyricsEditor(editor)) => super::lyrics::draw_editor(frame, state, editor),
         Some(Popup::AddToPlaylist { target, cursor }) => {
             draw_picker(frame, state, &target.label(), *cursor)
         }
@@ -22,8 +24,16 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             fields,
             focus,
             error,
-            ..
-        }) => draw_edit(frame, state, title, fields, *focus, error.as_deref()),
+            target,
+        }) => draw_edit(
+            frame,
+            state,
+            title,
+            fields,
+            *focus,
+            error.as_deref(),
+            matches!(target, crate::app::state::EditTarget::Track(_)),
+        ),
         Some(Popup::ConfirmDelete { label, .. }) => draw_confirm_delete(frame, state, label),
         Some(Popup::ConfirmPodcastUnsubscribe { title, .. }) => {
             draw_confirm_podcast_unsubscribe(frame, state, title)
@@ -1213,6 +1223,7 @@ fn draw_edit(
     fields: &[EditField],
     focus: usize,
     error: Option<&str>,
+    track: bool,
 ) {
     let height = (fields.len() as u16 * 3 + 4).min(frame.area().height.saturating_sub(2));
     let area = centered(frame.area(), 60, height);
@@ -1257,6 +1268,10 @@ fn draw_edit(
     let footer = areas[areas.len() - 1];
     let hint = match error {
         Some(error) => Line::styled(error.to_string(), theme::accent_for(state)),
+        None if track => Line::styled(
+            "F3 lyrics · tab/↑↓ field · enter save · esc cancel",
+            theme::dim(),
+        ),
         None => Line::styled("tab/↑↓ field · enter save · esc cancel", theme::dim()),
     };
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), footer);
