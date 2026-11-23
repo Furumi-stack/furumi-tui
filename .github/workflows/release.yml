@@ -78,6 +78,9 @@ jobs:
 
   publish:
     name: Publish release assets
+    concurrency:
+      group: release-assets-${{ github.ref }}
+      cancel-in-progress: false
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -98,15 +101,46 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Hash archive bytes; manifest entries use the release asset basenames.
-          for archive in artifacts/*/*; do
-            (cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")")
-          done > SHA256SUMS
+          archives=(artifacts/*/*)
+          assets=$(mktemp)
+          if ! gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > "$assets"; then
+            for archive in "${archives[@]}"; do
+              (cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")")
+            done > SHA256SUMS
+            gh release create "$RELEASE_TAG" "${archives[@]}" SHA256SUMS \
+              --title "furumi ${RELEASE_TAG}" \
+              --notes "Release ${RELEASE_TAG}" \
+              --verify-tag
+            exit 0
+          fi
 
-          gh release create "$RELEASE_TAG" artifacts/*/* SHA256SUMS \
-            --title "furumi ${RELEASE_TAG}" \
-            --notes "Release ${RELEASE_TAG}" \
-            --verify-tag
+          # Hash existing archives from the release itself. Rebuilt artifacts
+          # can have different bytes even if the tag and file names match.
+          published=$(mktemp -d)
+          missing=()
+          : > SHA256SUMS
+          for archive in "${archives[@]}"; do
+            name=$(basename "$archive")
+            if grep -Fxq -- "$name" "$assets"; then
+              gh release download "$RELEASE_TAG" --pattern "$name" --dir "$published"
+              (cd "$published" && sha256sum "$name") >> SHA256SUMS
+            else
+              missing+=("$archive")
+              (cd "$(dirname "$archive")" && sha256sum "$name") >> SHA256SUMS
+            fi
+          done
+
+          if (( ${#missing[@]} )); then
+            gh release upload "$RELEASE_TAG" "${missing[@]}"
+          fi
+          if grep -Fxq -- SHA256SUMS "$assets"; then
+            gh release download "$RELEASE_TAG" --pattern SHA256SUMS --dir "$published"
+            if ! cmp -s "$published/SHA256SUMS" SHA256SUMS; then
+              gh release upload "$RELEASE_TAG" SHA256SUMS --clobber
+            fi
+          else
+            gh release upload "$RELEASE_TAG" SHA256SUMS
+          fi
 
   update-homebrew:
     name: Dispatch Homebrew formula update
